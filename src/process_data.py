@@ -44,6 +44,7 @@ def load_data(exp_dirs, grid_width=7) -> dict:
             'path': exp_dir,
             'shifts_raw': shifts_raw,
             'time': time,
+            'img_path': exp_dir / 'box_overhead_image.png'
         }
         data[name] = d
     return data
@@ -135,7 +136,7 @@ def get_gradients(fft_vals, n_lasers):
     return gradients
 
 
-def process_data(exp_dirs, min_freq=50, max_freq=1000, n_modes=10, min_distance=10, canonical_mode_freqs=None):
+def process_data_all(exp_dirs, min_freq=50, max_freq=1000, n_modes=10, min_distance=10, canonical_mode_freqs=None):
 
     data = load_data(exp_dirs)
     print(f'Loaded {len(data)} experiments')
@@ -162,5 +163,21 @@ def process_data(exp_dirs, min_freq=50, max_freq=1000, n_modes=10, min_distance=
         d['synced_fft_gradients'] = get_gradients(d['synced_fft_vals'], n_lasers)  # shape: (n_freqs, 2, 10, 10)
         d['mode_fft_gradients'] = get_gradients(d['mode_fft_vals'], n_lasers)  # shape: (n_modes, 2, 10, 10)
         d['synced_mode_fft_gradients'] = get_gradients(d['synced_mode_fft_vals'], n_lasers)  # shape: (n_modes, 2, 10, 10)
+
+    return data
+
+
+def process_data(exp_dirs, min_freq=50, max_freq=1000, n_modes=10, min_distance=10, canonical_mode_freqs=None):
+
+    data = load_data(exp_dirs)
+    print(f'Loaded {len(data)} experiments')
+
+    for name, d in tqdm(data.items()):
+
+        # clean data
+        d['shifts'] = hann_window(bandpass_filter(d['shifts_raw'], d['fs']))
+
+        # compute fft
+        d['fft_vals'], d['freqs'] = shifts_to_fft(d['shifts'], d['fs'], min_freq, max_freq)
 
     return data
