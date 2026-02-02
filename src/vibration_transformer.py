@@ -133,8 +133,14 @@ class SignalTransformer(ComposerModel):
         nn.init.trunc_normal_(self.cls_token, std=.02)  # Initialize to small random values
 
         # Prediction heads
-        self.mlp_head_capacity = nn.Sequential(nn.Linear(d_model, 64), nn.ReLU(), nn.Linear(64, num_classes))
-        self.mlp_head_classification = nn.Sequential(nn.Linear(d_model, 64), nn.ReLU(), nn.Linear(64, num_classes))
+        self.mlp_head_x_position = nn.Sequential(nn.Linear(d_model, 64), nn.ReLU(), nn.Linear(64, num_classes))
+        self.mlp_head_y_position = nn.Sequential(nn.Linear(d_model, 64), nn.ReLU(), nn.Linear(64, num_classes))
+
+        # metrics
+        self.train_accuracy = MulticlassAccuracy(num_classes=num_classes, average='micro')
+        self.val_accuracy = MulticlassAccuracy(num_classes=num_classes, average='micro')
+        self.val_cross_entropy = CrossEntropy()
+        self.train_cross_entropy = CrossEntropy()
 
     def forward(self, batch):
         inputs, _ = batch
@@ -158,25 +164,37 @@ class SignalTransformer(ComposerModel):
         # Add learnable sequence CLS token: (B, 1, d_model)
         cls_token = self.cls_token.expand(B, -1, -1)
 
-        transformer_input = torch.cat((cls_token, pnt_tokens), dim=1)  # Shape: (B, num_points + 1, d_model)
+        transformer_input = torch.cat((cls_token, pnt_tokens), dim=1)  # (B, num_points + 1, d_model)
 
         # Process through the sequence-level transformer
-        output = self.transformer_encoder(transformer_input)  # Shape: (B, num_points + 1, d_model)
+        output = self.transformer_encoder(transformer_input)  # (B, num_points + 1, d_model)
 
         # Extract the sequence-level CLS embedding
         cls_embedding = output[:, 0, :]  # Shape: (B, d_model)
 
-        # Predict capacity and classification outputs
-        logits_capacity_pred = self.mlp_head_capacity(cls_embedding)  # Shape: (B, VECTOR_SIZE)
-        logits_class_pred = self.mlp_head_classification(cls_embedding)  # Shape: (B, NUM_CLASSES)
-
-        return logits_capacity_pred, logits_class_pred, cls_embedding
+        # Predict x and y position
+        logits_x_position = self.mlp_head_x_position(cls_embedding)
+        logits_y_position = self.mlp_head_y_position(cls_embedding)
+        return logits_x_position, logits_y_position, cls_embedding
 
     def loss(self, outputs, batch):
         _, targets = batch
-        logits_capacity_pred, logits_class_pred, cls_embedding = outputs
-        return F.cross_entropy(logits_class_pred, targets)
+        logits_x_position, _, _ = outputs
+        return F.cross_entropy(logits_x_position, targets)
 
+    def update_metric(self, batch, outputs, metric):
+        _, targets = batch
+        logits_x_position, _, _ = outputs
+        metric.update(logits_x_position, targets)
+
+    def get_metrics(self, is_train=False):
+        return {'MulticlassAccuracy': self.train_accuracy, 'CrossEntropy': self.train_cross_entropy} if is_train else {'MulticlassAccuracy': self.val_accuracy, 'CrossEntropy': self.val_cross_entropy}
+
+    def eval_forward(self, batch, outputs=None):
+        return outputs if outputs is not None else self.forward(batch)
+
+def count_parameters(model: nn.Module) -> int:
+    return sum([p_.numel() for p_ in model.parameters()])
 
 def get_parser():
     parser = argparse.ArgumentParser()
@@ -196,7 +214,7 @@ def get_parser():
 
     # learning
     parser.add_argument('--batch_size', type=int, default=8)
-    parser.add_argument('--lr', type=float, default=1e-5)
+    parser.add_argument('--lr', type=float, default=1e-8)
     return parser
 
 
@@ -215,12 +233,13 @@ def main():
     model = SignalTransformer(args.d_model, args.pnt_num_heads, args.pnt_num_layers, args.cls_num_heads,
                               args.cls_num_layers, args.patch_size, n_freqs_used, args.signal_is, n_classes, num_positions)
     optimizer = torch.optim.Adam(model.parameters(), args.lr)
-    # metrics = [CrossEntropy(), MulticlassAccuracy(num_classes=n_classes, average='micro')]
+    config = {'n_params': count_parameters(model), 'n_classes':n_classes, 'n_patches':n_patches, 'num_positions':num_positions} | vars(args)
+    logger = WandBLogger('good-vibe-rations', 'classify-position', init_kwargs={'config': config})
 
     trainer = Trainer(
         model=model, train_dataloader=train_loader, eval_dataloader=test_loader,
-        max_duration="1ep", optimizers=optimizer, device=device, seed=args.seed,
-        loggers=WandBLogger('good-vibe-rations', 'classify-position', init_kwargs={'config': args}))
+        max_duration="5ep", optimizers=optimizer, device=device, seed=args.seed,
+        loggers=logger, log_to_console=True)
     trainer.fit()
     print(trainer.state.train_metrics)
     print(trainer.state.eval_metrics)
