@@ -1,6 +1,7 @@
 # Project specific
 data/experiment*
 wandb/*
+checkpoints/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
