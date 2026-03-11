@@ -32,7 +32,7 @@ class VibrationDataset(Dataset):
         y_labels_raw = torch.load(y_label_path)
         _, self.x_labels = x_labels_raw.unique(return_inverse=True)
         _, self.y_labels = y_labels_raw.unique(return_inverse=True)
-        self.patch_size = patch_size
+        self.patch_size = patch_size 
     def __len__(self): return len(self.x_labels)
     def __getitem__(self, idx):
         n_lasers, n_freqs, n_coords = self.fft_vals[idx].shape  # index into n_samples of (n_samples, n_lasers, n_freqs, 2)

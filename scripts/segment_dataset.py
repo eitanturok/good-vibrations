@@ -1,7 +1,7 @@
 import io
 import numpy as np
 import matplotlib.pyplot as plt
-from PIL import Image, ImageDraw
+from PIL import Image
 from sam3.model_builder import build_sam3_image_model
 from sam3.model.sam3_image_processor import Sam3Processor
 
