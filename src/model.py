@@ -125,35 +125,28 @@ class PointTransformer(nn.Module):
         self.token_dropout_prob = dropout_prob
 
     def _raw_signal_to_tokenizable_one(self, tokens):
-        # tokens are: (B, num_tokens, 2, patch_size)  of type COMPLEX!
+        # tokens: (B, N_PATCHES, N_COORDS, patch_size)  complex
+        # B may be B*N_LASERS when called from SignalTransformer
         if self.signal_is == 'magnitude':
-            tokens = tokens.abs()
+            tokens = tokens.abs()                                              # (B, N_PATCHES, N_COORDS, patch_size)  real
         elif self.signal_is == 'complex':
-            tokens = torch.cat([tokens.real, tokens.imag], dim=-1)
+            tokens = torch.cat([tokens.real, tokens.imag], dim=-1)            # (B, N_PATCHES, N_COORDS, 2*patch_size)
         elif self.signal_is == 'mag_phase':
-            tokens = torch.cat([tokens.abs(), tokens.angle()], dim=-1)
+            tokens = torch.cat([tokens.abs(), tokens.angle()], dim=-1)        # (B, N_PATCHES, N_COORDS, 2*patch_size)
         else:
             raise RuntimeError(f'unknown signal type {self.signal_is}')
         return tokens
 
-
     def forward(self, tokens):
-        tokens = self._raw_signal_to_tokenizable_one(tokens)
-        B, P, _, _ = tokens.shape # (B, num_patches, 2, patch_size)
-        tokens_emb = self.embedding(tokens.reshape(B, P, -1))  # (B, num_patches, 2, patch_size) -> (B, num_patches, D)
-
-        # Add positional encoding to token embeddings
-        tokens_emb = self.learnable_positional_encoding(tokens_emb)  # (B, num_tokens, d_model)
-
-        # Add PNT token
-        cls_token_expanded = self.cls_token.expand(B, -1, -1)  # (B, 1, d_model)
-        tokens_emb = torch.cat((cls_token_expanded, tokens_emb), dim=1)  # (B, num_tokens + 1, d_model)
-
-        # Transformer encoder
-        output = self.transformer_encoder(tokens_emb)  # (B, num_tokens + 1, d_model)
-
-        # Return PNT token representation
-        PNT = output[:, 0, :]  # (B, d_model)
+        # tokens: (B, N_PATCHES, N_COORDS, patch_size)  — B may be B*N_LASERS
+        tokens = self._raw_signal_to_tokenizable_one(tokens)                  # (B, N_PATCHES, N_COORDS, patch_size|2*patch_size)
+        B, P, _, _ = tokens.shape
+        tokens_emb = self.embedding(tokens.reshape(B, P, -1))                 # (B, N_PATCHES, d_model)
+        tokens_emb = self.learnable_positional_encoding(tokens_emb)           # (B, N_PATCHES, d_model)
+        cls_token_expanded = self.cls_token.expand(B, -1, -1)                 # (B, 1, d_model)
+        tokens_emb = torch.cat((cls_token_expanded, tokens_emb), dim=1)       # (B, N_PATCHES+1, d_model)
+        output = self.transformer_encoder(tokens_emb)                         # (B, N_PATCHES+1, d_model)
+        PNT = output[:, 0, :]                                                  # (B, d_model)
         return PNT
 
 
@@ -209,33 +202,22 @@ class SignalTransformer(ComposerModel):
 
     def forward(self, batch):
         inputs, _ = batch
-        B, N_LASERS, N_PATCHES, PATCH_SIZE, N_COORDS = inputs.shape
+        B, N_LASERS, N_PATCHES, N_COORDS, PATCH_SIZE = inputs.shape
 
-        pnt_tokens = []
-        # TODO: batch process all together!!
-        # Pass each point's data through PointTransformer
-        points_to_process = range(inputs.size(1))
-        for i in points_to_process:
-            point_data = inputs[:, i]  # Shape: (B, num_tokens, patch_size)
-            pnt_token = self.point_transformer(point_data)  # Output shape: (B, d_model)
-            pnt_tokens.append(pnt_token)
-
-        # Stack CLS tokens from PointTransformers: (B, num_points, d_model)
-        pnt_tokens = torch.stack(pnt_tokens, dim=1)
+        # Fuse batch and laser dims so PointTransformer processes all lasers in one pass
+        inputs_flat = inputs.view(B * N_LASERS, N_PATCHES, N_COORDS, PATCH_SIZE)    # (B*N_LASERS, N_PATCHES, N_COORDS, patch_size)
+        pnt_tokens_flat = self.point_transformer(inputs_flat)                       # (B*N_LASERS, d_model)
+        pnt_tokens = pnt_tokens_flat.view(B, N_LASERS, -1)                          # (B, N_LASERS, d_model)
 
         # Add positional encoding
-        pnt_tokens = self.learnable_positional_encoding(pnt_tokens)
-
+        pnt_tokens = self.learnable_positional_encoding(pnt_tokens)                 # (B, N_LASERS, d_model)
         # Add learnable sequence CLS token: (B, 1, d_model)
-        cls_token = self.cls_token.expand(B, -1, -1)
-
-        transformer_input = torch.cat((cls_token, pnt_tokens), dim=1)  # (B, num_points + 1, d_model)
-
+        cls_token = self.cls_token.expand(B, -1, -1)                                # (B, 1, d_model)
+        transformer_input = torch.cat((cls_token, pnt_tokens), dim=1)               # (B, N_LASERS+1, d_model)
         # Process through the sequence-level transformer
-        output = self.transformer_encoder(transformer_input)  # (B, num_points + 1, d_model)
-
+        output = self.transformer_encoder(transformer_input)                        # (B, N_LASERS+1, d_model)
         # Extract the sequence-level CLS embedding
-        cls_embedding = output[:, 0, :]  # Shape: (B, d_model)
+        cls_embedding = output[:, 0, :]                                             # (B, d_model)
 
         # Predict x and y position
         logits_x_position = self.mlp_head_x_position(cls_embedding)
@@ -305,7 +287,7 @@ def get_parser():
     parser.add_argument('--alpha', type=float, default=0.9)
     parser.add_argument('--beta', type=float, default=0.5)
     parser.add_argument('--max_duration', type=str, default='1_000ep')
-    parser.add_argument('--eval_interval', type=str, default='5ep')
+    parser.add_argument('--eval_interval', type=str, default='10ep')
     return parser
 
 def main():
