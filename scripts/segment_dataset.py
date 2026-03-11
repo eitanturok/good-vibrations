@@ -1,3 +1,4 @@
+import io
 import numpy as np
 import matplotlib.pyplot as plt
 from PIL import Image, ImageDraw
@@ -100,35 +101,56 @@ if __name__ == "__main__":
             all_masks[f"mask_{mask_idx}"] = mask_tensor.cpu().to(torch.bool)
             torch.cuda.empty_cache()
 
-            # Build derived images as numpy arrays (Arrow-serializable, no PIL encoding hang)
+            # Build derived images and encode as PNG bytes for HF viewer compatibility
+            def to_png_bytes(arr):
+                buf = io.BytesIO()
+                Image.fromarray(arr).save(buf, format="PNG", compress_level=1)
+                return {"bytes": buf.getvalue()}
+
             crop_line_arr = img.copy()
             crop_line_arr[y1:y1+2, :] = (255, 0, 0)
             crop_line_arr[y2-2:y2, :] = (255, 0, 0)
             crop_line_arr[:, x1:x1+2] = (255, 0, 0)
             crop_line_arr[:, x2-2:x2] = (255, 0, 0)
 
-            mask_np      = mask_tensor.cpu().numpy().astype(np.uint8) * 255
-            mask_arr     = np.stack([mask_np, mask_np, mask_np], axis=-1)  # H'xW'x3
+            mask_np  = mask_tensor.cpu().numpy().astype(np.uint8) * 255
+            mask_arr = np.stack([mask_np, mask_np, mask_np], axis=-1)
 
-            overlay_rgba = (overlay_arr * 255).astype(np.uint8)
-            alpha        = overlay_rgba[:, :, 3:4] / 255.0
+            overlay_rgba    = (overlay_arr * 255).astype(np.uint8)
+            alpha           = overlay_rgba[:, :, 3:4] / 255.0
             overlay_arr_rgb = (cropped_arr * (1 - alpha) + overlay_rgba[:, :, :3] * alpha).astype(np.uint8)
 
             new_cols[mask_idx] = {
                 "mask_idx":        mask_idx,
-                "crop_line_image": crop_line_arr,
-                "cropped_image":   cropped_arr,
-                "mask_image":      mask_arr,
-                "overlay_image":   overlay_arr_rgb,
+                "crop_line_image": to_png_bytes(crop_line_arr),
+                "cropped_image":   to_png_bytes(cropped_arr),
+                "mask_image":      to_png_bytes(mask_arr),
+                "overlay_image":   to_png_bytes(overlay_arr_rgb),
             }
         return new_cols
 
-    from datasets import DatasetDict
+    from datasets import DatasetDict, Features, Value, Image as HFImage
+
+    FEATURES = Features({
+        "x_position":        Value("int32"),
+        "y_position":        Value("int32"),
+        "object":            Value("string"),
+        "raw_image":         HFImage(),
+        "crop_line_image":   HFImage(),
+        "cropped_image":     HFImage(),
+        "mask_image":        HFImage(),
+        "overlay_image":     HFImage(),
+        "shifts_idx":        Value("int32"),
+        "mask_idx":          Value("int32"),
+        "fps":               Value("int32"),
+        "experiment_config": Value("string"),
+    })
 
     new_splits = {}
     for split in ds:
         new_cols = process_split(ds[split], split)
-        new_splits[split] = ds[split].map(lambda sample: new_cols[sample["shifts_idx"]], num_proc=1)
+        split_ds = ds[split].map(lambda sample: new_cols[sample["shifts_idx"]], num_proc=1)
+        new_splits[split] = split_ds.cast(FEATURES)
 
     new_ds = DatasetDict(new_splits)
 
