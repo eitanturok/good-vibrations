@@ -1,33 +1,33 @@
-import os, json, re, random
-from sklearn.model_selection import GroupShuffleSplit
+import os, json, re
 import numpy as np
 import torch
 from safetensors.torch import save_file
 from PIL import Image
+from sklearn.model_selection import GroupShuffleSplit
 from datasets import Dataset, DatasetDict, Features, Value, Image as HFImage
 from huggingface_hub import HfApi
 
 REPO_ID = "eturok-weizmann/vibration-data"
 DATA_ROOT = os.path.join(os.path.dirname(__file__), "..", "data")
-SAFETENSORS_PATH = "/tmp/shifts.safetensors"
+SHIFTS_SAFETENSORS_PATH = "/tmp/shifts.safetensors"
 SEED = 42
 
 
 def load_sample(idx, cube_path):
     recovery = np.load(os.path.join(cube_path, "RECOVERY.npz"), allow_pickle=True)
-    shifts = recovery["all_shifts"]  # (100, 9000, 2)
+    shifts = recovery["all_shifts"]  # (100, N_frames, 2)
     config = json.load(open(os.path.join(cube_path, "experiment_config.json")))
     fps = int(config["FPS"])
     m = re.search(r"cube-(\d+)x-(\d+)y", os.path.basename(cube_path))
     tensors = {f"shifts_{idx}": torch.from_numpy(shifts)}
     meta = {
-        "shifts_idx": idx,
-        "overhead_image": Image.open(os.path.join(cube_path, "box_overhead_image.png")),
-        "x_position": int(m.group(1)),
-        "y_position": int(m.group(2)),
+        "shifts_idx":        idx,
+        "raw_image":         Image.open(os.path.join(cube_path, "box_overhead_image.png")),
+        "x_position":        int(m.group(1)),
+        "y_position":        int(m.group(2)),
         "experiment_config": json.dumps(config),
-        "fps": fps,
-        "object": "cube",
+        "fps":               fps,
+        "object":            "cube",
     }
     return tensors, meta
 
@@ -57,19 +57,19 @@ for i, path in enumerate(cube_paths):
     all_tensors.update(tensors)
     all_meta.append(meta)
 
-# Save safetensors file
-print(f"Saving safetensors to {SAFETENSORS_PATH}...")
-save_file(all_tensors, SAFETENSORS_PATH)
+# Save safetensors
+print(f"Saving shifts to {SHIFTS_SAFETENSORS_PATH}...")
+save_file(all_tensors, SHIFTS_SAFETENSORS_PATH)
 
 # Build HF DatasetDict
 features = Features({
-    "shifts_idx": Value("int32"),
-    "overhead_image": HFImage(),
-    "x_position": Value("int32"),
-    "y_position": Value("int32"),
+    "shifts_idx":        Value("int32"),
+    "raw_image":         HFImage(),
+    "x_position":        Value("int32"),
+    "y_position":        Value("int32"),
     "experiment_config": Value("string"),
-    "fps": Value("int32"),
-    "object": Value("string"),
+    "fps":               Value("int32"),
+    "object":            Value("string"),
 })
 n_train = len(train_paths)
 ds = DatasetDict({
@@ -77,13 +77,13 @@ ds = DatasetDict({
     "test":  Dataset.from_list(all_meta[n_train:], features=features),
 })
 
-# Upload both to HF
+# Upload to HF
 api = HfApi()
 api.create_repo(REPO_ID, repo_type="dataset", exist_ok=True)
 print("Pushing dataset to HF...")
 ds.push_to_hub(REPO_ID)
 print("Uploading shifts.safetensors...")
-api.upload_file(path_or_fileobj=SAFETENSORS_PATH, path_in_repo="shifts.safetensors",
+api.upload_file(path_or_fileobj=SHIFTS_SAFETENSORS_PATH, path_in_repo="shifts.safetensors",
                 repo_id=REPO_ID, repo_type="dataset")
 
 print(f"Done: {n_train} train, {len(cube_paths)-n_train} test samples")
