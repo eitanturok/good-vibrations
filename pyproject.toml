@@ -1,0 +1,26 @@
+[project]
+name = "good-vibrations"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "datasets>=4.7.0",
+    "opencv-python>=4.11.0.86",
+    "safetensors>=0.7.0",
+    "sam3[notebooks]",
+    "setuptools<82",
+    "torch==2.7.0",
+    "torchaudio>=2.7.0",
+    "torchvision>=0.22.0",
+]
+
+[[tool.uv.index]]
+url = "https://pypi.org/simple"
+
+[[tool.uv.index]]
+url = "https://download.pytorch.org/whl/cu126"
+default = true
+
+[tool.uv.sources]
+sam3 = { git = "https://github.com/facebookresearch/sam3" }
