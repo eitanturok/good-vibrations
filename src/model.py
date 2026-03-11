@@ -59,6 +59,9 @@ class VibrationDataset(torch.utils.data.Dataset):
         self.st_shifts = safe_open(hf_hub_download(repo_id, "shifts.safetensors", repo_type="dataset", token=token), framework="pt", device="cpu")
         self.st_masks = safe_open(hf_hub_download(repo_id, "masks.safetensors",  repo_type="dataset", token=token),  framework="pt", device="cpu")
         self.patch_size = patch_size
+        # remap raw position values to 0-indexed class labels (same as vibration_transformer.py)
+        self.x_labels = torch.tensor(self.ds["x_position"]).unique(return_inverse=True)[1]
+        self.y_labels = torch.tensor(self.ds["y_position"]).unique(return_inverse=True)[1]
     def __repr__(self): return f"VibrationDataset(split={self.ds.split}, n={len(self.ds)})"
     def __len__(self): return len(self.ds)
     def __getitem__(self, idx):
@@ -70,15 +73,17 @@ class VibrationDataset(torch.utils.data.Dataset):
         fft, freqs = do_fft(shifts, row["fps"])                             # (n_lasers, n_freqs, 2)
         # patchify: unfold freq dim into non-overlapping patches -> (n_lasers, n_patches, n_coords, patch_size)
         fft_patches = fft.unfold(1, self.patch_size, self.patch_size)
-        return fft_patches.float(), (mask, torch.tensor(row["x_position"]), torch.tensor(row["y_position"]))
+        return fft_patches.float(), (mask, self.x_labels[idx], self.y_labels[idx])
 
-def get_dataloaders(repo_id:str, patch_size:int=256, batch_size:int=8, eval_batch_size:int=16, shuffle:bool=True, num_workers:int=0, seed:int=42, token:str | None = None) -> tuple[DataLoader, DataLoader]:
+def get_dataloaders(repo_id:str, patch_size:int=256, batch_size:int=8, eval_batch_size:int=16, shuffle:bool=True, num_workers:int=0, seed:int=42, token:str | None = None):
     train_set = VibrationDataset(repo_id, split="train", patch_size=patch_size, token=token)
     test_set = VibrationDataset(repo_id, split="test", patch_size=patch_size, token=token)
     generator = torch.Generator().manual_seed(seed)
     train_loader = DataLoader(train_set, batch_size=batch_size,     shuffle=shuffle,  num_workers=num_workers, generator=generator, pin_memory=True)
     test_loader  = DataLoader(test_set,  batch_size=eval_batch_size, shuffle=False,   num_workers=num_workers, generator=generator, pin_memory=True)
-    return train_loader, test_loader
+    num_x_positions = int(train_set.x_labels.max()) + 1
+    num_y_positions = int(train_set.y_labels.max()) + 1
+    return train_loader, test_loader, num_x_positions, num_y_positions
 
 # ***** model *****
 
@@ -252,7 +257,7 @@ class SignalTransformer(ComposerModel):
         return self.beta * ce_sord_loss_x + (1 - self.beta) * ce_sord_loss_y
 
     def update_metric(self, batch, outputs, metric):
-        _, (targets_x, targets_y) = batch
+        _, (_, targets_x, targets_y) = batch
         logits_x_position, logits_y_position, _ = outputs
 
         is_x_metric = metric.position == 'x'
@@ -265,23 +270,17 @@ class SignalTransformer(ComposerModel):
             metric.update(logits, targets)
 
     def get_metrics(self, is_train=False):
-        if is_train:
-            return {
-                'x/MulticlassAccuracy': self.train_accuracy_x, 'x/CrossEntropy': self.train_cross_entropy_x, 'x/rMSE': self.train_rmse_x,
-                'y/MulticlassAccuracy': self.train_accuracy_y, 'y/CrossEntropy': self.train_cross_entropy_y, 'y/rMSE': self.train_rmse_y,
-            }
-        return {
-            'x/MulticlassAccuracy': self.val_accuracy_x, 'x/CrossEntropy': self.val_cross_entropy_x, 'x/rMSE': self.val_rmse_x,
-            'y/MulticlassAccuracy': self.val_accuracy_y, 'y/CrossEntropy': self.val_cross_entropy_y, 'y/rMSE': self.val_rmse_y,
-        }
+        if is_train: return {'x/MulticlassAccuracy': self.train_accuracy_x, 'x/CrossEntropy': self.train_cross_entropy_x, 'x/rMSE': self.train_rmse_x,
+                             'y/MulticlassAccuracy': self.train_accuracy_y, 'y/CrossEntropy': self.train_cross_entropy_y, 'y/rMSE': self.train_rmse_y}
+        return {'x/MulticlassAccuracy': self.val_accuracy_x, 'x/CrossEntropy': self.val_cross_entropy_x, 'x/rMSE': self.val_rmse_x,
+                'y/MulticlassAccuracy': self.val_accuracy_y, 'y/CrossEntropy': self.val_cross_entropy_y, 'y/rMSE': self.val_rmse_y}
 
     def eval_forward(self, batch, outputs=None):
         return outputs if outputs is not None else self.forward(batch)
 
-def count_parameters(model: nn.Module) -> int:
-    return sum([p_.numel() for p_ in model.parameters()])
-
 # ***** main *****
+
+def count_parameters(model: nn.Module) -> int: return sum([p_.numel() for p_ in model.parameters()])
 
 def get_parser():
     parser = argparse.ArgumentParser()
@@ -300,7 +299,7 @@ def get_parser():
     parser.add_argument('--patch_size', type=int, default=256)
 
     # learning
-    parser.add_argument('--batch_size', type=int, default=64)
+    parser.add_argument('--batch_size', type=int, default=4096)
     parser.add_argument('--eval_batch_size', type=int, default=16)
     parser.add_argument('--lr', type=float, default=1e-4)
     parser.add_argument('--alpha', type=float, default=0.9)
@@ -309,15 +308,13 @@ def get_parser():
     parser.add_argument('--eval_interval', type=str, default='5ep')
     return parser
 
-
 def main():
     parser = get_parser()
     args = parser.parse_args()
     seed_all(args.seed) # must seed before initializing the model
 
-    train_loader, test_loader = get_dataloaders(args.data_dir, args.patch_size, args.batch_size, args.eval_batch_size, seed=args.seed)
-    next(iter(train_loader))
-    num_x_positions, num_y_positions, num_lasers, n_freqs_used, n_patches = 10, 7, 100, 3328, 13
+    train_loader, test_loader, num_x_positions, num_y_positions = get_dataloaders(args.data_dir, args.patch_size, args.batch_size, args.eval_batch_size, seed=args.seed)
+    num_lasers, n_freqs_used, n_patches = 100, 3328, 13
     device = 'gpu' if torch.cuda.is_available() else 'cpu'
 
     model = SignalTransformer(args.d_model, args.pnt_num_heads, args.pnt_num_layers, args.seq_num_heads, args.seq_num_layers, args.patch_size, n_freqs_used, args.signal_is, num_x_positions, num_y_positions, num_lasers, args.alpha, args.beta)
