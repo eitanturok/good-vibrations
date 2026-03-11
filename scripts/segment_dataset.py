@@ -76,7 +76,7 @@ def plot_segment(sample, img, lines, cropped, overlay, mask):
 if __name__ == "__main__":
     import torch
     from safetensors.torch import save_file
-    from datasets import load_dataset, concatenate_datasets
+    from datasets import load_dataset
     from huggingface_hub import HfApi
 
     # Download existing dataset
@@ -89,60 +89,48 @@ if __name__ == "__main__":
     all_masks = {}
 
     def process_split(split_ds, split_name):
-        new_rows = []
+        # Only collect new columns keyed by shifts_idx — do NOT unpack the full sample
+        new_cols = {}
         for i, sample in enumerate(split_ds):
             print(f"[{split_name}] Segmenting {i+1}/{len(split_ds)}")
-            img, (x1, x2, y1, y2), cropped_arr, overlay_arr, mask_tensor = segment_object(sample, processor)
+            with torch.no_grad():
+                img, (x1, x2, y1, y2), cropped_arr, overlay_arr, mask_tensor = segment_object(sample, processor)
 
             mask_idx = sample["shifts_idx"]
             all_masks[f"mask_{mask_idx}"] = mask_tensor.cpu().to(torch.bool)
+            torch.cuda.empty_cache()
 
-            # Build derived images
-            crop_line_img = Image.fromarray(img).convert("RGB")
-            draw = ImageDraw.Draw(crop_line_img)
-            W, H = crop_line_img.size
-            draw.line([(x1, 0), (x1, H)], fill="red", width=2)
-            draw.line([(x2, 0), (x2, H)], fill="red", width=2)
-            draw.line([(0, y1), (W, y1)], fill="red", width=2)
-            draw.line([(0, y2 - 1), (W, y2 - 1)], fill="red", width=2)
+            # Build derived images as numpy arrays (Arrow-serializable, no PIL encoding hang)
+            crop_line_arr = img.copy()
+            crop_line_arr[y1:y1+2, :] = (255, 0, 0)
+            crop_line_arr[y2-2:y2, :] = (255, 0, 0)
+            crop_line_arr[:, x1:x1+2] = (255, 0, 0)
+            crop_line_arr[:, x2-2:x2] = (255, 0, 0)
 
-            cropped_img  = Image.fromarray(cropped_arr)
-            mask_img     = Image.fromarray(mask_tensor.cpu().numpy().astype(np.uint8) * 255)
-            cropped_rgba = Image.fromarray(cropped_arr).convert("RGBA")
-            overlay_pil  = Image.fromarray((overlay_arr * 255).astype(np.uint8), mode="RGBA")
-            overlay_img  = Image.alpha_composite(cropped_rgba, overlay_pil).convert("RGB")
+            mask_np      = mask_tensor.cpu().numpy().astype(np.uint8) * 255
+            mask_arr     = np.stack([mask_np, mask_np, mask_np], axis=-1)  # H'xW'x3
 
-            new_rows.append({
-                **sample,
+            overlay_rgba = (overlay_arr * 255).astype(np.uint8)
+            alpha        = overlay_rgba[:, :, 3:4] / 255.0
+            overlay_arr_rgb = (cropped_arr * (1 - alpha) + overlay_rgba[:, :, :3] * alpha).astype(np.uint8)
+
+            new_cols[mask_idx] = {
                 "mask_idx":        mask_idx,
-                "crop_line_image": crop_line_img,
-                "cropped_image":   cropped_img,
-                "mask_image":      mask_img,
-                "overlay_image":   overlay_img,
-            })
-        return new_rows
+                "crop_line_image": crop_line_arr,
+                "cropped_image":   cropped_arr,
+                "mask_image":      mask_arr,
+                "overlay_image":   overlay_arr_rgb,
+            }
+        return new_cols
 
-    from datasets import Dataset, DatasetDict, Features, Value, Image as HFImage
+    from datasets import DatasetDict
 
-    features = Features({
-        "shifts_idx":        Value("int32"),
-        "mask_idx":          Value("int32"),
-        "raw_image":         HFImage(),
-        "crop_line_image":   HFImage(),
-        "cropped_image":     HFImage(),
-        "mask_image":        HFImage(),
-        "overlay_image":     HFImage(),
-        "x_position":        Value("int32"),
-        "y_position":        Value("int32"),
-        "experiment_config": Value("string"),
-        "fps":               Value("int32"),
-        "object":            Value("string"),
-    })
+    new_splits = {}
+    for split in ds:
+        new_cols = process_split(ds[split], split)
+        new_splits[split] = ds[split].map(lambda sample: new_cols[sample["shifts_idx"]], num_proc=1)
 
-    new_ds = DatasetDict({
-        split: Dataset.from_list(process_split(ds[split], split), features=features)
-        for split in ds
-    })
+    new_ds = DatasetDict(new_splits)
 
     # Save and upload masks safetensors
     print(f"Saving masks to {MASKS_SAFETENSORS_PATH}...")
