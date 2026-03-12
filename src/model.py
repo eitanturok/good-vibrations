@@ -210,9 +210,9 @@ class PointTransformer(nn.Module):
 
 
 class SignalTransformer(ComposerModel):
-    def __init__(self, d_model, pnt_num_heads, pnt_num_layers, seq_num_heads, seq_num_layers, patch_size, signal_length, signal_is, num_x_positions, num_y_positions, num_lasers, alpha, beta, gamma=0.5, mask_h=100, mask_w=100):
+    def __init__(self, d_model, pnt_num_heads, pnt_num_layers, seq_num_heads, seq_num_layers, patch_size, signal_length, signal_is, num_x_positions, num_y_positions, num_lasers, alpha, beta, gamma=0.5, delta=0.5, mask_h=100, mask_w=100):
         super().__init__()
-        self.beta, self.gamma, self.mask_h, self.mask_w = beta, gamma, mask_h, mask_w
+        self.beta, self.gamma, self.delta, self.mask_h, self.mask_w = beta, gamma, delta, mask_h, mask_w
 
         # Initialize one PointTransformer for every point
         self.point_transformer = PointTransformer(patch_size, d_model, pnt_num_heads, pnt_num_layers, signal_length, signal_is)
@@ -308,10 +308,13 @@ class SignalTransformer(ComposerModel):
             pos_weight = torch.tensor([(target == 0).sum() / (target == 1).sum().clamp(min=1)], device=mask_logits.device)
             bce_loss = F.binary_cross_entropy_with_logits(mask_logits, target, pos_weight=pos_weight)
 
-            mask_loss = 0.5 * dice_loss + 0.5 * bce_loss
+            mask_loss = self.delta * dice_loss + (1 - self.delta) * bce_loss
             loss_log.update({'loss/train/dice': dice_loss, 'loss/train/bce': bce_loss, 'loss/train/mask': mask_loss})
 
-        total_loss = position_loss * (1 - self.gamma) + self.gamma * mask_loss
+        if POSITION and MASK:
+            total_loss = position_loss * (1 - self.gamma) + self.gamma * mask_loss
+        else:
+            total_loss = position_loss if POSITION else mask_loss
         loss_log['loss/train/total'] = total_loss
 
         self.logger.log_metrics({k: v.item() for k, v in loss_log.items()})
@@ -365,6 +368,7 @@ def get_parser():
     parser.add_argument('--alpha', type=float, default=0.9)
     parser.add_argument('--beta', type=float, default=0.5)
     parser.add_argument('--gamma', type=float, default=0.5)
+    parser.add_argument('--delta', type=float, default=0.5)
     parser.add_argument('--max_duration', type=str, default='1_000ep')
     parser.add_argument('--eval_interval', type=str, default='10ep')
     return parser
@@ -378,9 +382,9 @@ def main():
     num_lasers, n_freqs_used, n_patches, mask_height, mask_width = 100, 3328, 13, 1157, 637
     device = 'gpu' if torch.cuda.is_available() else 'cpu'
 
-    model = SignalTransformer(args.d_model, args.pnt_num_heads, args.pnt_num_layers, args.seq_num_heads, args.seq_num_layers, args.patch_size, n_freqs_used, args.signal_is, num_x_positions, num_y_positions, num_lasers, args.alpha, args.beta, gamma=args.gamma, mask_h=mask_height, mask_w=mask_width)
+    model = SignalTransformer(args.d_model, args.pnt_num_heads, args.pnt_num_layers, args.seq_num_heads, args.seq_num_layers, args.patch_size, n_freqs_used, args.signal_is, num_x_positions, num_y_positions, num_lasers, args.alpha, args.beta, gamma=args.gamma, delta=args.delta, mask_h=mask_height, mask_w=mask_width)
     optimizer = torch.optim.Adam(model.parameters(), args.lr)
-    config = {'n_params': count_parameters(model), 'num_x_positions': num_x_positions, 'num_y_positions': num_y_positions, 'n_patches':n_patches, 'num_lasers':num_lasers, 'SORD': SORD, 'MASK': MASK, 'POSITION': POSITION} | vars(args)
+    config = {'n_params': count_parameters(model), 'num_x_positions': num_x_positions, 'num_y_positions': num_y_positions, 'n_patches':n_patches, 'num_lasers':num_lasers, 'delta': args.delta, 'SORD': SORD, 'MASK': MASK, 'POSITION': POSITION} | vars(args)
     logger = WandBLogger('good-vibe-rations', 'classify-position', init_kwargs={'config': config, 'save_code': True})
     hf_ckpt_upload = HFChkptUploader("eturok-weizmann/good-vibrations", interval=args.eval_interval, monitor="x/rMSE", save_local=True)
     mask_viz = MaskVisualizationCallback(n_samples=args.eval_batch_size, save_dir="visualizations")
@@ -394,7 +398,7 @@ def main():
         # callbacks=[hf_ckpt_upload, mask_viz])
         callbacks=[mask_viz])
     # override wandb run name
-    wandb.run.name = '-'.join(wandb.run.name.split('-')[1:]) + f'_lr{float(args.lr)}_SORD{SORD}_alpha{args.alpha}_beta{args.beta}'
+    wandb.run.name = '-'.join(wandb.run.name.split('-')[1:]) + f'_lr{float(args.lr)}_delta{args.delta}'
 
     trainer.fit()
     ic(trainer.state.train_metrics, type(trainer.state.train_metrics))
