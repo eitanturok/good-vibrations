@@ -3,6 +3,9 @@ from typing import Any
 
 import torch
 import wandb
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
 from composer import Callback
 from composer.core import Time
 from huggingface_hub import HfApi
@@ -72,6 +75,58 @@ class HFChkptUploader(Callback):
     msg = f"epoch {ts.epoch.value}" + (f" | {self.monitor}={v:.4f}" if v else "")
     print(f"HFChkptUploader: saving checkpoint at {msg}")
     self.api.run_as_future(self._push, state.model, msg)
+
+
+class MaskVisualizationCallback(Callback):
+    """After each eval, renders true vs predicted mask side-by-side, saves locally, and logs to WandB."""
+
+    def __init__(self, n_samples: int = 4, save_dir: str = "visualizations"):
+        self.n_samples = n_samples
+        self.save_dir = save_dir
+        self._last_batch = None
+
+    def eval_batch_end(self, state, logger):
+        # Grab only the first eval batch for visualization
+        if self._last_batch is None:
+            self._last_batch = (state.batch, state.outputs)
+
+    def eval_end(self, state, logger):
+        if self._last_batch is None:
+            return
+
+        batch, outputs = self._last_batch
+        self._last_batch = None  # reset for next eval
+
+        _, (true_masks, _, _) = batch          # true_masks: (B, H, W) bool/int
+        _, _, _, mask_logits = outputs         # mask_logits: (B, H, W)
+
+        n = min(self.n_samples, true_masks.shape[0])
+        pred_probs = mask_logits[:n].sigmoid().detach().cpu().float()
+        true_masks = true_masks[:n].detach().cpu().float()
+
+        os.makedirs(self.save_dir, exist_ok=True)
+        epoch = state.timestamp.epoch.value
+        wandb_images = []
+
+        for i in range(n):
+            fig, axes = plt.subplots(1, 2, figsize=(8, 4))
+            axes[0].imshow(true_masks[i].numpy(), vmin=0, vmax=1, cmap='gray')
+            axes[0].set_title('True mask')
+            axes[0].axis('off')
+            axes[1].imshow(pred_probs[i].numpy(), vmin=0, vmax=1, cmap='hot')
+            axes[1].set_title('Predicted (prob)')
+            axes[1].axis('off')
+            fig.suptitle(f'Epoch {epoch} — sample {i}')
+            fig.tight_layout()
+
+            path = os.path.join(self.save_dir, f'epoch_{epoch:04d}_sample_{i}.png')
+            fig.savefig(path, dpi=100)
+            wandb_images.append(wandb.Image(fig, caption=f'sample {i}'))
+            plt.close(fig)
+
+        if wandb.run:
+            wandb.log({'mask_viz': wandb_images}, step=state.timestamp.batch.value)
+
 
 # from composer.callbacks import CheckpointSaver
 

@@ -14,7 +14,8 @@ from scipy.signal import butter, sosfiltfilt
 from composer import Trainer
 from composer.models import ComposerModel
 from composer.metrics import CrossEntropy
-from torchmetrics.classification import MulticlassAccuracy
+from torchmetrics.classification import MulticlassAccuracy, BinaryJaccardIndex, BinaryPrecision, BinaryRecall
+from torchmetrics.segmentation import GeneralizedDiceScore
 from torchmetrics.regression import MeanSquaredError
 from composer.loggers import WandBLogger
 from composer.utils.reproducibility import seed_all
@@ -22,10 +23,12 @@ from composer.utils.reproducibility import seed_all
 from icecream import install
 install()
 
-from helpers import getenv, HFChkptUploader
+from helpers import getenv, HFChkptUploader, MaskVisualizationCallback
 
 SORD = getenv("SORD", 1)
 DEBUG = getenv("DEBUG", 0)
+MASK = getenv("MASK", 1)
+POSITION = getenv("POSITION", 0)
 
 # ***** Dataset *****
 
@@ -87,6 +90,64 @@ def get_dataloaders(repo_id:str, patch_size:int=256, batch_size:int=8, eval_batc
 
 # ***** model *****
 
+def _tag(m, pos: str):
+    m._pos = pos
+    return m
+
+class PositionMetrics:
+    """Accuracy, cross-entropy, and RMSE for one position head (x or y), for both train and val."""
+    def __init__(self, num_classes: int, pos: str):
+        self.pos = pos
+        self.train_accuracy      = _tag(MulticlassAccuracy(num_classes=num_classes, average='micro'), pos)
+        self.val_accuracy        = _tag(MulticlassAccuracy(num_classes=num_classes, average='micro'), pos)
+        self.train_cross_entropy = _tag(CrossEntropy(), pos)
+        self.val_cross_entropy   = _tag(CrossEntropy(), pos)
+        self.train_rmse          = _tag(MeanSquaredError(squared=False), pos)
+        self.val_rmse            = _tag(MeanSquaredError(squared=False), pos)
+
+    def get(self, is_train: bool) -> dict:
+        p = 'train' if is_train else 'val'
+        return {
+            f'{self.pos}/MulticlassAccuracy': getattr(self, f'{p}_accuracy'),
+            f'{self.pos}/CrossEntropy':       getattr(self, f'{p}_cross_entropy'),
+            f'{self.pos}/rMSE':               getattr(self, f'{p}_rmse'),
+        }
+
+    def update(self, metric, logits, targets):
+        if isinstance(metric, MeanSquaredError):
+            metric.update(logits.argmax(dim=-1), targets)
+        else:
+            metric.update(logits, targets)
+
+class MaskMetrics:
+    """IoU, Dice, Precision, and Recall for the mask head, for both train and val."""
+    def __init__(self):
+        self.train_iou       = _tag(BinaryJaccardIndex(), 'mask')
+        self.val_iou         = _tag(BinaryJaccardIndex(), 'mask')
+        self.train_precision = _tag(BinaryPrecision(),    'mask')
+        self.val_precision   = _tag(BinaryPrecision(),    'mask')
+        self.train_recall    = _tag(BinaryRecall(),       'mask')
+        self.val_recall      = _tag(BinaryRecall(),       'mask')
+        self.train_dice      = _tag(GeneralizedDiceScore(num_classes=2), 'mask')
+        self.val_dice        = _tag(GeneralizedDiceScore(num_classes=2), 'mask')
+
+    def get(self, is_train: bool) -> dict:
+        p = 'train' if is_train else 'val'
+        return {
+            'mask/IoU':       getattr(self, f'{p}_iou'),
+            'mask/Precision': getattr(self, f'{p}_precision'),
+            'mask/Recall':    getattr(self, f'{p}_recall'),
+            'mask/Dice':      getattr(self, f'{p}_dice'),
+        }
+
+    def update(self, metric, mask_logits, mask):
+        preds, targets = (mask_logits.sigmoid() > 0.5).int(), mask.int()
+        if isinstance(metric, GeneralizedDiceScore):
+            metric.update(torch.stack([1 - preds, preds], dim=1), torch.stack([1 - targets, targets], dim=1))
+        else:
+            metric.update(preds, targets)
+
+
 def sord_loss(predictions, targets, cost_matrix):
     """SORD loss with soft labels based on ordinal distance."""
     soft_labels = torch.exp(-cost_matrix[targets])
@@ -125,14 +186,13 @@ class PointTransformer(nn.Module):
         self.token_dropout_prob = dropout_prob
 
     def _raw_signal_to_tokenizable_one(self, tokens):
-        # tokens: (B, N_PATCHES, N_COORDS, patch_size)  complex
-        # B may be B*N_LASERS when called from SignalTransformer
+        # tokens: (B*N_LASERS, N_PATCHES, N_COORDS, patch_size)  complex
         if self.signal_is == 'magnitude':
-            tokens = tokens.abs()                                              # (B, N_PATCHES, N_COORDS, patch_size)  real
+            tokens = tokens.abs()                                              # (B*N_LASERS, N_PATCHES, N_COORDS, patch_size)  real
         elif self.signal_is == 'complex':
-            tokens = torch.cat([tokens.real, tokens.imag], dim=-1)            # (B, N_PATCHES, N_COORDS, 2*patch_size)
+            tokens = torch.cat([tokens.real, tokens.imag], dim=-1)            # (B*N_LASERS, N_PATCHES, N_COORDS, 2*patch_size)
         elif self.signal_is == 'mag_phase':
-            tokens = torch.cat([tokens.abs(), tokens.angle()], dim=-1)        # (B, N_PATCHES, N_COORDS, 2*patch_size)
+            tokens = torch.cat([tokens.abs(), tokens.angle()], dim=-1)        # (B*N_LASERS, N_PATCHES, N_COORDS, 2*patch_size)
         else:
             raise RuntimeError(f'unknown signal type {self.signal_is}')
         return tokens
@@ -150,9 +210,9 @@ class PointTransformer(nn.Module):
 
 
 class SignalTransformer(ComposerModel):
-    def __init__(self, d_model, pnt_num_heads, pnt_num_layers, seq_num_heads, seq_num_layers, patch_size, signal_length, signal_is, num_x_positions, num_y_positions, num_lasers, alpha, beta):
+    def __init__(self, d_model, pnt_num_heads, pnt_num_layers, seq_num_heads, seq_num_layers, patch_size, signal_length, signal_is, num_x_positions, num_y_positions, num_lasers, alpha, beta, gamma=0.5, mask_h=100, mask_w=100):
         super().__init__()
-        self.beta = beta
+        self.beta, self.gamma, self.mask_h, self.mask_w = beta, gamma, mask_h, mask_w
 
         # Initialize one PointTransformer for every point
         self.point_transformer = PointTransformer(patch_size, d_model, pnt_num_heads, pnt_num_layers, signal_length, signal_is)
@@ -171,29 +231,16 @@ class SignalTransformer(ComposerModel):
         # Prediction heads
         self.mlp_head_x_position = nn.Sequential(nn.Linear(d_model, 32), nn.ReLU(), nn.Linear(32, num_x_positions))
         self.mlp_head_y_position = nn.Sequential(nn.Linear(d_model, 32), nn.ReLU(), nn.Linear(32, num_y_positions))
+        self.mlp_head_mask = nn.Sequential(nn.Linear(d_model, 256), nn.ReLU(), nn.Linear(256, mask_h * mask_w))
 
         # SORD loss cost matrix
         self.alpha = alpha
         self.register_buffer('cost_matrix_x', self._init_cost_matrix(num_x_positions))
         self.register_buffer('cost_matrix_y', self._init_cost_matrix(num_y_positions))
 
-        # metrics - tag each with position attribute
-        def _tag(m, pos):
-            m.position = pos
-            return m
-        self.train_accuracy_x = _tag(MulticlassAccuracy(num_classes=num_x_positions, average='micro'), 'x')
-        self.val_accuracy_x = _tag(MulticlassAccuracy(num_classes=num_x_positions, average='micro'), 'x')
-        self.train_cross_entropy_x = _tag(CrossEntropy(), 'x')
-        self.val_cross_entropy_x = _tag(CrossEntropy(), 'x')
-        self.train_rmse_x = _tag(MeanSquaredError(squared=False), 'x')
-        self.val_rmse_x = _tag(MeanSquaredError(squared=False), 'x')
-
-        self.train_accuracy_y = _tag(MulticlassAccuracy(num_classes=num_y_positions, average='micro'), 'y')
-        self.val_accuracy_y = _tag(MulticlassAccuracy(num_classes=num_y_positions, average='micro'), 'y')
-        self.train_cross_entropy_y = _tag(CrossEntropy(), 'y')
-        self.val_cross_entropy_y = _tag(CrossEntropy(), 'y')
-        self.train_rmse_y = _tag(MeanSquaredError(squared=False), 'y')
-        self.val_rmse_y = _tag(MeanSquaredError(squared=False), 'y')
+        self.x_metrics    = PositionMetrics(num_x_positions, 'x')
+        self.y_metrics    = PositionMetrics(num_y_positions, 'y')
+        self.mask_metrics = MaskMetrics()
 
     def _init_cost_matrix(self, num_classes, multiplier=0.5):
         indices = torch.arange(num_classes)
@@ -219,43 +266,74 @@ class SignalTransformer(ComposerModel):
         # Extract the sequence-level CLS embedding
         cls_embedding = output[:, 0, :]                                             # (B, d_model)
 
-        # Predict x and y position
-        logits_x_position = self.mlp_head_x_position(cls_embedding)
-        logits_y_position = self.mlp_head_y_position(cls_embedding)
-        return logits_x_position, logits_y_position, cls_embedding
+        # Predict x and y position, and segmentation mask
+        logits_x = self.mlp_head_x_position(cls_embedding)
+        logits_y = self.mlp_head_y_position(cls_embedding)
+        mask_logits = self.mlp_head_mask(cls_embedding).view(B, self.mask_h, self.mask_w)
+        return logits_x, logits_y, cls_embedding, mask_logits
 
     def loss(self, outputs, batch):
-        _, (_, targets_x, targets_y) = batch
-        logits_x, logits_y, _ = outputs
+        _, (mask, targets_x, targets_y) = batch
+        logits_x, logits_y, _, mask_logits = outputs
+        position_loss = mask_loss = 0.0
+        loss_log = {}
 
-        ce_loss_x = F.cross_entropy(logits_x, targets_x)
-        ce_loss_y = F.cross_entropy(logits_y, targets_y)
-        if not SORD: return self.beta * ce_loss_x + (1 - self.beta) * ce_loss_y
+        if POSITION:
+            ce_loss_x = F.cross_entropy(logits_x, targets_x)
+            ce_loss_y = F.cross_entropy(logits_y, targets_y)
+            if not SORD:
+                position_loss = self.beta * ce_loss_x + (1 - self.beta) * ce_loss_y
+                loss_log.update({'loss/train/ce_x': ce_loss_x, 'loss/train/ce_y': ce_loss_y})
+            else:
+                sord_loss_x = sord_loss(logits_x, targets_x, self.cost_matrix_x)
+                sord_loss_y = sord_loss(logits_y, targets_y, self.cost_matrix_y)
+                ce_sord_loss_x = self.alpha * sord_loss_x + (1 - self.alpha) * ce_loss_x
+                ce_sord_loss_y = self.alpha * sord_loss_y + (1 - self.alpha) * ce_loss_y
+                position_loss = self.beta * ce_sord_loss_x + (1 - self.beta) * ce_sord_loss_y
+                loss_log.update({'loss/train/ce_x': ce_loss_x, 'loss/train/ce_y': ce_loss_y,
+                                 'loss/train/sord_x': sord_loss_x, 'loss/train/sord_y': sord_loss_y,
+                                 'loss/train/ce_sord_x': ce_sord_loss_x, 'loss/train/ce_sord_y': ce_sord_loss_y})
+            loss_log['loss/train/position'] = position_loss
 
-        sord_loss_x = sord_loss(logits_x, targets_x, self.cost_matrix_x)
-        sord_loss_y = sord_loss(logits_y, targets_y, self.cost_matrix_y)
-        ce_sord_loss_x = self.alpha * sord_loss_x + (1 - self.alpha) * ce_loss_x
-        ce_sord_loss_y = self.alpha * sord_loss_y + (1 - self.alpha) * ce_loss_y
-        return self.beta * ce_sord_loss_x + (1 - self.beta) * ce_sord_loss_y
+        if MASK:
+            target = mask.float()
+            probs  = mask_logits.sigmoid()
+
+            # Dice loss
+            intersection = (probs * target).sum(dim=(-2, -1))
+            dice_loss = 1 - (2 * intersection + 1) / (probs.sum(dim=(-2, -1)) + target.sum(dim=(-2, -1)) + 1)
+            dice_loss = dice_loss.mean()
+
+            # Weighted BCE — increase weight on foreground (object) class to counter imbalance
+            pos_weight = torch.tensor([(target == 0).sum() / (target == 1).sum().clamp(min=1)], device=mask_logits.device)
+            bce_loss = F.binary_cross_entropy_with_logits(mask_logits, target, pos_weight=pos_weight)
+
+            mask_loss = 0.5 * dice_loss + 0.5 * bce_loss
+            loss_log.update({'loss/train/dice': dice_loss, 'loss/train/bce': bce_loss, 'loss/train/mask': mask_loss})
+
+        total_loss = position_loss * (1 - self.gamma) + self.gamma * mask_loss
+        loss_log['loss/train/total'] = total_loss
+
+        self.logger.log_metrics({k: v.item() for k, v in loss_log.items()})
+
+        return total_loss
 
     def update_metric(self, batch, outputs, metric):
-        _, (_, targets_x, targets_y) = batch
-        logits_x_position, logits_y_position, _ = outputs
+        _, (mask, targets_x, targets_y) = batch
+        logits_x, logits_y, _, mask_logits = outputs
+        pos = getattr(metric, '_pos', None)
 
-        is_x_metric = metric.position == 'x'
-        logits = logits_x_position if is_x_metric else logits_y_position
-        targets = targets_x if is_x_metric else targets_y
-
-        if isinstance(metric, MeanSquaredError):
-            metric.update(logits.argmax(dim=-1), targets)
+        if pos == 'mask':
+            self.mask_metrics.update(metric, mask_logits, mask)
+        elif pos == 'x':
+            self.x_metrics.update(metric, logits_x, targets_x)
+        elif pos == 'y':
+            self.y_metrics.update(metric, logits_y, targets_y)
         else:
-            metric.update(logits, targets)
+            raise ValueError(f'pos must be mask, x, y but got {pos=}')
 
     def get_metrics(self, is_train=False):
-        if is_train: return {'x/MulticlassAccuracy': self.train_accuracy_x, 'x/CrossEntropy': self.train_cross_entropy_x, 'x/rMSE': self.train_rmse_x,
-                             'y/MulticlassAccuracy': self.train_accuracy_y, 'y/CrossEntropy': self.train_cross_entropy_y, 'y/rMSE': self.train_rmse_y}
-        return {'x/MulticlassAccuracy': self.val_accuracy_x, 'x/CrossEntropy': self.val_cross_entropy_x, 'x/rMSE': self.val_rmse_x,
-                'y/MulticlassAccuracy': self.val_accuracy_y, 'y/CrossEntropy': self.val_cross_entropy_y, 'y/rMSE': self.val_rmse_y}
+        return self.x_metrics.get(is_train) | self.y_metrics.get(is_train) | self.mask_metrics.get(is_train)
 
     def eval_forward(self, batch, outputs=None):
         return outputs if outputs is not None else self.forward(batch)
@@ -286,6 +364,7 @@ def get_parser():
     parser.add_argument('--lr', type=float, default=1e-4)
     parser.add_argument('--alpha', type=float, default=0.9)
     parser.add_argument('--beta', type=float, default=0.5)
+    parser.add_argument('--gamma', type=float, default=0.5)
     parser.add_argument('--max_duration', type=str, default='1_000ep')
     parser.add_argument('--eval_interval', type=str, default='10ep')
     return parser
@@ -296,15 +375,15 @@ def main():
     seed_all(args.seed) # must seed before initializing the model
 
     train_loader, test_loader, num_x_positions, num_y_positions = get_dataloaders(args.data_dir, args.patch_size, args.batch_size, args.eval_batch_size, seed=args.seed)
-    num_lasers, n_freqs_used, n_patches = 100, 3328, 13
+    num_lasers, n_freqs_used, n_patches, mask_height, mask_width = 100, 3328, 13, 1157, 637
     device = 'gpu' if torch.cuda.is_available() else 'cpu'
 
-    model = SignalTransformer(args.d_model, args.pnt_num_heads, args.pnt_num_layers, args.seq_num_heads, args.seq_num_layers, args.patch_size, n_freqs_used, args.signal_is, num_x_positions, num_y_positions, num_lasers, args.alpha, args.beta)
+    model = SignalTransformer(args.d_model, args.pnt_num_heads, args.pnt_num_layers, args.seq_num_heads, args.seq_num_layers, args.patch_size, n_freqs_used, args.signal_is, num_x_positions, num_y_positions, num_lasers, args.alpha, args.beta, gamma=args.gamma, mask_h=mask_height, mask_w=mask_width)
     optimizer = torch.optim.Adam(model.parameters(), args.lr)
-    config = {'n_params': count_parameters(model), 'num_x_positions': num_x_positions, 'num_y_positions': num_y_positions, 'n_patches':n_patches, 'num_lasers':num_lasers, 'SORD': SORD} | vars(args)
-    # logger = WandBLogger('good-vibe-rations', 'classify-position', init_kwargs={'config': config, 'save_code': True})
-    logger = WandBLogger('good-vibe-rations', 'classify-position', init_kwargs={'save_code': True})
+    config = {'n_params': count_parameters(model), 'num_x_positions': num_x_positions, 'num_y_positions': num_y_positions, 'n_patches':n_patches, 'num_lasers':num_lasers, 'SORD': SORD, 'MASK': MASK, 'POSITION': POSITION} | vars(args)
+    logger = WandBLogger('good-vibe-rations', 'classify-position', init_kwargs={'config': config, 'save_code': True})
     hf_ckpt_upload = HFChkptUploader("eturok-weizmann/good-vibrations", interval=args.eval_interval, monitor="x/rMSE", save_local=True)
+    mask_viz = MaskVisualizationCallback(n_samples=args.eval_batch_size, save_dir="visualizations")
     ic(config)
 
     trainer = Trainer(
@@ -312,7 +391,8 @@ def main():
         max_duration=args.max_duration, eval_interval=args.eval_interval,
         optimizers=optimizer, device=device, seed=args.seed,
         loggers=logger, log_to_console=True, auto_log_hparams=True, save_metrics=True,
-        callbacks=[hf_ckpt_upload,])
+        # callbacks=[hf_ckpt_upload, mask_viz])
+        callbacks=[mask_viz])
     # override wandb run name
     wandb.run.name = '-'.join(wandb.run.name.split('-')[1:]) + f'_lr{float(args.lr)}_SORD{SORD}_alpha{args.alpha}_beta{args.beta}'
 
