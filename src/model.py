@@ -314,7 +314,8 @@ class SignalTransformer(ComposerModel):
             dice_loss = dice_loss.mean()
 
             # Weighted BCE — increase weight on foreground (object) class to counter imbalance
-            pos_weight = torch.tensor([(target == 0).sum() / (target == 1).sum().clamp(min=1)], device=mask_logits.device)
+            fg_area, bg_area = target.sum(), (1 - target).sum()
+            pos_weight = bg_area / fg_area.clamp(min=1e-6)
             bce_loss = F.binary_cross_entropy_with_logits(mask_logits, target, pos_weight=pos_weight)
 
             mask_loss = self.delta * dice_loss + (1 - self.delta) * bce_loss
