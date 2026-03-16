@@ -2,4 +2,4 @@
 
 ![good vibes](assets/good%20vibes.png)
 
-`uv run src/model.py`
+`uv run modal run -d src/model.py`

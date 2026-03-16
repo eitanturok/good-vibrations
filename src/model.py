@@ -1,5 +1,5 @@
 import argparse
-from pathlib import Path
+import modal
 
 import torch
 import wandb
@@ -29,6 +29,11 @@ SORD = getenv("SORD", 1)
 DEBUG = getenv("DEBUG", 0)
 MASK = getenv("MASK", 1)
 POSITION = getenv("POSITION", 0)
+
+# **** Modal ****
+
+image = modal.Image.debian_slim().apt_install("git").uv_sync().add_local_dir("src", remote_path="/root")
+app = modal.App(image=image)
 
 # ***** Dataset *****
 
@@ -251,7 +256,7 @@ class SignalTransformer(ComposerModel):
         B, N_LASERS, N_PATCHES, N_COORDS, PATCH_SIZE = inputs.shape
 
         # Flatten batch and laser dims so PointTransformer processes all lasers in one pass
-        pnt_tokens = self.point_transformer(inputs.flatten(0, 1)).reshape(B, N_LASERS, -1) # (B, N_LASERS, d_model)
+        pnt_tokens = self.point_transformer(inputs.flatten(0, 1)).reshape(B, N_LASERS, -1) # (B, N_LASERS, N_PATCHES, N_COORDS, PATCH_SIZE) -> (B, N_LASERS, d_model)
 
         # Add positional encoding
         pnt_tokens = self.learnable_positional_encoding(pnt_tokens)                 # (B, N_LASERS, d_model)
@@ -373,6 +378,7 @@ def get_parser():
     parser.add_argument('--eval_interval', type=str, default='10ep')
     return parser
 
+@app.function(gpu="A100", secrets=[modal.Secret.from_name("huggingface"), modal.Secret.from_name("wandb")])
 def main():
     parser = get_parser()
     args = parser.parse_args()
