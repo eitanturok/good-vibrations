@@ -62,30 +62,34 @@ class VibrationDataset(torch.utils.data.Dataset):
     tensor off disk — the OS never loads the full file into RAM.
     """
 
-    def __init__(self, repo_id:str, split:str="train", patch_size:int=256, token:str|None=None):
+    def __init__(self, repo_id:str, split:str="train", mask_h:int=40, mask_w:int=20, patch_size:int=256, token:str|None=None):
         self.ds = load_dataset(repo_id, split=split, token=token, columns=["shifts_idx", "mask_idx", "x_position", "y_position", "object", "fps"])
         self.st_shifts = safe_open(hf_hub_download(repo_id, "shifts.safetensors", repo_type="dataset", token=token), framework="pt", device="cpu")
         self.st_masks = safe_open(hf_hub_download(repo_id, "masks.safetensors",  repo_type="dataset", token=token),  framework="pt", device="cpu")
-        self.patch_size = patch_size
-        # remap raw position values to 0-indexed class labels (same as vibration_transformer.py)
+        self.patch_size, self.mask_h, self.mask_w = patch_size, mask_h, mask_w
+        # remap raw position values to 0-indexed class labels
         self.x_labels = torch.tensor(self.ds["x_position"]).unique(return_inverse=True)[1]
         self.y_labels = torch.tensor(self.ds["y_position"]).unique(return_inverse=True)[1]
     def __repr__(self): return f"VibrationDataset(split={self.ds.split}, n={len(self.ds)})"
     def __len__(self): return len(self.ds)
     def __getitem__(self, idx):
         row = self.ds[idx]
-        mask = self.st_masks.get_tensor(f"mask_{row['mask_idx']}")          # (H, W) bool
-        shifts = self.st_shifts.get_tensor(f"shifts_{row['shifts_idx']}")   # (n_lasers, n_timesteps, 2)
-        # clean + fft the shift data
-        shifts = clean_shifts(shifts, row["fps"])                           # (n_lasers, n_timesteps, 2)
-        fft, freqs = do_fft(shifts, row["fps"])                             # (n_lasers, n_freqs, 2)
-        # patchify: unfold freq dim into non-overlapping patches -> (n_lasers, n_patches, n_coords, patch_size)
-        fft_patches = fft.unfold(1, self.patch_size, self.patch_size)
-        return fft_patches.float(), (mask, self.x_labels[idx], self.y_labels[idx])
 
-def get_dataloaders(repo_id:str, patch_size:int=256, batch_size:int=8, eval_batch_size:int=16, shuffle:bool=True, num_workers:int=0, seed:int=42, token:str | None = None):
-    train_set = VibrationDataset(repo_id, split="train", patch_size=patch_size, token=token)
-    test_set = VibrationDataset(repo_id, split="test", patch_size=patch_size, token=token)
+        # discretize the mask
+        mask = self.st_masks.get_tensor(f"mask_{row['mask_idx']}")                                      # (H, W) bool
+        mask = F.adaptive_avg_pool2d(mask.float()[None, None], (self.mask_h, self.mask_w)).squeeze()    # (mask_h, mask_w)
+
+        # clean + fft the laser shifts
+        shifts = self.st_shifts.get_tensor(f"shifts_{row['shifts_idx']}")       # (n_lasers, n_timesteps, 2)
+        shifts = clean_shifts(shifts, row["fps"])                               # (n_lasers, n_timesteps, 2)
+        fft, _ = do_fft(shifts, row["fps"])                                     # (n_lasers, n_freqs, 2)
+        fft_patches = fft.unfold(1, self.patch_size, self.patch_size).float()   # (n_lasers, n_freqs, 2) -> (n_lasers, n_patches, 2, patch_size)
+
+        return fft_patches, (mask, self.x_labels[idx], self.y_labels[idx])
+
+def get_dataloaders(repo_id:str, patch_size:int=256, mask_h:int=40, mask_w:int=20, batch_size:int=8, eval_batch_size:int=16, shuffle:bool=True, num_workers:int=0, seed:int=42, token:str | None = None):
+    train_set = VibrationDataset(repo_id, split="train", patch_size=patch_size, mask_h=mask_h, mask_w=mask_w, token=token)
+    test_set = VibrationDataset(repo_id, split="test", patch_size=patch_size, mask_h=mask_h, mask_w=mask_w, token=token)
     generator = torch.Generator().manual_seed(seed)
     train_loader = DataLoader(train_set, batch_size=batch_size,     shuffle=shuffle,  num_workers=num_workers, generator=generator, pin_memory=True)
     test_loader  = DataLoader(test_set,  batch_size=eval_batch_size, shuffle=False,   num_workers=num_workers, generator=generator, pin_memory=True)
@@ -365,6 +369,8 @@ def get_parser():
     parser.add_argument('--pnt_num_layers', type=int, default=2)
     parser.add_argument('--seq_num_layers', type=int, default=2)
     parser.add_argument('--patch_size', type=int, default=256)
+    parser.add_argument('--mask_h', type=int, default=40)
+    parser.add_argument('--mask_w', type=int, default=20)
 
     # learning
     parser.add_argument('--batch_size', type=int, default=4096)
@@ -384,32 +390,54 @@ def get_parser():
     retries=3,
     secrets=[modal.Secret.from_name("huggingface"), modal.Secret.from_name("wandb")],
     )
-def main():
-    parser = get_parser()
-    args = parser.parse_args()
-    seed_all(args.seed) # must seed before initializing the model
+def train(
+    # data
+    data_dir: str = 'eturok-weizmann/vibration-data',
+    seed: int = 42,
+    signal_is: str = 'magnitude',
+    # model arch
+    d_model: int = 64,
+    pnt_num_heads: int = 2,
+    seq_num_heads: int = 2,
+    pnt_num_layers: int = 2,
+    seq_num_layers: int = 2,
+    patch_size: int = 256,
+    mask_h: int = 40,
+    mask_w: int = 20,
+    # learning
+    batch_size: int = 4096,
+    eval_batch_size: int = 16,
+    lr: float = 1e-4,
+    alpha: float = 0.9,
+    beta: float = 0.5,
+    gamma: float = 0.5,
+    delta: float = 0.5,
+    max_duration: str = '1_000ep',
+    eval_interval: str = '10ep',
+):
+    seed_all(seed)
 
-    train_loader, test_loader, num_x_positions, num_y_positions = get_dataloaders(args.data_dir, args.patch_size, args.batch_size, args.eval_batch_size, seed=args.seed)
-    num_lasers, n_freqs_used, n_patches, mask_height, mask_width = 100, 3328, 13, 1157, 637
+    train_loader, test_loader, num_x_positions, num_y_positions = get_dataloaders(data_dir, patch_size, mask_h, mask_w, batch_size, eval_batch_size, seed=seed)
+    num_lasers, n_freqs_used, n_patches = 100, 3328, 13
     device = 'gpu' if torch.cuda.is_available() else 'cpu'
 
-    model = SignalTransformer(args.d_model, args.pnt_num_heads, args.pnt_num_layers, args.seq_num_heads, args.seq_num_layers, args.patch_size, n_freqs_used, args.signal_is, num_x_positions, num_y_positions, num_lasers, args.alpha, args.beta, gamma=args.gamma, delta=args.delta, mask_h=mask_height, mask_w=mask_width)
-    optimizer = torch.optim.Adam(model.parameters(), args.lr)
-    config = {'n_params': count_parameters(model), 'num_x_positions': num_x_positions, 'num_y_positions': num_y_positions, 'n_patches':n_patches, 'num_lasers':num_lasers, 'delta': args.delta, 'SORD': SORD, 'MASK': MASK, 'POSITION': POSITION} | vars(args)
+    model = SignalTransformer(d_model, pnt_num_heads, pnt_num_layers, seq_num_heads, seq_num_layers, patch_size, n_freqs_used, signal_is, num_x_positions, num_y_positions, num_lasers, alpha, beta, gamma=gamma, delta=delta, mask_h=mask_h, mask_w=mask_w)
+    optimizer = torch.optim.Adam(model.parameters(), lr)
+    config = {'n_params': count_parameters(model), 'num_x_positions': num_x_positions, 'num_y_positions': num_y_positions, 'n_patches':n_patches, 'num_lasers':num_lasers, 'delta': delta, 'SORD': SORD, 'MASK': MASK, 'POSITION': POSITION, 'data_dir': data_dir, 'seed': seed, 'signal_is': signal_is, 'd_model': d_model, 'pnt_num_heads': pnt_num_heads, 'seq_num_heads': seq_num_heads, 'pnt_num_layers': pnt_num_layers, 'seq_num_layers': seq_num_layers, 'patch_size': patch_size, 'batch_size': batch_size, 'eval_batch_size': eval_batch_size, 'lr': lr, 'alpha': alpha, 'beta': beta, 'gamma': gamma, 'max_duration': max_duration, 'eval_interval': eval_interval}
     logger = WandBLogger('good-vibe-rations', 'classify-position', init_kwargs={'config': config, 'save_code': True})
-    hf_ckpt_upload = HFChkptUploader("eturok-weizmann/good-vibrations", interval=args.eval_interval, monitor="x/rMSE", save_local=True)
-    mask_viz = MaskVisualizationCallback(n_samples=args.eval_batch_size, save_dir="visualizations")
+    hf_ckpt_upload = HFChkptUploader("eturok-weizmann/good-vibrations", interval=eval_interval, monitor="x/rMSE", save_local=True)
+    mask_viz = MaskVisualizationCallback(n_samples=eval_batch_size, save_dir="visualizations")
     ic(config)
 
     trainer = Trainer(
         model=model, train_dataloader=train_loader, eval_dataloader=test_loader,
-        max_duration=args.max_duration, eval_interval=args.eval_interval,
-        optimizers=optimizer, device=device, seed=args.seed,
+        max_duration=max_duration, eval_interval=eval_interval,
+        optimizers=optimizer, device=device, seed=seed,
         loggers=logger, log_to_console=True, auto_log_hparams=True, save_metrics=True,
         # callbacks=[hf_ckpt_upload, mask_viz])
         callbacks=[mask_viz])
     # override wandb run name
-    wandb.run.name = '-'.join(wandb.run.name.split('-')[1:]) + f'_lr{float(args.lr)}_delta{args.delta}'
+    wandb.run.name = '-'.join(wandb.run.name.split('-')[1:]) + f'_lr{float(lr)}_delta{delta}'
 
     trainer.fit()
     ic(trainer.state.train_metrics, type(trainer.state.train_metrics))
@@ -417,5 +445,42 @@ def main():
 
     trainer.close()
 
+@app.local_entrypoint()
+def main(
+    # data
+    data_dir: str = 'eturok-weizmann/vibration-data',
+    seed: int = 42,
+    signal_is: str = 'magnitude',
+    # model arch
+    d_model: int = 64,
+    pnt_num_heads: int = 2,
+    seq_num_heads: int = 2,
+    pnt_num_layers: int = 2,
+    seq_num_layers: int = 2,
+    patch_size: int = 256,
+    mask_h: int = 40,
+    mask_w: int = 20,
+    # learning
+    batch_size: int = 4096,
+    eval_batch_size: int = 16,
+    lr: float = 1e-4,
+    alpha: float = 0.9,
+    beta: float = 0.5,
+    gamma: float = 0.5,
+    delta: float = 0.5,
+    max_duration: str = '1_000ep',
+    eval_interval: str = '10ep',
+):
+    train.remote(  # runs on Modal GPU
+        data_dir=data_dir, seed=seed, signal_is=signal_is,
+        d_model=d_model, pnt_num_heads=pnt_num_heads, seq_num_heads=seq_num_heads,
+        pnt_num_layers=pnt_num_layers, seq_num_layers=seq_num_layers, patch_size=patch_size,
+        mask_h=mask_h, mask_w=mask_w,
+        batch_size=batch_size, eval_batch_size=eval_batch_size, lr=lr,
+        alpha=alpha, beta=beta, gamma=gamma, delta=delta,
+        max_duration=max_duration, eval_interval=eval_interval,
+    )
+
 if __name__ == '__main__':
-    main()
+    args = get_parser().parse_args()
+    train.local(**vars(args))
