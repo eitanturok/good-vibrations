@@ -380,7 +380,7 @@ def get_parser():
 
 @app.function(
     gpu="A100",
-    timeout=24*60*60, # maximum timeout is 24 hours; see https://modal.com/docs/guide/timeouts#timeouts
+    timeout=86_400, # maximum timeout is 24 hours; see https://modal.com/docs/guide/timeouts#timeouts
     retries=3,
     secrets=[modal.Secret.from_name("huggingface"), modal.Secret.from_name("wandb")],
     )
