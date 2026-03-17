@@ -1,4 +1,4 @@
-import argparse
+import argparse, math
 import modal
 
 import torch
@@ -13,9 +13,8 @@ from safetensors import safe_open
 from scipy.signal import butter, sosfiltfilt
 from composer import Trainer
 from composer.models import ComposerModel
-from composer.metrics import CrossEntropy
-from torchmetrics.classification import MulticlassAccuracy, BinaryJaccardIndex, BinaryPrecision, BinaryRecall
-from torchmetrics.segmentation import GeneralizedDiceScore
+from torchmetrics.aggregation import MeanMetric
+from torchmetrics.classification import MulticlassAccuracy, BinaryJaccardIndex
 from torchmetrics.regression import MeanSquaredError
 from composer.loggers import WandBLogger
 from composer.utils.reproducibility import seed_all
@@ -28,7 +27,7 @@ from helpers import getenv, HFChkptUploader, MaskVisualizationCallback
 SORD = getenv("SORD", 1)
 DEBUG = getenv("DEBUG", 0)
 MASK = getenv("MASK", 1)
-POSITION = getenv("POSITION", 0)
+POSITION = getenv("POSITION", 1)
 
 # **** Modal ****
 
@@ -134,65 +133,47 @@ def get_dataloaders(repo_id:str, patch_size:int=256, mask_h:int=40, mask_w:int=2
     num_y_positions = int(train_set.y_labels.max()) + 1
     return train_loader, test_loader, num_x_positions, num_y_positions
 
-# ***** model *****
+# ***** metrics *****
 
-def _tag(m, pos: str):
-    m._pos = pos
+def _tag(m, metric_name:str, pred_type:str, pos:str|None=None):
+    m.metric_name = metric_name
+    m.pred_type = pred_type     # 'x', 'y', or 'mask'
+    m.pos = pos                 # 'x', 'y', or None (for profile axis)
     return m
 
-class PositionMetrics:
-    """Accuracy, cross-entropy, and RMSE for one position head (x or y), for both train and val."""
-    def __init__(self, num_classes: int, pos: str):
-        self.pos = pos
-        self.train_accuracy      = _tag(MulticlassAccuracy(num_classes=num_classes, average='micro'), pos)
-        self.val_accuracy        = _tag(MulticlassAccuracy(num_classes=num_classes, average='micro'), pos)
-        self.train_cross_entropy = _tag(CrossEntropy(), pos)
-        self.val_cross_entropy   = _tag(CrossEntropy(), pos)
-        self.train_rmse          = _tag(MeanSquaredError(squared=False), pos)
-        self.val_rmse            = _tag(MeanSquaredError(squared=False), pos)
+def create_metrics(nx: int, ny: int):
+    return {
+        "pos/x_Acc":        _tag(MulticlassAccuracy(num_classes=nx), 'Accuracy', 'x'),
+        "pos/y_Acc":        _tag(MulticlassAccuracy(num_classes=ny), 'Accuracy', 'y'),
+        "pos/x_rMSE":       _tag(MeanSquaredError(squared=False),   'rMSE', 'x'),
+        "pos/y_rMSE":       _tag(MeanSquaredError(squared=False),   'rMSE', 'y'),
+        "pos/x_CE":         _tag(MeanMetric(), 'CE', 'x'),
+        "pos/y_CE":         _tag(MeanMetric(), 'CE', 'y'),
+        "mask/IoU":         _tag(BinaryJaccardIndex(), 'IoU', 'mask'),
+        "pos/WeightedCE":   _tag(MeanMetric(), 'WeightedCE', 'mask'),
+        "mask/SoftDice":    _tag(MeanMetric(), 'SoftDice',   'mask'),
+        "mask/x_SoftDice":  _tag(MeanMetric(), 'SoftDice', 'mask', 'x'),
+        "mask/y_SoftDice":  _tag(MeanMetric(), 'SoftDice', 'mask', 'y'),
+    }
 
-    def get(self, is_train: bool) -> dict:
-        p = 'train' if is_train else 'val'
-        return {
-            f'{self.pos}/MulticlassAccuracy': getattr(self, f'{p}_accuracy'),
-            f'{self.pos}/CrossEntropy':       getattr(self, f'{p}_cross_entropy'),
-            f'{self.pos}/rMSE':               getattr(self, f'{p}_rmse'),
-        }
+# **** model ****
 
-    def update(self, metric, logits, targets):
-        if isinstance(metric, MeanSquaredError):
-            metric.update(logits.argmax(dim=-1), targets)
-        else:
-            metric.update(logits, targets)
+def precompute_freqs_cis(dim:int, end:int, theta:float=10000.0) -> torch.Tensor:
+    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[:(dim // 2)] / dim))
+    freqs = torch.arange(end).unsqueeze(dim=1) * freqs.unsqueeze(dim=0)
+    return torch.cat([freqs.cos(), freqs.sin()], dim=-1)
 
-class MaskMetrics:
-    """IoU, Dice, Precision, and Recall for the mask head, for both train and val."""
-    def __init__(self):
-        self.train_iou       = _tag(BinaryJaccardIndex(), 'mask')
-        self.val_iou         = _tag(BinaryJaccardIndex(), 'mask')
-        self.train_precision = _tag(BinaryPrecision(),    'mask')
-        self.val_precision   = _tag(BinaryPrecision(),    'mask')
-        self.train_recall    = _tag(BinaryRecall(),       'mask')
-        self.val_recall      = _tag(BinaryRecall(),       'mask')
-        self.train_dice      = _tag(GeneralizedDiceScore(num_classes=2), 'mask')
-        self.val_dice        = _tag(GeneralizedDiceScore(num_classes=2), 'mask')
+def precompute_freqs_cis_2d(dim:int, h:int, w:int, theta:float = 10000.0) -> torch.Tensor:
+    freqs_h, freqs_w = precompute_freqs_cis(dim // 2, h, theta), precompute_freqs_cis(dim // 2, w, theta)
+    freqs_h, freqs_w = freqs_h.reshape(h, 1, -1).repeat(1, w, 1), freqs_w.reshape(1, w, -1).repeat(h, 1, 1)
+    return torch.cat([freqs_h, freqs_w], dim=-1).reshape(h * w, dim)
 
-    def get(self, is_train: bool) -> dict:
-        p = 'train' if is_train else 'val'
-        return {
-            'mask/IoU':       getattr(self, f'{p}_iou'),
-            'mask/Precision': getattr(self, f'{p}_precision'),
-            'mask/Recall':    getattr(self, f'{p}_recall'),
-            'mask/Dice':      getattr(self, f'{p}_dice'),
-        }
-
-    def update(self, metric, mask_logits, mask):
-        preds, targets = (mask_logits.sigmoid() > 0.5).int(), mask.int()
-        if isinstance(metric, GeneralizedDiceScore):
-            metric.update(torch.stack([1 - preds, preds], dim=1), torch.stack([1 - targets, targets], dim=1))
-        else:
-            metric.update(preds, targets)
-
+def apply_rope(x:torch.Tensor, freqs_cis:torch.Tensor) -> torch.Tensor:
+    assert x.shape[-1] % 2 == 0
+    shp = [1]*(x.ndim-2) + [x.shape[1], -1] # works with 1D + 2D rope
+    cos, sin = freqs_cis.reshape(*shp).chunk(2, dim=-1)
+    x1, x2 = x.chunk(2, dim=-1)
+    return torch.cat([x1 * cos - x2 * sin, x2 * cos + x1 * sin], dim=-1)
 
 def sord_loss(predictions, targets, cost_matrix):
     """SORD loss with soft labels based on ordinal distance."""
@@ -201,138 +182,105 @@ def sord_loss(predictions, targets, cost_matrix):
     log_predictions = F.log_softmax(predictions, dim=-1)
     return -(soft_labels * log_predictions).sum(dim=1).mean()
 
-class LearnablePositionalEncoding(nn.Module):
-    def __init__(self, dim, hidden_dim):
-        super().__init__()
-        self.embed = nn.Embedding(dim, hidden_dim)  # Learnable embeddings
+def soft_dice_fn(logits, targets, axis=None):
+    """Computes Soft Dice for the full mask, or just along X or Y directions"""
+    probs = logits.sigmoid()
+    if axis is not None: probs, targets = probs.mean(dim=axis), targets.mean(dim=axis)
+    spatial_dims = tuple(range(1, probs.ndim))  # (-2, -1) for dice over entire mask or (-1,) for dice on just x,y profiles
+    intersection = (probs * targets).sum(dim=spatial_dims)
+    total_sum = probs.sum(dim=spatial_dims) + targets.sum(dim=spatial_dims)
+    dice_score = (2 * intersection + 1) / (total_sum + 1)
+    return 1 - dice_score.mean()
 
-    def forward(self, x):
-        positions = torch.arange(x.shape[1], device=x.device).unsqueeze(0)
-        return x + self.embed(positions)
+def weighted_cross_entropy_fn(mask_logits, target):
+    pos_weight = (1 - target).sum() / target.sum().clamp(min=1e-6)
+    return F.binary_cross_entropy_with_logits(mask_logits, target, pos_weight=pos_weight)
 
 class PointTransformer(nn.Module):
-    def __init__(self, patch_size, d_model, num_heads, num_layers, signal_length, signal_is, dropout_prob=0.5):
+    def __init__(self, patch_size, d_model, num_heads, num_layers, signal_length, signal_is):
         super().__init__()
-        self.signal_is = signal_is
-
-        # Token embedding projection
-        self.embedding = nn.Linear(2 * patch_size, d_model)
-
-        # Positional encoding
-        self.learnable_positional_encoding = LearnablePositionalEncoding(signal_length // patch_size, d_model)
-
-        # Transformer encoder setup
-        encoder_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=num_heads, batch_first=True)
-        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-
-        # Learnable CLS token
+        self.embed = nn.Linear(2 * patch_size, d_model)
+        self.layers = nn.TransformerEncoder(nn.TransformerEncoderLayer(d_model=d_model, nhead=num_heads, batch_first=True), num_layers=num_layers)
         self.cls_token = nn.Parameter(torch.zeros(1, 1, d_model))
+        self.register_buffer("freqs_cis", precompute_freqs_cis(d_model, signal_length//patch_size))
+        self.raw_to_tokens = {'magnitude': lambda t: t.abs(), 'complex': lambda t: torch.cat([t.real, t.imag], dim=-1), 'mag_phase': lambda t: torch.cat([t.abs(), t.angle()], dim=-1)}[signal_is]
 
-        # Token dropout probability
-        self.token_dropout_prob = dropout_prob
-
-    def _raw_signal_to_tokenizable_one(self, tokens):
-        # tokens: (B*N_LASERS, N_PATCHES, N_COORDS, patch_size)  complex
-        if self.signal_is == 'magnitude':
-            tokens = tokens.abs()                                              # (B*N_LASERS, N_PATCHES, N_COORDS, patch_size)  real
-        elif self.signal_is == 'complex':
-            tokens = torch.cat([tokens.real, tokens.imag], dim=-1)            # (B*N_LASERS, N_PATCHES, N_COORDS, 2*patch_size)
-        elif self.signal_is == 'mag_phase':
-            tokens = torch.cat([tokens.abs(), tokens.angle()], dim=-1)        # (B*N_LASERS, N_PATCHES, N_COORDS, 2*patch_size)
-        else:
-            raise RuntimeError(f'unknown signal type {self.signal_is}')
-        return tokens
-
-    def forward(self, tokens):
-        tokens = self._raw_signal_to_tokenizable_one(tokens)                  # (B*N_LASERS, N_PATCHES, N_COORDS, patch_size|2*patch_size)
-        B, P, _, _ = tokens.shape
-        tokens_emb = self.embedding(tokens.reshape(B, P, -1))                 # (B*N_LASERS, N_PATCHES, d_model)
-        tokens_emb = self.learnable_positional_encoding(tokens_emb)           # (B*N_LASERS, N_PATCHES, d_model)
-        cls_token_expanded = self.cls_token.expand(B, -1, -1)                 # (B*N_LASERS, 1, d_model)
-        tokens_emb = torch.cat((cls_token_expanded, tokens_emb), dim=1)       # (B*N_LASERS, N_PATCHES+1, d_model)
-        output = self.transformer_encoder(tokens_emb)                         # (B*N_LASERS, N_PATCHES+1, d_model)
-        PNT = output[:, 0, :]                                                 # (B*N_LASERS, d_model)
-        return PNT
+    def forward(self, x):
+        # x.shape = (B_L,P,C,_PS) = (batch_size * n_lasers, n_patches, n_coords, patch_size)
+        B_L, P, _, _ = x.shape
+        x = self.raw_to_tokens(x)                                                   # (B_L,P,C,_PS) -> (B_L,P,C,PS) where PS=_PS or 2*_PS
+        x = self.embed(x.reshape(B_L, P, -1))                                       # (B_L,P,C,PS) -> (B_L,P,D)
+        x = apply_rope(x, self.freqs_cis.to(x.device))                              # (B_L,P,D)
+        x = torch.cat((self.cls_token.expand(B_L, -1, -1).to(x.device), x), dim=1)  # (B_L,P+1,D)
+        output = self.layers(x)                                                     # (B_L,P+1,D)
+        return output[:, 0, :]                                                      # (B_L,D)
 
 
 class SignalTransformer(ComposerModel):
     def __init__(self, d_model, pnt_num_heads, pnt_num_layers, seq_num_heads, seq_num_layers, patch_size, signal_length, signal_is, num_x_positions, num_y_positions, num_lasers, alpha, beta, gamma=0.5, delta=0.5, mask_h=100, mask_w=100):
         super().__init__()
-        self.beta, self.gamma, self.delta, self.mask_h, self.mask_w = beta, gamma, delta, mask_h, mask_w
-
-        # Initialize one PointTransformer for every point
-        self.point_transformer = PointTransformer(patch_size, d_model, pnt_num_heads, pnt_num_layers, signal_length, signal_is)
-
-        # Positional encoding for point embeddings
-        self.learnable_positional_encoding = LearnablePositionalEncoding(num_lasers, d_model)
-
-        # Sequence-level transformer encoder
-        encoder_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=seq_num_heads, batch_first=True)
-        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=seq_num_layers)
-
-        # Learnable [CLS] token for the sequence-level transformer
+        self.alpha, self.beta, self.gamma, self.delta, self.mask_h, self.mask_w, self.num_x_pos, self.num_y_pos = alpha, beta, gamma, delta, mask_h, mask_w, num_x_positions, num_y_positions
+        self.pnt_trans = PointTransformer(patch_size, d_model, pnt_num_heads, pnt_num_layers, signal_length, signal_is)
+        self.seq_trans = nn.TransformerEncoder(nn.TransformerEncoderLayer(d_model=d_model, nhead=seq_num_heads, batch_first=True), num_layers=seq_num_layers)
         self.cls_token = nn.Parameter(torch.zeros(1, 1, d_model))
         nn.init.trunc_normal_(self.cls_token, std=.02)  # Initialize to small random values
 
+        # positional embeddings for segmentation mask and laser grid
+        self.register_buffer("freqs_mask", precompute_freqs_cis_2d(d_model, mask_h, mask_w))
+        self.register_buffer("freqs_laser", precompute_freqs_cis_2d(d_model, int(math.sqrt(num_lasers)), int(math.sqrt(num_lasers))))
+
         # Prediction heads
-        self.mlp_head_x_position = nn.Sequential(nn.Linear(d_model, 32), nn.ReLU(), nn.Linear(32, num_x_positions))
-        self.mlp_head_y_position = nn.Sequential(nn.Linear(d_model, 32), nn.ReLU(), nn.Linear(32, num_y_positions))
+        self.mlp_head_x_position = nn.Sequential(nn.Linear(d_model, 32), nn.ReLU(), nn.Linear(32, self.num_x_pos))
+        self.mlp_head_y_position = nn.Sequential(nn.Linear(d_model, 32), nn.ReLU(), nn.Linear(32, self.num_y_pos))
         self.mlp_head_mask = nn.Sequential(nn.Linear(d_model, 256), nn.ReLU(), nn.Linear(256, mask_h * mask_w))
 
         # SORD loss cost matrix
-        self.alpha = alpha
-        self.register_buffer('cost_matrix_x', self._init_cost_matrix(num_x_positions))
-        self.register_buffer('cost_matrix_y', self._init_cost_matrix(num_y_positions))
+        self.register_buffer('cost_matrix_x', self._init_cost_matrix(self.num_x_pos))
+        self.register_buffer('cost_matrix_y', self._init_cost_matrix(self.num_y_pos))
 
-        self.x_metrics    = PositionMetrics(num_x_positions, 'x')
-        self.y_metrics    = PositionMetrics(num_y_positions, 'y')
-        self.mask_metrics = MaskMetrics()
+        # Metrics
+        self.train_metrics, self.val_metrics = create_metrics(self.num_x_pos, self.num_y_pos), create_metrics(self.num_x_pos, self.num_y_pos)
 
     def _init_cost_matrix(self, num_classes, multiplier=0.5):
         indices = torch.arange(num_classes)
         return multiplier * (indices.unsqueeze(1) - indices.unsqueeze(0)).abs() ** 2
 
     def forward(self, batch):
-        inputs, _ = batch
-        B, N_LASERS, N_PATCHES, N_COORDS, PATCH_SIZE = inputs.shape
+        # B=batch size, L=n_lasters, C=n_coordinates=2, PS=patch size, D=d_model
+        x, _ = batch
+        B, L,_, _, _ = x.shape
 
-        # Flatten batch and laser dims so PointTransformer processes all lasers in one pass
-        pnt_tokens = self.point_transformer(inputs.flatten(0, 1)).reshape(B, N_LASERS, -1) # (B, N_LASERS, N_PATCHES, N_COORDS, PATCH_SIZE) -> (B, N_LASERS, d_model)
+        # PointTransformer learns patterns between all frequencies from a single laser
+        # flatten so PointTransformer processes all lasers across all batches in parallel
+        x = self.pnt_trans(x.flatten(0, 1)).reshape(B, L, -1)       # (B,L,P,C,PS) -> (B,L,D)
 
-        # Add positional encoding
-        pnt_tokens = self.learnable_positional_encoding(pnt_tokens)                 # (B, N_LASERS, d_model)
+        # SequenceTransformer learns patterns between all lasers in the the laser grid
+        x = apply_rope(x, self.freqs_laser.to(x.device))            # (B,L,D) -> (B,L,D)
+        x = torch.cat((self.cls_token.expand(B, -1, -1), x), dim=1) # (B,L,D) (1,1,D) -> (B,L+1,D)
+        output = self.seq_trans(x)                                  # (B,L+1,D) -> (B,L+1,D)
+        cls_embedding = output[:, 0, :]                             # (B,D)
 
-        # Add learnable sequence CLS token: (B, 1, d_model)
-        cls_token = self.cls_token.expand(B, -1, -1)                                # (B, 1, d_model)
-        transformer_input = torch.cat((cls_token, pnt_tokens), dim=1)               # (B, N_LASERS+1, d_model)
-
-        # Process through the sequence-level transformer
-        output = self.transformer_encoder(transformer_input)                        # (B, N_LASERS+1, d_model)
-
-        # Extract the sequence-level CLS embedding
-        cls_embedding = output[:, 0, :]                                             # (B, d_model)
-
-        # Predict x and y position, and segmentation mask
-        logits_x = self.mlp_head_x_position(cls_embedding)
-        logits_y = self.mlp_head_y_position(cls_embedding)
+        # Predict x position, y position, and segmentation mask
+        x_logits = self.mlp_head_x_position(cls_embedding)
+        y_logits = self.mlp_head_y_position(cls_embedding)
         mask_logits = self.mlp_head_mask(cls_embedding).view(B, self.mask_h, self.mask_w)
-        return logits_x, logits_y, cls_embedding, mask_logits
+        return x_logits, y_logits, cls_embedding, mask_logits
 
     def loss(self, outputs, batch):
-        _, (mask, targets_x, targets_y) = batch
-        logits_x, logits_y, _, mask_logits = outputs
+        _, (mask_true, x_true, y_true) = batch
+        x_logits, y_logits, _, mask_logits = outputs
         position_loss = mask_loss = 0.0
         loss_log = {}
 
         if POSITION:
-            ce_loss_x = F.cross_entropy(logits_x, targets_x)
-            ce_loss_y = F.cross_entropy(logits_y, targets_y)
+            ce_loss_x = F.cross_entropy(x_logits, x_true)
+            ce_loss_y = F.cross_entropy(y_logits, y_true)
             if not SORD:
                 position_loss = self.beta * ce_loss_x + (1 - self.beta) * ce_loss_y
                 loss_log.update({'loss/train/ce_x': ce_loss_x, 'loss/train/ce_y': ce_loss_y})
             else:
-                sord_loss_x = sord_loss(logits_x, targets_x, self.cost_matrix_x)
-                sord_loss_y = sord_loss(logits_y, targets_y, self.cost_matrix_y)
+                sord_loss_x = sord_loss(x_logits, x_true, self.cost_matrix_x)
+                sord_loss_y = sord_loss(y_logits, y_true, self.cost_matrix_y)
                 ce_sord_loss_x = self.alpha * sord_loss_x + (1 - self.alpha) * ce_loss_x
                 ce_sord_loss_y = self.alpha * sord_loss_y + (1 - self.alpha) * ce_loss_y
                 position_loss = self.beta * ce_sord_loss_x + (1 - self.beta) * ce_sord_loss_y
@@ -342,21 +290,10 @@ class SignalTransformer(ComposerModel):
             loss_log['loss/train/position'] = position_loss
 
         if MASK:
-            target = mask.float()
-            probs  = mask_logits.sigmoid()
-
-            # Dice loss
-            intersection = (probs * target).sum(dim=(-2, -1))
-            dice_loss = 1 - (2 * intersection + 1) / (probs.sum(dim=(-2, -1)) + target.sum(dim=(-2, -1)) + 1)
-            dice_loss = dice_loss.mean()
-
-            # Weighted BCE — increase weight on foreground (object) class to counter imbalance
-            fg_area, bg_area = target.sum(), (1 - target).sum()
-            pos_weight = bg_area / fg_area.clamp(min=1e-6)
-            bce_loss = F.binary_cross_entropy_with_logits(mask_logits, target, pos_weight=pos_weight)
-
-            mask_loss = self.delta * dice_loss + (1 - self.delta) * bce_loss
-            loss_log.update({'loss/train/dice': dice_loss, 'loss/train/bce': bce_loss, 'loss/train/mask': mask_loss})
+            mask_dice_loss = soft_dice_fn(mask_logits, mask_true)
+            mask_ce_loss = weighted_cross_entropy_fn(mask_logits, mask_true)
+            mask_loss = self.delta * mask_dice_loss + (1 - self.delta) * mask_ce_loss
+            loss_log.update({'loss/train/mask_dice': mask_dice_loss, 'loss/train/mask_cross_entropy': mask_ce_loss, 'loss/train/mask_total': mask_loss})
 
         if POSITION and MASK:
             total_loss = position_loss * (1 - self.gamma) + self.gamma * mask_loss
@@ -365,25 +302,35 @@ class SignalTransformer(ComposerModel):
         loss_log['loss/train/total'] = total_loss
 
         self.logger.log_metrics({k: v.item() for k, v in loss_log.items()})
-
         return total_loss
 
-    def update_metric(self, batch, outputs, metric):
-        _, (mask, targets_x, targets_y) = batch
-        logits_x, logits_y, _, mask_logits = outputs
-        pos = getattr(metric, '_pos', None)
-
-        if pos == 'mask':
-            self.mask_metrics.update(metric, mask_logits, mask)
-        elif pos == 'x':
-            self.x_metrics.update(metric, logits_x, targets_x)
-        elif pos == 'y':
-            self.y_metrics.update(metric, logits_y, targets_y)
-        else:
-            raise ValueError(f'pos must be mask, x, y but got {pos=}')
-
     def get_metrics(self, is_train=False):
-        return self.x_metrics.get(is_train) | self.y_metrics.get(is_train) | self.mask_metrics.get(is_train)
+        return self.train_metrics if is_train else self.val_metrics
+
+    def update_metric(self, batch, outputs, metric):
+        _, (mask_true, x_true, y_true) = batch
+        x_logits, y_logits, _, mask_logits = outputs
+        metric_name, pred_type, pos = getattr(metric, 'metric_name', None), getattr(metric, 'pred_type', None), getattr(metric, 'pos', None)
+
+        if pred_type == 'x':
+            if metric_name == 'rMSE': metric.update(x_logits.argmax(-1), x_true)
+            elif metric_name == 'CE': metric.update(F.cross_entropy(x_logits, x_true))
+            elif metric_name == 'Accuracy': metric.update(x_logits, x_true) # multiclass accuracy
+            else: raise ValueError(f"did not recognize {metric_name=}")
+        elif pred_type == 'y':
+            if metric_name == 'rMSE': metric.update(y_logits.argmax(-1), y_true)
+            elif metric_name == 'CE': metric.update(F.cross_entropy(y_logits, y_true))
+            elif metric_name == 'Accuracy': metric.update(y_logits, y_true)
+            else: raise ValueError(f"did not recognize {metric_name=}")
+        elif pred_type == 'mask':
+            if metric_name == 'SoftDice':
+                axis = 1 if pos == 'x' else (0 if pos == 'y' else None)
+                metric.update(soft_dice_fn(mask_logits, mask_true, axis=axis))
+            elif metric_name == 'IoU': metric.update((mask_logits.sigmoid() > 0.5).int(), mask_true.int())
+            elif metric_name == 'WeightedCE': metric.update(weighted_cross_entropy_fn(mask_logits, mask_true))
+            else: raise ValueError(f"did not recognize {metric_name=}")
+        else:
+            raise ValueError(f"did not recognize {pred_type=}")
 
     def eval_forward(self, batch, outputs=None):
         return outputs if outputs is not None else self.forward(batch)
@@ -475,7 +422,7 @@ def train(
         # callbacks=[hf_ckpt_upload, mask_viz])
         callbacks=[mask_viz])
     # override wandb run name
-    wandb.run.name = '-'.join(wandb.run.name.split('-')[1:]) + f'_lr{float(lr)}_delta{delta}'
+    wandb.run.name = '-'.join(wandb.run.name.split('-')[1:]) + f'_lr{float(lr)}_{gamma=}'
 
     trainer.fit()
     ic(trainer.state.train_metrics, type(trainer.state.train_metrics))
