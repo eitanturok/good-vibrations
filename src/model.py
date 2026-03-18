@@ -93,11 +93,11 @@ class VibrationDataset(torch.utils.data.Dataset):
     tensor off disk — the OS never loads the full file into RAM.
     """
 
-    def __init__(self, repo_id:str, split:str="train", mask_h:int=40, mask_w:int=20, patch_size:int=256, token:str|None=None):
+    def __init__(self, repo_id:str, split:str="train", disc_mask_h:int=40, disc_mask_w:int=20, patch_size:int=256, token:str|None=None):
         self.ds = load_dataset(repo_id, split=split, token=token, columns=["shifts_idx", "mask_idx", "x_position", "y_position", "object", "fps"])
         self.st_shifts = safe_open(hf_hub_download(repo_id, "shifts.safetensors", repo_type="dataset", token=token), framework="pt", device="cpu")
         self.st_masks = safe_open(hf_hub_download(repo_id, "masks.safetensors",  repo_type="dataset", token=token),  framework="pt", device="cpu")
-        self.patch_size, self.mask_h, self.mask_w = patch_size, mask_h, mask_w
+        self.patch_size, self.disc_mask_h, self.disc_mask_w = patch_size, disc_mask_h, disc_mask_w
         # remap raw position values to 0-indexed class labels
         self.x_labels = torch.tensor(self.ds["x_position"]).unique(return_inverse=True)[1]
         self.y_labels = torch.tensor(self.ds["y_position"]).unique(return_inverse=True)[1]
@@ -107,8 +107,8 @@ class VibrationDataset(torch.utils.data.Dataset):
         row = self.ds[idx]
 
         # discretize the mask
-        mask = self.st_masks.get_tensor(f"mask_{row['mask_idx']}")                                      # (H, W) bool
-        if DISCRETIZED_MASK: mask = F.adaptive_avg_pool2d(mask.float()[None, None], (self.mask_h, self.mask_w)).squeeze()    # (mask_h, mask_w)
+        mask = self.st_masks.get_tensor(f"mask_{row['mask_idx']}").float()                                           # (H, W)
+        if DISCRETIZED_MASK: mask = F.adaptive_avg_pool2d(mask[None, None], (self.disc_mask_h, self.disc_mask_w)).squeeze()    # (disc_mask_h, disc_mask_w)
 
         # clean + fft the laser shifts
         shifts = self.st_shifts.get_tensor(f"shifts_{row['shifts_idx']}")       # (n_lasers, n_timesteps, 2)
@@ -118,15 +118,18 @@ class VibrationDataset(torch.utils.data.Dataset):
 
         return fft_patches, (mask, self.x_labels[idx], self.y_labels[idx])
 
-def get_dataloaders(repo_id:str, patch_size:int=256, mask_h:int=40, mask_w:int=20, batch_size:int=8, eval_batch_size:int=16, shuffle:bool=True, num_workers:int=0, seed:int=42, token:str | None = None):
-    train_set = VibrationDataset(repo_id, split="train", patch_size=patch_size, mask_h=mask_h, mask_w=mask_w, token=token)
-    test_set = VibrationDataset(repo_id, split="test", patch_size=patch_size, mask_h=mask_h, mask_w=mask_w, token=token)
+def get_dataloaders(repo_id:str, patch_size:int=256, disc_mask_h:int=40, disc_mask_w:int=20, batch_size:int=8, eval_batch_size:int=16, shuffle:bool=True, num_workers:int=0, seed:int=42, token:str | None = None):
+    train_set = VibrationDataset(repo_id, split="train", patch_size=patch_size, disc_mask_h=disc_mask_h, disc_mask_w=disc_mask_w, token=token)
+    test_set = VibrationDataset(repo_id, split="test", patch_size=patch_size, disc_mask_h=disc_mask_h, disc_mask_w=disc_mask_w, token=token)
     generator = torch.Generator().manual_seed(seed)
     train_loader = DataLoader(train_set, batch_size=batch_size,     shuffle=shuffle,  num_workers=num_workers, generator=generator, pin_memory=True)
     test_loader  = DataLoader(test_set,  batch_size=eval_batch_size, shuffle=False,   num_workers=num_workers, generator=generator, pin_memory=True)
-    num_x_positions = int(train_set.x_labels.max()) + 1
-    num_y_positions = int(train_set.y_labels.max()) + 1
-    return train_loader, test_loader, num_x_positions, num_y_positions
+    fft_patches, _ = train_set[0]  # (n_lasers, n_patches, 2, patch_size)
+    orig_mask = train_set.st_masks.get_tensor("mask_0")  # (orig_h, orig_w)
+    data_info = {'num_x_positions': int(train_set.x_labels.max()) + 1, 'num_y_positions': int(train_set.y_labels.max()) + 1,
+                 'mask_h': orig_mask.shape[0], 'mask_w': orig_mask.shape[1], 'disc_mask_h': disc_mask_h, 'disc_mask_w': disc_mask_w,
+                 'num_lasers': fft_patches.shape[0], 'n_freqs': fft_patches.shape[1] * patch_size, 'n_patches': fft_patches.shape[1]}
+    return train_loader, test_loader, data_info
 
 # ***** metrics *****
 
@@ -145,7 +148,7 @@ def create_metrics(nx: int, ny: int):
         "pos/x_CE":         _tag(MeanMetric(), 'CE', 'x'),
         "pos/y_CE":         _tag(MeanMetric(), 'CE', 'y'),
         "mask/IoU":         _tag(BinaryJaccardIndex(), 'IoU', 'mask'),
-        "pos/WeightedCE":   _tag(MeanMetric(), 'WeightedCE', 'mask'),
+        "mask/WeightedCE":   _tag(MeanMetric(), 'WeightedCE', 'mask'),
         "mask/SoftDice":    _tag(MeanMetric(), 'SoftDice',   'mask'),
         "mask/x_SoftDice":  _tag(MeanMetric(), 'SoftDice', 'mask', 'x'),
         "mask/y_SoftDice":  _tag(MeanMetric(), 'SoftDice', 'mask', 'y'),
@@ -221,25 +224,26 @@ class PointTransformer(nn.Module):
 
 
 class SignalTransformer(ComposerModel):
-    def __init__(self, d_model, pnt_num_heads, pnt_num_layers, seq_num_heads, seq_num_layers, patch_size, signal_length, signal_is, num_x_positions, num_y_positions, num_lasers, alpha, beta, gamma=0.5, delta=0.5, mask_h=100, mask_w=100):
+    def __init__(self, d_model, pnt_num_heads, pnt_num_layers, seq_num_heads, seq_num_layers, patch_size, signal_is, data_info, alpha, beta, gamma=0.5, delta=0.5):
         super().__init__()
-        self.alpha, self.beta, self.gamma, self.delta, self.mask_h, self.mask_w, self.num_x_pos, self.num_y_pos = alpha, beta, gamma, delta, mask_h, mask_w, num_x_positions, num_y_positions
-        self.pnt_trans = PointTransformer(patch_size, d_model, pnt_num_heads, pnt_num_layers, signal_length, signal_is)
+        self.alpha, self.beta, self.gamma, self.delta = alpha, beta, gamma, delta
+        self.num_x_pos, self.num_y_pos, num_lasers = data_info['num_x_positions'], data_info['num_y_positions'], data_info['num_lasers']
+        self.out_h, self.out_w = (data_info['disc_mask_h'], data_info['disc_mask_w']) if DISCRETIZED_MASK else (data_info['mask_h'], data_info['mask_w'])
+        self.pnt_trans = PointTransformer(patch_size, d_model, pnt_num_heads, pnt_num_layers, data_info['n_freqs'], signal_is)
         self.seq_trans = nn.TransformerEncoder(nn.TransformerEncoderLayer(d_model=d_model, nhead=seq_num_heads, batch_first=True), num_layers=seq_num_layers)
         self.cls_token = nn.Parameter(torch.zeros(1, 1, d_model))
         nn.init.trunc_normal_(self.cls_token, std=.02)  # Initialize to small random values
 
-        # positional embeddings for segmentation mask and laser grid
+        # positional embeddings for laser grid
         if ROPE:
-            self.register_buffer("freqs_mask", precompute_freqs_cis_2d(d_model, mask_h, mask_w))
+            self.register_buffer("freqs_laser", precompute_freqs_cis_2d(d_model, int(math.sqrt(num_lasers)), int(math.sqrt(num_lasers))))
         else:
             self.laser_pos_embd = LearnablePositionalEncoding(num_lasers, d_model)
-        self.register_buffer("freqs_laser", precompute_freqs_cis_2d(d_model, int(math.sqrt(num_lasers)), int(math.sqrt(num_lasers))))
 
         # Prediction heads
         self.mlp_head_x_position = nn.Sequential(nn.Linear(d_model, 32), nn.ReLU(), nn.Linear(32, self.num_x_pos))
         self.mlp_head_y_position = nn.Sequential(nn.Linear(d_model, 32), nn.ReLU(), nn.Linear(32, self.num_y_pos))
-        self.mlp_head_mask = nn.Sequential(nn.Linear(d_model, 256), nn.ReLU(), nn.Linear(256, mask_h * mask_w))
+        self.mlp_head_mask = nn.Sequential(nn.Linear(d_model, 256), nn.ReLU(), nn.Linear(256, self.out_h * self.out_w))
 
         # SORD loss cost matrix
         self.register_buffer('cost_matrix_x', self._init_cost_matrix(self.num_x_pos))
@@ -270,7 +274,7 @@ class SignalTransformer(ComposerModel):
         # Predict x position, y position, and segmentation mask
         x_logits = self.mlp_head_x_position(cls_embedding)
         y_logits = self.mlp_head_y_position(cls_embedding)
-        mask_logits = self.mlp_head_mask(cls_embedding).view(B, self.mask_h, self.mask_w)
+        mask_logits = self.mlp_head_mask(cls_embedding).view(B, self.out_h, self.out_w)
         return x_logits, y_logits, cls_embedding, mask_logits
 
     def loss(self, outputs, batch):
@@ -351,8 +355,8 @@ def get_parser():
 
     # flags
     parser.add_argument('--sord', type=int, default=1)
-    parser.add_argument('--mask', type=int, default=1)
-    parser.add_argument('--position', type=int, default=1)
+    parser.add_argument('--mask-loss', type=int, default=1)
+    parser.add_argument('--position-loss', type=int, default=1)
     parser.add_argument('--discretized-mask', type=int, default=1)
     parser.add_argument('--rope', type=int, default=1)
 
@@ -362,8 +366,8 @@ def get_parser():
     parser.add_argument('--signal-is', type=str, default='magnitude')
 
     parser.add_argument('--patch-size', type=int, default=256)
-    parser.add_argument('--mask-h', type=int, default=40)
-    parser.add_argument('--mask-w', type=int, default=20)
+    parser.add_argument('--disc-mask-h', type=int, default=40)
+    parser.add_argument('--disc-mask-w', type=int, default=20)
 
     # model arch
     parser.add_argument('--d-model', type=int, default=64)
@@ -397,16 +401,15 @@ def train(**kwargs):
     args = get_parser().parse_args([])  # get defaults
     args.__dict__.update(kwargs)        # apply overrides
     global SORD, MASK, POSITION, ROPE, DISCRETIZED_MASK # environment variables
-    SORD, MASK, POSITION, ROPE, DISCRETIZED_MASK = args.sord, args.mask, args.position, args.rope, args.discretized_mask
+    SORD, MASK, POSITION, ROPE, DISCRETIZED_MASK = args.sord, args.mask_loss, args.position_loss, args.rope, args.discretized_mask
 
     seed_all(args.seed) # must seed before initializing model + dataloader (which has random shuffle)
-    train_loader, test_loader, num_x_positions, num_y_positions = get_dataloaders(args.data_dir, args.patch_size, args.mask_h, args.mask_w, args.batch_size, args.eval_batch_size, seed=args.seed)
-    num_lasers, n_freqs_used, n_patches = 100, 3328, 13
+    train_loader, test_loader, data_info = get_dataloaders(args.data_dir, args.patch_size, args.disc_mask_h, args.disc_mask_w, args.batch_size, args.eval_batch_size, seed=args.seed)
     device = 'gpu' if torch.cuda.is_available() else 'cpu'
 
-    model = SignalTransformer(args.d_model, args.pnt_num_heads, args.pnt_num_layers, args.seq_num_heads, args.seq_num_layers, args.patch_size, n_freqs_used, args.signal_is, num_x_positions, num_y_positions, num_lasers, args.alpha, args.beta, gamma=args.gamma, delta=args.delta, mask_h=args.mask_h, mask_w=args.mask_w)
+    model = SignalTransformer(args.d_model, args.pnt_num_heads, args.pnt_num_layers, args.seq_num_heads, args.seq_num_layers, args.patch_size, args.signal_is, data_info, args.alpha, args.beta, gamma=args.gamma, delta=args.delta)
     optimizer = torch.optim.Adam(model.parameters(), args.lr)
-    config = {'n_params': count_parameters(model), 'num_x_positions': num_x_positions, 'num_y_positions': num_y_positions, 'n_patches':n_patches, 'num_lasers':num_lasers, 'delta': args.delta, 'SORD': SORD, 'MASK': MASK, 'POSITION': POSITION, 'data_dir': args.data_dir, 'seed': args.seed, 'signal_is': args.signal_is, 'd_model': args.d_model, 'pnt_num_heads': args.pnt_num_heads, 'seq_num_heads': args.seq_num_heads, 'pnt_num_layers': args.pnt_num_layers, 'seq_num_layers': args.seq_num_layers, 'patch_size': args.patch_size, 'batch_size': args.batch_size, 'eval_batch_size': args.eval_batch_size, 'lr': args.lr, 'alpha': args.alpha, 'beta': args.beta, 'gamma': args.gamma, 'max_duration': args.max_duration, 'eval_interval': args.eval_interval}
+    config = {'n_params': count_parameters(model), **data_info, 'delta': args.delta, 'SORD': SORD, 'MASK': MASK, 'POSITION': POSITION, 'data_dir': args.data_dir, 'seed': args.seed, 'signal_is': args.signal_is, 'd_model': args.d_model, 'pnt_num_heads': args.pnt_num_heads, 'seq_num_heads': args.seq_num_heads, 'pnt_num_layers': args.pnt_num_layers, 'seq_num_layers': args.seq_num_layers, 'patch_size': args.patch_size, 'batch_size': args.batch_size, 'eval_batch_size': args.eval_batch_size, 'lr': args.lr, 'alpha': args.alpha, 'beta': args.beta, 'gamma': args.gamma, 'max_duration': args.max_duration, 'eval_interval': args.eval_interval}
     logger = WandBLogger('good-vibrations', 'seg-mask', init_kwargs={'config': config, 'save_code': True})
     hf_ckpt_upload = HFChkptUploader("eturok-weizmann/good-vibrations", interval=args.eval_interval, monitor="x/rMSE", save_local=True)
     mask_viz = MaskVisualizationCallback(n_samples=args.eval_batch_size, save_dir="visualizations")
