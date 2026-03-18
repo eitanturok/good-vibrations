@@ -357,28 +357,28 @@ def get_parser():
     parser.add_argument('--rope', type=int, default=1)
 
     # data
-    parser.add_argument('--data_dir', type=str, default='eturok-weizmann/vibration-data')
+    parser.add_argument('--data-dir', type=str, default='eturok-weizmann/vibration-data')
     parser.add_argument('--seed', type=int, default=42)
-    parser.add_argument('--signal_is', type=str, default='magnitude')
+    parser.add_argument('--signal-is', type=str, default='magnitude')
 
-    parser.add_argument('--patch_size', type=int, default=256)
-    parser.add_argument('--mask_h', type=int, default=40)
-    parser.add_argument('--mask_w', type=int, default=20)
+    parser.add_argument('--patch-size', type=int, default=256)
+    parser.add_argument('--mask-h', type=int, default=40)
+    parser.add_argument('--mask-w', type=int, default=20)
 
     # model arch
-    parser.add_argument('--d_model', type=int, default=64)
-    parser.add_argument('--pnt_num_heads', type=int, default=2)
-    parser.add_argument('--seq_num_heads', type=int, default=2)
-    parser.add_argument('--pnt_num_layers', type=int, default=2)
-    parser.add_argument('--seq_num_layers', type=int, default=2)
+    parser.add_argument('--d-model', type=int, default=64)
+    parser.add_argument('--pnt-num-heads', type=int, default=2)
+    parser.add_argument('--seq-num-heads', type=int, default=2)
+    parser.add_argument('--pnt-num-layers', type=int, default=2)
+    parser.add_argument('--seq-num-layers', type=int, default=2)
 
     # learning
-    parser.add_argument('--batch_size', type=int, default=4096)
-    parser.add_argument('--eval_batch_size', type=int, default=16)
+    parser.add_argument('--batch-size', type=int, default=4096)
+    parser.add_argument('--eval-batch-size', type=int, default=16)
     parser.add_argument('--lr', type=float, default=1e-4)
-    parser.add_argument('--max_duration', type=str, default='1_000ep')
-    parser.add_argument('--eval_interval', type=str, default='10ep')
-    parser.add_argument('--run_name', type=str, default=None)
+    parser.add_argument('--max-duration', type=str, default='1_000ep')
+    parser.add_argument('--eval-interval', type=str, default='10ep')
+    parser.add_argument('--run-name', type=str, default=None)
 
     # loss
     parser.add_argument('--alpha', type=float, default=0.9)
