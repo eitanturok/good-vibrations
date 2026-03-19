@@ -14,7 +14,7 @@ from scipy.signal import butter, sosfiltfilt
 from composer import Trainer
 from composer.models import ComposerModel
 from torchmetrics.aggregation import MeanMetric
-from torchmetrics.classification import MulticlassAccuracy, BinaryJaccardIndex
+from torchmetrics.classification import MulticlassAccuracy
 from torchmetrics.regression import MeanSquaredError
 from composer.loggers import WandBLogger
 from composer.utils.reproducibility import seed_all
@@ -147,7 +147,7 @@ def create_metrics(nx: int, ny: int):
         "pos/y_rMSE":       _tag(MeanSquaredError(squared=False),   'rMSE', 'y'),
         "pos/x_CE":         _tag(MeanMetric(), 'CE', 'x'),
         "pos/y_CE":         _tag(MeanMetric(), 'CE', 'y'),
-        "mask/IoU":         _tag(BinaryJaccardIndex(), 'IoU', 'mask'),
+        "mask/IoU":         _tag(MeanMetric(), 'IoU', 'mask'),
         "mask/WeightedCE":   _tag(MeanMetric(), 'WeightedCE', 'mask'),
         "mask/SoftDice":    _tag(MeanMetric(), 'SoftDice',   'mask'),
         "mask/x_SoftDice":  _tag(MeanMetric(), 'SoftDice', 'mask', 'x'),
@@ -181,18 +181,143 @@ def sord_loss(predictions, targets, cost_matrix):
     return -(soft_labels * log_predictions).sum(dim=1).mean()
 
 def soft_dice_fn(logits, targets, axis=None):
-    """Computes Soft Dice for the full mask, or just along X or Y directions"""
+    """Computes Soft Dice for the full mask, or just along X or Y directions.
+    After collapsing along an axis, normalizes by profile length so the result
+    is resolution-independent across different disc_mask_h / disc_mask_w."""
     probs = logits.sigmoid()
     if axis is not None: probs, targets = probs.mean(dim=axis), targets.mean(dim=axis)
     spatial_dims = tuple(range(1, probs.ndim))  # (-2, -1) for dice over entire mask or (-1,) for dice on just x,y profiles
     intersection = (probs * targets).sum(dim=spatial_dims)
     total_sum = probs.sum(dim=spatial_dims) + targets.sum(dim=spatial_dims)
-    dice_score = (2 * intersection + 1) / (total_sum + 1)
+    dice_score = (2 * intersection) / total_sum.clamp(min=1e-6)
     return 1 - dice_score.mean()
 
+def soft_iou_fn(mask_logits, target):
+    """Soft (differentiable) IoU — resolution-independent ratio metric."""
+    probs = mask_logits.sigmoid()
+    intersection = (probs * target).sum(dim=(-2, -1))
+    union = (probs + target - probs * target).sum(dim=(-2, -1))
+    return 1 - (intersection / union.clamp(min=1e-6)).mean()
+
 def weighted_cross_entropy_fn(mask_logits, target):
-    pos_weight = (1 - target).sum() / target.sum().clamp(min=1e-6)
+    """Weighted BCE where pos_weight is based on pixel fraction, not raw counts,
+    so it stays stable across different disc_mask_h / disc_mask_w."""
+    n_pixels = target[0].numel()
+    pos_frac = target.sum(dim=(-2, -1)).mean() / n_pixels   # mean positive fraction across batch
+    neg_frac = 1.0 - pos_frac
+    pos_weight = (neg_frac / pos_frac.clamp(min=1e-6)).clamp(max=100.0)
     return F.binary_cross_entropy_with_logits(mask_logits, target, pos_weight=pos_weight)
+
+def focal_loss_fn(mask_logits, target, focal_gamma=2.0):
+    """Focal loss: down-weights easy examples via (1-p)^gamma so training focuses on hard pixels."""
+    bce = F.binary_cross_entropy_with_logits(mask_logits, target, reduction='none')
+    p = mask_logits.sigmoid()
+    pt = p * target + (1 - p) * (1 - target)  # prob of correct class per pixel
+    return (((1 - pt) ** focal_gamma) * bce).mean()
+
+# **** Decoders ****
+
+class MLPDecoder(nn.Module):
+    """Baseline: flat MLP from CLS token only."""
+    def __init__(self, d_model, out_h, out_w):
+        super().__init__()
+        self.net = nn.Sequential(nn.Linear(d_model, 256), nn.ReLU(), nn.Linear(256, out_h * out_w))
+        self.out_h, self.out_w = out_h, out_w
+    def forward(self, cls, laser_feats):
+        return self.net(cls).view(-1, self.out_h, self.out_w)
+
+
+class CNNDecoder(nn.Module):
+    """Reshape laser tokens to 10x10 grid, upsample to out_h x out_w via transposed convs."""
+    def __init__(self, d_model, out_h, out_w):
+        super().__init__()
+        # 10x10 -> 20x20 -> out_h x out_w  (assumes out_h=40, out_w=20)
+        self.up1 = nn.Sequential(
+            nn.ConvTranspose2d(d_model, 256, kernel_size=4, stride=2, padding=1),
+            nn.GroupNorm(16, 256), nn.GELU(),
+            nn.Conv2d(256, 256, 3, padding=1), nn.GroupNorm(16, 256), nn.GELU(),
+        )
+        self.cls_proj = nn.Linear(d_model, 256)
+        self.up2 = nn.Sequential(
+            nn.ConvTranspose2d(256, 128, kernel_size=(4, 3), stride=(2, 1), padding=(1, 1)),
+            nn.GroupNorm(8, 128), nn.GELU(),
+            nn.Conv2d(128, 64, 3, padding=1), nn.GroupNorm(4, 64), nn.GELU(),
+        )
+        self.head = nn.Conv2d(64, 1, 1)
+        self.out_h, self.out_w = out_h, out_w
+
+    def forward(self, cls, laser_feats):
+        B = cls.shape[0]
+        x = laser_feats.permute(0, 2, 1).reshape(B, -1, 10, 10)  # (B, D, 10, 10)
+        x = self.up1(x)                                            # (B, 256, 20, 20)
+        x = x + self.cls_proj(cls).reshape(B, 256, 1, 1)          # add CLS context
+        x = self.up2(x)                                            # (B, 64, 40, 20)
+        return self.head(x).squeeze(1)                             # (B, 40, 20)
+
+
+class CrossAttnDecoder(nn.Module):
+    """Each output pixel queries the laser tokens via stacked cross+self attention."""
+    def __init__(self, d_model, out_h, out_w, n_layers=4):
+        super().__init__()
+        self.mask_queries = nn.Parameter(torch.zeros(1, out_h * out_w, d_model))
+        nn.init.trunc_normal_(self.mask_queries, std=0.02)
+        self.register_buffer('mask_pos', precompute_freqs_cis_2d(d_model, out_h, out_w))
+        self.layers = nn.ModuleList([
+            nn.ModuleDict({
+                'cross_attn': nn.MultiheadAttention(d_model, num_heads=4, batch_first=True, dropout=0.1),
+                'cross_norm': nn.LayerNorm(d_model),
+                'self_attn':  nn.MultiheadAttention(d_model, num_heads=4, batch_first=True, dropout=0.1),
+                'self_norm':  nn.LayerNorm(d_model),
+                'ffn':        nn.Sequential(nn.Linear(d_model, d_model * 2), nn.GELU(), nn.Linear(d_model * 2, d_model)),
+                'ffn_norm':   nn.LayerNorm(d_model),
+            })
+            for _ in range(n_layers)
+        ])
+        self.head = nn.Linear(d_model, 1)
+        self.out_h, self.out_w = out_h, out_w
+
+    def forward(self, cls, laser_feats):
+        B = laser_feats.shape[0]
+        q = apply_rope(self.mask_queries.expand(B, -1, -1), self.mask_pos)  # (B, H*W, D)
+        for layer in self.layers:
+            q = layer['cross_norm'](q + layer['cross_attn'](q, laser_feats, laser_feats)[0])
+            q = layer['self_norm'](q + layer['self_attn'](q, q, q)[0])
+            q = layer['ffn_norm'](q + layer['ffn'](q))
+        return self.head(q).squeeze(-1).view(B, self.out_h, self.out_w)
+
+
+class PoolDecoder(nn.Module):
+    """Multi-scale attention pooling of laser tokens + bilinear upsample + CNN refinement."""
+    def __init__(self, d_model, out_h, out_w):
+        super().__init__()
+        self.pool_25 = nn.Linear(d_model, 25)
+        self.pool_4  = nn.Linear(d_model, 4)
+        self.to_base = nn.Sequential(nn.Linear(4 * d_model, 5 * 4 * 256), nn.GELU())
+        self.refine  = nn.Sequential(
+            nn.Conv2d(256, 256, 3, padding=1), nn.GroupNorm(16, 256), nn.GELU(),
+            nn.Conv2d(256, 128, 3, padding=1), nn.GroupNorm(8, 128), nn.GELU(),
+            nn.Conv2d(128, 1, 1),
+        )
+        self.out_h, self.out_w = out_h, out_w
+
+    def forward(self, cls, laser_feats):
+        B = laser_feats.shape[0]
+        global_avg = laser_feats.mean(1)                                                             # (B, D)
+        pool25 = (F.softmax(self.pool_25(laser_feats), dim=1).transpose(1, 2) @ laser_feats).mean(1) # (B, D)
+        pool4  = (F.softmax(self.pool_4(laser_feats),  dim=1).transpose(1, 2) @ laser_feats).mean(1) # (B, D)
+        combined = torch.cat([cls, global_avg, pool25, pool4], dim=-1)                              # (B, 4D)
+        x = self.to_base(combined).view(B, 256, 5, 4)                                               # (B, 256, 5, 4)
+        x = F.interpolate(x, size=(self.out_h, self.out_w), mode='bilinear', align_corners=False)   # (B, 256, H, W)
+        return self.refine(x).squeeze(1)                                                             # (B, H, W)
+
+
+def build_decoder(decoder, d_model, out_h, out_w, cross_attn_layers=4):
+    if decoder == 'mlp':        return MLPDecoder(d_model, out_h, out_w)
+    elif decoder == 'cnn':      return CNNDecoder(d_model, out_h, out_w)
+    elif decoder == 'cross_attn': return CrossAttnDecoder(d_model, out_h, out_w, cross_attn_layers)
+    elif decoder == 'pool':     return PoolDecoder(d_model, out_h, out_w)
+    else: raise ValueError(f"Unknown decoder: {decoder}")
+
 
 class LearnablePositionalEncoding(nn.Module):
     def __init__(self, dim, hidden_dim):
@@ -224,7 +349,7 @@ class PointTransformer(nn.Module):
 
 
 class SignalTransformer(ComposerModel):
-    def __init__(self, d_model, pnt_num_heads, pnt_num_layers, seq_num_heads, seq_num_layers, patch_size, signal_is, data_info, alpha, beta, gamma=0.5, delta=0.5):
+    def __init__(self, d_model, pnt_num_heads, pnt_num_layers, seq_num_heads, seq_num_layers, patch_size, signal_is, data_info, alpha, beta, gamma=0.5, delta=0.5, decoder='mlp', cross_attn_layers=4):
         super().__init__()
         self.alpha, self.beta, self.gamma, self.delta = alpha, beta, gamma, delta
         self.num_x_pos, self.num_y_pos, num_lasers = data_info['num_x_positions'], data_info['num_y_positions'], data_info['num_lasers']
@@ -243,7 +368,7 @@ class SignalTransformer(ComposerModel):
         # Prediction heads
         self.mlp_head_x_position = nn.Sequential(nn.Linear(d_model, 32), nn.ReLU(), nn.Linear(32, self.num_x_pos))
         self.mlp_head_y_position = nn.Sequential(nn.Linear(d_model, 32), nn.ReLU(), nn.Linear(32, self.num_y_pos))
-        self.mlp_head_mask = nn.Sequential(nn.Linear(d_model, 256), nn.ReLU(), nn.Linear(256, self.out_h * self.out_w))
+        self.decoder = build_decoder(decoder, d_model, self.out_h, self.out_w, cross_attn_layers)
 
         # SORD loss cost matrix
         self.register_buffer('cost_matrix_x', self._init_cost_matrix(self.num_x_pos))
@@ -272,9 +397,10 @@ class SignalTransformer(ComposerModel):
         cls_embedding = output[:, 0, :]                                                         # (B,D)
 
         # Predict x position, y position, and segmentation mask
+        laser_feats = output[:, 1:, :]                              # (B, L, D)
         x_logits = self.mlp_head_x_position(cls_embedding)
         y_logits = self.mlp_head_y_position(cls_embedding)
-        mask_logits = self.mlp_head_mask(cls_embedding).view(B, self.out_h, self.out_w)
+        mask_logits = self.decoder(cls_embedding, laser_feats)
         return x_logits, y_logits, cls_embedding, mask_logits
 
     def loss(self, outputs, batch):
@@ -299,12 +425,13 @@ class SignalTransformer(ComposerModel):
                                  'loss/train/sord_x': sord_loss_x, 'loss/train/sord_y': sord_loss_y,
                                  'loss/train/ce_sord_x': ce_sord_loss_x, 'loss/train/ce_sord_y': ce_sord_loss_y})
             loss_log['loss/train/position'] = position_loss
-
+      
         if MASK:
             mask_dice_loss = soft_dice_fn(mask_logits, mask_true)
-            mask_ce_loss = weighted_cross_entropy_fn(mask_logits, mask_true)
+            mask_ce_loss = focal_loss_fn(mask_logits, mask_true) if FOCAL else weighted_cross_entropy_fn(mask_logits, mask_true)
             mask_loss = self.delta * mask_dice_loss + (1 - self.delta) * mask_ce_loss
-            loss_log.update({'loss/train/mask_dice': mask_dice_loss, 'loss/train/mask_cross_entropy': mask_ce_loss, 'loss/train/mask_total': mask_loss})
+            ce_key = 'loss/train/mask_focal' if FOCAL else 'loss/train/mask_cross_entropy'
+            loss_log.update({'loss/train/mask_dice': mask_dice_loss, ce_key: mask_ce_loss, 'loss/train/mask_total': mask_loss})
 
         if POSITION and MASK:
             total_loss = position_loss * (1 - self.gamma) + self.gamma * mask_loss
@@ -335,10 +462,10 @@ class SignalTransformer(ComposerModel):
             else: raise ValueError(f"did not recognize {metric_name=}")
         elif pred_type == 'mask':
             if metric_name == 'SoftDice':
-                axis = 1 if pos == 'x' else (0 if pos == 'y' else None)
+                axis = 1 if pos == 'x' else (2 if pos == 'y' else None)
                 metric.update(soft_dice_fn(mask_logits, mask_true, axis=axis))
-            elif metric_name == 'IoU': metric.update((mask_logits.sigmoid() > 0.5).int(), mask_true.int())
-            elif metric_name == 'WeightedCE': metric.update(weighted_cross_entropy_fn(mask_logits, mask_true))
+            elif metric_name == 'IoU': metric.update(soft_iou_fn(mask_logits, mask_true))
+            elif metric_name == 'WeightedCE': metric.update(focal_loss_fn(mask_logits, mask_true) if FOCAL else weighted_cross_entropy_fn(mask_logits, mask_true))
             else: raise ValueError(f"did not recognize {metric_name=}")
         else:
             raise ValueError(f"did not recognize {pred_type=}")
@@ -354,15 +481,15 @@ def get_parser():
     parser = argparse.ArgumentParser()
 
     # flags
-    parser.add_argument('--sord', type=int, default=1)
+    parser.add_argument('--sord', type=int, default=0)
     parser.add_argument('--mask-loss', type=int, default=1)
     parser.add_argument('--position-loss', type=int, default=1)
     parser.add_argument('--discretized-mask', type=int, default=1)
     parser.add_argument('--rope', type=int, default=1)
+    parser.add_argument('--focal', type=int, default=0)
 
     # data
     parser.add_argument('--data-dir', type=str, default='eturok-weizmann/vibration-data')
-    parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--signal-is', type=str, default='magnitude')
 
     parser.add_argument('--patch-size', type=int, default=256)
@@ -370,6 +497,9 @@ def get_parser():
     parser.add_argument('--disc-mask-w', type=int, default=20)
 
     # model arch
+    parser.add_argument('--decoder', type=str, default='mlp', choices=['mlp', 'cnn', 'cross_attn', 'pool'])
+    parser.add_argument('--cross-attn-layers', type=int, default=4)
+
     parser.add_argument('--d-model', type=int, default=64)
     parser.add_argument('--pnt-num-heads', type=int, default=2)
     parser.add_argument('--seq-num-heads', type=int, default=2)
@@ -379,6 +509,7 @@ def get_parser():
     # learning
     parser.add_argument('--batch-size', type=int, default=4096)
     parser.add_argument('--eval-batch-size', type=int, default=16)
+    parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--lr', type=float, default=1e-4)
     parser.add_argument('--max-duration', type=str, default='1_000ep')
     parser.add_argument('--eval-interval', type=str, default='10ep')
@@ -387,7 +518,7 @@ def get_parser():
     # loss
     parser.add_argument('--alpha', type=float, default=0.9)
     parser.add_argument('--beta', type=float, default=0.5)
-    parser.add_argument('--gamma', type=float, default=0.5)
+    parser.add_argument('--gamma', type=float, default=0.8)
     parser.add_argument('--delta', type=float, default=0.5)
     return parser
 
@@ -400,16 +531,16 @@ def get_parser():
 def train(**kwargs):
     args = get_parser().parse_args([])  # get defaults
     args.__dict__.update(kwargs)        # apply overrides
-    global SORD, MASK, POSITION, ROPE, DISCRETIZED_MASK # environment variables
-    SORD, MASK, POSITION, ROPE, DISCRETIZED_MASK = args.sord, args.mask_loss, args.position_loss, args.rope, args.discretized_mask
+    global SORD, MASK, POSITION, ROPE, DISCRETIZED_MASK, FOCAL # environment variables
+    SORD, MASK, POSITION, ROPE, DISCRETIZED_MASK, FOCAL = args.sord, args.mask_loss, args.position_loss, args.rope, args.discretized_mask, args.focal
 
-    seed_all(args.seed) # must seed before initializing model + dataloader (which has random shuffle)
+    seed_all(args.seed) # must seed before initializing model + dataloader
     train_loader, test_loader, data_info = get_dataloaders(args.data_dir, args.patch_size, args.disc_mask_h, args.disc_mask_w, args.batch_size, args.eval_batch_size, seed=args.seed)
     device = 'gpu' if torch.cuda.is_available() else 'cpu'
 
-    model = SignalTransformer(args.d_model, args.pnt_num_heads, args.pnt_num_layers, args.seq_num_heads, args.seq_num_layers, args.patch_size, args.signal_is, data_info, args.alpha, args.beta, gamma=args.gamma, delta=args.delta)
+    model = SignalTransformer(args.d_model, args.pnt_num_heads, args.pnt_num_layers, args.seq_num_heads, args.seq_num_layers, args.patch_size, args.signal_is, data_info, args.alpha, args.beta, gamma=args.gamma, delta=args.delta, decoder=args.decoder, cross_attn_layers=args.cross_attn_layers)
     optimizer = torch.optim.Adam(model.parameters(), args.lr)
-    config = {'n_params': count_parameters(model), **data_info, 'delta': args.delta, 'SORD': SORD, 'MASK': MASK, 'POSITION': POSITION, 'data_dir': args.data_dir, 'seed': args.seed, 'signal_is': args.signal_is, 'd_model': args.d_model, 'pnt_num_heads': args.pnt_num_heads, 'seq_num_heads': args.seq_num_heads, 'pnt_num_layers': args.pnt_num_layers, 'seq_num_layers': args.seq_num_layers, 'patch_size': args.patch_size, 'batch_size': args.batch_size, 'eval_batch_size': args.eval_batch_size, 'lr': args.lr, 'alpha': args.alpha, 'beta': args.beta, 'gamma': args.gamma, 'max_duration': args.max_duration, 'eval_interval': args.eval_interval}
+    config = {'n_params': count_parameters(model), **data_info, 'delta': args.delta, 'SORD': SORD, 'MASK': MASK, 'POSITION': POSITION, 'data_dir': args.data_dir, 'seed': args.seed, 'signal_is': args.signal_is, 'd_model': args.d_model, 'pnt_num_heads': args.pnt_num_heads, 'seq_num_heads': args.seq_num_heads, 'pnt_num_layers': args.pnt_num_layers, 'seq_num_layers': args.seq_num_layers, 'patch_size': args.patch_size, 'batch_size': args.batch_size, 'eval_batch_size': args.eval_batch_size, 'lr': args.lr, 'alpha': args.alpha, 'beta': args.beta, 'gamma': args.gamma, 'max_duration': args.max_duration, 'eval_interval': args.eval_interval, 'decoder': args.decoder, 'cross_attn_layers': args.cross_attn_layers}
     logger = WandBLogger('good-vibrations', 'seg-mask', init_kwargs={'config': config, 'save_code': True})
     hf_ckpt_upload = HFChkptUploader("eturok-weizmann/good-vibrations", interval=args.eval_interval, monitor="x/rMSE", save_local=True)
     mask_viz = MaskVisualizationCallback(n_samples=args.eval_batch_size, save_dir="visualizations")
