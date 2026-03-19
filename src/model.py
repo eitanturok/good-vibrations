@@ -22,7 +22,7 @@ from composer.utils.reproducibility import seed_all
 from icecream import install
 install()
 
-from helpers import getenv, HFChkptUploader, MaskVisualizationCallback
+from helpers import HFChkptUploader, MaskVisualizationCallback
 
 # **** Modal ****
 
@@ -55,42 +55,34 @@ def hermit_poly(t):
     return A @ tt
 
 def interpolate(x, y, xs):
-    m = (y[1:] - y[:-1]) / (x[1:] - x[:-1])
-    m = torch.cat([m[[0]], (m[1:] + m[:-1]) / 2, m[[-1]]])
+    # x: (n_points,), y: (B, n_points), xs: (n_xs,) -> (B, n_xs)
+    m = (y[..., 1:] - y[..., :-1]) / (x[1:] - x[:-1])
+    m = torch.cat([m[..., [0]], (m[..., 1:] + m[..., :-1]) / 2, m[..., [-1]]], dim=-1)
     idxs = torch.searchsorted(x[1:], xs)
-    dx = (x[idxs + 1] - x[idxs])
+    dx = x[idxs + 1] - x[idxs]
     hh = hermit_poly((xs - x[idxs]) / dx)
-    return hh[0] * y[idxs] + hh[1] * m[idxs] * dx + hh[2] * y[idxs + 1] + hh[3] * m[idxs + 1] * dx
+    return hh[0] * y[..., idxs] + hh[1] * m[..., idxs] * dx + hh[2] * y[..., idxs + 1] + hh[3] * m[..., idxs + 1] * dx
 
 def frequency_augmentation(shifts:torch.Tensor, fs:int, min_freq:int=100, max_freq:int=2500):
-    # Initial points and domain
+    # shifts: (B, n_lasers, n_timesteps, 2) — returns G: (B, n_timesteps)
+    B = shifts.shape[0]
     x_points = torch.tensor([500, 1000, 1500, 2000, 2500], device=shifts.device)
-    y_points = torch.normal(mean=1.0, std=1, size=(len(x_points),), device=shifts.device)
-    domain = torch.linspace(min_freq, max_freq, 10000, device=shifts.device)  # TODO: arguments of F^{sample} the FIXED frequency domain
-
-    # Interpolate values over the domain
-    values = interpolate(x_points, y_points, domain)
-
-    # Normalize values
-    values = (values - torch.min(values)) / (torch.max(values) - torch.min(values))
-
-    # Spline between 0.8 to 1.2
-    normalized_values = values / 2.5 + 0.8
-
-    # Frequency range for the FFT
-    f = torch.fft.fftfreq(10200, 1 / 5100, device=shifts.device)  # TODO: arguments of F^{sample} the FIXED frequency domain
-
-    # Filter frequencies in the desired range and assign values
-    valid_freq_mask = (f >= min_freq) & (f <= max_freq)
-    G = torch.zeros_like(f, dtype=torch.float32, device=shifts.device)
-    G[valid_freq_mask] = normalized_values[torch.searchsorted(domain, f[valid_freq_mask])]
-    return G
+    y_points = torch.normal(mean=1.0, std=1, size=(B, len(x_points)), device=shifts.device)
+    domain = torch.linspace(min_freq, max_freq, 10000, device=shifts.device)
+    values = interpolate(x_points, y_points, domain)                            # (B, 10000)
+    lo, hi = values.min(dim=-1, keepdim=True).values, values.max(dim=-1, keepdim=True).values
+    values = (values - lo) / (hi - lo) / 2.5 + 0.8                             # (B, 10000), range [0.8, 1.2]
+    freq = torch.fft.fftfreq(shifts.shape[-2], 1/fs, device=shifts.device)
+    valid = (freq >= min_freq) & (freq <= max_freq)
+    G = torch.zeros(B, len(freq), dtype=torch.float32, device=shifts.device)
+    G[:, valid] = values[:, torch.searchsorted(domain, freq[valid])]
+    return G                                                                     # (B, n_timesteps)
 
 class VibrationDataset(torch.utils.data.Dataset):
     """
-    Downloads shifts.safetensors once via hf_hub_download (cached to disk after first run),
-    then memory-maps it with safe_open. Each __getitem__ reads only the pages for that
-    tensor off disk — the OS never loads the full file into RAM.
+    Downloads dataset from hf of (shift, mask) pairs
+    Download shifts.safetensors and mask.safetensors to CPU via hf_hub_download
+    Each __getitem__ reads only the pages for that tensor off disk — the OS never loads the full file into RAM.
     """
 
     def __init__(self, repo_id:str, split:str="train", disc_mask_h:int=40, disc_mask_w:int=20, patch_size:int=256, token:str|None=None):
@@ -105,27 +97,38 @@ class VibrationDataset(torch.utils.data.Dataset):
     def __len__(self): return len(self.ds)
     def __getitem__(self, idx):
         row = self.ds[idx]
-
-        # discretize the mask
         mask = self.st_masks.get_tensor(f"mask_{row['mask_idx']}").float()                                           # (H, W)
         if DISCRETIZED_MASK: mask = F.adaptive_avg_pool2d(mask[None, None], (self.disc_mask_h, self.disc_mask_w)).squeeze()    # (disc_mask_h, disc_mask_w)
+        shifts = self.st_shifts.get_tensor(f"shifts_{row['shifts_idx']}").float()                   # (n_lasers, n_timesteps, 2)
+        return shifts, (mask, self.x_labels[idx], self.y_labels[idx], row["fps"])
 
-        # clean + fft the laser shifts
-        shifts = self.st_shifts.get_tensor(f"shifts_{row['shifts_idx']}")       # (n_lasers, n_timesteps, 2)
-        shifts = clean_shifts(shifts, row["fps"])                               # (n_lasers, n_timesteps, 2)
-        fft, _ = do_fft(shifts, row["fps"])                                     # (n_lasers, n_freqs, 2)
-        fft_patches = fft.unfold(1, self.patch_size, self.patch_size).float()   # (n_lasers, n_freqs, 2) -> (n_lasers, n_patches, 2, patch_size)
-
-        return fft_patches, (mask, self.x_labels[idx], self.y_labels[idx])
+def make_collate(patch_size:int):
+    def collate(batch):
+        shifts_list, labels = zip(*batch) # each shifts: (n_lasers, n_timesteps, 2)
+        masks, xs, ys, fpss = zip(*labels) # (h,w)*B, (1,)*B, (1,)*B, (1,)*B
+        if AUGMENT:
+            assert len(set(fpss)) == 1, f"all fps in batch must match, got {set(fpss)}"
+            shifts_batch = torch.stack(list(shifts_list))                            # (B, n_lasers, n_timesteps, 2)
+            G = frequency_augmentation(shifts_batch, fpss[0])                        # (B, n_timesteps)
+            aug_shifts = torch.fft.ifft(torch.fft.fft(shifts_batch, dim=2) * G[:, None, :, None], dim=2).real
+            shifts_list = list(shifts_list) + list(aug_shifts)                       # 2B items
+            masks, xs, ys, fpss = masks + masks, xs + xs, ys + ys, fpss + fpss
+        fft_patches = torch.stack([
+            do_fft(clean_shifts(s, fps), fps)[0].unfold(1, patch_size, patch_size).float()
+            for s, fps in zip(shifts_list, fpss)
+        ])                                                                      # (B or 2B, n_lasers, n_patches, 2, patch_size)
+        return fft_patches, (torch.stack(list(masks)), torch.stack(list(xs)), torch.stack(list(ys)))
+    return collate
 
 def get_dataloaders(repo_id:str, patch_size:int=256, disc_mask_h:int=40, disc_mask_w:int=20, batch_size:int=8, eval_batch_size:int=16, shuffle:bool=True, num_workers:int=0, seed:int=42, token:str | None = None):
     train_set = VibrationDataset(repo_id, split="train", patch_size=patch_size, disc_mask_h=disc_mask_h, disc_mask_w=disc_mask_w, token=token)
     test_set = VibrationDataset(repo_id, split="test", patch_size=patch_size, disc_mask_h=disc_mask_h, disc_mask_w=disc_mask_w, token=token)
     generator = torch.Generator().manual_seed(seed)
-    train_loader = DataLoader(train_set, batch_size=batch_size,     shuffle=shuffle,  num_workers=num_workers, generator=generator, pin_memory=True)
-    test_loader  = DataLoader(test_set,  batch_size=eval_batch_size, shuffle=False,   num_workers=num_workers, generator=generator, pin_memory=True)
-    fft_patches, _ = train_set[0]  # (n_lasers, n_patches, 2, patch_size)
-    orig_mask = train_set.st_masks.get_tensor("mask_0")  # (orig_h, orig_w)
+    train_collate_fn, test_collate_fn = make_collate(patch_size), make_collate(patch_size)
+    train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers, generator=generator, pin_memory=True, collate_fn=train_collate_fn)
+    test_loader  = DataLoader(test_set,  batch_size=eval_batch_size, shuffle=False, num_workers=num_workers, generator=generator, pin_memory=True, collate_fn=test_collate_fn)
+    fft_patches = test_collate_fn([test_set[0]])[0][0]   # (n_lasers, n_patches, 2, patch_size)
+    orig_mask = test_set.st_masks.get_tensor("mask_0")  # (orig_h, orig_w)
     data_info = {'num_x_positions': int(train_set.x_labels.max()) + 1, 'num_y_positions': int(train_set.y_labels.max()) + 1,
                  'mask_h': orig_mask.shape[0], 'mask_w': orig_mask.shape[1], 'disc_mask_h': disc_mask_h, 'disc_mask_w': disc_mask_w,
                  'num_lasers': fft_patches.shape[0], 'n_freqs': fft_patches.shape[1] * patch_size, 'n_patches': fft_patches.shape[1]}
@@ -425,7 +428,7 @@ class SignalTransformer(ComposerModel):
                                  'loss/train/sord_x': sord_loss_x, 'loss/train/sord_y': sord_loss_y,
                                  'loss/train/ce_sord_x': ce_sord_loss_x, 'loss/train/ce_sord_y': ce_sord_loss_y})
             loss_log['loss/train/position'] = position_loss
-      
+
         if MASK:
             mask_dice_loss = soft_dice_fn(mask_logits, mask_true)
             mask_ce_loss = focal_loss_fn(mask_logits, mask_true) if FOCAL else weighted_cross_entropy_fn(mask_logits, mask_true)
@@ -487,6 +490,7 @@ def get_parser():
     parser.add_argument('--discretized-mask', type=int, default=1)
     parser.add_argument('--rope', type=int, default=1)
     parser.add_argument('--focal', type=int, default=0)
+    parser.add_argument('--augment', type=int, default=0)
 
     # data
     parser.add_argument('--data-dir', type=str, default='eturok-weizmann/vibration-data')
@@ -531,8 +535,8 @@ def get_parser():
 def train(**kwargs):
     args = get_parser().parse_args([])  # get defaults
     args.__dict__.update(kwargs)        # apply overrides
-    global SORD, MASK, POSITION, ROPE, DISCRETIZED_MASK, FOCAL # environment variables
-    SORD, MASK, POSITION, ROPE, DISCRETIZED_MASK, FOCAL = args.sord, args.mask_loss, args.position_loss, args.rope, args.discretized_mask, args.focal
+    global SORD, MASK, POSITION, ROPE, DISCRETIZED_MASK, FOCAL, AUGMENT # environment variables
+    SORD, MASK, POSITION, ROPE, DISCRETIZED_MASK, FOCAL, AUGMENT = args.sord, args.mask_loss, args.position_loss, args.rope, args.discretized_mask, args.focal, args.augment
 
     seed_all(args.seed) # must seed before initializing model + dataloader
     train_loader, test_loader, data_info = get_dataloaders(args.data_dir, args.patch_size, args.disc_mask_h, args.disc_mask_w, args.batch_size, args.eval_batch_size, seed=args.seed)
