@@ -100,31 +100,34 @@ class VibrationDataset(torch.utils.data.Dataset):
         mask = self.st_masks.get_tensor(f"mask_{row['mask_idx']}").float()                                           # (H, W)
         if DISCRETIZED_MASK: mask = F.adaptive_avg_pool2d(mask[None, None], (self.disc_mask_h, self.disc_mask_w)).squeeze()    # (disc_mask_h, disc_mask_w)
         shifts = self.st_shifts.get_tensor(f"shifts_{row['shifts_idx']}").float()                   # (n_lasers, n_timesteps, 2)
-        return shifts, (mask, self.x_labels[idx], self.y_labels[idx], row["fps"])
+        return {'shifts': shifts, 'mask': mask, 'x': self.x_labels[idx], 'y': self.y_labels[idx], 'fps': row["fps"]}
 
-def make_collate(patch_size:int):
+def make_collate(patch_size:int, augment:bool=False):
     def collate(batch):
-        shifts_list, labels = zip(*batch) # each shifts: (n_lasers, n_timesteps, 2)
-        masks, xs, ys, fpss = zip(*labels) # (h,w)*B, (1,)*B, (1,)*B, (1,)*B
-        if AUGMENT:
-            assert len(set(fpss)) == 1, f"all fps in batch must match, got {set(fpss)}"
-            shifts_batch = torch.stack(list(shifts_list))                            # (B, n_lasers, n_timesteps, 2)
-            G = frequency_augmentation(shifts_batch, fpss[0])                        # (B, n_timesteps)
-            aug_shifts = torch.fft.ifft(torch.fft.fft(shifts_batch, dim=2) * G[:, None, :, None], dim=2).real
-            shifts_list = list(shifts_list) + list(aug_shifts)                       # 2B items
-            masks, xs, ys, fpss = masks + masks, xs + xs, ys + ys, fpss + fpss
-        fft_patches = torch.stack([
-            do_fft(clean_shifts(s, fps), fps)[0].unfold(1, patch_size, patch_size).float()
-            for s, fps in zip(shifts_list, fpss)
-        ])                                                                      # (B or 2B, n_lasers, n_patches, 2, patch_size)
-        return fft_patches, (torch.stack(list(masks)), torch.stack(list(xs)), torch.stack(list(ys)))
+        shifts, mask = torch.stack([b["shifts"] for b in batch]), torch.stack([b["mask"] for b in batch])
+        fps, x, y = [b["fps"] for b in batch], torch.tensor([b["x"] for b in batch]), torch.tensor([b["y"] for b in batch])
+
+        if augment:
+            assert len(set(fps)) == 1, f"all fps in batch must match, got {set(fps)}"
+            G = frequency_augmentation(shifts, fps[0])                            # (B, T)
+            shifts_aug = torch.fft.ifft(torch.fft.fft(shifts, dim=2) * G[:, None, :, None], dim=2).real
+            shifts, mask = torch.cat([shifts, shifts_aug]), torch.cat([mask, mask]) # (2B, L, T, 2)
+            x, y, fps = torch.cat([x, x]), torch.cat([y, y]), fps + fps
+
+        fft_patches = []
+        for i in range(len(shifts)):
+            shifts_clean = clean_shifts(shifts[i], fps[i])                      # (L,T,2) -> (L,T,2)
+            fft, _ = do_fft(shifts_clean, fps[i])                               # (L,T,2) -> (L,F,2)
+            fft_patches.append(fft.unfold(1, patch_size, patch_size).float())   # (L,F,2) -> (L,P,2,PS)
+
+        return torch.stack(fft_patches), (mask, x, y)
     return collate
 
 def get_dataloaders(repo_id:str, patch_size:int=256, disc_mask_h:int=40, disc_mask_w:int=20, batch_size:int=8, eval_batch_size:int=16, shuffle:bool=True, num_workers:int=0, seed:int=42, token:str | None = None):
     train_set = VibrationDataset(repo_id, split="train", patch_size=patch_size, disc_mask_h=disc_mask_h, disc_mask_w=disc_mask_w, token=token)
     test_set = VibrationDataset(repo_id, split="test", patch_size=patch_size, disc_mask_h=disc_mask_h, disc_mask_w=disc_mask_w, token=token)
     generator = torch.Generator().manual_seed(seed)
-    train_collate_fn, test_collate_fn = make_collate(patch_size), make_collate(patch_size)
+    train_collate_fn, test_collate_fn = make_collate(patch_size, augment=AUGMENT), make_collate(patch_size, augment=False)
     train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers, generator=generator, pin_memory=True, collate_fn=train_collate_fn)
     test_loader  = DataLoader(test_set,  batch_size=eval_batch_size, shuffle=False, num_workers=num_workers, generator=generator, pin_memory=True, collate_fn=test_collate_fn)
     fft_patches = test_collate_fn([test_set[0]])[0][0]   # (n_lasers, n_patches, 2, patch_size)
@@ -385,12 +388,12 @@ class SignalTransformer(ComposerModel):
         return multiplier * (indices.unsqueeze(1) - indices.unsqueeze(0)).abs() ** 2
 
     def forward(self, batch):
-        # B=batch size, L=n_lasters, C=n_coordinates=2, PS=patch size, D=d_model
+        # B=batch size, L=n_lasers, C=n_coordinates=2, PS=patch size, D=d_model
         x, _ = batch
         B, L,_, _, _ = x.shape
 
         # PointTransformer learns patterns between all frequencies from a single laser
-        # flatten so PointTransformer processes all lasers across all batches in parallel
+        # flatten so PointTransformer processes all lasers AND all batches in parallel
         x = self.pnt_trans(x.flatten(0, 1)).reshape(B, L, -1)                                   # (B,L,P,C,PS) -> (B,L,D)
 
         # SequenceTransformer learns patterns between all lasers in the the laser grid
