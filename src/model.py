@@ -411,7 +411,7 @@ class SignalTransformer(ComposerModel):
     def loss(self, outputs, batch):
         _, mask_true, x_true, y_true = batch
         x_logits, y_logits, _, mask_logits = outputs
-        position_loss = mask_loss = 0.0
+        position_loss = mask_loss = torch.tensor(0.0)
         loss_log = {}
 
         if POSITION and self.gamma != 1:
@@ -547,7 +547,7 @@ def train(**kwargs):
     model = SignalTransformer(args.d_model, args.pnt_num_heads, args.pnt_num_layers, args.seq_num_heads, args.seq_num_layers, args.patch_size, args.signal_is, data_info, args.alpha, args.beta, gamma=args.gamma, delta=args.delta, decoder=args.decoder, cross_attn_layers=args.cross_attn_layers)
     optimizer = torch.optim.Adam(model.parameters(), args.lr)
     config = {'n_params': count_parameters(model), **data_info, 'delta': args.delta, 'SORD': SORD, 'MASK': MASK, 'POSITION': POSITION, 'data_dir': args.data_dir, 'seed': args.seed, 'signal_is': args.signal_is, 'd_model': args.d_model, 'pnt_num_heads': args.pnt_num_heads, 'seq_num_heads': args.seq_num_heads, 'pnt_num_layers': args.pnt_num_layers, 'seq_num_layers': args.seq_num_layers, 'patch_size': args.patch_size, 'batch_size': args.batch_size, 'eval_batch_size': args.eval_batch_size, 'lr': args.lr, 'alpha': args.alpha, 'beta': args.beta, 'gamma': args.gamma, 'max_duration': args.max_duration, 'eval_interval': args.eval_interval, 'decoder': args.decoder, 'cross_attn_layers': args.cross_attn_layers}
-    logger = WandBLogger('good-vibrations', 'seg-mask', init_kwargs={'config': config, 'save_code': True})
+    logger = WandBLogger('good-vibrations', 'seg-mask', args.run_name, init_kwargs={'config': config, 'save_code': True})
     hf_ckpt_upload = HFChkptUploader("eturok-weizmann/good-vibrations", interval=args.eval_interval, monitor="x/rMSE", save_local=True)
     mask_viz = MaskVisualizationCallback(n_samples=args.eval_batch_size, save_dir="visualizations")
     ic(config)
@@ -559,8 +559,6 @@ def train(**kwargs):
         loggers=logger, log_to_console=True, auto_log_hparams=True, save_metrics=True,
         # callbacks=[hf_ckpt_upload, mask_viz])
         callbacks=[mask_viz])
-    # override wandb run name
-    wandb.run.name = args.run_name if args.run_name else '-'.join(wandb.run.name.split('-')[1:]) + f'_lr{float(args.lr)}_{args.gamma=}'
 
     trainer.fit()
     ic(trainer.state.train_metrics, type(trainer.state.train_metrics))

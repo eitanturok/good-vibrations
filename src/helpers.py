@@ -97,8 +97,8 @@ class MaskVisualizationCallback(Callback):
         batch, outputs = self._last_batch
         self._last_batch = None  # reset for next eval
 
-        _, (true_masks, _, _) = batch          # true_masks: (B, H, W) bool/int
-        _, _, _, mask_logits = outputs         # mask_logits: (B, H, W)
+        _, true_masks, _, _ = batch          # true_masks: (B, H, W) bool/int
+        _, _, _, mask_logits = outputs       # mask_logits: (B, H, W)
 
         n = min(self.n_samples, true_masks.shape[0])
         pred_probs = mask_logits[:n].sigmoid().detach().cpu().float()
