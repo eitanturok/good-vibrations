@@ -63,11 +63,11 @@ def interpolate(x, y, xs):
     hh = hermit_poly((xs - x[idxs]) / dx)
     return hh[0] * y[..., idxs] + hh[1] * m[..., idxs] * dx + hh[2] * y[..., idxs + 1] + hh[3] * m[..., idxs + 1] * dx
 
-def frequency_augmentation(shifts:torch.Tensor, fs:int, min_freq:int=100, max_freq:int=2500):
+def frequency_augmentation(shifts:torch.Tensor, fs:int, min_freq:int=100, max_freq:int=2500, generator:torch.Generator|None=None):
     # shifts: (B, n_lasers, n_timesteps, 2) — returns G: (B, n_timesteps)
     B = shifts.shape[0]
     x_points = torch.tensor([500, 1000, 1500, 2000, 2500], device=shifts.device)
-    y_points = torch.normal(mean=1.0, std=1, size=(B, len(x_points)), device=shifts.device)
+    y_points = torch.normal(mean=1.0, std=1, size=(B, len(x_points)), generator=generator)
     domain = torch.linspace(min_freq, max_freq, 10000, device=shifts.device)
     values = interpolate(x_points, y_points, domain)                            # (B, 10000)
     lo, hi = values.min(dim=-1, keepdim=True).values, values.max(dim=-1, keepdim=True).values
@@ -102,14 +102,14 @@ class VibrationDataset(torch.utils.data.Dataset):
         shifts = self.st_shifts.get_tensor(f"shifts_{row['shifts_idx']}").float()                   # (n_lasers, n_timesteps, 2)
         return {'shifts': shifts, 'mask': mask, 'x': self.x_labels[idx], 'y': self.y_labels[idx], 'fps': row["fps"]}
 
-def make_collate(patch_size:int, augment:bool=False):
+def make_collate(patch_size:int, augment:bool=False, generator:torch.Generator|None=None):
     def collate(batch):
         shifts, mask = torch.stack([b["shifts"] for b in batch]), torch.stack([b["mask"] for b in batch])
         fps, x, y = [b["fps"] for b in batch], torch.tensor([b["x"] for b in batch]), torch.tensor([b["y"] for b in batch])
 
         if augment:
             assert len(set(fps)) == 1, f"all fps in batch must match, got {set(fps)}"
-            G = frequency_augmentation(shifts, fps[0])                            # (B, T)
+            G = frequency_augmentation(shifts, fps[0], generator=generator)       # (B, T)
             shifts_aug = torch.fft.ifft(torch.fft.fft(shifts, dim=2) * G[:, None, :, None], dim=2).real
             shifts, mask = torch.cat([shifts, shifts_aug]), torch.cat([mask, mask]) # (2B, L, T, 2)
             x, y, fps = torch.cat([x, x]), torch.cat([y, y]), fps + fps
@@ -127,7 +127,7 @@ def get_dataloaders(repo_id:str, patch_size:int=256, disc_mask_h:int=40, disc_ma
     train_set = VibrationDataset(repo_id, split="train", patch_size=patch_size, disc_mask_h=disc_mask_h, disc_mask_w=disc_mask_w, token=token)
     test_set = VibrationDataset(repo_id, split="test", patch_size=patch_size, disc_mask_h=disc_mask_h, disc_mask_w=disc_mask_w, token=token)
     generator = torch.Generator().manual_seed(seed)
-    train_collate_fn, test_collate_fn = make_collate(patch_size, augment=AUGMENT), make_collate(patch_size, augment=False)
+    train_collate_fn, test_collate_fn = make_collate(patch_size, augment=AUGMENT, generator=generator), make_collate(patch_size, augment=False)
     train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers, generator=generator, pin_memory=True, collate_fn=train_collate_fn)
     test_loader  = DataLoader(test_set,  batch_size=eval_batch_size, shuffle=False, num_workers=num_workers, generator=generator, pin_memory=True, collate_fn=test_collate_fn)
     fft_patches = test_collate_fn([test_set[0]])[0][0]   # (n_lasers, n_patches, 2, patch_size)
@@ -436,7 +436,7 @@ class SignalTransformer(ComposerModel):
             mask_dice_loss = soft_dice_fn(mask_logits, mask_true)
             mask_ce_loss = focal_loss_fn(mask_logits, mask_true) if FOCAL else weighted_cross_entropy_fn(mask_logits, mask_true)
             mask_loss = self.delta * mask_dice_loss + (1 - self.delta) * mask_ce_loss
-            ce_key = 'loss/train/mask_focal' if FOCAL else 'loss/train/mask_cross_entropy'
+            ce_key = 'loss/train/mask/WeightedCE'
             loss_log.update({'loss/train/mask_dice': mask_dice_loss, ce_key: mask_ce_loss, 'loss/train/mask_total': mask_loss})
 
         if POSITION and MASK:
@@ -507,14 +507,14 @@ def get_parser():
     parser.add_argument('--decoder', type=str, default='mlp', choices=['mlp', 'cnn', 'cross_attn', 'pool'])
     parser.add_argument('--cross-attn-layers', type=int, default=4)
 
-    parser.add_argument('--d-model', type=int, default=64)
+    parser.add_argument('--d-model', type=int, default=128)
     parser.add_argument('--pnt-num-heads', type=int, default=2)
     parser.add_argument('--seq-num-heads', type=int, default=2)
     parser.add_argument('--pnt-num-layers', type=int, default=2)
     parser.add_argument('--seq-num-layers', type=int, default=2)
 
     # learning
-    parser.add_argument('--batch-size', type=int, default=4096)
+    parser.add_argument('--batch-size', type=int, default=64)
     parser.add_argument('--eval-batch-size', type=int, default=16)
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--lr', type=float, default=1e-4)
