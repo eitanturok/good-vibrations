@@ -104,9 +104,8 @@ class VibrationDataset(torch.utils.data.Dataset):
 
 def make_collate(patch_size:int, augment:bool=False, generator:torch.Generator|None=None):
     def collate(batch):
-        shifts, mask = torch.stack([b["shifts"] for b in batch]), torch.stack([b["mask"] for b in batch])
+        shifts, mask = torch.stack([b["shifts"] for b in batch]), torch.stack([b["mask"] for b in batch]).float()
         fps, x, y = [b["fps"] for b in batch], torch.tensor([b["x"] for b in batch]), torch.tensor([b["y"] for b in batch])
-
         if augment:
             assert len(set(fps)) == 1, f"all fps in batch must match, got {set(fps)}"
             G = frequency_augmentation(shifts, fps[0], generator=generator)       # (B, T)
@@ -118,9 +117,9 @@ def make_collate(patch_size:int, augment:bool=False, generator:torch.Generator|N
         for i in range(len(shifts)):
             shifts_clean = clean_shifts(shifts[i], fps[i])                      # (L,T,2) -> (L,T,2)
             fft, _ = do_fft(shifts_clean, fps[i])                               # (L,T,2) -> (L,F,2)
-            fft_patches.append(fft.unfold(1, patch_size, patch_size).float())   # (L,F,2) -> (L,P,2,PS)
+            fft_patches.append(fft.unfold(1, patch_size, patch_size))           # (L,F,2) -> (L,P,2,PS)
 
-        return torch.stack(fft_patches), (mask, x, y)
+        return torch.stack(fft_patches), mask, x, y
     return collate
 
 def get_dataloaders(repo_id:str, patch_size:int=256, disc_mask_h:int=40, disc_mask_w:int=20, batch_size:int=8, eval_batch_size:int=16, shuffle:bool=True, num_workers:int=0, seed:int=42, token:str | None = None):
@@ -346,7 +345,7 @@ class PointTransformer(nn.Module):
     def forward(self, x):
         # x.shape = (B_L,P,C,_PS) = (batch_size * n_lasers, n_patches, n_coords, patch_size)
         B_L, P, _, _ = x.shape
-        x = self.raw_to_tokens(x)                                                           # (B_L,P,C,_PS) -> (B_L,P,C,PS) where PS=_PS or 2*_PS
+        x = self.raw_to_tokens(x).float()                                                   # (B_L,P,C,_PS) -> (B_L,P,C,PS) where PS=_PS or 2*_PS
         x = self.embed(x.reshape(B_L, P, -1))                                               # (B_L,P,C,PS) -> (B_L,P,D)
         x = apply_rope(x, self.freqs_cis.to(x.device)) if ROPE else self.freq_pos_embd(x)   # (B_L,P,D)
         x = torch.cat((self.cls_token.expand(B_L, -1, -1).to(x.device), x), dim=1)          # (B_L,P+1,D)
@@ -389,7 +388,7 @@ class SignalTransformer(ComposerModel):
 
     def forward(self, batch):
         # B=batch size, L=n_lasers, C=n_coordinates=2, PS=patch size, D=d_model
-        x, _ = batch
+        x, *_ = batch
         B, L,_, _, _ = x.shape
 
         # PointTransformer learns patterns between all frequencies from a single laser
@@ -410,7 +409,7 @@ class SignalTransformer(ComposerModel):
         return x_logits, y_logits, cls_embedding, mask_logits
 
     def loss(self, outputs, batch):
-        _, (mask_true, x_true, y_true) = batch
+        _, mask_true, x_true, y_true = batch
         x_logits, y_logits, _, mask_logits = outputs
         position_loss = mask_loss = 0.0
         loss_log = {}
@@ -452,7 +451,7 @@ class SignalTransformer(ComposerModel):
         return self.train_metrics if is_train else self.val_metrics
 
     def update_metric(self, batch, outputs, metric):
-        _, (mask_true, x_true, y_true) = batch
+        _, mask_true, x_true, y_true = batch
         x_logits, y_logits, _, mask_logits = outputs
         metric_name, pred_type, pos = getattr(metric, 'metric_name', None), getattr(metric, 'pred_type', None), getattr(metric, 'pos', None)
 
