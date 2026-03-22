@@ -415,7 +415,7 @@ class SignalTransformer(ComposerModel):
         position_loss = mask_loss = 0.0
         loss_log = {}
 
-        if POSITION:
+        if POSITION and self.gamma != 1:
             ce_loss_x = F.cross_entropy(x_logits, x_true)
             ce_loss_y = F.cross_entropy(y_logits, y_true)
             if not SORD:
@@ -432,7 +432,7 @@ class SignalTransformer(ComposerModel):
                                  'loss/train/ce_sord_x': ce_sord_loss_x, 'loss/train/ce_sord_y': ce_sord_loss_y})
             loss_log['loss/train/position'] = position_loss
 
-        if MASK:
+        if MASK and self.gamma != 0:
             mask_dice_loss = soft_dice_fn(mask_logits, mask_true)
             mask_ce_loss = focal_loss_fn(mask_logits, mask_true) if FOCAL else weighted_cross_entropy_fn(mask_logits, mask_true)
             mask_loss = self.delta * mask_dice_loss + (1 - self.delta) * mask_ce_loss
@@ -525,7 +525,7 @@ def get_parser():
     # loss
     parser.add_argument('--alpha', type=float, default=0.9)
     parser.add_argument('--beta', type=float, default=0.5)
-    parser.add_argument('--gamma', type=float, default=0.8)
+    parser.add_argument('--gamma', type=float, default=1)
     parser.add_argument('--delta', type=float, default=0.5)
     return parser
 
