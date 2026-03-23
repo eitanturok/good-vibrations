@@ -490,8 +490,10 @@ def get_parser():
     parser.add_argument('--discretized-mask', type=int, default=1)
     parser.add_argument('--rope', type=int, default=1)
     parser.add_argument('--focal', type=int, default=0)
-    parser.add_argument('--augment', type=int, default=0)
+    parser.add_argument('--augment', type=int, default=1)
     parser.add_argument('--hard-mask', type=int, default=0)
+    parser.add_argument('--mask-viz-train-interval', type=int, default=10)
+    parser.add_argument('--mask-viz-thresholds', type=str, default='0.3,0.5,0.7,0.9')
 
     # data
     parser.add_argument('--data-dir', type=str, default='eturok-weizmann/vibration-data')
@@ -524,7 +526,7 @@ def get_parser():
     parser.add_argument('--alpha', type=float, default=0.9)
     parser.add_argument('--beta', type=float, default=0.5)
     parser.add_argument('--gamma', type=float, default=1)
-    parser.add_argument('--delta', type=float, default=0.0)
+    parser.add_argument('--delta', type=float, default=0.4)
     return parser
 
 @app.function(
@@ -548,7 +550,8 @@ def train(**kwargs):
     config = {'n_params': count_parameters(model), **data_info, 'delta': args.delta, 'SORD': SORD, 'MASK': MASK, 'POSITION': POSITION, 'data_dir': args.data_dir, 'seed': args.seed, 'signal_is': args.signal_is, 'd_model': args.d_model, 'pnt_num_heads': args.pnt_num_heads, 'seq_num_heads': args.seq_num_heads, 'pnt_num_layers': args.pnt_num_layers, 'seq_num_layers': args.seq_num_layers, 'patch_size': args.patch_size, 'batch_size': args.batch_size, 'eval_batch_size': args.eval_batch_size, 'lr': args.lr, 'alpha': args.alpha, 'beta': args.beta, 'gamma': args.gamma, 'max_duration': args.max_duration, 'eval_interval': args.eval_interval, 'decoder': args.decoder, 'cross_attn_layers': args.cross_attn_layers}
     logger = WandBLogger('good-vibrations', 'seg-mask', args.run_name, init_kwargs={'config': config, 'save_code': True})
     hf_ckpt_upload = HFChkptUploader("eturok-weizmann/good-vibrations", interval=args.eval_interval, monitor="x/rMSE", save_local=True)
-    mask_viz = MaskVisualizationCallback(n_samples=args.eval_batch_size, save_dir="visualizations")
+    thresholds = [float(x) for x in args.mask_viz_thresholds.split(',')]
+    mask_viz = MaskVisualizationCallback(n_samples=args.eval_batch_size, save_dir="visualizations", train_viz_interval=args.mask_viz_train_interval, thresholds=thresholds)
     ic(config)
 
     trainer = Trainer(

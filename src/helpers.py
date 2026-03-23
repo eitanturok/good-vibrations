@@ -78,54 +78,49 @@ class HFChkptUploader(Callback):
 
 
 class MaskVisualizationCallback(Callback):
-    """After each eval, renders true vs predicted mask side-by-side, saves locally, and logs to WandB."""
+    def __init__(self, n_samples=4, save_dir="visualizations", train_viz_interval=10, thresholds=(0.3, 0.5, 0.7, 0.9)):
+        self.n_samples, self.save_dir, self.train_viz_interval, self.thresholds = n_samples, save_dir, train_viz_interval, list(thresholds)
+        self._last_eval_batch = self._last_train_batch = None
 
-    def __init__(self, n_samples: int = 4, save_dir: str = "visualizations"):
-        self.n_samples = n_samples
-        self.save_dir = save_dir
-        self._last_batch = None
+    def epoch_start(self, state, logger): self._last_train_batch = None
+    def batch_end(self, state, logger):
+        if self._last_train_batch is None: self._last_train_batch = (state.batch, state.outputs)
+    def epoch_end(self, state, logger):
+        if state.timestamp.epoch.value % self.train_viz_interval == 0 and self._last_train_batch is not None:
+            self._visualize(*self._last_train_batch, state, "train")
 
     def eval_batch_end(self, state, logger):
-        # Grab only the first eval batch for visualization
-        if self._last_batch is None:
-            self._last_batch = (state.batch, state.outputs)
-
+        if self._last_eval_batch is None: self._last_eval_batch = (state.batch, state.outputs)
     def eval_end(self, state, logger):
-        if self._last_batch is None:
-            return
+        if self._last_eval_batch is None: return
+        self._visualize(*self._last_eval_batch, state, "eval")
+        self._last_eval_batch = None
 
-        batch, outputs = self._last_batch
-        self._last_batch = None  # reset for next eval
-
-        _, true_masks, _, _ = batch          # true_masks: (B, H, W) bool/int
-        _, _, _, mask_logits = outputs       # mask_logits: (B, H, W)
-
+    def _visualize(self, batch, outputs, state, split):
+        _, true_masks, _, _ = batch
+        _, _, _, mask_logits = outputs
         n = min(self.n_samples, true_masks.shape[0])
-        pred_probs = mask_logits[:n].sigmoid().detach().cpu().float()
-        true_masks = true_masks[:n].detach().cpu().float()
-
-        os.makedirs(self.save_dir, exist_ok=True)
+        probs = mask_logits[:n].sigmoid().detach().cpu().float().numpy()
+        true = true_masks[:n].detach().cpu().float().numpy()
         epoch = state.timestamp.epoch.value
-        wandb_images = []
-
+        os.makedirs(self.save_dir, exist_ok=True)
+        if not wandb.run: return
+        log = {}
         for i in range(n):
-            fig, axes = plt.subplots(1, 2, figsize=(8, 4))
-            axes[0].imshow(true_masks[i].numpy(), vmin=0, vmax=1, cmap='gray')
-            axes[0].set_title('True mask')
-            axes[0].axis('off')
-            axes[1].imshow(pred_probs[i].numpy(), vmin=0, vmax=1, cmap='hot')
-            axes[1].set_title('Predicted (prob)')
-            axes[1].axis('off')
-            fig.suptitle(f'Epoch {epoch} — sample {i}')
-            fig.tight_layout()
-
-            path = os.path.join(self.save_dir, f'epoch_{epoch:04d}_sample_{i}.png')
-            fig.savefig(path, dpi=100)
-            wandb_images.append(wandb.Image(fig, caption=f'sample {i}'))
-            plt.close(fig)
-
-        if wandb.run:
-            wandb.log({'mask_viz': wandb_images}, step=state.timestamp.batch.value)
+            # continuous prob map (no threshold)
+            fig, (ax0, ax1) = plt.subplots(1, 2, figsize=(8, 4))
+            ax0.imshow(true[i], vmin=0, vmax=1, cmap='gray'); ax0.set_title('True Mask'); ax0.axis('off')
+            ax1.imshow(probs[i], vmin=0, vmax=1, cmap='hot'); ax1.set_title('Pred Mask (prob)'); ax1.axis('off')
+            fig.suptitle(f'Epoch {epoch}, {split.capitalize()} Sample {i}, Prob'); fig.tight_layout()
+            log.setdefault(f'mask_viz/{split}/prob', []).append(wandb.Image(fig, caption=f'sample {i}')); plt.close(fig)
+            # binarized at each threshold
+            for t in self.thresholds:
+                fig, (ax0, ax1) = plt.subplots(1, 2, figsize=(8, 4))
+                ax0.imshow(true[i], vmin=0, vmax=1, cmap='gray'); ax0.set_title('true'); ax0.axis('off')
+                ax1.imshow((probs[i] > t).astype(float), vmin=0, vmax=1, cmap='gray'); ax1.set_title(f'Pred Mask (threshold {t})'); ax1.axis('off')
+                fig.suptitle(f'Epoch {epoch}, {split.capitalize()} Sample {i}, threshold {t}'); fig.tight_layout()
+                log.setdefault(f'mask_viz/{split}/thresh{t}', []).append(wandb.Image(fig, caption=f'sample {i}')); plt.close(fig)
+        wandb.log(log, step=state.timestamp.batch.value)
 
 
 # from composer.callbacks import CheckpointSaver
