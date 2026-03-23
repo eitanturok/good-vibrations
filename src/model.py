@@ -98,9 +98,9 @@ class VibrationDataset(torch.utils.data.Dataset):
     def __len__(self): return len(self.ds)
     def __getitem__(self, idx):
         row = self.ds[idx]
-        mask = self.st_masks.get_tensor(f"mask_{row['mask_idx']}").float()                                           # (H, W)
+        mask = self.st_masks.get_tensor(f"mask_{row['mask_idx']}").float()                                                  # (H, W)
         if DISCRETIZED_MASK: mask = self.discretize_fn(mask[None, None], (self.disc_mask_h, self.disc_mask_w)).squeeze()    # (disc_mask_h, disc_mask_w)
-        shifts = self.st_shifts.get_tensor(f"shifts_{row['shifts_idx']}").float()                   # (n_lasers, n_timesteps, 2)
+        shifts = self.st_shifts.get_tensor(f"shifts_{row['shifts_idx']}").float()                                           # (n_lasers, n_timesteps, 2)
         return {'shifts': shifts, 'mask': mask, 'x': self.x_labels[idx], 'y': self.y_labels[idx], 'fps': row["fps"]}
 
 def make_collate(patch_size:int, augment:bool=False, generator:torch.Generator|None=None):
