@@ -90,6 +90,7 @@ class VibrationDataset(torch.utils.data.Dataset):
         self.st_shifts = safe_open(hf_hub_download(repo_id, "shifts.safetensors", repo_type="dataset", token=token), framework="pt", device="cpu")
         self.st_masks = safe_open(hf_hub_download(repo_id, "masks.safetensors",  repo_type="dataset", token=token),  framework="pt", device="cpu")
         self.patch_size, self.disc_mask_h, self.disc_mask_w = patch_size, disc_mask_h, disc_mask_w
+        self.discretize_fn = F.adaptive_max_pool2d if HARD_MASK else F.adaptive_avg_pool2d
         # remap raw position values to 0-indexed class labels
         self.x_labels = torch.tensor(self.ds["x_position"]).unique(return_inverse=True)[1]
         self.y_labels = torch.tensor(self.ds["y_position"]).unique(return_inverse=True)[1]
@@ -98,7 +99,7 @@ class VibrationDataset(torch.utils.data.Dataset):
     def __getitem__(self, idx):
         row = self.ds[idx]
         mask = self.st_masks.get_tensor(f"mask_{row['mask_idx']}").float()                                           # (H, W)
-        if DISCRETIZED_MASK: mask = F.adaptive_avg_pool2d(mask[None, None], (self.disc_mask_h, self.disc_mask_w)).squeeze()    # (disc_mask_h, disc_mask_w)
+        if DISCRETIZED_MASK: mask = self.discretize_fn(mask[None, None], (self.disc_mask_h, self.disc_mask_w)).squeeze()    # (disc_mask_h, disc_mask_w)
         shifts = self.st_shifts.get_tensor(f"shifts_{row['shifts_idx']}").float()                   # (n_lasers, n_timesteps, 2)
         return {'shifts': shifts, 'mask': mask, 'x': self.x_labels[idx], 'y': self.y_labels[idx], 'fps': row["fps"]}
 
@@ -146,17 +147,17 @@ def _tag(m, metric_name:str, pred_type:str, pos:str|None=None):
 
 def create_metrics(nx: int, ny: int):
     return {
-        "pos/x_Acc":        _tag(MulticlassAccuracy(num_classes=nx), 'Accuracy', 'x'),
-        "pos/y_Acc":        _tag(MulticlassAccuracy(num_classes=ny), 'Accuracy', 'y'),
-        "pos/x_rMSE":       _tag(MeanSquaredError(squared=False),   'rMSE', 'x'),
-        "pos/y_rMSE":       _tag(MeanSquaredError(squared=False),   'rMSE', 'y'),
-        "pos/x_CE":         _tag(MeanMetric(), 'CE', 'x'),
-        "pos/y_CE":         _tag(MeanMetric(), 'CE', 'y'),
-        "mask/IoU":         _tag(MeanMetric(), 'IoU', 'mask'),
-        "mask/WeightedCE":   _tag(MeanMetric(), 'WeightedCE', 'mask'),
-        "mask/SoftDice":    _tag(MeanMetric(), 'SoftDice',   'mask'),
-        "mask/x_SoftDice":  _tag(MeanMetric(), 'SoftDice', 'mask', 'x'),
-        "mask/y_SoftDice":  _tag(MeanMetric(), 'SoftDice', 'mask', 'y'),
+        "position/x/acc":   _tag(MulticlassAccuracy(num_classes=nx), 'Accuracy', 'x'),
+        "position/y/acc":   _tag(MulticlassAccuracy(num_classes=ny), 'Accuracy', 'y'),
+        "position/x/rmse":  _tag(MeanSquaredError(squared=False),    'rMSE', 'x'),
+        "position/y/rmse":  _tag(MeanSquaredError(squared=False),    'rMSE', 'y'),
+        "position/x/ce":    _tag(MeanMetric(), 'CE', 'x'),
+        "position/y/ce":    _tag(MeanMetric(), 'CE', 'y'),
+        "mask/iou":         _tag(MeanMetric(), 'IoU', 'mask'),
+        "mask/ce":          _tag(MeanMetric(), 'WeightedCE', 'mask'),
+        "mask/dice":        _tag(MeanMetric(), 'SoftDice',   'mask'),
+        "mask/x/dice":      _tag(MeanMetric(), 'SoftDice', 'mask', 'x'),
+        "mask/y/dice":      _tag(MeanMetric(), 'SoftDice', 'mask', 'y'),
     }
 
 # **** model ****
@@ -315,14 +316,12 @@ class PoolDecoder(nn.Module):
         x = F.interpolate(x, size=(self.out_h, self.out_w), mode='bilinear', align_corners=False)   # (B, 256, H, W)
         return self.refine(x).squeeze(1)                                                             # (B, H, W)
 
-
 def build_decoder(decoder, d_model, out_h, out_w, cross_attn_layers=4):
     if decoder == 'mlp':        return MLPDecoder(d_model, out_h, out_w)
     elif decoder == 'cnn':      return CNNDecoder(d_model, out_h, out_w)
     elif decoder == 'cross_attn': return CrossAttnDecoder(d_model, out_h, out_w, cross_attn_layers)
     elif decoder == 'pool':     return PoolDecoder(d_model, out_h, out_w)
     else: raise ValueError(f"Unknown decoder: {decoder}")
-
 
 class LearnablePositionalEncoding(nn.Module):
     def __init__(self, dim, hidden_dim):
@@ -419,24 +418,23 @@ class SignalTransformer(ComposerModel):
             ce_loss_y = F.cross_entropy(y_logits, y_true)
             if not SORD:
                 position_loss = self.beta * ce_loss_x + (1 - self.beta) * ce_loss_y
-                loss_log.update({'loss/train/ce_x': ce_loss_x, 'loss/train/ce_y': ce_loss_y})
+                loss_log.update({'loss/train/position/x/ce': ce_loss_x, 'loss/train/position/y/ce': ce_loss_y})
             else:
                 sord_loss_x = sord_loss(x_logits, x_true, self.cost_matrix_x)
                 sord_loss_y = sord_loss(y_logits, y_true, self.cost_matrix_y)
                 ce_sord_loss_x = self.alpha * sord_loss_x + (1 - self.alpha) * ce_loss_x
                 ce_sord_loss_y = self.alpha * sord_loss_y + (1 - self.alpha) * ce_loss_y
                 position_loss = self.beta * ce_sord_loss_x + (1 - self.beta) * ce_sord_loss_y
-                loss_log.update({'loss/train/ce_x': ce_loss_x, 'loss/train/ce_y': ce_loss_y,
-                                 'loss/train/sord_x': sord_loss_x, 'loss/train/sord_y': sord_loss_y,
-                                 'loss/train/ce_sord_x': ce_sord_loss_x, 'loss/train/ce_sord_y': ce_sord_loss_y})
-            loss_log['loss/train/position'] = position_loss
+                loss_log.update({'loss/train/position/x/ce': ce_loss_x, 'loss/train/position/y/ce': ce_loss_y,
+                                 'loss/train/position/x/sord': sord_loss_x, 'loss/train/position/y/sord': sord_loss_y,
+                                 'loss/train/position/x/ce_sord': ce_sord_loss_x, 'loss/train/position/y/ce_sord': ce_sord_loss_y})
+            loss_log['loss/train/position/total'] = position_loss
 
         if MASK and self.gamma != 0:
             mask_dice_loss = soft_dice_fn(mask_logits, mask_true)
             mask_ce_loss = focal_loss_fn(mask_logits, mask_true) if FOCAL else weighted_cross_entropy_fn(mask_logits, mask_true)
             mask_loss = self.delta * mask_dice_loss + (1 - self.delta) * mask_ce_loss
-            ce_key = 'loss/train/mask/WeightedCE'
-            loss_log.update({'loss/train/mask_dice': mask_dice_loss, ce_key: mask_ce_loss, 'loss/train/mask_total': mask_loss})
+            loss_log.update({'loss/train/mask/dice': mask_dice_loss, 'loss/train/mask/ce': mask_ce_loss, 'loss/train/mask/total': mask_loss})
 
         if POSITION and MASK:
             total_loss = position_loss * (1 - self.gamma) + self.gamma * mask_loss
@@ -493,6 +491,7 @@ def get_parser():
     parser.add_argument('--rope', type=int, default=1)
     parser.add_argument('--focal', type=int, default=0)
     parser.add_argument('--augment', type=int, default=0)
+    parser.add_argument('--hard-mask', type=int, default=0)
 
     # data
     parser.add_argument('--data-dir', type=str, default='eturok-weizmann/vibration-data')
@@ -525,7 +524,7 @@ def get_parser():
     parser.add_argument('--alpha', type=float, default=0.9)
     parser.add_argument('--beta', type=float, default=0.5)
     parser.add_argument('--gamma', type=float, default=1)
-    parser.add_argument('--delta', type=float, default=0.5)
+    parser.add_argument('--delta', type=float, default=0.0)
     return parser
 
 @app.function(
@@ -537,8 +536,8 @@ def get_parser():
 def train(**kwargs):
     args = get_parser().parse_args([])  # get defaults
     args.__dict__.update(kwargs)        # apply overrides
-    global SORD, MASK, POSITION, ROPE, DISCRETIZED_MASK, FOCAL, AUGMENT # environment variables
-    SORD, MASK, POSITION, ROPE, DISCRETIZED_MASK, FOCAL, AUGMENT = args.sord, args.mask_loss, args.position_loss, args.rope, args.discretized_mask, args.focal, args.augment
+    global SORD, MASK, POSITION, ROPE, DISCRETIZED_MASK, FOCAL, AUGMENT, HARD_MASK # environment variables
+    SORD, MASK, POSITION, ROPE, DISCRETIZED_MASK, FOCAL, AUGMENT, HARD_MASK = args.sord, args.mask_loss, args.position_loss, args.rope, args.discretized_mask, args.focal, args.augment, args.hard_mask
 
     seed_all(args.seed) # must seed before initializing model + dataloader
     train_loader, test_loader, data_info = get_dataloaders(args.data_dir, args.patch_size, args.disc_mask_h, args.disc_mask_w, args.batch_size, args.eval_batch_size, seed=args.seed)
