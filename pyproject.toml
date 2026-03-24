@@ -27,6 +27,7 @@ dependencies = [
 lab = [
     "cupy-cuda12x>=13.6.0",
     "egrabber",
+    "pyueye>=4.96.952",
 ]
 
 [[tool.uv.index]]
