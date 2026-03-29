@@ -18,6 +18,7 @@ def segment_object(sample, processor):
         overlay     : (H', W', 4) float32 RGBA ndarray
         mask        : (H', W') BoolTensor
     """
+
     img = np.array(sample["raw_image"].convert("RGB"))
     H, W = img.shape[:2]
     x1, x2 = int(W * 0.31), int(W * 0.62)

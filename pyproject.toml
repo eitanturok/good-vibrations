@@ -7,6 +7,7 @@ requires-python = ">=3.12"
 dependencies = [
     "composer>=0.32.1",
     "datasets>=4.7.0",
+    "einops>=0.8.2",
     "icecream>=2.1.10",
     "ipykernel>=7.2.0",
     "matplotlib>=3.10.8",
@@ -15,12 +16,18 @@ dependencies = [
     "opencv-python>=4.11.0.86",
     "safetensors>=0.7.0",
     "sam3",
+    "scikit-learn>=1.8.0",
     "scipy>=1.17.1",
     "setuptools<82",
     "torch==2.7.0",
+    "triton>=3.3.0; sys_platform == 'linux'",
     "torchaudio>=2.7.0",
     "torchvision>=0.22.0",
     "wandb>=0.25.1",
+    "sounddevice>=0.5.5",
+    "soundfile>=0.13.1",
+    "decord>=0.6.0",
+    "pycocotools>=2.0.11",
 ]
 
 [project.optional-dependencies]
