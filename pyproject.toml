@@ -32,11 +32,10 @@ dependencies = [
 
 [project.optional-dependencies]
 lab = [
-    "cupy-cuda12x>=13.6.0",
-    "egrabber",
-    "pyueye>=4.96.952",
-    "sounddevice>=0.5.5",
-    "soundfile>=0.13.1",
+    "cupy-cuda12x>=13.6.0; sys_platform == 'win32'",
+    "pyueye>=4.96.952; sys_platform == 'win32'",
+    "sounddevice>=0.5.5; sys_platform == 'win32'",
+    "soundfile>=0.13.1; sys_platform == 'win32'",
 ]
 
 [[tool.uv.index]]
@@ -48,4 +47,3 @@ default = true
 
 [tool.uv.sources]
 sam3 = { git = "https://github.com/facebookresearch/sam3" }
-egrabber = { path = "../../../Program Files/Euresys/eGrabber/python/egrabber-26.01.0.5-py2.py3-none-any.whl" }
