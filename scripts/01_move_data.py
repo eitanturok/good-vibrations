@@ -60,6 +60,15 @@ def move_item(src: Path, dst_root: Path, delete: bool = False) -> bool:
         elapsed = time.perf_counter() - t_start
         print(f"  Copied dir  '{src.name}' in {elapsed:.3f}s — verifying files...")
 
+        # Race condition fix: the notebook may still be writing files (e.g. experiment_config.json)
+        # while copytree is running. Re-copy any files present in src but missing from dst.
+        for f in src.rglob("*"):
+            if f.is_file():
+                dst_f = dst / f.relative_to(src)
+                if not dst_f.exists():
+                    dst_f.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(f, dst_f)
+
         files = list(src.rglob("*"))
         failed = any(
             not verify_move(f, dst / f.relative_to(src))
@@ -110,7 +119,7 @@ def main() -> None:
     args = parser.parse_args()
 
     local_dir:  Path = args.local_dir.resolve()
-    shared_dir: Path = args.shared_dir.resolve()
+    shared_dir: Path = args.shared_dir
     shared_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"[INFO] Watching: {local_dir}  ->  {shared_dir}")

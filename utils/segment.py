@@ -20,7 +20,7 @@ image = (
 
 
 @app.function(gpu="A10G", image=image, secrets=[modal.Secret.from_name("huggingface")])
-def segment(image, object):
+def segment(image, object, box_material="cardboard"):
     from sam3.model_builder import build_sam3_image_model
     from sam3.model.sam3_image_processor import Sam3Processor
 
@@ -29,7 +29,7 @@ def segment(image, object):
 
     processor.set_confidence_threshold(0.0)
     state = processor.set_image(Image.fromarray(image))
-    prompt = f"A {object} inside an open cardboard box from a bird's eye view."
+    prompt = f"A {object} inside an open {box_material} box from a bird's eye view."
     out = processor.set_text_prompt(state=state, prompt=prompt)
 
     n = len(out["scores"])
@@ -78,13 +78,13 @@ def plot_overlay_image(cropped_image, overlay, x_pos, y_pos):
 
 # ── Core pipeline ─────────────────────────────────────────────────────────────
 
-def segment_sample(sample_path, left=0.15, right=0.67, up=0.08, down=0.7, object="circle"):
+def segment_sample(sample_path, left=0.15, right=0.67, up=0.08, down=0.7, object="circle", box_material="cardboard"):
     """Run the vision pipeline. Returns only what was learned from the image."""
     raw_image = Image.open(os.path.join(sample_path, "box_overhead_image.png"))
     cropped_image = crop_image(raw_image, left=left, right=right, up=up, down=down)
 
     with app.run():
-        mask, overlay = segment.remote(np.array(cropped_image), object)
+        mask, overlay = segment.remote(np.array(cropped_image), object, box_material)
 
     y_pos, x_pos = center_of_mass(mask)
     overlay_image = plot_overlay_image(cropped_image, overlay, x_pos, y_pos)

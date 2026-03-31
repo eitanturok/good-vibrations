@@ -7,7 +7,7 @@ import sys
 import time
 
 import numpy as np
-from datasets import Dataset, Image as HFImage, load_dataset
+from datasets import Dataset, Image as HFImage
 from huggingface_hub import HfApi
 
 
@@ -54,17 +54,34 @@ def upload_sample(repo_id, shifts, mask, data):
         repo_type="dataset",
     )
 
-    row = {**data, "sample_idx": idx, **{col: to_webp(data[col]) for col in IMAGE_COLS}}
-    try:
-        # force_redownload ensures we get the latest data from the hub, not a stale
-        # local cache — without it, samples uploaded since the last run would be lost
-        ds = load_dataset(repo_id, split="train", download_mode="force_redownload")
-        ds = ds.add_item(row)
-    except Exception:
-        ds = Dataset.from_list([row])
+    row = {
+        "object": data["object"],
+        "n_objects": data["n_objects"],
+        "speakers": data["speakers"],
+        "box_material": data["box_material"],
+        "x_position": data["x_position"],
+        "y_position": data["y_position"],
+        "raw_image": to_webp(data["raw_image"]),
+        "cropped_image": to_webp(data["cropped_image"]),
+        "overlay_image": to_webp(data["overlay_image"]),
+        "fps": data["fps"],
+        "sample_idx": idx,
+        "experiment_config": data["experiment_config"],
+    }
+    ds = Dataset.from_list([row])
     for col in IMAGE_COLS:
         ds = ds.cast_column(col, HFImage())
-    ds.push_to_hub(repo_id)
+    # upload as a new shard — HF concatenates all data/train-*.parquet shards on load,
+    # so we never need to download existing data just to append a row
+    buf = io.BytesIO()
+    ds.to_parquet(buf)
+    buf.seek(0)
+    api.upload_file(
+        path_or_fileobj=buf,
+        path_in_repo=f"data/train-{idx:05d}.parquet",
+        repo_id=repo_id,
+        repo_type="dataset",
+    )
 
 
 def build_process(shared_dir, hf_dataset, left, right, up, down):
@@ -80,7 +97,7 @@ def build_process(shared_dir, hf_dataset, left, right, up, down):
 
         print(f"Segmenting {sample_path.name}...")
         t0 = time.time()
-        mask, vision = segment_sample(sample_path, left=left, right=right, up=up, down=down, object=config.get("object"))
+        mask, vision = segment_sample(sample_path, left=left, right=right, up=up, down=down, object=config.get("object"), box_material=config.get("box_material", "cardboard"))
         print(f"Segmented. ({time.time() - t0:.1f}s)")
 
         recovery = np.load(os.path.join(sample_path, "RECOVERY.npz"), allow_pickle=True)
