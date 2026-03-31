@@ -17,7 +17,8 @@
       "Bash(git commit:*)",
       "Bash(python3:*)",
       "Bash(python:*)",
-      "Bash(chmod +x /c/Users/eitanturok/good-vibrations/scripts/run_experiment.sh)"
+      "Bash(chmod +x /c/Users/eitanturok/good-vibrations/scripts/run_experiment.sh)",
+      "Bash(uv add:*)"
     ]
   }
 }

@@ -16,6 +16,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent / 'utils'))
 from watch import watch
+from status import claim, finish
 
 
 POLL_INTERVAL_SECONDS = 5
@@ -45,7 +46,7 @@ def verify_move(src: Path, dst: Path) -> bool:
     return True
 
 
-def move_item(src: Path, dst_root: Path) -> bool:
+def move_item(src: Path, dst_root: Path, delete: bool = False) -> bool:
     """
     Copy src (file or directory tree) into dst_root, verify, then delete src.
     Returns True if the item was successfully moved and verified.
@@ -68,7 +69,7 @@ def move_item(src: Path, dst_root: Path) -> bool:
             return False
 
         print(f"  [OK] Dir  '{src.name}' verified ({sum(1 for f in files if f.is_file())} files)")
-        shutil.rmtree(src)
+        if delete: shutil.rmtree(src)
 
     else:
         shutil.copy2(src, dst)
@@ -79,17 +80,22 @@ def move_item(src: Path, dst_root: Path) -> bool:
             return False
 
         print(f"  [OK] File '{src.name}' verified")
-        src.unlink()
+        if delete: src.unlink()
 
     print(f"  Total time for '{src.name}': {time.perf_counter() - t_start:.3f}s")
     return True
 
 
-def build_process(source, destination, idle_timeout=IDLE_TIMEOUT_SECONDS):
+def build_process(source, destination, delete=False, idle_timeout=IDLE_TIMEOUT_SECONDS):
     @watch(source, idle=idle_timeout, poll=POLL_INTERVAL_SECONDS)
     def process(item):
+        result = claim(item, "move_data")
+        if result == "taken":   return True
+        if result == "waiting": return False
         print(f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] Moving: {item.name}")
-        move_item(item, destination)
+        if move_item(item, destination, delete=delete):
+            finish(destination / item.name, "move_data")
+        return True
     return process
 
 
@@ -100,15 +106,16 @@ def main() -> None:
     parser.add_argument("local_dir", type=Path, help="Local dir with raw experiment results")
     parser.add_argument("shared_dir",     type=Path, help="Mounted shared dir accessible by both local machine and cluster")
     parser.add_argument("--idle-timeout", type=float, default=IDLE_TIMEOUT_SECONDS, metavar="SECONDS")
+    parser.add_argument("--delete", action="store_true", default=False, help="Delete source after moving")
     args = parser.parse_args()
 
-    local_dir: Path = args.local_dir.resolve()
-    shared_dir:     Path = args.shared_dir.resolve()
+    local_dir:  Path = args.local_dir.resolve()
+    shared_dir: Path = args.shared_dir.resolve()
     shared_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"[INFO] Watching: {local_dir}  ->  {shared_dir}")
 
-    process = build_process(local_dir, shared_dir, args.idle_timeout)
+    process = build_process(local_dir, shared_dir, delete=args.delete, idle_timeout=args.idle_timeout)
     process()
 
 

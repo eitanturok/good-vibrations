@@ -14,6 +14,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'utils'))
 from segment import segment_sample
 from watch import watch
+from status import claim, finish
 
 
 IMAGE_COLS = ["raw_image", "cropped_image", "overlay_image"]
@@ -56,25 +57,31 @@ def upload_sample(repo_id, shifts, mask, data):
 def build_process(shared_dir, hf_dataset, left, right, up, down):
     @watch(shared_dir)
     def process(sample_path):
+        result = claim(sample_path, "upload", prerequisite="run_pclk")
+        if result == "taken":   return True
+        if result == "waiting": return False
+
+        config = json.load(open(os.path.join(sample_path, "experiment_config.json")))
+
         print(f"Segmenting {sample_path.name}...")
         t0 = time.time()
-        mask, vision = segment_sample(sample_path, left=left, right=right, up=up, down=down, object=config["object"])
+        mask, vision = segment_sample(sample_path, left=left, right=right, up=up, down=down, object=config.get("object"))
         print(f"Segmented. ({time.time() - t0:.1f}s)")
 
-        print('Organizing data...')
-        t0 = time.time()
         recovery = np.load(os.path.join(sample_path, "RECOVERY.npz"), allow_pickle=True)
         shifts = recovery["all_shifts"]
-        config = json.load(open(os.path.join(sample_path, "experiment_config.json")))
-        data = {**vision, "object": config["object"], "speakers": config["speakers"], "fps": int(config["FPS"]), "experiment_config": json.dumps(config)}
-        print(f"Organized data. ({time.time() - t0:.1f}s)")
+        fps = config.get("FPS")
+        n_objects = config.get("n_objects")
+        data = {**vision, "object": config.get("object"), "speakers": config.get("speakers"), "fps": int(fps) if fps is not None else None, "n_objects": int(n_objects) if n_objects is not None else None, "box_material": config.get("box_material"), "experiment_config": json.dumps(config)}
 
-        print(f"Uploading...")
+        print('Uploading...')
         t0 = time.time()
         upload_sample(hf_dataset, shifts, mask, data)
         print(f"Uploaded. ({time.time() - t0:.1f}s)")
-        
         print(f"Done. See dataset at https://huggingface.co/datasets/{hf_dataset}")
+
+        finish(sample_path, "upload")
+        return True
     return process
 
 

@@ -6,10 +6,10 @@ import wandb
 import numpy as np
 from torch import nn
 from torch.nn import functional as F
-from torch.utils.data import DataLoader
+from torch.utils.data import Dataset, DataLoader, random_split
 from datasets import load_dataset
-from huggingface_hub import hf_hub_download
-from safetensors import safe_open
+import os
+from huggingface_hub import snapshot_download
 from scipy.signal import butter, sosfiltfilt
 from composer import Trainer
 from composer.models import ComposerModel
@@ -78,7 +78,7 @@ def frequency_augmentation(shifts:torch.Tensor, fs:int, min_freq:int=100, max_fr
     G[:, valid] = values[:, torch.searchsorted(domain, freq[valid])]
     return G                                                                     # (B, n_timesteps)
 
-class VibrationDataset(torch.utils.data.Dataset):
+class VibrationDataset(Dataset):
     """
     Downloads dataset from hf of (shift, mask) pairs
     Download shifts.safetensors and mask.safetensors to CPU via hf_hub_download
@@ -86,22 +86,21 @@ class VibrationDataset(torch.utils.data.Dataset):
     """
 
     def __init__(self, repo_id:str, split:str="train", disc_mask_h:int=40, disc_mask_w:int=20, patch_size:int=256, token:str|None=None):
-        self.ds = load_dataset(repo_id, split=split, token=token, columns=["shifts_idx", "mask_idx", "x_position", "y_position", "object", "fps"])
-        self.st_shifts = safe_open(hf_hub_download(repo_id, "shifts.safetensors", repo_type="dataset", token=token), framework="pt", device="cpu")
-        self.st_masks = safe_open(hf_hub_download(repo_id, "masks.safetensors",  repo_type="dataset", token=token),  framework="pt", device="cpu")
+        self.ds = load_dataset(repo_id, split=split, token=token, columns=["sample_idx", "x_position", "y_position", "object", "fps"])
+        self.snapshot_dir = snapshot_download(repo_id, repo_type="dataset", allow_patterns="data/sample_*.npz", token=token)
         self.patch_size, self.disc_mask_h, self.disc_mask_w = patch_size, disc_mask_h, disc_mask_w
         self.discretize_fn = F.adaptive_max_pool2d if HARD_MASK else F.adaptive_avg_pool2d
         # remap raw position values to 0-indexed class labels
-        self.x_labels = torch.tensor(self.ds["x_position"]).unique(return_inverse=True)[1]
-        self.y_labels = torch.tensor(self.ds["y_position"]).unique(return_inverse=True)[1]
+        # self.x_labels = torch.tensor(self.ds["x_position"]).unique(return_inverse=True)[1]
+        # self.y_labels = torch.tensor(self.ds["y_position"]).unique(return_inverse=True)[1]
     def __repr__(self): return f"VibrationDataset(split={self.ds.split}, n={len(self.ds)})"
     def __len__(self): return len(self.ds)
     def __getitem__(self, idx):
         row = self.ds[idx]
-        mask = self.st_masks.get_tensor(f"mask_{row['mask_idx']}").float()                                                  # (H, W)
-        if DISCRETIZED_MASK: mask = self.discretize_fn(mask[None, None], (self.disc_mask_h, self.disc_mask_w)).squeeze()    # (disc_mask_h, disc_mask_w)
-        shifts = self.st_shifts.get_tensor(f"shifts_{row['shifts_idx']}").float()                                           # (n_lasers, n_timesteps, 2)
-        return {'shifts': shifts, 'mask': mask, 'x': self.x_labels[idx], 'y': self.y_labels[idx], 'fps': row["fps"]}
+        data = np.load(os.path.join(self.snapshot_dir, f"data/sample_{row['sample_idx']}.npz"))
+        shifts, mask = torch.from_numpy(data['shifts']), torch.from_numpy(data['mask'].astype(np.float32))                  # (n_lasers, n_timesteps, 2), (H, W)
+        if DISCRETIZED_MASK: mask = self.discretize_fn(mask[None, None], (self.disc_mask_h, self.disc_mask_w)).squeeze()    # (H, W) -> (disc_mask_h, disc_mask_w)
+        return {'shifts': shifts, 'mask': mask, 'x': row["x_position"], 'y': row["y_position"], 'fps': row["fps"]}
 
 def make_collate(patch_size:int, augment:bool=False, generator:torch.Generator|None=None):
     def collate(batch):
@@ -123,16 +122,18 @@ def make_collate(patch_size:int, augment:bool=False, generator:torch.Generator|N
         return torch.stack(fft_patches), mask, x, y
     return collate
 
-def get_dataloaders(repo_id:str, patch_size:int=256, disc_mask_h:int=40, disc_mask_w:int=20, batch_size:int=8, eval_batch_size:int=16, shuffle:bool=True, num_workers:int=0, seed:int=42, token:str | None = None):
-    train_set = VibrationDataset(repo_id, split="train", patch_size=patch_size, disc_mask_h=disc_mask_h, disc_mask_w=disc_mask_w, token=token)
-    test_set = VibrationDataset(repo_id, split="test", patch_size=patch_size, disc_mask_h=disc_mask_h, disc_mask_w=disc_mask_w, token=token)
+def get_dataloaders(repo_id:str, patch_size:int=256, disc_mask_h:int=40, disc_mask_w:int=20, batch_size:int=8, eval_batch_size:int=16, shuffle:bool=True, num_workers:int=0, seed:int=42, token:str | None = None, test_split=0.2):
+    dataset = VibrationDataset(repo_id, patch_size=patch_size, disc_mask_h=disc_mask_h, disc_mask_w=disc_mask_w, token=token)
+    test_size = int(len(dataset) * test_split)
+    print(f'{len(dataset)-test_size} train samples\n{test_size} test samples')
     generator = torch.Generator().manual_seed(seed)
+    train_set, test_set = random_split(dataset, [len(dataset) - test_size, test_size], generator=generator)
     train_collate_fn, test_collate_fn = make_collate(patch_size, augment=AUGMENT, generator=generator), make_collate(patch_size, augment=False)
     train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers, generator=generator, pin_memory=True, collate_fn=train_collate_fn)
     test_loader  = DataLoader(test_set,  batch_size=eval_batch_size, shuffle=False, num_workers=num_workers, generator=generator, pin_memory=True, collate_fn=test_collate_fn)
-    fft_patches = test_collate_fn([test_set[0]])[0][0]   # (n_lasers, n_patches, 2, patch_size)
-    orig_mask = test_set.st_masks.get_tensor("mask_0")  # (orig_h, orig_w)
-    data_info = {'num_x_positions': int(train_set.x_labels.max()) + 1, 'num_y_positions': int(train_set.y_labels.max()) + 1,
+    fft_patches = test_collate_fn([dataset[0]])[0][0]   # (n_lasers, n_patches, 2, patch_size)
+    orig_mask = torch.from_numpy(np.load(os.path.join(dataset.snapshot_dir, "data/sample_0.npz"))['mask'])  # (orig_h, orig_w)
+    data_info = {'num_x_positions': int(dataset.x_labels.max()) + 1, 'num_y_positions': int(dataset.y_labels.max()) + 1,
                  'mask_h': orig_mask.shape[0], 'mask_w': orig_mask.shape[1], 'disc_mask_h': disc_mask_h, 'disc_mask_w': disc_mask_w,
                  'num_lasers': fft_patches.shape[0], 'n_freqs': fft_patches.shape[1] * patch_size, 'n_patches': fft_patches.shape[1]}
     return train_loader, test_loader, data_info
@@ -496,7 +497,7 @@ def get_parser():
     parser.add_argument('--mask-viz-thresholds', type=str, default='0.3,0.5,0.7,0.9')
 
     # data
-    parser.add_argument('--data-dir', type=str, default='eturok-weizmann/vibration-data')
+    parser.add_argument('--data-dir', type=str, default='eturok-weizmann/vibrations')
     parser.add_argument('--signal-is', type=str, default='magnitude')
 
     parser.add_argument('--patch-size', type=int, default=256)
