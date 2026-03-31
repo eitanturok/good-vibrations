@@ -20,7 +20,7 @@ REMOTE_DATA_DIR = 'mark_sheinin_lab/DATA'
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--experiment-name', default='experiment-12')
+    parser.add_argument('--experiment-name', default='experiment-15')
     parser.add_argument('--delete',           action='store_true', default=False, help='Delete local data after moving to shared dir')
     parser.add_argument('--hf-dataset',      default='eturok-weizmann/vibrations')
     parser.add_argument('--left',            type=float, default=0.15)

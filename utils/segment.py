@@ -29,7 +29,8 @@ def segment(image, object, box_material="cardboard"):
 
     processor.set_confidence_threshold(0.0)
     state = processor.set_image(Image.fromarray(image))
-    prompt = f"A {object} inside an open {box_material} box from a bird's eye view."
+    # prompt = f"A {object} inside an open {box_material} box from a bird's eye view."
+    prompt = "A black metal cube inside an open cardboard box from a bird's eye view."
     out = processor.set_text_prompt(state=state, prompt=prompt)
 
     n = len(out["scores"])
