@@ -90,7 +90,7 @@ def build_process(source, destination, delete=False, idle_timeout=IDLE_TIMEOUT_S
     @watch(source, idle=idle_timeout, poll=POLL_INTERVAL_SECONDS)
     def process(item):
         result = claim(item, "move_data")
-        if result == "taken":   return True
+        if result in ("taken", "finished"): return True
         if result == "waiting": return False
         print(f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] Moving: {item.name}")
         if move_item(item, destination, delete=delete):

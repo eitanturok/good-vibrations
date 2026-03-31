@@ -2,6 +2,7 @@ import argparse
 import io
 import json
 import os
+import subprocess
 import sys
 import time
 
@@ -15,6 +16,16 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'utils'))
 from segment import segment_sample
 from watch import watch
 from status import claim, finish
+
+REMOTE_HOST = 'mcluster11'
+
+
+def slurm_job_completed(sample_name):
+    result = subprocess.run(
+        ['ssh', REMOTE_HOST, f'sacct --name {sample_name} -n -o State -X'],
+        capture_output=True, text=True, check=True
+    )
+    return 'COMPLETED' in result.stdout
 
 
 IMAGE_COLS = ["raw_image", "cropped_image", "overlay_image"]
@@ -45,7 +56,9 @@ def upload_sample(repo_id, shifts, mask, data):
 
     row = {**data, "sample_idx": idx, **{col: to_webp(data[col]) for col in IMAGE_COLS}}
     try:
-        ds = load_dataset(repo_id, split="train")
+        # force_redownload ensures we get the latest data from the hub, not a stale
+        # local cache — without it, samples uploaded since the last run would be lost
+        ds = load_dataset(repo_id, split="train", download_mode="force_redownload")
         ds = ds.add_item(row)
     except Exception:
         ds = Dataset.from_list([row])
@@ -57,9 +70,11 @@ def upload_sample(repo_id, shifts, mask, data):
 def build_process(shared_dir, hf_dataset, left, right, up, down):
     @watch(shared_dir)
     def process(sample_path):
-        result = claim(sample_path, "upload", prerequisite="run_pclk")
-        if result == "taken":   return True
-        if result == "waiting": return False
+        result = claim(sample_path, "upload", prerequisite="move_data")
+        if result == "finished": return True
+        if result == "waiting":  return False
+        if not slurm_job_completed(sample_path.name):
+            return False
 
         config = json.load(open(os.path.join(sample_path, "experiment_config.json")))
 

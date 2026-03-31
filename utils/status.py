@@ -5,7 +5,7 @@ from pathlib import Path
 from filelock import FileLock
 
 
-STAGES = ["move_data", "run_pclk", "upload"]
+STAGES = ["move_data", "upload"]
 
 NOT_STARTED = "not_started"
 IN_PROGRESS = "in_progress"
@@ -36,7 +36,9 @@ def claim(sample_dir, stage, prerequisite=None):
         status = read(sample_dir)
         if prerequisite and status.get(prerequisite) != FINISHED:
             return "waiting"
-        if status.get(stage) in (IN_PROGRESS, FINISHED):
+        if status.get(stage) == FINISHED:
+            return "finished"
+        if status.get(stage) == IN_PROGRESS:
             return "taken"
         status[stage] = IN_PROGRESS
         _write(sample_dir, status)

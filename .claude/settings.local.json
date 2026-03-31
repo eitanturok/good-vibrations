@@ -18,7 +18,13 @@
       "Bash(python3:*)",
       "Bash(python:*)",
       "Bash(chmod +x /c/Users/eitanturok/good-vibrations/scripts/run_experiment.sh)",
-      "Bash(uv add:*)"
+      "Bash(uv add:*)",
+      "Read(//q/mark_sheinin_lab/DATA/experiment-11/empty--31-03-14-20-33/**)",
+      "Read(///mcluster11/mark_sheinin_lab/DATA/experiment-11/empty--31-03-14-20-33/**)",
+      "Bash(powershell -Command \"Get-Content ''Q:\\\\mark_sheinin_lab\\\\DATA\\\\experiment-11\\\\empty--31-03-14-20-33\\\\out.log'' | Select-Object -Last 5\")",
+      "Bash(ssh mcluster11:*)",
+      "Bash(powershell -Command \"Get-Content ''Q:\\\\mark_sheinin_lab\\\\DATA\\\\experiment-11\\\\empty--31-03-14-20-33\\\\out.log'' | Select-Object -Last 10\")",
+      "Bash(powershell -Command \"Get-Content ''Q:\\\\mark_sheinin_lab\\\\DATA\\\\experiment-11\\\\empty--31-03-14-20-33\\\\err.log'' | Select-Object -Last 20\")"
     ]
   }
 }
