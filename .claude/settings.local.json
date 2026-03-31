@@ -1,0 +1,23 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//mnt/c/Program Files/Euresys/eGrabber/**)",
+      "Read(//c/Program Files/Euresys/eGrabber/python/**)",
+      "Read(//mnt/c/Windows/**)",
+      "Read(//mnt/c/**)",
+      "Bash(find /mnt/c/ -name *ueye*.dll)",
+      "Bash(find '/mnt/c/Program Files' '/mnt/c/Program Files \\(x86\\)' -iname *ids* -o -iname *ueye*)",
+      "Bash(find '/mnt/c/Program Files/IDS' -name *.exe -o -name *.bat -o -name *.msi)",
+      "Bash(cmd.exe /c \"dir \"\"C:\\\\Program Files\\\\IDS\"\"\")",
+      "Bash(python -c \"import json; nb=json.load\\(open\\(''c:/Users/eitanturok/good-vibrations/notebooks/13_segment.ipynb''\\)\\); [print\\(c[''id''], repr\\(c[''source''][:60]\\)\\) for c in nb[''cells'']]\")",
+      "Bash(uv --version)",
+      "Bash(uv lock:*)",
+      "Bash(git checkout:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(python3:*)",
+      "Bash(python:*)",
+      "Bash(chmod +x /c/Users/eitanturok/good-vibrations/scripts/run_experiment.sh)"
+    ]
+  }
+}

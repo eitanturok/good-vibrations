@@ -11,28 +11,12 @@ from huggingface_hub import HfApi
 
 
 sys.path.insert(0, os.path.dirname(__file__))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'utils'))
 from segment import segment_sample
+from watch import watch
 
 
 IMAGE_COLS = ["raw_image", "cropped_image", "overlay_image"]
-
-
-def extract_sample(sample_path, left=0.15, right=0.67, up=0.08, down=0.7):
-    """Run segmentation and combine with sample metadata into a full record."""
-    recovery = np.load(os.path.join(sample_path, "RECOVERY.npz"), allow_pickle=True)
-    shifts = recovery["all_shifts"]  # (100, N_frames, 2)
-    config = json.load(open(os.path.join(sample_path, "experiment_config.json")))
-
-    mask, vision = segment_sample(sample_path, left=left, right=right, up=up, down=down, object=config["object"])
-
-    data = {
-        **vision,
-        "object":            config["object"],
-        "speakers":          config["speakers"],
-        "fps":               int(config["FPS"]),
-        "experiment_config": json.dumps(config),
-    }
-    return shifts, mask, data
 
 
 def to_webp(img):
@@ -69,30 +53,43 @@ def upload_sample(repo_id, shifts, mask, data):
     ds.push_to_hub(repo_id)
 
 
+def build_process(shared_dir, hf_dataset, left, right, up, down):
+    @watch(shared_dir)
+    def process(sample_path):
+        print(f"Segmenting {sample_path.name}...")
+        t0 = time.time()
+        mask, vision = segment_sample(sample_path, left=left, right=right, up=up, down=down, object=config["object"])
+        print(f"Segmented. ({time.time() - t0:.1f}s)")
+
+        print('Organizing data...')
+        t0 = time.time()
+        recovery = np.load(os.path.join(sample_path, "RECOVERY.npz"), allow_pickle=True)
+        shifts = recovery["all_shifts"]
+        config = json.load(open(os.path.join(sample_path, "experiment_config.json")))
+        data = {**vision, "object": config["object"], "speakers": config["speakers"], "fps": int(config["FPS"]), "experiment_config": json.dumps(config)}
+        print(f"Organized data. ({time.time() - t0:.1f}s)")
+
+        print(f"Uploading...")
+        t0 = time.time()
+        upload_sample(hf_dataset, shifts, mask, data)
+        print(f"Uploaded. ({time.time() - t0:.1f}s)")
+        
+        print(f"Done. See dataset at https://huggingface.co/datasets/{hf_dataset}")
+    return process
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Extract a sample and upload to HuggingFace.")
-    parser.add_argument("--hf-dataset", default='eturok-weizmann/vibrations', help="HuggingFace dataset repo id, e.g. eturok-weizmann/vibrations")
-    parser.add_argument("--sample-path", required=True, help="Path to sample directory")
+    parser = argparse.ArgumentParser(description="Watch a directory and upload each new sample to HuggingFace.")
+    parser.add_argument("--shared-dir",  required=True, help="Mounted shared dir to watch for new sample subdirectories")
+    parser.add_argument("--hf-dataset",  default='eturok-weizmann/vibrations')
     parser.add_argument("--left",        type=float, default=0.15)
     parser.add_argument("--right",       type=float, default=0.67)
     parser.add_argument("--up",          type=float, default=0.08)
     parser.add_argument("--down",        type=float, default=0.7)
     args = parser.parse_args()
 
-    print("Extracting and segmenting sample...")
-    t0 = time.time()
-    shifts, mask, data = extract_sample(
-        args.sample_path,
-        left=args.left, right=args.right, up=args.up, down=args.down,
-    )
-    print(f"Done. ({time.time() - t0:.1f}s)")
-
-    print("Uploading sample...")
-    t0 = time.time()
-    upload_sample(args.hf_dataset, shifts, mask, data)
-    print(f"Done. ({time.time() - t0:.1f}s)")
-
-    print(f"Done. https://huggingface.co/datasets/{args.hf_dataset}")
+    process = build_process(args.shared_dir, args.hf_dataset, args.left, args.right, args.up, args.down)
+    process()
 
 
 if __name__ == "__main__":
