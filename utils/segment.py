@@ -15,23 +15,28 @@ image = (
     modal.Image.from_registry("nvidia/cuda:12.8.0-devel-ubuntu22.04", add_python="3.12")
     .entrypoint([])
     .apt_install("git")
-    .uv_sync(uv_project_dir=".")
+    .uv_sync(uv_project_dir=os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 )
 
 
+PROMPT = "A black metal cube inside an open cardboard box from a bird's eye view."
+
+
 @app.function(gpu="A10G", image=image, secrets=[modal.Secret.from_name("huggingface")])
-def segment(image, object, box_material="cardboard"):
+def segment(image, object, box_material="cardboard", prompt=None):
     from sam3.model_builder import build_sam3_image_model
     from sam3.model.sam3_image_processor import Sam3Processor
 
+    import torch
     model = build_sam3_image_model()
     processor = Sam3Processor(model)
 
     processor.set_confidence_threshold(0.0)
-    state = processor.set_image(Image.fromarray(image))
-    # prompt = f"A {object} inside an open {box_material} box from a bird's eye view."
-    prompt = "A black metal cube inside an open cardboard box from a bird's eye view."
-    out = processor.set_text_prompt(state=state, prompt=prompt)
+    if prompt is None:
+        prompt = PROMPT
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        state = processor.set_image(Image.fromarray(image))
+        out = processor.set_text_prompt(state=state, prompt=prompt)
 
     n = len(out["scores"])
     if n > 1:
@@ -79,13 +84,18 @@ def plot_overlay_image(cropped_image, overlay, x_pos, y_pos):
 
 # ── Core pipeline ─────────────────────────────────────────────────────────────
 
-def segment_sample(sample_path, left=0.15, right=0.67, up=0.08, down=0.7, object="circle", box_material="cardboard"):
-    """Run the vision pipeline. Returns only what was learned from the image."""
-    raw_image = Image.open(os.path.join(sample_path, "box_overhead_image.png"))
+def segment_sample(sample_path=None, raw_image=None, left=0.15, right=0.67, up=0.08, down=0.7, object="circle", box_material="cardboard", prompt=None):
+    """Run the vision pipeline. Exactly one of sample_path or raw_image must be provided."""
+    if (sample_path is None) == (raw_image is None):
+        raise ValueError("Exactly one of sample_path or raw_image must be provided.")
+    if raw_image is None:
+        raw_image = Image.open(os.path.join(sample_path, "box_overhead_image.png"))
+
     cropped_image = crop_image(raw_image, left=left, right=right, up=up, down=down)
 
+    image_array = np.array(cropped_image.convert("RGB"), dtype=np.uint8)
     with app.run():
-        mask, overlay = segment.remote(np.array(cropped_image), object, box_material)
+        mask, overlay = segment.remote(image_array, object, box_material, prompt)
 
     y_pos, x_pos = center_of_mass(mask)
     overlay_image = plot_overlay_image(cropped_image, overlay, x_pos, y_pos)
@@ -110,6 +120,7 @@ def main():
     parser.add_argument("--right",       type=float, default=0.67)
     parser.add_argument("--up",          type=float, default=0.08)
     parser.add_argument("--down",        type=float, default=0.7)
+    parser.add_argument("--prompt",      default=None, help=f"Text prompt for segmentation (default: '{PROMPT}')")
     parser.add_argument("--out",         default="processed.npz", help="Output .npz to save shifts, mask, and data")
     parser.add_argument("--show-images", default=True,  action=argparse.BooleanOptionalAction, help="Open each intermediate image in the system viewer")
     parser.add_argument("--debug-dir",   default="debug", help="Directory to save intermediate images (default: debug/)")
@@ -122,6 +133,7 @@ def main():
         up=args.up,
         down=args.down,
         object=args.object,
+        prompt=args.prompt,
     )
 
     # Save intermediate images to debug dir

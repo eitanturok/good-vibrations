@@ -25,8 +25,21 @@ from helpers import HFChkptUploader, MaskVisualizationCallback
 
 # **** Modal ****
 
-image = modal.Image.debian_slim().apt_install("git").uv_sync().add_local_dir("src", remote_path="/root")
-app = modal.App(image=image)
+HF_CACHE_VOL = modal.Volume.from_name("huggingface-cache", create_if_missing=True)
+HF_CACHE_PATH = "/root/.cache/huggingface"
+
+image = (
+    modal.Image.debian_slim()
+    .apt_install("git")
+    .env({"HF_HUB_CACHE": HF_CACHE_PATH, "HF_XET_HIGH_PERFORMANCE": "1"})
+    .uv_sync()
+    .add_local_dir("src", remote_path="/root")
+)
+app = modal.App(
+    image=image,
+    volumes={HF_CACHE_VOL: HF_CACHE_PATH},
+    secrets=[modal.Secret.from_name("huggingface"), modal.Secret.from_name("wandb")],
+    )
 
 # ***** Dataset *****
 
@@ -533,7 +546,7 @@ def get_parser():
     gpu="A100",
     timeout=86_400, # maximum timeout is 24 hours; see https://modal.com/docs/guide/timeouts#timeouts
     retries=3,
-    secrets=[modal.Secret.from_name("huggingface"), modal.Secret.from_name("wandb")],
+    secrets=secrets,
     )
 def train(**kwargs):
     args = get_parser().parse_args([])  # get defaults

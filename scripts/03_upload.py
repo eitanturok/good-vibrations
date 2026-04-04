@@ -83,6 +83,7 @@ def upload_sample(repo_id, shifts, mask, data):
         repo_type="dataset",
     )
 
+def cast(value, _type): return _type(value) if value is not None else None
 
 def build_process(shared_dir, hf_dataset, left, right, up, down):
     @watch(shared_dir)
@@ -97,14 +98,16 @@ def build_process(shared_dir, hf_dataset, left, right, up, down):
 
         print(f"Segmenting {sample_path.name}...")
         t0 = time.time()
-        mask, vision = segment_sample(sample_path, left=left, right=right, up=up, down=down, object=config.get("object"), box_material=config.get("box_material", "cardboard"))
+        mask, vision = segment_sample(sample_path=sample_path, left=left, right=right, up=up, down=down, object=config.get("object"), box_material=config.get("box_material", "cardboard"))
         print(f"Segmented. ({time.time() - t0:.1f}s)")
 
         recovery = np.load(os.path.join(sample_path, "RECOVERY.npz"), allow_pickle=True)
         shifts = recovery["all_shifts"]
         fps = config.get("FPS")
         n_objects = config.get("n_objects")
-        data = {**vision, "object": config.get("object"), "speakers": config.get("speakers"), "fps": int(fps) if fps is not None else None, "n_objects": int(n_objects) if n_objects is not None else None, "box_material": config.get("box_material"), "experiment_config": json.dumps(config)}
+        data = {**vision, "object": config.get("object", ""), "speakers": config.get("speakers", ""), "fps": cast(fps, int),
+                "n_objects": cast(n_objects, int), "box_material": config.get("box_material", ""), "experiment_config": json.dumps(config),
+                "mask_area": float(mask.sum() / mask.size * 100)}
 
         print('Uploading...')
         t0 = time.time()
