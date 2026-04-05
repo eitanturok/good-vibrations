@@ -99,7 +99,7 @@ class MaskVisualizationCallback(Callback):
     def _visualize(self, batch, outputs, state, split):
         _, true_masks, _, _ = batch
         _, _, _, mask_logits = outputs
-        n = min(self.n_samples, true_masks.shape[0])
+        n = min(self.n_samples, true_masks.shape[0], mask_logits.shape[0])
         probs = mask_logits[:n].sigmoid().detach().cpu().float().numpy()
         true = true_masks[:n].detach().cpu().float().numpy()
         epoch = state.timestamp.epoch.value

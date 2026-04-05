@@ -35,9 +35,10 @@ image = (
     .uv_sync()
     .add_local_dir("src", remote_path="/root")
 )
+
 app = modal.App(
     image=image,
-    volumes={HF_CACHE_VOL: HF_CACHE_PATH},
+    volumes={HF_CACHE_PATH: HF_CACHE_VOL},
     secrets=[modal.Secret.from_name("huggingface"), modal.Secret.from_name("wandb")],
     )
 
@@ -60,6 +61,19 @@ def do_fft(shifts:torch.Tensor, fs:int, min_freq:int=50, max_freq:int=1000):
     mask = (freqs >= min_freq) & (freqs <= max_freq)
     fft, freqs = fft[:, mask, :], freqs[mask]
     return fft, freqs
+
+def sync_phases(fft, laser_idx=0, xy_idx=0, eps=1e-20):
+    fft_synced = fft.clone()                    # copy
+    ref = fft[laser_idx, :, xy_idx]             # shape (freq,)
+    phase = ref.conj() / (ref.abs()**2 + eps)   # unit complex + divide by magnitude
+    fft_synced *= phase[None, :, None]          # broadcast over lasers and xy
+    assert torch.allclose(torch.ones(1, device=fft.device), fft_synced[laser_idx, :, xy_idx].real) # check we have magnitude 1
+    return fft_synced                           # (L,F,2)
+
+def normalize_magnitude(fft):
+    # normalizing the magnitude of the fourier transform
+    fft /= fft.abs().std(dim=1, keepdim=True)
+    return fft
 
 def hermit_poly(t):
     tt = t[None, :] ** torch.arange(4, device=t.device)[:, None]
@@ -97,14 +111,15 @@ class VibrationDataset(Dataset):
     Each __getitem__ reads only the pages for that tensor off disk — the OS never loads the full file into RAM.
     """
 
-    def __init__(self, repo_id:str, split:str="train", disc_mask_h:int=40, disc_mask_w:int=20, patch_size:int=256, token:str|None=None):
-        self.ds = load_dataset(repo_id, split=split, token=token, columns=["sample_idx", "x_position", "y_position", "object", "fps"])
+    def __init__(self, repo_id:str, split:str="train", disc_mask_h:int=40, disc_mask_w:int=20, patch_size:int=256, floor_cols:int=11, floor_rows:int=12, token:str|None=None, speakers:list|None=None):
+        self.ds = load_dataset(repo_id, split=split, token=token, columns=["sample_idx", "x_position", "y_position", "object", "fps", "speakers"])
+        if speakers is not None:
+            if not isinstance(speakers[0], list): speakers = [speakers]
+            self.ds = self.ds.filter(lambda row: row["speakers"] in speakers)
         self.snapshot_dir = snapshot_download(repo_id, repo_type="dataset", allow_patterns="data/sample_*.npz", token=token)
         self.patch_size, self.disc_mask_h, self.disc_mask_w = patch_size, disc_mask_h, disc_mask_w
+        self.floor_cols, self.floor_rows = floor_cols, floor_rows
         self.discretize_fn = F.adaptive_max_pool2d if HARD_MASK else F.adaptive_avg_pool2d
-        # remap raw position values to 0-indexed class labels
-        # self.x_labels = torch.tensor(self.ds["x_position"]).unique(return_inverse=True)[1]
-        # self.y_labels = torch.tensor(self.ds["y_position"]).unique(return_inverse=True)[1]
     def __repr__(self): return f"VibrationDataset(split={self.ds.split}, n={len(self.ds)})"
     def __len__(self): return len(self.ds)
     def __getitem__(self, idx):
@@ -112,40 +127,53 @@ class VibrationDataset(Dataset):
         data = np.load(os.path.join(self.snapshot_dir, f"data/sample_{row['sample_idx']}.npz"))
         shifts, mask = torch.from_numpy(data['shifts']), torch.from_numpy(data['mask'].astype(np.float32))                  # (n_lasers, n_timesteps, 2), (H, W)
         if DISCRETIZED_MASK: mask = self.discretize_fn(mask[None, None], (self.disc_mask_h, self.disc_mask_w)).squeeze()    # (H, W) -> (disc_mask_h, disc_mask_w)
-        return {'shifts': shifts, 'mask': mask, 'x': row["x_position"], 'y': row["y_position"], 'fps': row["fps"]}
 
-def make_collate(patch_size:int, augment:bool=False, generator:torch.Generator|None=None):
+        def round_to_floor(x, n): return min(int(x / n), n - 1)
+        H, W = mask.shape[-2], mask.shape[-1]
+        floor_x, floor_y = round_to_floor(row["x_position"], W / self.floor_cols), round_to_floor(row["y_position"], H / self.floor_rows)
+
+        return {'shifts': shifts, 'mask': mask, 'floor_x': floor_x, 'floor_y': floor_y, 'fps': row["fps"]}
+
+def make_collate(patch_size:int, augment:bool=False, generator:torch.Generator|None=None, normalize:str|None=None):
+
+    normalize_fn = {'magnitude': normalize_magnitude, 'phase_sync': sync_phases}.get(normalize, None)
+
     def collate(batch):
+
+        fps = [b["fps"] for b in batch]
+        floor_x = torch.tensor([b["floor_x"] for b in batch], dtype=torch.long)
+        floor_y = torch.tensor([b["floor_y"] for b in batch], dtype=torch.long)
         shifts, mask = torch.stack([b["shifts"] for b in batch]), torch.stack([b["mask"] for b in batch]).float()
-        fps, x, y = [b["fps"] for b in batch], torch.tensor([b["x"] for b in batch]), torch.tensor([b["y"] for b in batch])
+
         if augment:
             assert len(set(fps)) == 1, f"all fps in batch must match, got {set(fps)}"
             G = frequency_augmentation(shifts, fps[0], generator=generator)       # (B, T)
             shifts_aug = torch.fft.ifft(torch.fft.fft(shifts, dim=2) * G[:, None, :, None], dim=2).real
             shifts, mask = torch.cat([shifts, shifts_aug]), torch.cat([mask, mask]) # (2B, L, T, 2)
-            x, y, fps = torch.cat([x, x]), torch.cat([y, y]), fps + fps
+            floor_x, floor_y, fps = torch.cat([floor_x, floor_x]), torch.cat([floor_y, floor_y]), fps + fps
 
         fft_patches = []
         for i in range(len(shifts)):
-            shifts_clean = clean_shifts(shifts[i], fps[i])                      # (L,T,2) -> (L,T,2)
-            fft, _ = do_fft(shifts_clean, fps[i])                               # (L,T,2) -> (L,F,2)
-            fft_patches.append(fft.unfold(1, patch_size, patch_size))           # (L,F,2) -> (L,P,2,PS)
+            shifts_clean = clean_shifts(shifts[i], fps[i])              # (L,T,2) -> (L,T,2)
+            fft, _ = do_fft(shifts_clean, fps[i])                       # (L,T,2) -> (L,F,2)
+            if normalize: fft = normalize_fn(fft)                       # (L,F,2) -> (L,F,2)
+            fft_patches.append(fft.unfold(1, patch_size, patch_size))   # (L,F,2) -> (L,P,2,PS)
 
-        return torch.stack(fft_patches), mask, x, y
+        return torch.stack(fft_patches), mask, floor_x, floor_y
     return collate
 
-def get_dataloaders(repo_id:str, patch_size:int=256, disc_mask_h:int=40, disc_mask_w:int=20, batch_size:int=8, eval_batch_size:int=16, shuffle:bool=True, num_workers:int=0, seed:int=42, token:str | None = None, test_split=0.2):
-    dataset = VibrationDataset(repo_id, patch_size=patch_size, disc_mask_h=disc_mask_h, disc_mask_w=disc_mask_w, token=token)
+def get_dataloaders(repo_id:str, patch_size:int=256, disc_mask_h:int=40, disc_mask_w:int=20, floor_cols:int=11, floor_rows:int=12, batch_size:int=8, eval_batch_size:int=16, shuffle:bool=True, num_workers:int=0, seed:int=42, token:str | None = None, test_split=0.2, speakers:list|None=None, normalize:str|None=None):
+    dataset = VibrationDataset(repo_id, patch_size=patch_size, disc_mask_h=disc_mask_h, disc_mask_w=disc_mask_w, floor_cols=floor_cols, floor_rows=floor_rows, token=token, speakers=speakers)
     test_size = int(len(dataset) * test_split)
     print(f'{len(dataset)-test_size} train samples\n{test_size} test samples')
     generator = torch.Generator().manual_seed(seed)
     train_set, test_set = random_split(dataset, [len(dataset) - test_size, test_size], generator=generator)
-    train_collate_fn, test_collate_fn = make_collate(patch_size, augment=AUGMENT, generator=generator), make_collate(patch_size, augment=False)
+    train_collate_fn, test_collate_fn = make_collate(patch_size, augment=AUGMENT, generator=generator, normalize=normalize), make_collate(patch_size, augment=False, normalize=normalize)
     train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers, generator=generator, pin_memory=True, collate_fn=train_collate_fn)
     test_loader  = DataLoader(test_set,  batch_size=eval_batch_size, shuffle=False, num_workers=num_workers, generator=generator, pin_memory=True, collate_fn=test_collate_fn)
     fft_patches = test_collate_fn([dataset[0]])[0][0]   # (n_lasers, n_patches, 2, patch_size)
     orig_mask = torch.from_numpy(np.load(os.path.join(dataset.snapshot_dir, "data/sample_0.npz"))['mask'])  # (orig_h, orig_w)
-    data_info = {'num_x_positions': int(dataset.x_labels.max()) + 1, 'num_y_positions': int(dataset.y_labels.max()) + 1,
+    data_info = {'floor_cols': floor_cols, 'floor_rows': floor_rows,
                  'mask_h': orig_mask.shape[0], 'mask_w': orig_mask.shape[1], 'disc_mask_h': disc_mask_h, 'disc_mask_w': disc_mask_w,
                  'num_lasers': fft_patches.shape[0], 'n_freqs': fft_patches.shape[1] * patch_size, 'n_patches': fft_patches.shape[1]}
     return train_loader, test_loader, data_info
@@ -369,7 +397,8 @@ class SignalTransformer(ComposerModel):
     def __init__(self, d_model, pnt_num_heads, pnt_num_layers, seq_num_heads, seq_num_layers, patch_size, signal_is, data_info, alpha, beta, gamma=0.5, delta=0.5, decoder='mlp', cross_attn_layers=4):
         super().__init__()
         self.alpha, self.beta, self.gamma, self.delta = alpha, beta, gamma, delta
-        self.num_x_pos, self.num_y_pos, num_lasers = data_info['num_x_positions'], data_info['num_y_positions'], data_info['num_lasers']
+        self.floor_cols, self.floor_rows = data_info['floor_cols'], data_info['floor_rows']
+        laser_rows, laser_cols = int(math.sqrt(data_info['num_lasers'])), int(math.sqrt(data_info['num_lasers']))
         self.out_h, self.out_w = (data_info['disc_mask_h'], data_info['disc_mask_w']) if DISCRETIZED_MASK else (data_info['mask_h'], data_info['mask_w'])
         self.pnt_trans = PointTransformer(patch_size, d_model, pnt_num_heads, pnt_num_layers, data_info['n_freqs'], signal_is)
         self.seq_trans = nn.TransformerEncoder(nn.TransformerEncoderLayer(d_model=d_model, nhead=seq_num_heads, batch_first=True), num_layers=seq_num_layers)
@@ -378,21 +407,21 @@ class SignalTransformer(ComposerModel):
 
         # positional embeddings for laser grid
         if ROPE:
-            self.register_buffer("freqs_laser", precompute_freqs_cis_2d(d_model, int(math.sqrt(num_lasers)), int(math.sqrt(num_lasers))))
+            self.register_buffer("freqs_laser", precompute_freqs_cis_2d(d_model, laser_rows, laser_cols))
         else:
-            self.laser_pos_embd = LearnablePositionalEncoding(num_lasers, d_model)
+            self.laser_pos_embd = LearnablePositionalEncoding(laser_rows * laser_cols, d_model)
 
         # Prediction heads
-        self.mlp_head_x_position = nn.Sequential(nn.Linear(d_model, 32), nn.ReLU(), nn.Linear(32, self.num_x_pos))
-        self.mlp_head_y_position = nn.Sequential(nn.Linear(d_model, 32), nn.ReLU(), nn.Linear(32, self.num_y_pos))
+        self.mlp_head_floor_x = nn.Sequential(nn.Linear(d_model, 32), nn.ReLU(), nn.Linear(32, self.floor_cols))
+        self.mlp_head_floor_y = nn.Sequential(nn.Linear(d_model, 32), nn.ReLU(), nn.Linear(32, self.floor_rows))
         self.decoder = build_decoder(decoder, d_model, self.out_h, self.out_w, cross_attn_layers)
 
         # SORD loss cost matrix
-        self.register_buffer('cost_matrix_x', self._init_cost_matrix(self.num_x_pos))
-        self.register_buffer('cost_matrix_y', self._init_cost_matrix(self.num_y_pos))
+        self.register_buffer('cost_matrix_x', self._init_cost_matrix(self.floor_cols))
+        self.register_buffer('cost_matrix_y', self._init_cost_matrix(self.floor_rows))
 
         # Metrics
-        self.train_metrics, self.val_metrics = create_metrics(self.num_x_pos, self.num_y_pos), create_metrics(self.num_x_pos, self.num_y_pos)
+        self.train_metrics, self.val_metrics = create_metrics(self.floor_cols, self.floor_rows), create_metrics(self.floor_cols, self.floor_rows)
 
     def _init_cost_matrix(self, num_classes, multiplier=0.5):
         indices = torch.arange(num_classes)
@@ -415,26 +444,26 @@ class SignalTransformer(ComposerModel):
 
         # Predict x position, y position, and segmentation mask
         laser_feats = output[:, 1:, :]                              # (B, L, D)
-        x_logits = self.mlp_head_x_position(cls_embedding)
-        y_logits = self.mlp_head_y_position(cls_embedding)
+        x_logits = self.mlp_head_floor_x(cls_embedding)
+        y_logits = self.mlp_head_floor_y(cls_embedding)
         mask_logits = self.decoder(cls_embedding, laser_feats)
         return x_logits, y_logits, cls_embedding, mask_logits
 
     def loss(self, outputs, batch):
-        _, mask_true, x_true, y_true = batch
+        _, mask_true, floor_x_true, floor_y_true = batch
         x_logits, y_logits, _, mask_logits = outputs
         position_loss = mask_loss = torch.tensor(0.0)
         loss_log = {}
 
         if POSITION and self.gamma != 1:
-            ce_loss_x = F.cross_entropy(x_logits, x_true)
-            ce_loss_y = F.cross_entropy(y_logits, y_true)
+            ce_loss_x = F.cross_entropy(x_logits, floor_x_true)
+            ce_loss_y = F.cross_entropy(y_logits, floor_y_true)
             if not SORD:
                 position_loss = self.beta * ce_loss_x + (1 - self.beta) * ce_loss_y
                 loss_log.update({'loss/train/position/x/ce': ce_loss_x, 'loss/train/position/y/ce': ce_loss_y})
             else:
-                sord_loss_x = sord_loss(x_logits, x_true, self.cost_matrix_x)
-                sord_loss_y = sord_loss(y_logits, y_true, self.cost_matrix_y)
+                sord_loss_x = sord_loss(x_logits, floor_x_true, self.cost_matrix_x)
+                sord_loss_y = sord_loss(y_logits, floor_y_true, self.cost_matrix_y)
                 ce_sord_loss_x = self.alpha * sord_loss_x + (1 - self.alpha) * ce_loss_x
                 ce_sord_loss_y = self.alpha * sord_loss_y + (1 - self.alpha) * ce_loss_y
                 position_loss = self.beta * ce_sord_loss_x + (1 - self.beta) * ce_sord_loss_y
@@ -462,19 +491,19 @@ class SignalTransformer(ComposerModel):
         return self.train_metrics if is_train else self.val_metrics
 
     def update_metric(self, batch, outputs, metric):
-        _, mask_true, x_true, y_true = batch
+        _, mask_true, floor_x_true, floor_y_true = batch
         x_logits, y_logits, _, mask_logits = outputs
         metric_name, pred_type, pos = getattr(metric, 'metric_name', None), getattr(metric, 'pred_type', None), getattr(metric, 'pos', None)
 
         if pred_type == 'x':
-            if metric_name == 'rMSE': metric.update(x_logits.argmax(-1), x_true)
-            elif metric_name == 'CE': metric.update(F.cross_entropy(x_logits, x_true))
-            elif metric_name == 'Accuracy': metric.update(x_logits, x_true) # multiclass accuracy
+            if metric_name == 'rMSE': metric.update(x_logits.argmax(-1), floor_x_true)
+            elif metric_name == 'CE': metric.update(F.cross_entropy(x_logits, floor_x_true))
+            elif metric_name == 'Accuracy': metric.update(x_logits, floor_x_true) # multiclass accuracy
             else: raise ValueError(f"did not recognize {metric_name=}")
         elif pred_type == 'y':
-            if metric_name == 'rMSE': metric.update(y_logits.argmax(-1), y_true)
-            elif metric_name == 'CE': metric.update(F.cross_entropy(y_logits, y_true))
-            elif metric_name == 'Accuracy': metric.update(y_logits, y_true)
+            if metric_name == 'rMSE': metric.update(y_logits.argmax(-1), floor_y_true)
+            elif metric_name == 'CE': metric.update(F.cross_entropy(y_logits, floor_y_true))
+            elif metric_name == 'Accuracy': metric.update(y_logits, floor_y_true)
             else: raise ValueError(f"did not recognize {metric_name=}")
         elif pred_type == 'mask':
             if metric_name == 'SoftDice':
@@ -496,7 +525,7 @@ def count_parameters(model: nn.Module) -> int: return sum([p_.numel() for p_ in 
 def get_parser():
     parser = argparse.ArgumentParser()
 
-    # flags
+    # abalations
     parser.add_argument('--sord', type=int, default=0)
     parser.add_argument('--mask-loss', type=int, default=1)
     parser.add_argument('--position-loss', type=int, default=1)
@@ -505,12 +534,12 @@ def get_parser():
     parser.add_argument('--focal', type=int, default=0)
     parser.add_argument('--augment', type=int, default=1)
     parser.add_argument('--hard-mask', type=int, default=0)
-    parser.add_argument('--mask-viz-train-interval', type=int, default=10)
-    parser.add_argument('--mask-viz-thresholds', type=str, default='0.3,0.5,0.7,0.9')
 
     # data
     parser.add_argument('--data-dir', type=str, default='eturok-weizmann/vibrations')
     parser.add_argument('--signal-is', type=str, default='magnitude')
+    parser.add_argument('--normalize', type=str, default=None, choices=['magnitude', 'phase_sync'])
+    parser.add_argument('--speakers', type=str, default=None, help='JSON list of speakers to include, e.g. \'[[0,1,0,0],[1,0,0,0]]\'')
 
     parser.add_argument('--patch-size', type=int, default=256)
     parser.add_argument('--disc-mask-h', type=int, default=40)
@@ -526,13 +555,19 @@ def get_parser():
     parser.add_argument('--pnt-num-layers', type=int, default=2)
     parser.add_argument('--seq-num-layers', type=int, default=2)
 
-    # learning
-    parser.add_argument('--batch-size', type=int, default=64)
-    parser.add_argument('--eval-batch-size', type=int, default=16)
+    # training
+    parser.add_argument('--batch-size', type=int, default=256)
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--lr', type=float, default=1e-4)
+
+    # evaluation
+    parser.add_argument('--eval-batch-size', type=int, default=16)
     parser.add_argument('--max-duration', type=str, default='1_000ep')
     parser.add_argument('--eval-interval', type=str, default='10ep')
+
+    # logging
+    parser.add_argument('--mask-viz-train-interval', type=int, default=10)
+    parser.add_argument('--mask-viz-thresholds', type=str, default='0.3,0.5,0.7,0.9')
     parser.add_argument('--run-name', type=str, default=None)
 
     # loss
@@ -544,9 +579,8 @@ def get_parser():
 
 @app.function(
     gpu="A100",
-    timeout=86_400, # maximum timeout is 24 hours; see https://modal.com/docs/guide/timeouts#timeouts
+    timeout=86_400, # maximum timeout is 24 hours or 86_400 seconds; see https://modal.com/docs/guide/timeouts#timeouts
     retries=3,
-    secrets=secrets,
     )
 def train(**kwargs):
     args = get_parser().parse_args([])  # get defaults
@@ -555,13 +589,15 @@ def train(**kwargs):
     SORD, MASK, POSITION, ROPE, DISCRETIZED_MASK, FOCAL, AUGMENT, HARD_MASK = args.sord, args.mask_loss, args.position_loss, args.rope, args.discretized_mask, args.focal, args.augment, args.hard_mask
 
     seed_all(args.seed) # must seed before initializing model + dataloader
-    train_loader, test_loader, data_info = get_dataloaders(args.data_dir, args.patch_size, args.disc_mask_h, args.disc_mask_w, args.batch_size, args.eval_batch_size, seed=args.seed)
+    import json
+    speakers = json.loads(args.speakers) if args.speakers else None
+    train_loader, test_loader, data_info = get_dataloaders(args.data_dir, args.patch_size, args.disc_mask_h, args.disc_mask_w, batch_size=args.batch_size, eval_batch_size=args.eval_batch_size, seed=args.seed, speakers=speakers, normalize=args.normalize)
     device = 'gpu' if torch.cuda.is_available() else 'cpu'
 
     model = SignalTransformer(args.d_model, args.pnt_num_heads, args.pnt_num_layers, args.seq_num_heads, args.seq_num_layers, args.patch_size, args.signal_is, data_info, args.alpha, args.beta, gamma=args.gamma, delta=args.delta, decoder=args.decoder, cross_attn_layers=args.cross_attn_layers)
     optimizer = torch.optim.Adam(model.parameters(), args.lr)
     config = {'n_params': count_parameters(model), **data_info, 'delta': args.delta, 'SORD': SORD, 'MASK': MASK, 'POSITION': POSITION, 'data_dir': args.data_dir, 'seed': args.seed, 'signal_is': args.signal_is, 'd_model': args.d_model, 'pnt_num_heads': args.pnt_num_heads, 'seq_num_heads': args.seq_num_heads, 'pnt_num_layers': args.pnt_num_layers, 'seq_num_layers': args.seq_num_layers, 'patch_size': args.patch_size, 'batch_size': args.batch_size, 'eval_batch_size': args.eval_batch_size, 'lr': args.lr, 'alpha': args.alpha, 'beta': args.beta, 'gamma': args.gamma, 'max_duration': args.max_duration, 'eval_interval': args.eval_interval, 'decoder': args.decoder, 'cross_attn_layers': args.cross_attn_layers}
-    logger = WandBLogger('good-vibrations', 'seg-mask', args.run_name, init_kwargs={'config': config, 'save_code': True})
+    logger = WandBLogger('good-vibrations', group='experiment-14', name=args.run_name, init_kwargs={'config': config, 'save_code': True})
     hf_ckpt_upload = HFChkptUploader("eturok-weizmann/good-vibrations", interval=args.eval_interval, monitor="x/rMSE", save_local=True)
     thresholds = [float(x) for x in args.mask_viz_thresholds.split(',')]
     mask_viz = MaskVisualizationCallback(n_samples=args.eval_batch_size, save_dir="visualizations", train_viz_interval=args.mask_viz_train_interval, thresholds=thresholds)

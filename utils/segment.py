@@ -19,7 +19,7 @@ image = (
 )
 
 
-PROMPT = "A black metal cube inside an open cardboard box from a bird's eye view."
+PROMPT = "A black metal cube sitting on the floor of an open cardboard box from a bird's eye view."
 
 
 @app.function(gpu="A10G", image=image, secrets=[modal.Secret.from_name("huggingface")])
