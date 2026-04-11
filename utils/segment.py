@@ -93,20 +93,18 @@ def segment_sample(sample_path=None, raw_image=None, left=0.15, right=0.67, up=0
 
     cropped_image = crop_image(raw_image, left=left, right=right, up=up, down=down)
 
+    h, w = np.array(cropped_image).shape[:2]
+    mask = np.zeros((h, w), dtype=bool)
+    vision = {"x_position": -1.0, "y_position": -1.0, "raw_image": raw_image, "cropped_image": cropped_image, "overlay_image": cropped_image}
+
+    if object == "empty":
+        print("Skipping segmentation for empty box.")
+        return mask, vision
+
     image_array = np.array(cropped_image.convert("RGB"), dtype=np.uint8)
-    with app.run():
-        mask, overlay = segment.remote(image_array, object, box_material, prompt)
-
+    with app.run(): mask, overlay = segment.remote(image_array, object, box_material, prompt)
     y_pos, x_pos = center_of_mass(mask)
-    overlay_image = plot_overlay_image(cropped_image, overlay, x_pos, y_pos)
-
-    vision = {
-        "x_position":    x_pos,
-        "y_position":    y_pos,
-        "raw_image":     raw_image,
-        "cropped_image": cropped_image,
-        "overlay_image": overlay_image,
-    }
+    vision |= {"x_position": x_pos, "y_position": y_pos, "overlay_image": plot_overlay_image(cropped_image, overlay, x_pos, y_pos)}
     return mask, vision
 
 

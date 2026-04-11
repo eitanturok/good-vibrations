@@ -62,18 +62,41 @@ def do_fft(shifts:torch.Tensor, fs:int, min_freq:int=50, max_freq:int=1000):
     fft, freqs = fft[:, mask, :], freqs[mask]
     return fft, freqs
 
-def sync_phases(fft, laser_idx=0, xy_idx=0, eps=1e-20):
-    fft_synced = fft.clone()                    # copy
-    ref = fft[laser_idx, :, xy_idx]             # shape (freq,)
-    phase = ref.conj() / (ref.abs()**2 + eps)   # unit complex + divide by magnitude
-    fft_synced *= phase[None, :, None]          # broadcast over lasers and xy
-    assert torch.allclose(torch.ones(1, device=fft.device), fft_synced[laser_idx, :, xy_idx].real) # check we have magnitude 1
-    return fft_synced                           # (L,F,2)
+# phase_sync
+# for each frequency, rotates all lasers (both x and y) by the same angle so that laser_idx's x-channel has phase=0, i.e. imaginary part is zero and real part is positive
+# This removes the absolute phase offset caused by speaker position (propagation delay), making signals comparable across speakers
+# This preserves the relative phase differences between all lasers and between x and y channels
+def phase_sync(fft, laser_idx=0, xy_idx=0, eps=1e-20):
+    ref = fft[laser_idx, :, xy_idx]              # (F,) — x-channel of reference laser
+    phase = ref.conj() / (ref.abs() + eps)      # (F,) — unit-phase rotators from x-channel
+    fft_synced = fft * phase[None, :, None]     # (L, F, 2) — same rotation applied to x and y
+    assert all(abs(v.item()) < 1e-5 for v in fft_synced[laser_idx, :, xy_idx].imag), "phase sync failed: reference laser x-channel is not real after rotation"
+    return fft_synced                           # (L, F, 2)
 
-def normalize_magnitude(fft):
-    # normalizing the magnitude of the fourier transform
-    fft /= fft.abs().std(dim=1, keepdim=True)
-    return fft
+# Global std normalization
+# divides by a single scalar (std of all magnitudes), so freq magnitudes are distributed with unit std
+# preserves spatial ratios between lasers (loud vs quiet lasers remain proportional)
+def global_magnitude(fft, eps=1e-20): return fft / (fft.abs().std() + eps)
+
+# Per-laser std normalization
+# divides each laser by its own magnitude std (over frequencies), so freq magnitudes are distributed with unit std
+# removes spatial ratios between lasers (a loud laser and a quiet laser look the same after)
+def local_magnitude(fft, eps=1e-20): return fft / (fft.abs().std(dim=1, keepdim=True) + eps)
+
+# Both phase sync and global magnitude normalization
+def global_magnitude_and_phase_sync(fft, eps=1e-20): return global_magnitude(phase_sync(fft, eps=eps), eps=eps)
+
+# Both phase sync and per-laser magnitude normalization
+# removes absolute phase offsets and equalizes per-laser response strength, but destroys spatial amplitude ratios between lasers
+def local_magnitude_and_phase_sync(fft, eps=1e-20): return local_magnitude(phase_sync(fft, eps=eps), eps=eps)
+
+# # Strategy 3: Median-laser normalization — computes median per-laser mean magnitude as a robust
+# # single scalar, preserving spatial ratios while being robust to outlier lasers.
+# # fft: (L,F,2) complex
+# def normalize_median(fft, eps=1e-20):
+#     per_laser_mean = fft.abs().mean(dim=1)   # (L, 2)
+#     s = per_laser_mean.median()              # scalar
+#     return fft / (s + eps)
 
 def hermit_poly(t):
     tt = t[None, :] ** torch.arange(4, device=t.device)[:, None]
@@ -136,7 +159,7 @@ class VibrationDataset(Dataset):
 
 def make_collate(patch_size:int, augment:bool=False, generator:torch.Generator|None=None, normalize:str|None=None):
 
-    normalize_fn = {'magnitude': normalize_magnitude, 'phase_sync': sync_phases}.get(normalize, None)
+    normalize_fn = {'global-magnitude': global_magnitude, 'local-magnitude': local_magnitude, 'phase-sync': phase_sync, 'global-magnitude-phase-sync': global_magnitude_and_phase_sync, 'local-magnitude-phase-sync': local_magnitude_and_phase_sync}.get(normalize, None)
 
     def collate(batch):
 
@@ -534,11 +557,11 @@ def get_parser():
     parser.add_argument('--focal', type=int, default=0)
     parser.add_argument('--augment', type=int, default=1)
     parser.add_argument('--hard-mask', type=int, default=0)
+    parser.add_argument('--normalize', type=str, default=None, choices=['global-magnitude', 'local-magnitude', 'phase-sync', 'global-magnitude-phase-sync', 'local-magnitude-phase-sync'])
 
     # data
     parser.add_argument('--data-dir', type=str, default='eturok-weizmann/vibrations')
     parser.add_argument('--signal-is', type=str, default='magnitude')
-    parser.add_argument('--normalize', type=str, default=None, choices=['magnitude', 'phase_sync'])
     parser.add_argument('--speakers', type=str, default=None, help='JSON list of speakers to include, e.g. \'[[0,1,0,0],[1,0,0,0]]\'')
 
     parser.add_argument('--patch-size', type=int, default=256)
@@ -597,7 +620,7 @@ def train(**kwargs):
     model = SignalTransformer(args.d_model, args.pnt_num_heads, args.pnt_num_layers, args.seq_num_heads, args.seq_num_layers, args.patch_size, args.signal_is, data_info, args.alpha, args.beta, gamma=args.gamma, delta=args.delta, decoder=args.decoder, cross_attn_layers=args.cross_attn_layers)
     optimizer = torch.optim.Adam(model.parameters(), args.lr)
     config = {'n_params': count_parameters(model), **data_info, 'delta': args.delta, 'SORD': SORD, 'MASK': MASK, 'POSITION': POSITION, 'data_dir': args.data_dir, 'seed': args.seed, 'signal_is': args.signal_is, 'd_model': args.d_model, 'pnt_num_heads': args.pnt_num_heads, 'seq_num_heads': args.seq_num_heads, 'pnt_num_layers': args.pnt_num_layers, 'seq_num_layers': args.seq_num_layers, 'patch_size': args.patch_size, 'batch_size': args.batch_size, 'eval_batch_size': args.eval_batch_size, 'lr': args.lr, 'alpha': args.alpha, 'beta': args.beta, 'gamma': args.gamma, 'max_duration': args.max_duration, 'eval_interval': args.eval_interval, 'decoder': args.decoder, 'cross_attn_layers': args.cross_attn_layers}
-    logger = WandBLogger('good-vibrations', group='experiment-14', name=args.run_name, init_kwargs={'config': config, 'save_code': True})
+    logger = WandBLogger('good-vibrations', group='normalization', name=args.run_name, init_kwargs={'config': config, 'save_code': True})
     hf_ckpt_upload = HFChkptUploader("eturok-weizmann/good-vibrations", interval=args.eval_interval, monitor="x/rMSE", save_local=True)
     thresholds = [float(x) for x in args.mask_viz_thresholds.split(',')]
     mask_viz = MaskVisualizationCallback(n_samples=args.eval_batch_size, save_dir="visualizations", train_viz_interval=args.mask_viz_train_interval, thresholds=thresholds)
