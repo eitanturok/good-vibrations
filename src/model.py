@@ -1,8 +1,5 @@
 import argparse, math
-import os
 import modal
-
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 import torch
 import numpy as np
