@@ -165,7 +165,7 @@ class VibrationDataset(Dataset):
         H, W = mask.shape[-2], mask.shape[-1]
         floor_x, floor_y = round_to_floor(row["x_position"], W / self.floor_cols), round_to_floor(row["y_position"], H / self.floor_rows)
 
-        return {'shifts': shifts, 'mask': mask.astype('float32'), 'floor_x': floor_x, 'floor_y': floor_y, 'fps': row["fps"]}
+        return {'shifts': shifts, 'mask': mask.float(), 'floor_x': floor_x, 'floor_y': floor_y, 'fps': row["fps"]}
 
 def make_collate(patch_size:int, augment:bool=False, generator:torch.Generator|None=None, normalize:str|None=None):
 
