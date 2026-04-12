@@ -139,24 +139,33 @@ class VibrationDataset(Dataset):
             if not isinstance(speakers[0], list): speakers = [speakers]
             self.ds = self.ds.filter(lambda row: row["speakers"] in speakers)
         print(f"Loaded dataset with {len(self.ds)} samples after filtering for speakers={speakers}")
+
+        # load samples into RAM for fast access during training
         sample_patterns = [f"data/sample_{idx}.npz" for idx in self.ds["sample_idx"]]
         self.snapshot_dir = snapshot_download(repo_id, repo_type="dataset", allow_patterns=sample_patterns, token=token)
+        def load_npz(sample_idx):
+            d = np.load(os.path.join(self.snapshot_dir, f"data/sample_{sample_idx}.npz"))
+            return torch.from_numpy(d['shifts'].copy()), torch.from_numpy(d['mask'].copy())
+        _shift, _mask = load_npz(self.ds['sample_idx'][0])
+        self.shifts, self.masks = torch.empty(len(self.ds), *_shift.shape), torch.empty(len(self.ds), *_mask.shape)
+        for i, idx in enumerate(self.ds["sample_idx"]): self.shifts[i], self.masks[i] = load_npz(idx)
+
         self.patch_size, self.disc_mask_h, self.disc_mask_w = patch_size, disc_mask_h, disc_mask_w
         self.floor_cols, self.floor_rows = floor_cols, floor_rows
         self.discretize_fn = F.adaptive_max_pool2d if HARD_MASK else F.adaptive_avg_pool2d
+
     def __repr__(self): return f"VibrationDataset(split={self.ds.split}, n={len(self.ds)})"
     def __len__(self): return len(self.ds)
     def __getitem__(self, idx):
         row = self.ds[idx]
-        data = np.load(os.path.join(self.snapshot_dir, f"data/sample_{row['sample_idx']}.npz"))
-        shifts, mask = torch.from_numpy(data['shifts']), torch.from_numpy(data['mask'].astype(np.float32))                  # (n_lasers, n_timesteps, 2), (H, W)
+        shifts, mask = self.data[row['sample_idx']]                                                                          # (n_lasers, n_timesteps, 2), (H, W)
         if DISCRETIZED_MASK: mask = self.discretize_fn(mask[None, None], (self.disc_mask_h, self.disc_mask_w)).squeeze()    # (H, W) -> (disc_mask_h, disc_mask_w)
 
         def round_to_floor(x, n): return min(int(x / n), n - 1)
         H, W = mask.shape[-2], mask.shape[-1]
         floor_x, floor_y = round_to_floor(row["x_position"], W / self.floor_cols), round_to_floor(row["y_position"], H / self.floor_rows)
 
-        return {'shifts': shifts, 'mask': mask, 'floor_x': floor_x, 'floor_y': floor_y, 'fps': row["fps"]}
+        return {'shifts': shifts, 'mask': mask.astype('float32'), 'floor_x': floor_x, 'floor_y': floor_y, 'fps': row["fps"]}
 
 def make_collate(patch_size:int, augment:bool=False, generator:torch.Generator|None=None, normalize:str|None=None):
 
