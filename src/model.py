@@ -158,7 +158,7 @@ class VibrationDataset(Dataset):
     def __len__(self): return len(self.ds)
     def __getitem__(self, idx):
         row = self.ds[idx]
-        shifts, mask = self.data[row['sample_idx']]                                                                          # (n_lasers, n_timesteps, 2), (H, W)
+        shifts, mask = self.shifts[idx], self.masks[idx]                                                                          # (n_lasers, n_timesteps, 2), (H, W)
         if DISCRETIZED_MASK: mask = self.discretize_fn(mask[None, None], (self.disc_mask_h, self.disc_mask_w)).squeeze()    # (H, W) -> (disc_mask_h, disc_mask_w)
 
         def round_to_floor(x, n): return min(int(x / n), n - 1)
