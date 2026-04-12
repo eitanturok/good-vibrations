@@ -194,8 +194,8 @@ def get_dataloaders(repo_id:str, patch_size:int=256, disc_mask_h:int=40, disc_ma
     generator = torch.Generator().manual_seed(seed)
     train_set, test_set = random_split(dataset, [len(dataset) - test_size, test_size], generator=generator)
     train_collate_fn, test_collate_fn = make_collate(patch_size, augment=AUGMENT, generator=generator, normalize=normalize), make_collate(patch_size, augment=False, normalize=normalize)
-    train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers, generator=generator, pin_memory=True, collate_fn=train_collate_fn)
-    test_loader  = DataLoader(test_set,  batch_size=eval_batch_size, shuffle=False, num_workers=num_workers, generator=generator, pin_memory=True, collate_fn=test_collate_fn)
+    train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers, generator=generator, pin_memory=False, collate_fn=train_collate_fn)
+    test_loader  = DataLoader(test_set,  batch_size=eval_batch_size, shuffle=False, num_workers=num_workers, generator=generator, pin_memory=False, collate_fn=test_collate_fn)
     fft_patches = test_collate_fn([dataset[0]])[0][0]   # (n_lasers, n_patches, 2, patch_size)
     orig_mask = torch.from_numpy(np.load(os.path.join(dataset.snapshot_dir, "data/sample_0.npz"))['mask'])  # (orig_h, orig_w)
     data_info = {'floor_cols': floor_cols, 'floor_rows': floor_rows,
