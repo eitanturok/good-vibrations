@@ -140,7 +140,8 @@ class VibrationDataset(Dataset):
             if not isinstance(speakers[0], list): speakers = [speakers]
             self.ds = self.ds.filter(lambda row: row["speakers"] in speakers)
         print(f"Loaded dataset with {len(self.ds)} samples after filtering for speakers={speakers}")
-        self.snapshot_dir = snapshot_download(repo_id, repo_type="dataset", allow_patterns="data/sample_*.npz", token=token)
+        sample_patterns = [f"data/sample_{idx}.npz" for idx in self.ds["sample_idx"]]
+        self.snapshot_dir = snapshot_download(repo_id, repo_type="dataset", allow_patterns=sample_patterns, token=token)
         self.patch_size, self.disc_mask_h, self.disc_mask_w = patch_size, disc_mask_h, disc_mask_w
         self.floor_cols, self.floor_rows = floor_cols, floor_rows
         self.discretize_fn = F.adaptive_max_pool2d if HARD_MASK else F.adaptive_avg_pool2d
