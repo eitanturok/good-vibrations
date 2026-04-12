@@ -1,5 +1,8 @@
 import argparse, math
+import os
 import modal
+
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 import torch
 import numpy as np
@@ -7,7 +10,6 @@ from torch import nn
 from torch.nn import functional as F
 from torch.utils.data import Dataset, DataLoader, random_split
 from datasets import load_dataset
-import os
 from huggingface_hub import snapshot_download
 from scipy.signal import butter, sosfiltfilt
 from composer import Trainer
