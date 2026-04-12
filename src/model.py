@@ -135,10 +135,11 @@ class VibrationDataset(Dataset):
     """
 
     def __init__(self, repo_id:str, split:str="train", disc_mask_h:int=40, disc_mask_w:int=20, patch_size:int=256, floor_cols:int=11, floor_rows:int=12, token:str|None=None, speakers:list|None=None):
-        self.ds = load_dataset(repo_id, split=split, token=token, columns=["sample_idx", "x_position", "y_position", "object", "fps", "speakers"])
+        self.ds = load_dataset(repo_id, split=split, token=token, columns=["sample_idx", "x_position", "y_position", "object", "fps", "speakers"], verification_mode="no_checks")
         if speakers is not None:
             if not isinstance(speakers[0], list): speakers = [speakers]
             self.ds = self.ds.filter(lambda row: row["speakers"] in speakers)
+        print(f"Loaded dataset with {len(self.ds)} samples after filtering for speakers={speakers}")
         self.snapshot_dir = snapshot_download(repo_id, repo_type="dataset", allow_patterns="data/sample_*.npz", token=token)
         self.patch_size, self.disc_mask_h, self.disc_mask_w = patch_size, disc_mask_h, disc_mask_w
         self.floor_cols, self.floor_rows = floor_cols, floor_rows
