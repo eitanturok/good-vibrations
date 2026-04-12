@@ -628,6 +628,14 @@ def train(**kwargs):
     mask_viz = MaskVisualizationCallback(n_samples=args.eval_batch_size, save_dir="visualizations", train_viz_interval=args.mask_viz_train_interval, thresholds=thresholds)
     ic(config)
 
+    print(f"CUDA available: {torch.cuda.is_available()}")
+    print(f"CUDA device count: {torch.cuda.device_count()}")
+    if torch.cuda.is_available():
+        print(f"CUDA device name: {torch.cuda.get_device_name(0)}")
+        print(f"CUDA memory total: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
+        print(f"CUDA memory allocated: {torch.cuda.memory_allocated(0) / 1e9:.2f} GB")
+        print(f"CUDA memory reserved: {torch.cuda.memory_reserved(0) / 1e9:.2f} GB")
+
     trainer = Trainer(
         model=model, train_dataloader=train_loader, eval_dataloader=test_loader,
         max_duration=args.max_duration, eval_interval=args.eval_interval,
