@@ -150,8 +150,15 @@ class VibrationDataset(Dataset):
             d = np.load(os.path.join(self.snapshot_dir, f"data/sample_{sample_idx}.npz"))
             return torch.from_numpy(d['shifts'].copy()), torch.from_numpy(d['mask'].copy())
         _shift, _mask = load_npz(self.ds['sample_idx'][0])
+        print(f"Sample shape: shifts={_shift.shape} ({_shift.dtype}), mask={_mask.shape} ({_mask.dtype})")
+        shifts_bytes = len(self.ds) * _shift.numel() * _shift.element_size()
+        masks_bytes = len(self.ds) * _mask.numel() * _mask.element_size()
+        print(f"Dataset RAM estimate: shifts={shifts_bytes/1e9:.2f} GB, masks={masks_bytes/1e9:.2f} GB, total={( shifts_bytes+masks_bytes)/1e9:.2f} GB")
         self.shifts, self.masks = torch.empty(len(self.ds), *_shift.shape), torch.empty(len(self.ds), *_mask.shape)
         for i, idx in enumerate(self.ds["sample_idx"]): self.shifts[i], self.masks[i] = load_npz(idx)
+        import psutil
+        ram = psutil.virtual_memory()
+        print(f"RAM after loading dataset: used={ram.used/1e9:.1f} GB, available={ram.available/1e9:.1f} GB, total={ram.total/1e9:.1f} GB")
 
         self.patch_size, self.disc_mask_h, self.disc_mask_w = patch_size, disc_mask_h, disc_mask_w
         self.floor_cols, self.floor_rows = floor_cols, floor_rows
@@ -656,6 +663,14 @@ def train(**kwargs):
         print(f"CUDA memory total: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
         print(f"CUDA memory allocated: {torch.cuda.memory_allocated(0) / 1e9:.2f} GB")
         print(f"CUDA memory reserved: {torch.cuda.memory_reserved(0) / 1e9:.2f} GB")
+    import psutil
+    ram = psutil.virtual_memory()
+    print(f"RAM before training: used={ram.used/1e9:.1f} GB, available={ram.available/1e9:.1f} GB, total={ram.total/1e9:.1f} GB")
+    # Estimate batch memory: (batch_size, n_lasers, n_patches, 2, patch_size) fp16
+    n_lasers = data_info['num_lasers']
+    n_patches = data_info['n_patches']
+    batch_bytes = args.batch_size * n_lasers * n_patches * 2 * args.patch_size * 2  # fp16=2 bytes
+    print(f"Estimated batch GPU memory: {batch_bytes/1e9:.2f} GB (batch_size={args.batch_size}, n_lasers={n_lasers}, n_patches={n_patches}, patch_size={args.patch_size})")
 
     trainer = Trainer(
         model=model, train_dataloader=train_loader, eval_dataloader=test_loader,
