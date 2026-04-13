@@ -608,7 +608,7 @@ def get_parser():
 
     # evaluation
     parser.add_argument('--eval-batch-size', type=int, default=16)
-    parser.add_argument('--max-duration', type=str, default='1_000ep')
+    parser.add_argument('--max-duration', type=str, default='10_000ep')
     parser.add_argument('--eval-interval', type=str, default='10ep')
 
     # logging
