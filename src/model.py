@@ -447,7 +447,7 @@ class SignalTransformer(ComposerModel):
         else:
             self.laser_pos_embd = LearnablePositionalEncoding(laser_rows * laser_cols, d_model)
 
-        self.loss_fn = {'ce': F.cross_entropy, 'focal': focal_loss_fn, 'mse': F.mse_loss, 'dice': dice_loss_fn}[LOSS]
+        # self.loss_fn = {'ce': F.cross_entropy, 'focal': focal_loss_fn, 'mse': F.mse_loss, 'dice': dice_loss_fn}[LOSS]
 
         # Prediction heads
         self.mlp_head_floor_x = nn.Sequential(nn.Linear(d_model, 32), nn.ReLU(), nn.Linear(32, self.floor_cols))
