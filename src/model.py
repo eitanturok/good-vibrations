@@ -133,12 +133,15 @@ class VibrationDataset(Dataset):
     Each __getitem__ reads only the pages for that tensor off disk — the OS never loads the full file into RAM.
     """
 
-    def __init__(self, repo_id:str, split:str="train", disc_mask_h:int=40, disc_mask_w:int=20, patch_size:int=256, floor_cols:int=11, floor_rows:int=12, token:str|None=None, speakers:list|None=None):
+    def __init__(self, repo_id:str, split:str="train", disc_mask_h:int=40, disc_mask_w:int=20, patch_size:int=256, floor_cols:int=11, floor_rows:int=12, token:str|None=None, speakers:list|None=None, num_objects:int|None=None):
         self.ds = load_dataset(repo_id, split=split, token=token, columns=["sample_idx", "x_position", "y_position", "object", "fps", "speakers"], verification_mode="no_checks")
         if speakers is not None:
             if not isinstance(speakers[0], list): speakers = [speakers]
             self.ds = self.ds.filter(lambda row: row["speakers"] in speakers)
-        print(f"Loaded dataset with {len(self.ds)} samples after filtering for speakers={speakers}")
+        if num_objects is not None:
+            objects = sorted(set(self.ds["object"]))[:num_objects]
+            self.ds = self.ds.filter(lambda row: row["object"] in objects)
+        print(f"Loaded dataset with {len(self.ds)} samples after filtering for speakers={speakers}, num_objects={num_objects}")
 
         # load samples into RAM for fast access during training
         sample_patterns = [f"data/sample_{idx}.npz" for idx in self.ds["sample_idx"]]
@@ -195,8 +198,8 @@ def make_collate(patch_size:int, augment:bool=False, generator:torch.Generator|N
         return torch.stack(fft_patches), mask, floor_x, floor_y
     return collate
 
-def get_dataloaders(repo_id:str, patch_size:int=256, disc_mask_h:int=40, disc_mask_w:int=20, floor_cols:int=11, floor_rows:int=12, batch_size:int=8, eval_batch_size:int=16, shuffle:bool=True, num_workers:int=0, seed:int=42, token:str | None = None, test_split=0.2, speakers:list|None=None, normalize:str|None=None):
-    dataset = VibrationDataset(repo_id, patch_size=patch_size, disc_mask_h=disc_mask_h, disc_mask_w=disc_mask_w, floor_cols=floor_cols, floor_rows=floor_rows, token=token, speakers=speakers)
+def get_dataloaders(repo_id:str, patch_size:int=256, disc_mask_h:int=40, disc_mask_w:int=20, floor_cols:int=11, floor_rows:int=12, batch_size:int=8, eval_batch_size:int=16, shuffle:bool=True, num_workers:int=0, seed:int=42, token:str | None = None, test_split=0.2, speakers:list|None=None, normalize:str|None=None, num_objects:int|None=None):
+    dataset = VibrationDataset(repo_id, patch_size=patch_size, disc_mask_h=disc_mask_h, disc_mask_w=disc_mask_w, floor_cols=floor_cols, floor_rows=floor_rows, token=token, speakers=speakers, num_objects=num_objects)
     test_size = int(len(dataset) * test_split)
     print(f'{len(dataset)-test_size} train samples\n{test_size} test samples')
     generator = torch.Generator().manual_seed(seed)
@@ -444,6 +447,8 @@ class SignalTransformer(ComposerModel):
         else:
             self.laser_pos_embd = LearnablePositionalEncoding(laser_rows * laser_cols, d_model)
 
+        self.loss_fn = {'ce': F.cross_entropy, 'focal': focal_loss_fn, 'mse': F.mse_loss, 'dice': dice_loss_fn}[LOSS]
+
         # Prediction heads
         self.mlp_head_floor_x = nn.Sequential(nn.Linear(d_model, 32), nn.ReLU(), nn.Linear(32, self.floor_cols))
         self.mlp_head_floor_y = nn.Sequential(nn.Linear(d_model, 32), nn.ReLU(), nn.Linear(32, self.floor_rows))
@@ -481,6 +486,13 @@ class SignalTransformer(ComposerModel):
         y_logits = self.mlp_head_floor_y(cls_embedding)
         mask_logits = self.decoder(cls_embedding, laser_feats)
         return x_logits, y_logits, cls_embedding, mask_logits
+
+    def loss(self, outputs, batch):
+        _, mask_true, floor_x_true, floor_y_true = batch
+        x_logits, y_logits, _, mask_logits = outputs
+        loss = self.loss_fn(mask_logits, mask_true)
+        self.logger.log_metrics({k: v.item() for k, v in loss_log.items()})
+        return loss
 
     def loss(self, outputs, batch):
         _, mask_true, floor_x_true, floor_y_true = batch
@@ -573,6 +585,7 @@ def get_parser():
     parser.add_argument('--data-dir', type=str, default='eturok-weizmann/vibrations')
     parser.add_argument('--signal-is', type=str, default='magnitude')
     parser.add_argument('--speakers', type=str, default=None, help='JSON list of speakers to include, e.g. \'[[0,1,0,0],[1,0,0,0]]\'')
+    parser.add_argument('--num-objects', type=int, default=None, help='Number of objects to include (takes first N sorted unique objects)')
 
     parser.add_argument('--patch-size', type=int, default=256)
     parser.add_argument('--disc-mask-h', type=int, default=40)
@@ -624,13 +637,13 @@ def train(**kwargs):
     seed_all(args.seed) # must seed before initializing model + dataloader
     import json
     speakers = json.loads(args.speakers) if args.speakers else None
-    train_loader, test_loader, data_info = get_dataloaders(args.data_dir, args.patch_size, args.disc_mask_h, args.disc_mask_w, batch_size=args.batch_size, eval_batch_size=args.eval_batch_size, seed=args.seed, speakers=speakers, normalize=args.normalize)
+    train_loader, test_loader, data_info = get_dataloaders(args.data_dir, args.patch_size, args.disc_mask_h, args.disc_mask_w, batch_size=args.batch_size, eval_batch_size=args.eval_batch_size, seed=args.seed, speakers=speakers, normalize=args.normalize, num_objects=args.num_objects)
     device = 'gpu' if torch.cuda.is_available() else 'cpu'
 
     model = SignalTransformer(args.d_model, args.pnt_num_heads, args.pnt_num_layers, args.seq_num_heads, args.seq_num_layers, args.patch_size, args.signal_is, data_info, args.alpha, args.beta, gamma=args.gamma, delta=args.delta, decoder=args.decoder, cross_attn_layers=args.cross_attn_layers)
     optimizer = torch.optim.Adam(model.parameters(), args.lr)
     config = {'n_params': count_parameters(model), **data_info, 'delta': args.delta, 'SORD': SORD, 'MASK': MASK, 'POSITION': POSITION, 'data_dir': args.data_dir, 'seed': args.seed, 'signal_is': args.signal_is, 'd_model': args.d_model, 'pnt_num_heads': args.pnt_num_heads, 'seq_num_heads': args.seq_num_heads, 'pnt_num_layers': args.pnt_num_layers, 'seq_num_layers': args.seq_num_layers, 'patch_size': args.patch_size, 'batch_size': args.batch_size, 'eval_batch_size': args.eval_batch_size, 'lr': args.lr, 'alpha': args.alpha, 'beta': args.beta, 'gamma': args.gamma, 'max_duration': args.max_duration, 'eval_interval': args.eval_interval, 'decoder': args.decoder, 'cross_attn_layers': args.cross_attn_layers}
-    logger = WandBLogger('good-vibrations', group='normalization', name=args.run_name, init_kwargs={'config': config, 'save_code': True})
+    logger = WandBLogger('good-vibrations', group='losses', name=args.run_name, init_kwargs={'config': config, 'save_code': True})
     hf_ckpt_upload = HFChkptUploader("eturok-weizmann/good-vibrations", interval=args.eval_interval, monitor="x/rMSE", save_local=True)
     thresholds = [float(x) for x in args.mask_viz_thresholds.split(',')]
     mask_viz = MaskVisualizationCallback(n_samples=args.eval_batch_size, save_dir="visualizations", train_viz_interval=args.mask_viz_train_interval, thresholds=thresholds)
