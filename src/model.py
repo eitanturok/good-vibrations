@@ -208,9 +208,9 @@ def get_dataloaders(repo_id:str, patch_size:int=256, disc_mask_h:int=40, disc_ma
     train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers, generator=generator, pin_memory=True, collate_fn=train_collate_fn)
     test_loader  = DataLoader(test_set,  batch_size=eval_batch_size, shuffle=False, num_workers=num_workers, generator=generator, pin_memory=True, collate_fn=test_collate_fn)
     fft_patches = test_collate_fn([dataset[0]])[0][0]   # (n_lasers, n_patches, 2, patch_size)
-    orig_mask = torch.from_numpy(np.load(os.path.join(dataset.snapshot_dir, "data/sample_0.npz"))['mask'])  # (orig_h, orig_w)
+    mask = train_loader.dataset.masks[0]                # (orig_h, orig_w)
     data_info = {'floor_cols': floor_cols, 'floor_rows': floor_rows,
-                 'mask_h': orig_mask.shape[0], 'mask_w': orig_mask.shape[1], 'disc_mask_h': disc_mask_h, 'disc_mask_w': disc_mask_w,
+                 'mask_h': mask.shape[0], 'mask_w': mask.shape[1], 'disc_mask_h': disc_mask_h, 'disc_mask_w': disc_mask_w,
                  'num_lasers': fft_patches.shape[0], 'n_freqs': fft_patches.shape[1] * patch_size, 'n_patches': fft_patches.shape[1]}
     return train_loader, test_loader, data_info
 
