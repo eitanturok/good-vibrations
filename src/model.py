@@ -133,15 +133,14 @@ class VibrationDataset(Dataset):
     Each __getitem__ reads only the pages for that tensor off disk — the OS never loads the full file into RAM.
     """
 
-    def __init__(self, repo_id:str, split:str="train", disc_mask_h:int=40, disc_mask_w:int=20, patch_size:int=256, floor_cols:int=11, floor_rows:int=12, token:str|None=None, speakers:list|None=None, num_objects:int|None=None):
-        self.ds = load_dataset(repo_id, split=split, token=token, columns=["sample_idx", "x_position", "y_position", "object", "fps", "speakers"], verification_mode="no_checks")
+    def __init__(self, repo_id:str, split:str="train", disc_mask_h:int=40, disc_mask_w:int=20, patch_size:int=256, floor_cols:int=11, floor_rows:int=12, token:str|None=None, speakers:list|None=None, n_objects:list|None=None):
+        self.ds = load_dataset(repo_id, split=split, token=token, columns=["sample_idx", "x_position", "y_position", "object", "fps", "speakers", "n_objects"], verification_mode="no_checks")
         if speakers is not None:
             if not isinstance(speakers[0], list): speakers = [speakers]
             self.ds = self.ds.filter(lambda row: row["speakers"] in speakers)
-        if num_objects is not None:
-            objects = sorted(set(self.ds["object"]))[:num_objects]
-            self.ds = self.ds.filter(lambda row: row["object"] in objects)
-        print(f"Loaded dataset with {len(self.ds)} samples after filtering for speakers={speakers}, num_objects={num_objects}")
+        if n_objects is not None:
+            self.ds = self.ds.filter(lambda row: row["n_objects"] in n_objects)
+        print(f"Loaded dataset with {len(self.ds)} samples after filtering for speakers={speakers}, n_objects={n_objects}")
 
         # load samples into RAM for fast access during training
         sample_patterns = [f"data/sample_{idx}.npz" for idx in self.ds["sample_idx"]]
@@ -205,8 +204,8 @@ def make_collate(patch_size:int, augment:bool=False, generator:torch.Generator|N
         return torch.stack(fft_patches), mask, floor_x, floor_y
     return collate
 
-def get_dataloaders(repo_id:str, patch_size:int=256, disc_mask_h:int=40, disc_mask_w:int=20, floor_cols:int=11, floor_rows:int=12, batch_size:int=8, eval_batch_size:int=16, shuffle:bool=True, num_workers:int=0, seed:int=42, token:str | None = None, test_split=0.2, speakers:list|None=None, normalize:str|None=None, num_objects:int|None=None):
-    dataset = VibrationDataset(repo_id, patch_size=patch_size, disc_mask_h=disc_mask_h, disc_mask_w=disc_mask_w, floor_cols=floor_cols, floor_rows=floor_rows, token=token, speakers=speakers, num_objects=num_objects)
+def get_dataloaders(repo_id:str, patch_size:int=256, disc_mask_h:int=40, disc_mask_w:int=20, floor_cols:int=11, floor_rows:int=12, batch_size:int=8, eval_batch_size:int=16, shuffle:bool=True, num_workers:int=0, seed:int=42, token:str | None = None, test_split=0.2, speakers:list|None=None, normalize:str|None=None, n_objects:list|None=None):
+    dataset = VibrationDataset(repo_id, patch_size=patch_size, disc_mask_h=disc_mask_h, disc_mask_w=disc_mask_w, floor_cols=floor_cols, floor_rows=floor_rows, token=token, speakers=speakers, n_objects=n_objects)
     test_size = int(len(dataset) * test_split)
     print(f'{len(dataset)-test_size} train samples\n{test_size} test samples')
     generator = torch.Generator().manual_seed(seed)
@@ -592,7 +591,7 @@ def get_parser():
     parser.add_argument('--data-dir', type=str, default='eturok-weizmann/vibrations')
     parser.add_argument('--signal-is', type=str, default='magnitude')
     parser.add_argument('--speakers', type=str, default=None, help='JSON list of speakers to include, e.g. \'[[0,1,0,0],[1,0,0,0]]\'')
-    parser.add_argument('--num-objects', type=int, default=None, help='Number of objects to include (takes first N sorted unique objects)')
+    parser.add_argument('--n-objects', type=int, nargs='+', default=[1], help='List of n_objects values to include, e.g. --n-objects 1 2')
 
     parser.add_argument('--patch-size', type=int, default=256)
     parser.add_argument('--disc-mask-h', type=int, default=40)
@@ -644,7 +643,8 @@ def train(**kwargs):
     seed_all(args.seed) # must seed before initializing model + dataloader
     import json
     speakers = json.loads(args.speakers) if args.speakers else None
-    train_loader, test_loader, data_info = get_dataloaders(args.data_dir, args.patch_size, args.disc_mask_h, args.disc_mask_w, batch_size=args.batch_size, eval_batch_size=args.eval_batch_size, seed=args.seed, speakers=speakers, normalize=args.normalize, num_objects=args.num_objects)
+    n_objects = args.n_objects
+    train_loader, test_loader, data_info = get_dataloaders(args.data_dir, args.patch_size, args.disc_mask_h, args.disc_mask_w, batch_size=args.batch_size, eval_batch_size=args.eval_batch_size, seed=args.seed, speakers=speakers, normalize=args.normalize, n_objects=n_objects)
     device = 'gpu' if torch.cuda.is_available() else 'cpu'
 
     model = SignalTransformer(args.d_model, args.pnt_num_heads, args.pnt_num_layers, args.seq_num_heads, args.seq_num_layers, args.patch_size, args.signal_is, data_info, args.alpha, args.beta, gamma=args.gamma, delta=args.delta, decoder=args.decoder, cross_attn_layers=args.cross_attn_layers)
