@@ -655,13 +655,11 @@ def train(**kwargs):
     config = {'n_params': count_parameters(model), **data_info, 'delta': args.delta, 'SORD': SORD, 'MASK': MASK, 'POSITION': POSITION, 'data_dir': args.data_dir, 'seed': args.seed, 'signal_is': args.signal_is, 'd_model': args.d_model, 'pnt_num_heads': args.pnt_num_heads, 'seq_num_heads': args.seq_num_heads, 'pnt_num_layers': args.pnt_num_layers, 'seq_num_layers': args.seq_num_layers, 'patch_size': args.patch_size, 'batch_size': args.batch_size, 'eval_batch_size': args.eval_batch_size, 'lr': args.lr, 'alpha': args.alpha, 'beta': args.beta, 'gamma': args.gamma, 'max_duration': args.max_duration, 'eval_interval': args.eval_interval, 'decoder': args.decoder, 'cross_attn_layers': args.cross_attn_layers}
     logger = WandBLogger('good-vibrations', group='losses', name=args.run_name, init_kwargs={'config': config, 'save_code': True})
     from composer.callbacks import CheckpointSaver
-    from datetime import datetime
-    run_id = f"{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}_{args.run_name}"
     HF_REPO = "eturok-weizmann/vibrations"
 
     # Full training-state checkpoints every epoch — resumable on any GPU
     resume_saver = CheckpointSaver(
-        folder=f'hf://{HF_REPO}/checkpoints/{run_id}',
+        folder=f'hf://{args.data_dir}/checkpoints/{args.run_name}',
         save_interval=args.checkpoint_interval,
         num_checkpoints_to_keep=1,
         overwrite=True,
@@ -671,7 +669,7 @@ def train(**kwargs):
     best_saver = BestMetricCheckpointSaver(
         metric_name=args.best_metric,
         higher_is_better=args.best_metric_higher_is_better,
-        folder=f'hf://{HF_REPO}/checkpoints/{run_id}/best',
+        folder=f'hf://{{args.data_dir}}/checkpoints/{args.run_name}/best',
         save_interval=args.eval_interval,
         num_checkpoints_to_keep=1,
         overwrite=True,
@@ -681,6 +679,7 @@ def train(**kwargs):
     ic(config)
 
     trainer = Trainer(
+        run_name=run_id,
         model=model, train_dataloader=train_loader, eval_dataloader=test_loader,
         max_duration=args.max_duration, eval_interval=args.eval_interval,
         optimizers=optimizer, device=device, seed=args.seed,
