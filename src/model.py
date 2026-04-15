@@ -669,7 +669,7 @@ def train(**kwargs):
     best_saver = BestMetricCheckpointSaver(
         metric_name=args.best_metric,
         higher_is_better=args.best_metric_higher_is_better,
-        folder=f'hf://{{args.data_dir}}/checkpoints/{args.run_name}/best',
+        folder=f'hf://{args.data_dir}/checkpoints/{args.run_name}/best',
         save_interval=args.eval_interval,
         num_checkpoints_to_keep=1,
         overwrite=True,
@@ -679,7 +679,7 @@ def train(**kwargs):
     ic(config)
 
     trainer = Trainer(
-        run_name=run_id,
+        run_name=args.run_name,
         model=model, train_dataloader=train_loader, eval_dataloader=test_loader,
         max_duration=args.max_duration, eval_interval=args.eval_interval,
         optimizers=optimizer, device=device, seed=args.seed,
