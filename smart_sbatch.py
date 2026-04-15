@@ -22,7 +22,7 @@ GPUS = [
 
 
 def sh(cmd):
-    return subprocess.run(cmd, shell=True, text=True, capture_output=True).stdout
+    return subprocess.run(cmd, shell=True, encoding='utf-8', stdout=subprocess.PIPE, stderr=subprocess.PIPE).stdout
 
 
 def job_counts():
@@ -115,7 +115,7 @@ def main():
         print(f"[dry-run] script saved to {script_path}, not submitted")
         return
 
-    result = subprocess.run(["sbatch", str(script_path)], capture_output=True, text=True)
+    result = subprocess.run(["sbatch", str(script_path)], encoding='utf-8', stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     print(result.stdout or result.stderr)
     print(f"Logs: tail -f {log_dir}/out.log {log_dir}/err.log")
 
