@@ -24,38 +24,27 @@ def load_from_hf(run_name: str | None = None, repo_id: str = "eturok-weizmann/go
     model.load_state_dict(torch.load(path, map_location="cpu", weights_only=True))
     return model.eval()
 
-def _hf_upload(api, repo, folder, dir_in_repo, msg):
-  t0 = time.time()
-  try:
-    api.upload_folder(folder_path=folder, repo_id=repo, path_in_repo=dir_in_repo, commit_message=msg)
-    print(f"HFSyncCallback: uploaded {folder} → {repo}/{dir_in_repo} in {time.time()-t0:.1f}s")
-  except Exception as e:
-    print(f"HFSyncCallback ERROR: {e}")
-
-
 class HFSyncCallback(Callback):
-  """Uploads to HuggingFace whenever Composer saves a checkpoint locally.
-  Waits for the previous upload to finish before allowing Composer to delete the old checkpoint.
+  """Blocking upload to HuggingFace after each local checkpoint save.
   Control frequency via Trainer(save_interval='Nep', ...)."""
   def __init__(self, local_folder: str, repo: str, dir_in_repo: str = "checkpoints"):
     self.local_folder, self.repo, self.dir_in_repo = local_folder, repo, dir_in_repo
     self.api = HfApi()
     self.api.create_repo(repo, exist_ok=True)
     self._t0 = None
-    self._upload_future = None
 
   def epoch_end(self, state, logger): self._t0 = time.time()
 
   def epoch_checkpoint(self, state, logger):
-    # Block until the previous upload finishes before Composer can delete the old checkpoint
-    if self._upload_future is not None:
-      print("HFSyncCallback: waiting for previous upload to finish before saving new checkpoint...")
-      self._upload_future.result()
-
     if self._t0: print(f"HFSyncCallback: local save took {time.time()-self._t0:.1f}s")
     msg = f"epoch {state.timestamp.epoch.value}"
     print(f"HFSyncCallback: uploading to HF at {msg}")
-    self._upload_future = self.api.run_as_future(_hf_upload, self.api, self.repo, self.local_folder, self.dir_in_repo, msg)
+    t0 = time.time()
+    try:
+      commit = self.api.upload_folder(folder_path=self.local_folder, repo_id=self.repo, path_in_repo=self.dir_in_repo, commit_message=msg)
+      print(f"HFSyncCallback: upload done in {time.time()-t0:.1f}s → {commit.commit_url}")
+    except Exception as e:
+      print(f"HFSyncCallback ERROR: {e}")
 
 
 class MaskVisualizationCallback(Callback):

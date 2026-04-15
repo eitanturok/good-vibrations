@@ -668,9 +668,7 @@ def train(**kwargs):
     )
 
     trainer.fit()
-    ic(trainer.state.train_metrics, type(trainer.state.train_metrics))
-    ic(trainer.state.eval_metrics)
-
+    ic(trainer.state.train_metrics, trainer.state.eval_metrics)
     trainer.close()
 
 @app.local_entrypoint()
