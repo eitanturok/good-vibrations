@@ -1,4 +1,5 @@
 import os, time
+from pathlib import Path
 from typing import Any, Callable, Optional, Union
 
 import torch
@@ -26,6 +27,72 @@ def load_from_hf(run_name: str | None = None, repo_id: str = "eturok-weizmann/go
     model = SignalTransformer(**model_kwargs)
     model.load_state_dict(torch.load(path, map_location="cpu", weights_only=True))
     return model.eval()
+
+def fetch_wandb_history(run_id: str, keys: list[str] | None = None,
+                        entity: str = "eturok", project: str = "good-vibrations") -> list[dict]:
+    """Return logged history rows for a run, sorted by step.
+
+    Args:
+        run_id: W&B run ID (e.g. 's3pqt79j') or run name.
+        keys: Which keys to fetch. None fetches all keys (slower).
+        entity: W&B entity. Check the WandBLogger call in model.py for the current value.
+        project: W&B project. Check the WandBLogger call in model.py for the current value.
+
+    Returns:
+        List of dicts sorted by '_step', one per logged step.
+
+    Example:
+        rows = fetch_wandb_history('s3pqt79j', keys=['_step', 'loss/train/total', 'metrics/eval/mask/iou'])
+        for r in rows:
+            print(r['_step'], r.get('loss/train/total'), r.get('metrics/eval/mask/iou'))
+    """
+    api = wandb.Api()
+    run = api.run(f"{entity}/{project}/{run_id}")
+    rows = list(run.scan_history(keys=keys))
+    rows.sort(key=lambda r: r.get('_step', 0))
+    return rows
+
+
+def fetch_wandb_images(run_id: str, split: str = "eval", epoch: int | None = None,
+                       key: str = "prob", download_dir: str = ".",
+                       entity: str = "eturok", project: str = "good-vibrations") -> list[Path]:
+    """Download mask_viz images from a W&B run and return their local paths.
+
+    Images are logged under mask_viz/{split}/{key} (e.g. mask_viz/eval/prob).
+    Each image is a side-by-side comparison: True Mask (gray) | Pred Mask (hot colormap).
+
+    Args:
+        run_id: W&B run ID or name.
+        split: 'eval' or 'train'.
+        epoch: Which epoch to fetch (1-indexed). None fetches the latest.
+        key: Image sub-key — 'prob' for the continuous prediction, or 'thresh{t}' for a binarized version.
+        download_dir: Local directory to save images into.
+        entity: W&B entity. Check the WandBLogger call in model.py for the current value.
+        project: W&B project. Check the WandBLogger call in model.py for the current value.
+
+    Returns:
+        List of local Paths to the downloaded PNG files.
+
+    Example:
+        paths = fetch_wandb_images('s3pqt79j', split='eval', epoch=10)
+        # Read them with PIL or pass to Claude's Read tool to view visually.
+    """
+    api = wandb.Api()
+    run = api.run(f"{entity}/{project}/{run_id}")
+    wandb_key = f"mask_viz/{split}/{key}"
+    rows = [r for r in run.scan_history(keys=['_step', wandb_key]) if wandb_key in r]
+    rows.sort(key=lambda r: r['_step'])
+    if not rows:
+        raise ValueError(f"No images found for key '{wandb_key}' in run {run_id}")
+    row = rows[(epoch - 1) if epoch is not None else -1]
+    img_data = row[wandb_key]
+    filenames = img_data['filenames'] if isinstance(img_data, dict) else [img_data['path']]
+    paths = []
+    for fname in filenames:
+        run.file(fname).download(root=download_dir, replace=True)
+        paths.append(Path(download_dir) / fname)
+    return paths
+
 
 class BestMetricCheckpointSaver(CheckpointSaver):
     """Saves weights-only checkpoints only when a metric hits a new best.

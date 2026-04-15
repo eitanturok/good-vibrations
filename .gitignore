@@ -4,6 +4,7 @@ wandb/*
 checkpoints/
 data/processed/
 visualizations/
+media/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
