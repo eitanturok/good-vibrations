@@ -33,18 +33,31 @@ class HFSyncCallback(Callback):
     self.api.create_repo(repo, exist_ok=True)
     self._t0 = None
 
-  def epoch_end(self, state, logger): self._t0 = time.time()
+  def epoch_end(self, state, logger):
+    self._t0 = time.time()
+    print(f"HFSyncCallback [epoch_end]: epoch {state.timestamp.epoch.value} ended, waiting for checkpoint...")
 
   def epoch_checkpoint(self, state, logger):
-    if self._t0: print(f"HFSyncCallback: local save took {time.time()-self._t0:.1f}s")
-    msg = f"epoch {state.timestamp.epoch.value}"
-    print(f"HFSyncCallback: uploading to HF at {msg}")
+    epoch = state.timestamp.epoch.value
+    print(f"HFSyncCallback [epoch_checkpoint]: fired for epoch {epoch}")
+    if self._t0: print(f"HFSyncCallback [epoch_checkpoint]: local save took {time.time()-self._t0:.1f}s")
+
+    # Check what's actually on disk before uploading
+    if os.path.exists(self.local_folder):
+      files = [(f, os.path.getsize(os.path.join(self.local_folder, f))) for f in os.listdir(self.local_folder)]
+      print(f"HFSyncCallback [epoch_checkpoint]: local folder '{self.local_folder}' contains: {files}")
+    else:
+      print(f"HFSyncCallback [epoch_checkpoint]: WARNING local folder '{self.local_folder}' does not exist!")
+
+    print(f"HFSyncCallback [epoch_checkpoint]: uploading to {self.repo}/{self.dir_in_repo}")
     t0 = time.time()
     try:
-      commit = self.api.upload_folder(folder_path=self.local_folder, repo_id=self.repo, path_in_repo=self.dir_in_repo, commit_message=msg)
-      print(f"HFSyncCallback: upload done in {time.time()-t0:.1f}s → {commit.commit_url}")
+      commit = self.api.upload_folder(folder_path=self.local_folder, repo_id=self.repo, path_in_repo=self.dir_in_repo, commit_message=f"epoch {epoch}")
+      print(f"HFSyncCallback [epoch_checkpoint]: upload done in {time.time()-t0:.1f}s → {commit.commit_url}")
     except Exception as e:
-      print(f"HFSyncCallback ERROR: {e}")
+      import traceback
+      print(f"HFSyncCallback [epoch_checkpoint]: ERROR: {e}")
+      traceback.print_exc()
 
 
 class MaskVisualizationCallback(Callback):
