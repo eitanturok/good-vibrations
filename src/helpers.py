@@ -1,4 +1,4 @@
-import tempfile, os, shutil
+import os, time
 from typing import Any
 
 import torch
@@ -7,7 +7,6 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from composer import Callback
-from composer.core import Time
 from huggingface_hub import HfApi
 
 def getenv(key:str, default:Any=0): return type(default)(os.getenv(key, default))
@@ -25,56 +24,29 @@ def load_from_hf(run_name: str | None = None, repo_id: str = "eturok-weizmann/go
     model.load_state_dict(torch.load(path, map_location="cpu", weights_only=True))
     return model.eval()
 
-class HFChkptUploader(Callback):
-  def __init__(self, repo: str, interval: str = "1ep", monitor: str | None = None, path_in_repo: str | None = None, save_local: bool = False):
-    self.repo, self.interval, self.monitor, self.api = repo, Time.from_timestring(interval), monitor, HfApi()
-    self.last_save, self.best, self.higher_is_better = None, None, None
-    self._path_in_repo = path_in_repo  # None = auto-derive from wandb.run.name
-    self.save_local = save_local
-    self.api.create_repo(repo, exist_ok=True)  # create once at init
+def _hf_path(path_in_repo): return path_in_repo if path_in_repo else (wandb.run.name if wandb.run else None)
 
-  def _get_path_in_repo(self) -> str | None:
-    if self._path_in_repo is not None: return self._path_in_repo
-    return wandb.run.name if wandb.run else None
+def _hf_upload(api, repo, folder, path_in_repo, msg):
+  t0 = time.time()
+  try:
+    api.upload_folder(folder_path=folder, repo_id=repo, path_in_repo=path_in_repo, commit_message=msg)
+    print(f"HFSyncCallback: uploaded {folder} → {repo}/{path_in_repo} in {time.time()-t0:.1f}s")
+  except Exception as e:
+    print(f"HFSyncCallback ERROR: {e}")
 
-  def _is_better(self, v) -> bool:
-    is_nan = self.best != self.best
-    if self.best is None or is_nan: return True
-    return v > self.best if self.higher_is_better else v < self.best
 
-  def _push(self, model, msg):
-    path_in_repo = self._get_path_in_repo()
-    folder = f"checkpoints/{path_in_repo}" if self.save_local else tempfile.mkdtemp()
-    os.makedirs(folder, exist_ok=True)
-    try:
-      torch.save(model.state_dict(), f"{folder}/model.pt")
-      self.api.upload_folder(folder_path=folder, repo_id=self.repo, path_in_repo=path_in_repo, commit_message=msg)
-      print(f"HFChkptUploader: uploaded to {self.repo}/{path_in_repo}")
-    except Exception as e:
-      print(f"HFChkptUploader ERROR: {e}")
-    finally:
-      if not self.save_local: shutil.rmtree(folder, ignore_errors=True)
+class HFSyncCallback(Callback):
+  """Uploads to HuggingFace whenever Composer saves a checkpoint locally.
+  Control frequency via Trainer(save_interval='Nep', ...)."""
+  def __init__(self, local_folder: str, repo: str, path_in_repo: str | None = None):
+    self.local_folder, self.repo, self._path_in_repo = local_folder, repo, path_in_repo
+    self.api = HfApi()
+    self.api.create_repo(repo, exist_ok=True)
 
-  def _time_for(self, ts) -> int:
-    return ts.get(self.interval.unit).value
-
-  def epoch_end(self, state, logger):
-    ts = state.timestamp
-    if self.last_save is not None and self._time_for(ts) - self.last_save < self.interval.value: return
-    if not self.monitor: return self._save(state, ts, None)
-    metric = state.eval_metrics.get('eval', {}).get(self.monitor)
-    if metric is None: return
-    if self.higher_is_better is None: self.higher_is_better = getattr(metric, 'higher_is_better', False)
-    v = metric.compute().item() if hasattr(metric, 'compute') else metric
-    if not self._is_better(v): return
-    self.best = v
-    self._save(state, ts, v)
-
-  def _save(self, state, ts, v):
-    self.last_save = self._time_for(ts)
-    msg = f"epoch {ts.epoch.value}" + (f" | {self.monitor}={v:.4f}" if v else "")
-    print(f"HFChkptUploader: saving checkpoint at {msg}")
-    self.api.run_as_future(self._push, state.model, msg)
+  def epoch_checkpoint(self, state, logger):
+    msg = f"epoch {state.timestamp.epoch.value}"
+    print(f"HFSyncCallback: syncing checkpoint at {msg}")
+    self.api.run_as_future(_hf_upload, self.api, self.repo, self.local_folder, _hf_path(self._path_in_repo), msg)
 
 
 class MaskVisualizationCallback(Callback):
