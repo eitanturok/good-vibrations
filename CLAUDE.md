@@ -61,7 +61,7 @@ jupyter notebook src/
 **Cluster:** `mcluster11.wisdom.weizmann.ac.il`, code at `mark_sheinin_lab/code/eitan/good-vibrations/`
 
 ```bash
-ssh ethantu@mcluster11.wisdom.weizmann.ac.il "cd mark_sheinin_lab/code/eitan/good-vibrations && git pull && python smart_sbatch.py --job-name my-job --loss focal --gamma 10 --speakers '[1,0,0,0]'"
+ssh ethantu@mcluster11.wisdom.weizmann.ac.il "cd mark_sheinin_lab/code/eitan/good-vibrations && git pull && python3 smart_sbatch.py --job-name my-job --loss focal --gamma 10 --speakers '[1,0,0,0]'"
 ```
 
 To tail logs after submitting, SSH in again and run:
