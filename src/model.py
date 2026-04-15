@@ -20,7 +20,7 @@ from composer.utils.reproducibility import seed_all
 from icecream import install
 install()
 
-from helpers import HFSyncCallback, MaskVisualizationCallback
+from helpers import BestMetricCheckpointSaver, MaskVisualizationCallback
 
 # **** Modal ****
 
@@ -621,6 +621,8 @@ def get_parser():
     parser.add_argument('--mask-viz-train-interval', type=int, default=10)
     parser.add_argument('--mask-viz-thresholds', type=str, default='0.3,0.5,0.7,0.9')
     parser.add_argument('--run-name', type=str, default=None)
+    parser.add_argument('--best-metric', type=str, default='x/MulticlassAccuracy', help='Eval metric key to gate best-checkpoint saving on')
+    parser.add_argument('--best-metric-higher-is-better', action='store_true', default=False, help='Set if larger metric values are better (e.g. accuracy)')
 
     # loss
     parser.add_argument('--alpha', type=float, default=0.9)
@@ -651,9 +653,29 @@ def train(**kwargs):
     optimizer = torch.optim.Adam(model.parameters(), args.lr)
     config = {'n_params': count_parameters(model), **data_info, 'delta': args.delta, 'SORD': SORD, 'MASK': MASK, 'POSITION': POSITION, 'data_dir': args.data_dir, 'seed': args.seed, 'signal_is': args.signal_is, 'd_model': args.d_model, 'pnt_num_heads': args.pnt_num_heads, 'seq_num_heads': args.seq_num_heads, 'pnt_num_layers': args.pnt_num_layers, 'seq_num_layers': args.seq_num_layers, 'patch_size': args.patch_size, 'batch_size': args.batch_size, 'eval_batch_size': args.eval_batch_size, 'lr': args.lr, 'alpha': args.alpha, 'beta': args.beta, 'gamma': args.gamma, 'max_duration': args.max_duration, 'eval_interval': args.eval_interval, 'decoder': args.decoder, 'cross_attn_layers': args.cross_attn_layers}
     logger = WandBLogger('good-vibrations', group='losses', name=args.run_name, init_kwargs={'config': config, 'save_code': True})
+    from composer.callbacks import CheckpointSaver
     from datetime import datetime
-    ckpt_folder = f"checkpoints/{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}_{args.run_name}"
-    hf_sync = HFSyncCallback(local_folder=ckpt_folder, repo="eturok-weizmann/vibrations", dir_in_repo=ckpt_folder)
+    run_id = f"{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}_{args.run_name}"
+    HF_REPO = "eturok-weizmann/vibrations"
+
+    # Full training-state checkpoints every epoch — resumable on any GPU
+    resume_saver = CheckpointSaver(
+        folder=f'hf://{HF_REPO}/checkpoints/{run_id}',
+        save_interval='1ep',
+        num_checkpoints_to_keep=1,
+        overwrite=True,
+    )
+
+    # Weights-only checkpoint saved only when eval metric improves
+    best_saver = BestMetricCheckpointSaver(
+        metric_name=args.best_metric,
+        higher_is_better=args.best_metric_higher_is_better,
+        folder=f'hf://{HF_REPO}/best/{run_id}',
+        save_interval=args.eval_interval,
+        num_checkpoints_to_keep=1,
+        overwrite=True,
+    )
+
     thresholds = [float(x) for x in args.mask_viz_thresholds.split(',')]
     mask_viz = MaskVisualizationCallback(n_samples=args.eval_batch_size, save_dir="visualizations", train_viz_interval=args.mask_viz_train_interval, thresholds=thresholds)
     ic(config)
@@ -663,8 +685,7 @@ def train(**kwargs):
         max_duration=args.max_duration, eval_interval=args.eval_interval,
         optimizers=optimizer, device=device, seed=args.seed,
         loggers=logger, log_to_console=True, auto_log_hparams=True, save_metrics=True,
-        callbacks=[mask_viz, hf_sync],
-        save_folder=ckpt_folder, save_interval='1ep', save_overwrite=True, save_num_checkpoints_to_keep=1,
+        callbacks=[mask_viz, resume_saver, best_saver],
     )
 
     trainer.fit()

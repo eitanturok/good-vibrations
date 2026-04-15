@@ -1,5 +1,5 @@
 import os, time
-from typing import Any
+from typing import Any, Callable, Optional, Union
 
 import torch
 import wandb
@@ -7,6 +7,9 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from composer import Callback
+from composer.callbacks import CheckpointSaver
+from composer.core import Event, State
+from composer.loggers import Logger
 from huggingface_hub import HfApi
 
 def getenv(key:str, default:Any=0): return type(default)(os.getenv(key, default))
@@ -24,34 +27,44 @@ def load_from_hf(run_name: str | None = None, repo_id: str = "eturok-weizmann/go
     model.load_state_dict(torch.load(path, map_location="cpu", weights_only=True))
     return model.eval()
 
-class HFSyncCallback(Callback):
-  """Blocking upload to HuggingFace after each local checkpoint save.
-  Control frequency via Trainer(save_interval='Nep', ...)."""
-  def __init__(self, local_folder: str, repo: str, dir_in_repo: str = "checkpoints"):
-    self.local_folder, self.repo, self.dir_in_repo = local_folder, repo, dir_in_repo
-    self.api = HfApi()
-    self.api.create_repo(repo, exist_ok=True)
-    self._t0 = None
+class BestMetricCheckpointSaver(CheckpointSaver):
+    """Saves weights-only checkpoints only when a metric hits a new best.
 
-  def _upload(self, epoch):
-    if not os.path.exists(self.local_folder) or not os.listdir(self.local_folder):
-      print(f"HFSyncCallback: skipping upload for epoch {epoch} — local folder empty or missing")
-      return
-    print(f"HFSyncCallback: uploading epoch {epoch} checkpoint to {self.repo}/{self.dir_in_repo}")
-    t0 = time.time()
-    try:
-      commit = self.api.upload_folder(folder_path=self.local_folder, repo_id=self.repo, path_in_repo=self.dir_in_repo, commit_message=f"epoch {epoch}")
-      print(f"HFSyncCallback: upload done in {time.time()-t0:.1f}s → {commit.commit_url}")
-    except Exception as e:
-      print(f"HFSyncCallback ERROR: {e}")
+    Wraps Composer's CheckpointSaver (with weights_only=True) and gates
+    each save on whether the target eval metric has improved since the
+    last save.
 
-  # Composer writes checkpoint files *after* epoch_checkpoint fires, so we see them one epoch later.
-  # epoch_checkpoint uploads the previous epoch's files; fit_end catches the final epoch.
-  def epoch_checkpoint(self, state, logger):
-    self._upload(state.timestamp.epoch.value - 1)
+    Args:
+        metric_name: Key into state.eval_metrics['eval'], e.g. 'x/MulticlassAccuracy'.
+        higher_is_better: True if larger metric values are better (e.g. accuracy).
+                          False for losses/errors. Default: False.
+        **kwargs: Forwarded to CheckpointSaver (folder, save_interval, etc.).
+                  weights_only is always set to True.
+    """
 
-  def fit_end(self, state, logger):
-    self._upload(state.timestamp.epoch.value)
+    def __init__(self, metric_name: str, higher_is_better: bool = False, **kwargs):
+        kwargs['weights_only'] = True
+        super().__init__(**kwargs)
+        self.metric_name = metric_name
+        self.higher_is_better = higher_is_better
+        self.best: Optional[float] = None
+
+    def _get_metric_value(self, state: State) -> Optional[float]:
+        m = state.eval_metrics.get('eval', {}).get(self.metric_name)
+        if m is None:
+            return None
+        return m.compute().item() if hasattr(m, 'compute') else float(m)
+
+    def _is_improved(self, val: float) -> bool:
+        if self.best is None or (val != val):  # first eval or NaN best
+            return True
+        return val > self.best if self.higher_is_better else val < self.best
+
+    def epoch_checkpoint(self, state: State, logger: Logger):
+        val = self._get_metric_value(state)
+        if val is not None and self._is_improved(val):
+            self.best = val
+            super().epoch_checkpoint(state, logger)
 
 
 class MaskVisualizationCallback(Callback):
@@ -100,38 +113,3 @@ class MaskVisualizationCallback(Callback):
         wandb.log(log, step=state.timestamp.batch.value)
 
 
-# from composer.callbacks import CheckpointSaver
-
-# class BestCheckpointSaver(CheckpointSaver):
-#     """Saves checkpoints only when a specified metric improves. Optionally uploads to HuggingFace."""
-
-#     def __init__(self, metric_name:str, hf_repo:str|None=None, **kwargs):
-#         super().__init__(overwrite=True, **kwargs)
-#         self.metric_name = metric_name
-#         self.best = None
-#         self.hf_repo = hf_repo
-#         if hf_repo:
-#             self.hf_api = HfApi()
-#             self.hf_api.create_repo(hf_repo, exist_ok=True)
-
-#     def _save_checkpoint(self, state, logger):
-#         metric = state.eval_metrics.get('eval', {}).get(self.metric_name)
-#         if metric is None: return
-#         higher_is_better = getattr(metric, 'higher_is_better', False)
-#         val = metric.compute().item() if hasattr(metric, 'compute') else float(metric)
-#         is_nan = self.best != self.best
-#         ic(val, self.best, is_nan)
-#         if self.best is None or is_nan or (val > self.best if higher_is_better else val < self.best):
-#             self.best = val
-#             super()._save_checkpoint(state, logger)
-#             if self.hf_repo:
-#                 self._upload_to_hf(state, val)
-
-#     def _upload_to_hf(self, state, val):
-#         folder = os.path.join(self.folder, state.run_name) if '{run_name}' in self.folder else self.folder
-#         msg = f"epoch {state.timestamp.epoch.value} | {self.metric_name}={val:.4f}"
-#         path_in_repo = wandb.run.name if wandb.run else None
-#         print(f"BestCheckpointSaver: uploading to {self.hf_repo}/{path_in_repo}")
-#         self.hf_api.run_as_future(self.hf_api.upload_folder, folder_path=folder, repo_id=self.hf_repo, path_in_repo=path_in_repo, commit_message=msg)
-
-#     best_ckpt_saver = BestCheckpointSaver(metric_name="x/rMSE", hf_repo="eturok-weizmann/good-vibrations", folder="checkpoints", num_checkpoints_to_keep=1, save_interval=args.eval_interval)
