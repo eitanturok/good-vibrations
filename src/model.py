@@ -623,6 +623,7 @@ def get_parser():
     parser.add_argument('--run-name', type=str, default=None)
     parser.add_argument('--best-metric', type=str, default='x/MulticlassAccuracy', help='Eval metric key to gate best-checkpoint saving on')
     parser.add_argument('--best-metric-higher-is-better', action='store_true', default=False, help='Set if larger metric values are better (e.g. accuracy)')
+    parser.add_argument('--checkpoint-interval', type=str, default='100ep', help='Interval for saving checkpoints to HF; see https://modal.com/docs/guide/checkpoints#checkpoint-intervals for supported formats')
 
     # loss
     parser.add_argument('--alpha', type=float, default=0.9)
@@ -661,7 +662,7 @@ def train(**kwargs):
     # Full training-state checkpoints every epoch — resumable on any GPU
     resume_saver = CheckpointSaver(
         folder=f'hf://{HF_REPO}/checkpoints/{run_id}',
-        save_interval='1ep',
+        save_interval=args.checkpoint_interval,
         num_checkpoints_to_keep=1,
         overwrite=True,
     )
@@ -676,8 +677,7 @@ def train(**kwargs):
         overwrite=True,
     )
 
-    thresholds = [float(x) for x in args.mask_viz_thresholds.split(',')]
-    mask_viz = MaskVisualizationCallback(n_samples=args.eval_batch_size, save_dir="visualizations", train_viz_interval=args.mask_viz_train_interval, thresholds=thresholds)
+    mask_viz = MaskVisualizationCallback(n_samples=args.eval_batch_size, save_dir="visualizations", train_viz_interval=args.mask_viz_train_interval)
     ic(config)
 
     trainer = Trainer(

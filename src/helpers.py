@@ -68,7 +68,7 @@ class BestMetricCheckpointSaver(CheckpointSaver):
 
 
 class MaskVisualizationCallback(Callback):
-    def __init__(self, n_samples=4, save_dir="visualizations", train_viz_interval=10, thresholds=(0.3, 0.5, 0.7, 0.9)):
+    def __init__(self, n_samples=4, save_dir="visualizations", train_viz_interval=10, thresholds=[]):
         self.n_samples, self.save_dir, self.train_viz_interval, self.thresholds = n_samples, save_dir, train_viz_interval, list(thresholds)
         self._last_eval_batch = self._last_train_batch = None
 
