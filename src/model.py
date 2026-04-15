@@ -652,27 +652,11 @@ def train(**kwargs):
     config = {'n_params': count_parameters(model), **data_info, 'delta': args.delta, 'SORD': SORD, 'MASK': MASK, 'POSITION': POSITION, 'data_dir': args.data_dir, 'seed': args.seed, 'signal_is': args.signal_is, 'd_model': args.d_model, 'pnt_num_heads': args.pnt_num_heads, 'seq_num_heads': args.seq_num_heads, 'pnt_num_layers': args.pnt_num_layers, 'seq_num_layers': args.seq_num_layers, 'patch_size': args.patch_size, 'batch_size': args.batch_size, 'eval_batch_size': args.eval_batch_size, 'lr': args.lr, 'alpha': args.alpha, 'beta': args.beta, 'gamma': args.gamma, 'max_duration': args.max_duration, 'eval_interval': args.eval_interval, 'decoder': args.decoder, 'cross_attn_layers': args.cross_attn_layers}
     logger = WandBLogger('good-vibrations', group='losses', name=args.run_name, init_kwargs={'config': config, 'save_code': True})
     from datetime import datetime
-    ckpt_folder = f"checkpoints/{datetime.now().strftime('%Y%m%d_%H%M%S')}_{args.run_name}"
+    ckpt_folder = f"checkpoints/{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}_{args.run_name}"
     hf_sync = HFSyncCallback(local_folder=ckpt_folder, repo="eturok-weizmann/vibrations", dir_in_repo=ckpt_folder)
     thresholds = [float(x) for x in args.mask_viz_thresholds.split(',')]
     mask_viz = MaskVisualizationCallback(n_samples=args.eval_batch_size, save_dir="visualizations", train_viz_interval=args.mask_viz_train_interval, thresholds=thresholds)
     ic(config)
-
-    print(f"CUDA available: {torch.cuda.is_available()}")
-    print(f"CUDA device count: {torch.cuda.device_count()}")
-    if torch.cuda.is_available():
-        print(f"CUDA device name: {torch.cuda.get_device_name(0)}")
-        print(f"CUDA memory total: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
-        print(f"CUDA memory allocated: {torch.cuda.memory_allocated(0) / 1e9:.2f} GB")
-        print(f"CUDA memory reserved: {torch.cuda.memory_reserved(0) / 1e9:.2f} GB")
-    import psutil
-    ram = psutil.virtual_memory()
-    print(f"RAM before training: used={ram.used/1e9:.1f} GB, available={ram.available/1e9:.1f} GB, total={ram.total/1e9:.1f} GB")
-    # Estimate batch memory: (batch_size, n_lasers, n_patches, 2, patch_size) fp16
-    n_lasers = data_info['num_lasers']
-    n_patches = data_info['n_patches']
-    batch_bytes = args.batch_size * n_lasers * n_patches * 2 * args.patch_size * 2  # fp16=2 bytes
-    print(f"Estimated batch GPU memory: {batch_bytes/1e9:.2f} GB (batch_size={args.batch_size}, n_lasers={n_lasers}, n_patches={n_patches}, patch_size={args.patch_size})")
 
     trainer = Trainer(
         model=model, train_dataloader=train_loader, eval_dataloader=test_loader,
