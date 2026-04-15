@@ -243,31 +243,14 @@ def create_metrics(nx: int, ny: int):
         "mask/y/dice":      _tag(MeanMetric(), 'SoftDice', 'mask', 'y'),
     }
 
-# **** model ****
+# **** loss ****
 
-def precompute_freqs_cis(dim:int, end:int, theta:float=10000.0) -> torch.Tensor:
-    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[:(dim // 2)] / dim))
-    freqs = torch.arange(end).unsqueeze(dim=1) * freqs.unsqueeze(dim=0)
-    return torch.cat([freqs.cos(), freqs.sin()], dim=-1)
-
-def precompute_freqs_cis_2d(dim:int, h:int, w:int, theta:float = 10000.0) -> torch.Tensor:
-    freqs_h, freqs_w = precompute_freqs_cis(dim // 2, h, theta), precompute_freqs_cis(dim // 2, w, theta)
-    freqs_h, freqs_w = freqs_h.reshape(h, 1, -1).repeat(1, w, 1), freqs_w.reshape(1, w, -1).repeat(h, 1, 1)
-    return torch.cat([freqs_h, freqs_w], dim=-1).reshape(h * w, dim)
-
-def apply_rope(x:torch.Tensor, freqs_cis:torch.Tensor) -> torch.Tensor:
-    assert x.shape[-1] % 2 == 0
-    shp = [1]*(x.ndim-2) + [x.shape[1], -1] # works with 1D + 2D rope
-    cos, sin = freqs_cis.reshape(*shp).chunk(2, dim=-1)
-    x1, x2 = x.chunk(2, dim=-1)
-    return torch.cat([x1 * cos - x2 * sin, x2 * cos + x1 * sin], dim=-1)
-
-def sord_loss(predictions, targets, cost_matrix):
-    """SORD loss with soft labels based on ordinal distance."""
-    soft_labels = torch.exp(-cost_matrix[targets])
-    soft_labels = F.normalize(soft_labels, p=1, dim=1)
-    log_predictions = F.log_softmax(predictions, dim=-1)
-    return -(soft_labels * log_predictions).sum(dim=1).mean()
+# def sord_loss(predictions, targets, cost_matrix):
+#     """SORD loss with soft labels based on ordinal distance."""
+#     soft_labels = torch.exp(-cost_matrix[targets])
+#     soft_labels = F.normalize(soft_labels, p=1, dim=1)
+#     log_predictions = F.log_softmax(predictions, dim=-1)
+#     return -(soft_labels * log_predictions).sum(dim=1).mean()
 
 def soft_dice_fn(logits, targets, axis=None):
     """Computes Soft Dice for the full mask, or just along X or Y directions.
@@ -303,6 +286,8 @@ def focal_loss_fn(mask_logits, target, focal_gamma=2.0):
     p = mask_logits.sigmoid()
     pt = p * target + (1 - p) * (1 - target)  # prob of correct class per pixel
     return (((1 - pt) ** focal_gamma) * bce).mean()
+
+LOSSES = {'ce': F.cross_entropy, 'wce': weighted_cross_entropy_fn, 'focal': focal_loss_fn, 'mse': F.mse_loss, 'dice': soft_dice_fn}
 
 # **** Decoders ****
 
@@ -406,6 +391,25 @@ def build_decoder(decoder, d_model, out_h, out_w, cross_attn_layers=4):
     elif decoder == 'pool':     return PoolDecoder(d_model, out_h, out_w)
     else: raise ValueError(f"Unknown decoder: {decoder}")
 
+# **** model ****
+
+def precompute_freqs_cis(dim:int, end:int, theta:float=10000.0) -> torch.Tensor:
+    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[:(dim // 2)] / dim))
+    freqs = torch.arange(end).unsqueeze(dim=1) * freqs.unsqueeze(dim=0)
+    return torch.cat([freqs.cos(), freqs.sin()], dim=-1)
+
+def precompute_freqs_cis_2d(dim:int, h:int, w:int, theta:float = 10000.0) -> torch.Tensor:
+    freqs_h, freqs_w = precompute_freqs_cis(dim // 2, h, theta), precompute_freqs_cis(dim // 2, w, theta)
+    freqs_h, freqs_w = freqs_h.reshape(h, 1, -1).repeat(1, w, 1), freqs_w.reshape(1, w, -1).repeat(h, 1, 1)
+    return torch.cat([freqs_h, freqs_w], dim=-1).reshape(h * w, dim)
+
+def apply_rope(x:torch.Tensor, freqs_cis:torch.Tensor) -> torch.Tensor:
+    assert x.shape[-1] % 2 == 0
+    shp = [1]*(x.ndim-2) + [x.shape[1], -1] # works with 1D + 2D rope
+    cos, sin = freqs_cis.reshape(*shp).chunk(2, dim=-1)
+    x1, x2 = x.chunk(2, dim=-1)
+    return torch.cat([x1 * cos - x2 * sin, x2 * cos + x1 * sin], dim=-1)
+
 class LearnablePositionalEncoding(nn.Module):
     def __init__(self, dim, hidden_dim):
         super().__init__()
@@ -434,9 +438,8 @@ class PointTransformer(nn.Module):
         output = self.layers(x)                                                             # (B_L,P+1,D)
         return output[:, 0, :]                                                              # (B_L,D)
 
-
 class SignalTransformer(ComposerModel):
-    def __init__(self, d_model, pnt_num_heads, pnt_num_layers, seq_num_heads, seq_num_layers, patch_size, signal_is, data_info, alpha, beta, gamma=0.5, delta=0.5, decoder='mlp', cross_attn_layers=4):
+    def __init__(self, d_model, pnt_num_heads, pnt_num_layers, seq_num_heads, seq_num_layers, patch_size, signal_is, data_info, alpha, beta, loss, gamma=0.5, delta=0.5, decoder='mlp', cross_attn_layers=4):
         super().__init__()
         self.alpha, self.beta, self.gamma, self.delta = alpha, beta, gamma, delta
         self.floor_cols, self.floor_rows = data_info['floor_cols'], data_info['floor_rows']
@@ -453,7 +456,7 @@ class SignalTransformer(ComposerModel):
         else:
             self.laser_pos_embd = LearnablePositionalEncoding(laser_rows * laser_cols, d_model)
 
-        # self.loss_fn = {'ce': F.cross_entropy, 'focal': focal_loss_fn, 'mse': F.mse_loss, 'dice': dice_loss_fn}[LOSS]
+        self.loss_fn = LOSSES[loss]
 
         # Prediction heads
         self.mlp_head_floor_x = nn.Sequential(nn.Linear(d_model, 32), nn.ReLU(), nn.Linear(32, self.floor_cols))
@@ -496,47 +499,45 @@ class SignalTransformer(ComposerModel):
     def loss(self, outputs, batch):
         _, mask_true, floor_x_true, floor_y_true = batch
         x_logits, y_logits, _, mask_logits = outputs
-        loss = self.loss_fn(mask_logits, mask_true)
-        self.logger.log_metrics({k: v.item() for k, v in loss_log.items()})
-        return loss
+        return self.loss_fn(mask_logits, mask_true)
 
-    def loss(self, outputs, batch):
-        _, mask_true, floor_x_true, floor_y_true = batch
-        x_logits, y_logits, _, mask_logits = outputs
-        position_loss = mask_loss = torch.tensor(0.0)
-        loss_log = {}
+    # def loss(self, outputs, batch):
+    #     _, mask_true, floor_x_true, floor_y_true = batch
+    #     x_logits, y_logits, _, mask_logits = outputs
+    #     position_loss = mask_loss = torch.tensor(0.0)
+    #     loss_log = {}
 
-        if POSITION and self.gamma != 1:
-            ce_loss_x = F.cross_entropy(x_logits, floor_x_true)
-            ce_loss_y = F.cross_entropy(y_logits, floor_y_true)
-            if not SORD:
-                position_loss = self.beta * ce_loss_x + (1 - self.beta) * ce_loss_y
-                loss_log.update({'loss/train/position/x/ce': ce_loss_x, 'loss/train/position/y/ce': ce_loss_y})
-            else:
-                sord_loss_x = sord_loss(x_logits, floor_x_true, self.cost_matrix_x)
-                sord_loss_y = sord_loss(y_logits, floor_y_true, self.cost_matrix_y)
-                ce_sord_loss_x = self.alpha * sord_loss_x + (1 - self.alpha) * ce_loss_x
-                ce_sord_loss_y = self.alpha * sord_loss_y + (1 - self.alpha) * ce_loss_y
-                position_loss = self.beta * ce_sord_loss_x + (1 - self.beta) * ce_sord_loss_y
-                loss_log.update({'loss/train/position/x/ce': ce_loss_x, 'loss/train/position/y/ce': ce_loss_y,
-                                 'loss/train/position/x/sord': sord_loss_x, 'loss/train/position/y/sord': sord_loss_y,
-                                 'loss/train/position/x/ce_sord': ce_sord_loss_x, 'loss/train/position/y/ce_sord': ce_sord_loss_y})
-            loss_log['loss/train/position/total'] = position_loss
+    #     if POSITION and self.gamma != 1:
+    #         ce_loss_x = F.cross_entropy(x_logits, floor_x_true)
+    #         ce_loss_y = F.cross_entropy(y_logits, floor_y_true)
+    #         if not SORD:
+    #             position_loss = self.beta * ce_loss_x + (1 - self.beta) * ce_loss_y
+    #             loss_log.update({'loss/train/position/x/ce': ce_loss_x, 'loss/train/position/y/ce': ce_loss_y})
+    #         else:
+    #             sord_loss_x = sord_loss(x_logits, floor_x_true, self.cost_matrix_x)
+    #             sord_loss_y = sord_loss(y_logits, floor_y_true, self.cost_matrix_y)
+    #             ce_sord_loss_x = self.alpha * sord_loss_x + (1 - self.alpha) * ce_loss_x
+    #             ce_sord_loss_y = self.alpha * sord_loss_y + (1 - self.alpha) * ce_loss_y
+    #             position_loss = self.beta * ce_sord_loss_x + (1 - self.beta) * ce_sord_loss_y
+    #             loss_log.update({'loss/train/position/x/ce': ce_loss_x, 'loss/train/position/y/ce': ce_loss_y,
+    #                              'loss/train/position/x/sord': sord_loss_x, 'loss/train/position/y/sord': sord_loss_y,
+    #                              'loss/train/position/x/ce_sord': ce_sord_loss_x, 'loss/train/position/y/ce_sord': ce_sord_loss_y})
+    #         loss_log['loss/train/position/total'] = position_loss
 
-        if MASK and self.gamma != 0:
-            mask_dice_loss = soft_dice_fn(mask_logits, mask_true)
-            mask_ce_loss = focal_loss_fn(mask_logits, mask_true) if FOCAL else weighted_cross_entropy_fn(mask_logits, mask_true)
-            mask_loss = self.delta * mask_dice_loss + (1 - self.delta) * mask_ce_loss
-            loss_log.update({'loss/train/mask/dice': mask_dice_loss, 'loss/train/mask/ce': mask_ce_loss, 'loss/train/mask/total': mask_loss})
+    #     if MASK and self.gamma != 0:
+    #         mask_dice_loss = soft_dice_fn(mask_logits, mask_true)
+    #         mask_ce_loss = focal_loss_fn(mask_logits, mask_true) if FOCAL else weighted_cross_entropy_fn(mask_logits, mask_true)
+    #         mask_loss = self.delta * mask_dice_loss + (1 - self.delta) * mask_ce_loss
+    #         loss_log.update({'loss/train/mask/dice': mask_dice_loss, 'loss/train/mask/ce': mask_ce_loss, 'loss/train/mask/total': mask_loss})
 
-        if POSITION and MASK:
-            total_loss = position_loss * (1 - self.gamma) + self.gamma * mask_loss
-        else:
-            total_loss = position_loss if POSITION else mask_loss
-        loss_log['loss/train/total'] = total_loss
+    #     if POSITION and MASK:
+    #         total_loss = position_loss * (1 - self.gamma) + self.gamma * mask_loss
+    #     else:
+    #         total_loss = position_loss if POSITION else mask_loss
+    #     loss_log['loss/train/total'] = total_loss
 
-        self.logger.log_metrics({k: v.item() for k, v in loss_log.items()})
-        return total_loss
+    #     self.logger.log_metrics({k: v.item() for k, v in loss_log.items()})
+    #     return total_loss
 
     def get_metrics(self, is_train=False):
         return self.train_metrics if is_train else self.val_metrics
@@ -586,6 +587,7 @@ def get_parser():
     parser.add_argument('--augment', type=int, default=1)
     parser.add_argument('--hard-mask', type=int, default=0)
     parser.add_argument('--normalize', type=str, default=None, choices=['global-magnitude', 'local-magnitude', 'phase-sync', 'global-magnitude-phase-sync', 'local-magnitude-phase-sync'])
+    parser.add_argument('--loss', type=str, default='dice', choices=LOSSES.keys(), help='Loss functions')
 
     # data
     parser.add_argument('--data-dir', type=str, default='eturok-weizmann/vibrations')
@@ -650,12 +652,11 @@ def train(**kwargs):
     train_loader, test_loader, data_info = get_dataloaders(args.data_dir, args.patch_size, args.disc_mask_h, args.disc_mask_w, batch_size=args.batch_size, eval_batch_size=args.eval_batch_size, seed=args.seed, speakers=speakers, normalize=args.normalize, n_objects=n_objects)
     device = 'gpu' if torch.cuda.is_available() else 'cpu'
 
-    model = SignalTransformer(args.d_model, args.pnt_num_heads, args.pnt_num_layers, args.seq_num_heads, args.seq_num_layers, args.patch_size, args.signal_is, data_info, args.alpha, args.beta, gamma=args.gamma, delta=args.delta, decoder=args.decoder, cross_attn_layers=args.cross_attn_layers)
+    model = SignalTransformer(args.d_model, args.pnt_num_heads, args.pnt_num_layers, args.seq_num_heads, args.seq_num_layers, args.patch_size, args.signal_is, data_info, args.alpha, args.beta, args.loss, gamma=args.gamma, delta=args.delta, decoder=args.decoder, cross_attn_layers=args.cross_attn_layers)
     optimizer = torch.optim.Adam(model.parameters(), args.lr)
     config = {'n_params': count_parameters(model), **data_info, 'delta': args.delta, 'SORD': SORD, 'MASK': MASK, 'POSITION': POSITION, 'data_dir': args.data_dir, 'seed': args.seed, 'signal_is': args.signal_is, 'd_model': args.d_model, 'pnt_num_heads': args.pnt_num_heads, 'seq_num_heads': args.seq_num_heads, 'pnt_num_layers': args.pnt_num_layers, 'seq_num_layers': args.seq_num_layers, 'patch_size': args.patch_size, 'batch_size': args.batch_size, 'eval_batch_size': args.eval_batch_size, 'lr': args.lr, 'alpha': args.alpha, 'beta': args.beta, 'gamma': args.gamma, 'max_duration': args.max_duration, 'eval_interval': args.eval_interval, 'decoder': args.decoder, 'cross_attn_layers': args.cross_attn_layers}
-    logger = WandBLogger('good-vibrations', group='losses', name=args.run_name, init_kwargs={'config': config, 'save_code': True})
+    logger = WandBLogger('good-vibrations', group='loss', name=args.run_name, init_kwargs={'config': config, 'save_code': True})
     from composer.callbacks import CheckpointSaver
-    HF_REPO = "eturok-weizmann/vibrations"
 
     # Full training-state checkpoints every epoch — resumable on any GPU
     resume_saver = CheckpointSaver(
@@ -679,8 +680,7 @@ def train(**kwargs):
     ic(config)
 
     trainer = Trainer(
-        run_name=args.run_name,
-        model=model, train_dataloader=train_loader, eval_dataloader=test_loader,
+        run_name=args.run_name, model=model, train_dataloader=train_loader, eval_dataloader=test_loader,
         max_duration=args.max_duration, eval_interval=args.eval_interval,
         optimizers=optimizer, device=device, seed=args.seed,
         loggers=logger, log_to_console=True, auto_log_hparams=True, save_metrics=True,
