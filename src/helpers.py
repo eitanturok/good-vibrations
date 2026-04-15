@@ -24,13 +24,11 @@ def load_from_hf(run_name: str | None = None, repo_id: str = "eturok-weizmann/go
     model.load_state_dict(torch.load(path, map_location="cpu", weights_only=True))
     return model.eval()
 
-def _hf_path(path_in_repo): return path_in_repo if path_in_repo else (wandb.run.name if wandb.run else None)
-
-def _hf_upload(api, repo, folder, path_in_repo, msg):
+def _hf_upload(api, repo, folder, dir_in_repo, msg):
   t0 = time.time()
   try:
-    api.upload_folder(folder_path=folder, repo_id=repo, path_in_repo=path_in_repo, commit_message=msg)
-    print(f"HFSyncCallback: uploaded {folder} → {repo}/{path_in_repo} in {time.time()-t0:.1f}s")
+    api.upload_folder(folder_path=folder, repo_id=repo, path_in_repo=dir_in_repo, commit_message=msg)
+    print(f"HFSyncCallback: uploaded {folder} → {repo}/{dir_in_repo} in {time.time()-t0:.1f}s")
   except Exception as e:
     print(f"HFSyncCallback ERROR: {e}")
 
@@ -38,15 +36,19 @@ def _hf_upload(api, repo, folder, path_in_repo, msg):
 class HFSyncCallback(Callback):
   """Uploads to HuggingFace whenever Composer saves a checkpoint locally.
   Control frequency via Trainer(save_interval='Nep', ...)."""
-  def __init__(self, local_folder: str, repo: str, path_in_repo: str | None = None):
-    self.local_folder, self.repo, self._path_in_repo = local_folder, repo, path_in_repo
+  def __init__(self, local_folder: str, repo: str, dir_in_repo: str = "checkpoints"):
+    self.local_folder, self.repo, self.dir_in_repo = local_folder, repo, dir_in_repo
     self.api = HfApi()
     self.api.create_repo(repo, exist_ok=True)
+    self._t0 = None
+
+  def epoch_end(self, state, logger): self._t0 = time.time()
 
   def epoch_checkpoint(self, state, logger):
+    if self._t0: print(f"HFSyncCallback: local save took {time.time()-self._t0:.1f}s")
     msg = f"epoch {state.timestamp.epoch.value}"
-    print(f"HFSyncCallback: syncing checkpoint at {msg}")
-    self.api.run_as_future(_hf_upload, self.api, self.repo, self.local_folder, _hf_path(self._path_in_repo), msg)
+    print(f"HFSyncCallback: uploading to HF at {msg}")
+    self.api.run_as_future(_hf_upload, self.api, self.repo, self.local_folder, self.dir_in_repo, msg)
 
 
 class MaskVisualizationCallback(Callback):

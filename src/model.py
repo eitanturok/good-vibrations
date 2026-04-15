@@ -651,8 +651,9 @@ def train(**kwargs):
     optimizer = torch.optim.Adam(model.parameters(), args.lr)
     config = {'n_params': count_parameters(model), **data_info, 'delta': args.delta, 'SORD': SORD, 'MASK': MASK, 'POSITION': POSITION, 'data_dir': args.data_dir, 'seed': args.seed, 'signal_is': args.signal_is, 'd_model': args.d_model, 'pnt_num_heads': args.pnt_num_heads, 'seq_num_heads': args.seq_num_heads, 'pnt_num_layers': args.pnt_num_layers, 'seq_num_layers': args.seq_num_layers, 'patch_size': args.patch_size, 'batch_size': args.batch_size, 'eval_batch_size': args.eval_batch_size, 'lr': args.lr, 'alpha': args.alpha, 'beta': args.beta, 'gamma': args.gamma, 'max_duration': args.max_duration, 'eval_interval': args.eval_interval, 'decoder': args.decoder, 'cross_attn_layers': args.cross_attn_layers}
     logger = WandBLogger('good-vibrations', group='losses', name=args.run_name, init_kwargs={'config': config, 'save_code': True})
-    ckpt_folder = f"checkpoints/{args.run_name}"
-    hf_sync = HFSyncCallback(local_folder=ckpt_folder, repo="eturok-weizmann/vibrations", path_in_repo="checkpoints")
+    from datetime import datetime
+    ckpt_folder = f"checkpoints/{datetime.now().strftime('%Y%m%d_%H%M%S')}_{args.run_name}"
+    hf_sync = HFSyncCallback(local_folder=ckpt_folder, repo="eturok-weizmann/vibrations", dir_in_repo=ckpt_folder)
     thresholds = [float(x) for x in args.mask_viz_thresholds.split(',')]
     mask_viz = MaskVisualizationCallback(n_samples=args.eval_batch_size, save_dir="visualizations", train_viz_interval=args.mask_viz_train_interval, thresholds=thresholds)
     ic(config)
