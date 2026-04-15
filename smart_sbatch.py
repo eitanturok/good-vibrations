@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""smart_sbatch.py — auto-picks the best available partition + GPU, then submits."""
+# -*- coding: utf-8 -*-
+"""smart_sbatch.py - auto-picks the best available partition + GPU, then submits."""
 
 import subprocess, sys, argparse, textwrap
 from datetime import datetime
