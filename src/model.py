@@ -288,6 +288,15 @@ def focal_loss_fn(mask_logits, target, focal_gamma=2.0):
     pt = p * target + (1 - p) * (1 - target)  # prob of correct class per pixel
     return (((1 - pt) ** focal_gamma) * bce).mean()
 
+def asymmetric_focal_loss_fn(mask_logits, target, gamma_neg=4, gamma_pos=0):
+    """Asymmetric focal loss: suppresses easy negatives (gamma_neg) without crushing positive gradients.
+    gamma_pos=0 means object pixels always get full BCE gradient regardless of confidence.
+    gamma_neg=4 aggressively suppresses background pixels the model is already confident about."""
+    bce = F.binary_cross_entropy_with_logits(mask_logits, target, reduction='none')
+    p = mask_logits.sigmoid()
+    weight = target * (1 - p) ** gamma_pos + (1 - target) * p ** gamma_neg
+    return (weight * bce).mean()
+
 def mse_loss_fn(mask_logits, target):
     """MSE on probabilities (after sigmoid). Using raw logits breaks semantics: logits are unbounded
     but targets are in [0,1], making the 'optimal' logit prediction the target value itself
@@ -306,7 +315,7 @@ def tversky_loss_fn(mask_logits, target, alpha=0.3, beta=0.7):
     tversky_score = tp / (tp + alpha * fp + beta * fn).clamp(min=1e-6)
     return 1 - tversky_score.mean()
 
-LOSSES = {'ce': F.cross_entropy, 'wce': weighted_cross_entropy_fn, 'focal': focal_loss_fn, 'mse': mse_loss_fn, 'dice': soft_dice_fn, 'tversky': tversky_loss_fn}
+LOSSES = {'ce': F.cross_entropy, 'wce': weighted_cross_entropy_fn, 'focal': focal_loss_fn, 'asym_focal': asymmetric_focal_loss_fn, 'mse': mse_loss_fn, 'dice': soft_dice_fn, 'tversky': tversky_loss_fn}
 
 # **** Decoders ****
 
@@ -480,6 +489,8 @@ class SignalTransformer(ComposerModel):
             loss_fn = functools.partial(loss_fn, alpha=alpha, beta=beta)
         elif loss == 'focal':
             loss_fn = functools.partial(loss_fn, focal_gamma=gamma)
+        elif loss == 'asym_focal':
+            loss_fn = functools.partial(loss_fn, gamma_neg=gamma, gamma_pos=delta)
         self.loss_fn = loss_fn
 
         # Prediction heads

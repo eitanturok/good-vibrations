@@ -80,7 +80,7 @@ python smart_sbatch.py --dry-run --job-name my-job --loss focal --gamma 10
 
 | Flag | Default | Notes |
 |---|---|---|
-| `--loss` | `dice` | choices: `dice`, `focal`, `bce`, `mse`, `tversky` |
+| `--loss` | `dice` | choices: `dice`, `focal`, `asym_focal`, `bce`, `mse`, `tversky` |
 | `--gamma` | `2.0` | focal loss gamma (standard default; gamma=10 crushes gradients at init) |
 | `--alpha` | `0.9` | loss weight |
 | `--beta` | `0.5` | loss weight |
