@@ -56,6 +56,8 @@ jupyter notebook src/
 
 **You (the AI) can and should run these commands directly using the Bash tool.** Do not tell the user to run them. SSH into the cluster, pull the latest code, and submit the job yourself. `squeue`, `sinfo`, and `sbatch` only exist on the cluster — that is exactly why you SSH in first.
 
+**IMPORTANT:** Any time code is changed locally, you must `git push` from the local machine and then `git pull` on the cluster before submitting a job. Never submit without pulling first — the cluster will silently run outdated code otherwise.
+
 **Cluster:** `mcluster11.wisdom.weizmann.ac.il`, code at `mark_sheinin_lab/code/eitan/good-vibrations/`
 
 ```bash
