@@ -297,6 +297,17 @@ def asymmetric_focal_loss_fn(mask_logits, target, gamma_neg=4, gamma_pos=0):
     weight = target * (1 - p) ** gamma_pos + (1 - target) * p ** gamma_neg
     return (weight * bce).mean()
 
+def boundary_loss_fn(mask_logits, target, kernel_size=3):
+    """Boundary loss: weighted BCE that focuses on object edges.
+    Extracts boundaries via morphological gradient (dilation - erosion) on the target,
+    then doubles the loss weight at those pixels so the model sharpens predicted edges."""
+    pad = kernel_size // 2
+    dilated  =  F.max_pool2d( target.unsqueeze(1), kernel_size, stride=1, padding=pad).squeeze(1)
+    eroded   = -F.max_pool2d(-target.unsqueeze(1), kernel_size, stride=1, padding=pad).squeeze(1)
+    boundary = (dilated - eroded).clamp(0, 1)   # (B, H, W) — 1 at edges, 0 elsewhere
+    weight   = 1.0 + boundary                    # boundary pixels get 2× weight
+    return F.binary_cross_entropy_with_logits(mask_logits, target, weight=weight)
+
 def mse_loss_fn(mask_logits, target):
     """MSE on probabilities (after sigmoid). Using raw logits breaks semantics: logits are unbounded
     but targets are in [0,1], making the 'optimal' logit prediction the target value itself
@@ -315,7 +326,7 @@ def tversky_loss_fn(mask_logits, target, alpha=0.3, beta=0.7):
     tversky_score = tp / (tp + alpha * fp + beta * fn).clamp(min=1e-6)
     return 1 - tversky_score.mean()
 
-LOSSES = {'ce': F.cross_entropy, 'wce': weighted_cross_entropy_fn, 'focal': focal_loss_fn, 'asym_focal': asymmetric_focal_loss_fn, 'mse': mse_loss_fn, 'dice': soft_dice_fn, 'tversky': tversky_loss_fn}
+LOSSES = {'ce': F.cross_entropy, 'wce': weighted_cross_entropy_fn, 'focal': focal_loss_fn, 'asym_focal': asymmetric_focal_loss_fn, 'mse': mse_loss_fn, 'dice': soft_dice_fn, 'tversky': tversky_loss_fn, 'boundary': boundary_loss_fn}
 
 # **** Decoders ****
 
@@ -584,7 +595,7 @@ def get_parser():
     parser.add_argument('--augment', type=int, default=1)
     parser.add_argument('--hard-mask', type=int, default=0)
     parser.add_argument('--normalize', type=str, default=None, choices=['global-magnitude', 'local-magnitude', 'phase-sync', 'global-magnitude-phase-sync', 'local-magnitude-phase-sync'])
-    parser.add_argument('--loss', type=str, default='dice', choices=LOSSES.keys(), help='Loss functions')
+    parser.add_argument('--loss', type=str, default='dice', choices=list(LOSSES.keys()), help='Loss functions')
 
     # data
     parser.add_argument('--data-dir', type=str, default='eturok-weizmann/vibrations')
