@@ -280,7 +280,7 @@ def weighted_cross_entropy_fn(mask_logits, target):
     pos_weight = (neg_frac / pos_frac.clamp(min=1e-6)).clamp(max=100.0)
     return F.binary_cross_entropy_with_logits(mask_logits, target, pos_weight=pos_weight)
 
-def focal_loss_fn(mask_logits, target, focal_gamma=2.0):
+def focal_loss_fn(mask_logits, target, focal_gamma=10.0):
     """Focal loss: down-weights easy examples via (1-p)^gamma so training focuses on hard pixels."""
     bce = F.binary_cross_entropy_with_logits(mask_logits, target, reduction='none')
     p = mask_logits.sigmoid()
@@ -500,44 +500,6 @@ class SignalTransformer(ComposerModel):
         _, mask_true, floor_x_true, floor_y_true = batch
         x_logits, y_logits, _, mask_logits = outputs
         return self.loss_fn(mask_logits, mask_true)
-
-    # def loss(self, outputs, batch):
-    #     _, mask_true, floor_x_true, floor_y_true = batch
-    #     x_logits, y_logits, _, mask_logits = outputs
-    #     position_loss = mask_loss = torch.tensor(0.0)
-    #     loss_log = {}
-
-    #     if POSITION and self.gamma != 1:
-    #         ce_loss_x = F.cross_entropy(x_logits, floor_x_true)
-    #         ce_loss_y = F.cross_entropy(y_logits, floor_y_true)
-    #         if not SORD:
-    #             position_loss = self.beta * ce_loss_x + (1 - self.beta) * ce_loss_y
-    #             loss_log.update({'loss/train/position/x/ce': ce_loss_x, 'loss/train/position/y/ce': ce_loss_y})
-    #         else:
-    #             sord_loss_x = sord_loss(x_logits, floor_x_true, self.cost_matrix_x)
-    #             sord_loss_y = sord_loss(y_logits, floor_y_true, self.cost_matrix_y)
-    #             ce_sord_loss_x = self.alpha * sord_loss_x + (1 - self.alpha) * ce_loss_x
-    #             ce_sord_loss_y = self.alpha * sord_loss_y + (1 - self.alpha) * ce_loss_y
-    #             position_loss = self.beta * ce_sord_loss_x + (1 - self.beta) * ce_sord_loss_y
-    #             loss_log.update({'loss/train/position/x/ce': ce_loss_x, 'loss/train/position/y/ce': ce_loss_y,
-    #                              'loss/train/position/x/sord': sord_loss_x, 'loss/train/position/y/sord': sord_loss_y,
-    #                              'loss/train/position/x/ce_sord': ce_sord_loss_x, 'loss/train/position/y/ce_sord': ce_sord_loss_y})
-    #         loss_log['loss/train/position/total'] = position_loss
-
-    #     if MASK and self.gamma != 0:
-    #         mask_dice_loss = soft_dice_fn(mask_logits, mask_true)
-    #         mask_ce_loss = focal_loss_fn(mask_logits, mask_true) if FOCAL else weighted_cross_entropy_fn(mask_logits, mask_true)
-    #         mask_loss = self.delta * mask_dice_loss + (1 - self.delta) * mask_ce_loss
-    #         loss_log.update({'loss/train/mask/dice': mask_dice_loss, 'loss/train/mask/ce': mask_ce_loss, 'loss/train/mask/total': mask_loss})
-
-    #     if POSITION and MASK:
-    #         total_loss = position_loss * (1 - self.gamma) + self.gamma * mask_loss
-    #     else:
-    #         total_loss = position_loss if POSITION else mask_loss
-    #     loss_log['loss/train/total'] = total_loss
-
-    #     self.logger.log_metrics({k: v.item() for k, v in loss_log.items()})
-    #     return total_loss
 
     def get_metrics(self, is_train=False):
         return self.train_metrics if is_train else self.val_metrics
