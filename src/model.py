@@ -1,4 +1,4 @@
-import argparse, math, os
+import argparse, math, os, functools
 import modal
 
 import torch
@@ -287,7 +287,19 @@ def focal_loss_fn(mask_logits, target, focal_gamma=10.0):
     pt = p * target + (1 - p) * (1 - target)  # prob of correct class per pixel
     return (((1 - pt) ** focal_gamma) * bce).mean()
 
-LOSSES = {'ce': F.cross_entropy, 'wce': weighted_cross_entropy_fn, 'focal': focal_loss_fn, 'mse': F.mse_loss, 'dice': soft_dice_fn}
+def tversky_loss_fn(mask_logits, target, alpha=0.3, beta=0.7):
+    """Tversky loss: generalization of Dice with asymmetric FP/FN weighting.
+    alpha weights FP, beta weights FN. Set beta > alpha to penalize false negatives more.
+    Reduces to Dice when alpha=beta=0.5."""
+    probs = mask_logits.sigmoid()
+    spatial_dims = tuple(range(1, probs.ndim))
+    tp = (probs * target).sum(dim=spatial_dims)
+    fp = (probs * (1 - target)).sum(dim=spatial_dims)
+    fn = ((1 - probs) * target).sum(dim=spatial_dims)
+    tversky_score = tp / (tp + alpha * fp + beta * fn).clamp(min=1e-6)
+    return 1 - tversky_score.mean()
+
+LOSSES = {'ce': F.cross_entropy, 'wce': weighted_cross_entropy_fn, 'focal': focal_loss_fn, 'mse': F.mse_loss, 'dice': soft_dice_fn, 'tversky': tversky_loss_fn}
 
 # **** Decoders ****
 
@@ -456,7 +468,10 @@ class SignalTransformer(ComposerModel):
         else:
             self.laser_pos_embd = LearnablePositionalEncoding(laser_rows * laser_cols, d_model)
 
-        self.loss_fn = LOSSES[loss]
+        loss_fn = LOSSES[loss]
+        if loss == 'tversky':
+            loss_fn = functools.partial(loss_fn, alpha=alpha, beta=beta)
+        self.loss_fn = loss_fn
 
         # Prediction heads
         self.mlp_head_floor_x = nn.Sequential(nn.Linear(d_model, 32), nn.ReLU(), nn.Linear(32, self.floor_cols))
