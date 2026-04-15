@@ -14,7 +14,7 @@ PARTITIONS = [
 ]
 # Preference order: best GPU first
 GPUS = [
-    ("l40s",            "gpu:l40s:1",            48),
+    ("l40s",            "gpu:L40S:1",            48),
     ("quadro_rtx_8000", "gpu:quadro_rtx_8000:1", 48),
     ("a10",             "gpu:a10:1",             24),
     ("quadro_rtx_6000", "gpu:quadro_rtx_6000:1", 24),
