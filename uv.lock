@@ -406,33 +406,6 @@ wheels = [
 ]
 
 [[package]]
-name = "composer"
-version = "0.32.1"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "coolname" },
-    { name = "importlib-metadata" },
-    { name = "mosaicml-cli" },
-    { name = "numpy" },
-    { name = "packaging" },
-    { name = "pillow" },
-    { name = "psutil" },
-    { name = "py-cpuinfo" },
-    { name = "pyyaml" },
-    { name = "requests" },
-    { name = "tabulate" },
-    { name = "torch" },
-    { name = "torch-optimizer" },
-    { name = "torchmetrics" },
-    { name = "torchvision" },
-    { name = "tqdm" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/5a/5c/9e7e6f35cdeebb5c64f33503a8788fe91bca8d1ac7f2b9c5a0d18a1adccf/composer-0.32.1.tar.gz", hash = "sha256:ea884f7e1bee3f9807803e0a5922714e3f6cd3280b1d2b025f0ce782f3c9bfe3", size = 524858, upload-time = "2025-07-26T00:30:54.611Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/fa/a0/245b6c93f48ae7959131cb45e9839e473e682c70e852b215e5b84e4188da/composer-0.32.1-py3-none-any.whl", hash = "sha256:dde36a048f8d62abbe95fccd42c3bde5c23c6ae4cf7bb890a01af396dbf9c231", size = 612199, upload-time = "2025-07-26T00:30:53.173Z" },
-]
-
-[[package]]
 name = "contourpy"
 version = "1.3.3"
 source = { registry = "https://pypi.org/simple" }
@@ -512,8 +485,8 @@ name = "cupy-cuda12x"
 version = "13.6.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "fastrlock" },
-    { name = "numpy" },
+    { name = "fastrlock", marker = "(platform_machine != 'aarch64' and sys_platform == 'linux') or (sys_platform != 'darwin' and sys_platform != 'linux')" },
+    { name = "numpy", marker = "(platform_machine != 'aarch64' and sys_platform == 'linux') or (sys_platform != 'darwin' and sys_platform != 'linux')" },
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/ae/8c/14555b63fd78cfac7b88af0094cea0a3cb845d243661ec7da69f7b3ea0de/cupy_cuda12x-13.6.0-cp312-cp312-win_amd64.whl", hash = "sha256:ca06fede7b8b83ca9ad80062544ef2e5bb8d4762d1c4fc3ac8349376de9c8a5e", size = 89785108, upload-time = "2025-08-18T08:24:54.527Z" },
@@ -589,7 +562,7 @@ name = "decord"
 version = "0.6.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "numpy" },
+    { name = "numpy", marker = "(platform_machine != 'aarch64' and sys_platform == 'linux') or (sys_platform != 'darwin' and sys_platform != 'linux')" },
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/11/79/936af42edf90a7bd4e41a6cac89c913d4b47fa48a26b042d5129a9242ee3/decord-0.6.0-py3-none-manylinux2010_x86_64.whl", hash = "sha256:51997f20be8958e23b7c4061ba45d0efcd86bffd5fe81c695d0befee0d442976", size = 13602299, upload-time = "2021-06-14T21:30:55.486Z" },
@@ -836,7 +809,6 @@ name = "good-vibrations"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
-    { name = "composer" },
     { name = "datasets" },
     { name = "decord", marker = "(platform_machine == 'x86_64' and sys_platform == 'linux') or sys_platform == 'win32'" },
     { name = "einops" },
@@ -849,6 +821,7 @@ dependencies = [
     { name = "modal" },
     { name = "mosaicml" },
     { name = "opencv-python" },
+    { name = "psutil" },
     { name = "pycocotools" },
     { name = "safetensors" },
     { name = "sam3" },
@@ -874,7 +847,6 @@ lab = [
 
 [package.metadata]
 requires-dist = [
-    { name = "composer", specifier = ">=0.32.1" },
     { name = "cupy-cuda12x", marker = "sys_platform == 'win32' and extra == 'lab'", specifier = ">=13.6.0" },
     { name = "datasets", specifier = ">=4.7.0" },
     { name = "decord", marker = "(platform_machine == 'x86_64' and sys_platform == 'linux') or sys_platform == 'win32'", specifier = ">=0.6.0" },
@@ -886,8 +858,9 @@ requires-dist = [
     { name = "ipywidgets", specifier = ">=8.1.8" },
     { name = "matplotlib", specifier = ">=3.10.8" },
     { name = "modal", specifier = ">=1.3.5" },
-    { name = "mosaicml", specifier = ">=0.32.1" },
+    { name = "mosaicml", git = "https://github.com/eitanturok/composer?branch=hf-object-store" },
     { name = "opencv-python", specifier = ">=4.11.0.86" },
+    { name = "psutil", specifier = ">=6.0.0" },
     { name = "pycocotools", specifier = ">=2.0.11" },
     { name = "pyueye", marker = "sys_platform == 'win32' and extra == 'lab'", specifier = ">=4.96.952" },
     { name = "safetensors", specifier = ">=0.7.0" },
@@ -1548,8 +1521,8 @@ wheels = [
 
 [[package]]
 name = "mosaicml"
-version = "0.32.1"
-source = { registry = "https://pypi.org/simple" }
+version = "0.33.0.dev0"
+source = { git = "https://github.com/eitanturok/composer?branch=hf-object-store#90e41a2a0eb5acabeed7f2ab45b7b6256ae76284" }
 dependencies = [
     { name = "coolname" },
     { name = "importlib-metadata" },
@@ -1567,10 +1540,6 @@ dependencies = [
     { name = "torchmetrics" },
     { name = "torchvision" },
     { name = "tqdm" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/e3/1a/ef03f07caf45706ad81d87c54b1b16c67e05c41d7a16a3a800405f97aed7/mosaicml-0.32.1.tar.gz", hash = "sha256:417c8aa574e22d39368a434eec0800268b275cb1cc2c8af8bc187475da4953d3", size = 524835, upload-time = "2025-07-26T00:30:58.256Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/4c/ad/eb9101cf2a0288984c5d1bc3a80409277e5861c877338b406949e6177e81/mosaicml-0.32.1-py3-none-any.whl", hash = "sha256:d5dc601cec7af281d6a30ab8baccb7c495ee0044237893a991081f54617f8919", size = 612208, upload-time = "2025-07-26T00:30:56.315Z" },
 ]
 
 [[package]]
@@ -1797,7 +1766,7 @@ name = "nvidia-cudnn-cu12"
 version = "9.5.1.17"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "nvidia-cublas-cu12" },
+    { name = "nvidia-cublas-cu12", marker = "(platform_machine != 'aarch64' and sys_platform == 'linux') or (sys_platform != 'darwin' and sys_platform != 'linux')" },
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/2a/78/4535c9c7f859a64781e43c969a3a7e84c54634e319a996d43ef32ce46f83/nvidia_cudnn_cu12-9.5.1.17-py3-none-manylinux_2_28_x86_64.whl", hash = "sha256:30ac3869f6db17d170e0e556dd6cc5eee02647abc31ca856634d5a40f82c15b2", size = 570988386, upload-time = "2024-10-25T19:54:26.39Z" },
@@ -1808,7 +1777,7 @@ name = "nvidia-cufft-cu12"
 version = "11.3.0.4"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "nvidia-nvjitlink-cu12" },
+    { name = "nvidia-nvjitlink-cu12", marker = "(platform_machine != 'aarch64' and sys_platform == 'linux') or (sys_platform != 'darwin' and sys_platform != 'linux')" },
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/8f/16/73727675941ab8e6ffd86ca3a4b7b47065edcca7a997920b831f8147c99d/nvidia_cufft_cu12-11.3.0.4-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:ccba62eb9cef5559abd5e0d54ceed2d9934030f51163df018532142a8ec533e5", size = 200221632, upload-time = "2024-11-20T17:41:32.357Z" },
@@ -1837,9 +1806,9 @@ name = "nvidia-cusolver-cu12"
 version = "11.7.1.2"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "nvidia-cublas-cu12" },
-    { name = "nvidia-cusparse-cu12" },
-    { name = "nvidia-nvjitlink-cu12" },
+    { name = "nvidia-cublas-cu12", marker = "(platform_machine != 'aarch64' and sys_platform == 'linux') or (sys_platform != 'darwin' and sys_platform != 'linux')" },
+    { name = "nvidia-cusparse-cu12", marker = "(platform_machine != 'aarch64' and sys_platform == 'linux') or (sys_platform != 'darwin' and sys_platform != 'linux')" },
+    { name = "nvidia-nvjitlink-cu12", marker = "(platform_machine != 'aarch64' and sys_platform == 'linux') or (sys_platform != 'darwin' and sys_platform != 'linux')" },
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/f0/6e/c2cf12c9ff8b872e92b4a5740701e51ff17689c4d726fca91875b07f655d/nvidia_cusolver_cu12-11.7.1.2-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:e9e49843a7707e42022babb9bcfa33c29857a93b88020c4e4434656a655b698c", size = 158229790, upload-time = "2024-11-20T17:43:43.211Z" },
@@ -1851,7 +1820,7 @@ name = "nvidia-cusparse-cu12"
 version = "12.5.4.2"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "nvidia-nvjitlink-cu12" },
+    { name = "nvidia-nvjitlink-cu12", marker = "(platform_machine != 'aarch64' and sys_platform == 'linux') or (sys_platform != 'darwin' and sys_platform != 'linux')" },
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/06/1e/b8b7c2f4099a37b96af5c9bb158632ea9e5d9d27d7391d7eb8fc45236674/nvidia_cusparse_cu12-12.5.4.2-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:7556d9eca156e18184b94947ade0fba5bb47d69cec46bf8660fd2c71a4b48b73", size = 216561367, upload-time = "2024-11-20T17:44:54.824Z" },
@@ -2464,7 +2433,7 @@ name = "pyueye"
 version = "4.96.952"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "enum-compat" },
+    { name = "enum-compat", marker = "(platform_machine != 'aarch64' and sys_platform == 'linux') or (sys_platform != 'darwin' and sys_platform != 'linux')" },
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/48/b9/2a372f906a4f5f197509f5fbc165f1e0e321daf4b6361edfcf46d0fe6888/pyueye-4.96.952-py2.py3-none-any.whl", hash = "sha256:b1393355be8d2072730f1c617a7b22a99186989a6f62a1386a5ff04fbcf30cd5", size = 57149, upload-time = "2022-06-28T13:45:11.217Z" },
@@ -3193,7 +3162,7 @@ name = "triton"
 version = "3.3.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "setuptools" },
+    { name = "setuptools", marker = "sys_platform != 'darwin'" },
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/11/53/ce18470914ab6cfbec9384ee565d23c4d1c55f0548160b1c7b33000b11fd/triton-3.3.0-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:b68c778f6c4218403a6bd01be7484f6dc9e20fe2083d22dd8aef33e3b87a10a3", size = 156504509, upload-time = "2025-04-09T20:27:40.413Z" },
