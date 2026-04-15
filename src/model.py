@@ -280,12 +280,19 @@ def weighted_cross_entropy_fn(mask_logits, target):
     pos_weight = (neg_frac / pos_frac.clamp(min=1e-6)).clamp(max=100.0)
     return F.binary_cross_entropy_with_logits(mask_logits, target, pos_weight=pos_weight)
 
-def focal_loss_fn(mask_logits, target, focal_gamma=10.0):
-    """Focal loss: down-weights easy examples via (1-p)^gamma so training focuses on hard pixels."""
+def focal_loss_fn(mask_logits, target, focal_gamma=2.0):
+    """Focal loss: down-weights easy examples via (1-p)^gamma so training focuses on hard pixels.
+    gamma=2 is the standard default. gamma=10 crushes gradients to ~0.1% of BCE at init (pt=0.5)."""
     bce = F.binary_cross_entropy_with_logits(mask_logits, target, reduction='none')
     p = mask_logits.sigmoid()
     pt = p * target + (1 - p) * (1 - target)  # prob of correct class per pixel
     return (((1 - pt) ** focal_gamma) * bce).mean()
+
+def mse_loss_fn(mask_logits, target):
+    """MSE on probabilities (after sigmoid). Using raw logits breaks semantics: logits are unbounded
+    but targets are in [0,1], making the 'optimal' logit prediction the target value itself
+    rather than the inverse-sigmoid of it. Sigmoid first ensures gradients flow correctly."""
+    return F.mse_loss(mask_logits.sigmoid(), target)
 
 def tversky_loss_fn(mask_logits, target, alpha=0.3, beta=0.7):
     """Tversky loss: generalization of Dice with asymmetric FP/FN weighting.
@@ -299,7 +306,7 @@ def tversky_loss_fn(mask_logits, target, alpha=0.3, beta=0.7):
     tversky_score = tp / (tp + alpha * fp + beta * fn).clamp(min=1e-6)
     return 1 - tversky_score.mean()
 
-LOSSES = {'ce': F.cross_entropy, 'wce': weighted_cross_entropy_fn, 'focal': focal_loss_fn, 'mse': F.mse_loss, 'dice': soft_dice_fn, 'tversky': tversky_loss_fn}
+LOSSES = {'ce': F.cross_entropy, 'wce': weighted_cross_entropy_fn, 'focal': focal_loss_fn, 'mse': mse_loss_fn, 'dice': soft_dice_fn, 'tversky': tversky_loss_fn}
 
 # **** Decoders ****
 
@@ -471,6 +478,8 @@ class SignalTransformer(ComposerModel):
         loss_fn = LOSSES[loss]
         if loss == 'tversky':
             loss_fn = functools.partial(loss_fn, alpha=alpha, beta=beta)
+        elif loss == 'focal':
+            loss_fn = functools.partial(loss_fn, focal_gamma=gamma)
         self.loss_fn = loss_fn
 
         # Prediction heads
