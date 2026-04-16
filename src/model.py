@@ -1,4 +1,5 @@
-import argparse, math, os, functools
+import argparse, math, os, functools, json
+from datetime import datetime
 import modal
 
 import torch
@@ -11,11 +12,10 @@ from huggingface_hub import snapshot_download
 from scipy.signal import butter, sosfiltfilt
 from composer import Trainer
 from composer.models import ComposerModel
-from torchmetrics.aggregation import MeanMetric
-from torchmetrics.classification import MulticlassAccuracy
 from torchmetrics.regression import MeanSquaredError
 from composer.loggers import WandBLogger
 from composer.utils.reproducibility import seed_all
+from composer.callbacks import CheckpointSaver
 
 from icecream import install
 install()
@@ -608,12 +608,8 @@ def train(**kwargs):
     global SORD, MASK, POSITION, ROPE, DISCRETIZED_MASK, FOCAL, AUGMENT, HARD_MASK # environment variables
     SORD, MASK, POSITION, ROPE, DISCRETIZED_MASK, FOCAL, AUGMENT, HARD_MASK = args.sord, args.mask_loss, args.position_loss, args.rope, args.discretized_mask, args.focal, args.augment, args.hard_mask
 
-    if args.run_name is None:
-        from datetime import datetime
-        args.run_name = f"{args.loss}-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
-
+    run_id = f"{args.run_name}-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
     seed_all(args.seed) # must seed before initializing model + dataloader
-    import json
     speakers = json.loads(args.speakers) if args.speakers else None
     n_objects = args.n_objects
     train_loader, test_loader, data_info = get_dataloaders(args.data_dir, args.patch_size, args.disc_mask_h, args.disc_mask_w, batch_size=args.batch_size, eval_batch_size=args.eval_batch_size, seed=args.seed, speakers=speakers, normalize=args.normalize, n_objects=n_objects)
@@ -622,32 +618,14 @@ def train(**kwargs):
     model = SignalTransformer(args.d_model, args.pnt_num_heads, args.pnt_num_layers, args.seq_num_heads, args.seq_num_layers, args.patch_size, args.signal_is, data_info, args.alpha, args.beta, args.loss, gamma=args.gamma, delta=args.delta, decoder=args.decoder, cross_attn_layers=args.cross_attn_layers)
     optimizer = torch.optim.Adam(model.parameters(), args.lr)
     config = {'n_params': count_parameters(model), **data_info, 'delta': args.delta, 'SORD': SORD, 'MASK': MASK, 'POSITION': POSITION, 'data_dir': args.data_dir, 'seed': args.seed, 'signal_is': args.signal_is, 'd_model': args.d_model, 'pnt_num_heads': args.pnt_num_heads, 'seq_num_heads': args.seq_num_heads, 'pnt_num_layers': args.pnt_num_layers, 'seq_num_layers': args.seq_num_layers, 'patch_size': args.patch_size, 'batch_size': args.batch_size, 'eval_batch_size': args.eval_batch_size, 'lr': args.lr, 'alpha': args.alpha, 'beta': args.beta, 'gamma': args.gamma, 'max_duration': args.max_duration, 'eval_interval': args.eval_interval, 'decoder': args.decoder, 'cross_attn_layers': args.cross_attn_layers}
-    logger = WandBLogger('good-vibrations', group='loss', name=args.run_name, init_kwargs={'config': config, 'save_code': True})
-    from composer.callbacks import CheckpointSaver
-
-    # Full training-state checkpoints every epoch — resumable on any GPU
-    resume_saver = CheckpointSaver(
-        folder=f'hf://{args.data_dir}/checkpoints/{args.run_name}',
-        save_interval=args.checkpoint_interval,
-        num_checkpoints_to_keep=1,
-        overwrite=True,
-    )
-
-    # Weights-only checkpoint saved only when eval metric improves
-    best_saver = BestMetricCheckpointSaver(
-        metric_name=args.best_metric,
-        higher_is_better=args.best_metric_higher_is_better,
-        folder=f'hf://{args.data_dir}/checkpoints/{args.run_name}/best',
-        save_interval=args.eval_interval,
-        num_checkpoints_to_keep=1,
-        overwrite=True,
-    )
-
+    logger = WandBLogger('good-vibrations', group='loss', name=run_id, init_kwargs={'config': config, 'save_code': True})
+    resume_saver = CheckpointSaver(folder=f'hf://{args.data_dir}/checkpoints/{run_id}', save_interval=args.checkpoint_interval, num_checkpoints_to_keep=1, overwrite=True)
+    best_saver = BestMetricCheckpointSaver(metric_name=args.best_metric, higher_is_better=args.best_metric_higher_is_better, folder=f'hf://{args.data_dir}/checkpoints/{run_id}/best', save_interval=args.eval_interval, num_checkpoints_to_keep=1, overwrite=True)
     mask_viz = MaskVisualizationCallback(n_samples=args.eval_batch_size, save_dir="visualizations", train_viz_interval=args.mask_viz_train_interval)
     ic(config)
 
     trainer = Trainer(
-        run_name=args.run_name, model=model, train_dataloader=train_loader, eval_dataloader=test_loader,
+        run_name=run_id, model=model, train_dataloader=train_loader, eval_dataloader=test_loader,
         max_duration=args.max_duration, eval_interval=args.eval_interval,
         optimizers=optimizer, device=device, seed=args.seed,
         loggers=logger, log_to_console=True, auto_log_hparams=True, save_metrics=True,
