@@ -183,9 +183,7 @@ class MemoryCallback(Callback):
             'memory/cpu/ram_available_gb': vm.available / 1e9,
             'memory/cpu/ram_total_gb':     vm.total / 1e9,
         }
-        print({k: f"{v:.2f}" for k, v in log.items()})
-        if wandb.run:
-            wandb.log(log, step=state.timestamp.batch.value)
+        logger.log_metrics(log)
 
 
 class MaskVisualizationCallback(Callback):
