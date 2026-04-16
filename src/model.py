@@ -174,7 +174,9 @@ class VibrationDataset(Dataset):
         H, W = mask.shape[-2], mask.shape[-1]
         floor_x, floor_y = round_to_floor(row["x_position"], W / self.floor_cols), round_to_floor(row["y_position"], H / self.floor_rows)
 
-        return {'shifts': shifts, 'mask': mask.float(), 'floor_x': floor_x, 'floor_y': floor_y, 'fps': row["fps"]}
+        return {'shifts': shifts, 'mask': mask.float(), 'floor_x': floor_x, 'floor_y': floor_y, 'fps': row["fps"],
+                'sample_idx': row["sample_idx"], 'x_position': row["x_position"], 'y_position': row["y_position"],
+                'object': row["object"], 'n_objects': row["n_objects"]}
 
 def make_collate(patch_size:int, augment:bool=False, generator:torch.Generator|None=None, normalize:str|None=None):
 
@@ -186,6 +188,13 @@ def make_collate(patch_size:int, augment:bool=False, generator:torch.Generator|N
         floor_x = torch.tensor([b["floor_x"] for b in batch], dtype=torch.long)
         floor_y = torch.tensor([b["floor_y"] for b in batch], dtype=torch.long)
         shifts, mask = torch.stack([b["shifts"] for b in batch]), torch.stack([b["mask"] for b in batch]).float()
+        meta = {
+            'sample_idx':  [b["sample_idx"]  for b in batch],
+            'x_position':  [b["x_position"]  for b in batch],
+            'y_position':  [b["y_position"]  for b in batch],
+            'object':      [b["object"]       for b in batch],
+            'n_objects':   [b["n_objects"]    for b in batch],
+        }
 
         if augment:
             assert len(set(fps)) == 1, f"all fps in batch must match, got {set(fps)}"
@@ -193,6 +202,7 @@ def make_collate(patch_size:int, augment:bool=False, generator:torch.Generator|N
             shifts_aug = torch.fft.ifft(torch.fft.fft(shifts, dim=2) * G[:, None, :, None], dim=2).real
             shifts, mask = torch.cat([shifts, shifts_aug]), torch.cat([mask, mask]) # (2B, L, T, 2)
             floor_x, floor_y, fps = torch.cat([floor_x, floor_x]), torch.cat([floor_y, floor_y]), fps + fps
+            meta = {k: v + v for k, v in meta.items()}  # duplicate metadata for augmented samples
 
         fft_patches = []
         for i in range(len(shifts)):
@@ -201,7 +211,7 @@ def make_collate(patch_size:int, augment:bool=False, generator:torch.Generator|N
             if normalize: fft = normalize_fn(fft)                       # (L,F,2) -> (L,F,2)
             fft_patches.append(fft.unfold(1, patch_size, patch_size))   # (L,F,2) -> (L,P,2,PS)
 
-        return torch.stack(fft_patches), mask, floor_x, floor_y
+        return torch.stack(fft_patches), mask, floor_x, floor_y, meta
     return collate
 
 def get_dataloaders(repo_id:str, patch_size:int=256, disc_mask_h:int=40, disc_mask_w:int=20, floor_cols:int=11, floor_rows:int=12, batch_size:int=8, eval_batch_size:int=16, shuffle:bool=True, num_workers:int=0, seed:int=42, token:str | None = None, test_split=0.2, speakers:list|None=None, normalize:str|None=None, n_objects:list|None=None):
@@ -517,7 +527,7 @@ class SignalTransformer(ComposerModel):
         return x_logits, y_logits, cls_embedding, mask_logits
 
     def loss(self, outputs, batch):
-        _, mask_true, floor_x_true, floor_y_true = batch
+        _, mask_true, floor_x_true, floor_y_true, *_ = batch
         x_logits, y_logits, _, mask_logits = outputs
         return self.loss_fn(mask_logits, mask_true)
 
@@ -525,7 +535,7 @@ class SignalTransformer(ComposerModel):
         return self.train_metrics if is_train else self.val_metrics
 
     def update_metric(self, batch, outputs, metric):
-        _, mask_true, floor_x_true, floor_y_true = batch
+        _, mask_true, floor_x_true, floor_y_true, *_ = batch
         x_logits, y_logits, _, mask_logits = outputs
         metric_name, pred_type, pos = getattr(metric, 'metric_name', None), getattr(metric, 'pred_type', None), getattr(metric, 'pos', None)
 
@@ -621,7 +631,7 @@ def train(**kwargs):
     logger = WandBLogger('good-vibrations', group='loss', name=run_id, init_kwargs={'config': config, 'save_code': True})
     resume_saver = CheckpointSaver(folder=f'hf://{args.data_dir}/checkpoints/{run_id}', save_interval=args.checkpoint_interval, num_checkpoints_to_keep=1, overwrite=True)
     best_saver = BestMetricCheckpointSaver(metric_name=args.best_metric, higher_is_better=args.best_metric_higher_is_better, folder=f'hf://{args.data_dir}/checkpoints/{run_id}/best', save_interval=args.eval_interval, num_checkpoints_to_keep=1, overwrite=True)
-    mask_viz = MaskVisualizationCallback(n_samples=args.eval_batch_size, save_dir="visualizations", train_viz_interval=args.mask_viz_train_interval)
+    mask_viz = MaskVisualizationCallback(n_samples=args.eval_batch_size, save_dir="visualizations", train_viz_interval=args.mask_viz_train_interval, pred_save_path=args.data_dir, run_id=run_id)
     dataset = train_loader.dataset.dataset
     dataset_gb = (dataset.shifts.nbytes + dataset.masks.nbytes) / 1e9
     mem_cb = MemoryCallback(dataset_gb=dataset_gb)
