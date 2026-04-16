@@ -16,10 +16,10 @@ PARTITIONS = [
 # (name, gres_flag, vram_gb, max_ram_gb)
 # max_ram_gb = node_total_ram / num_gpus_on_node, i.e. fair-share RAM per GPU slot
 GPUS = [
-    ("l40s",            "gpu:L40S:1",            48, 48),
-    ("quadro_rtx_8000", "gpu:quadro_rtx_8000:1", 48, 48),  # 384 GB / 8 GPUs
-    ("a10",             "gpu:a10:1",             24, 60),  # 256 GB / 4 GPUs
-    ("quadro_rtx_6000", "gpu:quadro_rtx_6000:1", 24, 48),  # 192 GB / 4 GPUs
+    ("l40s",            "gpu:L40S:1",            48, 128),  # 512-1536 GB / 4-8 GPUs → 128 GB min per slot
+    ("quadro_rtx_8000", "gpu:quadro_rtx_8000:1", 48,  48),  # 384 GB / 8 GPUs
+    ("a10",             "gpu:a10:1",             24,  48),  # 256 GB / 4 GPUs (NUMA socket split limits to ~48G)
+    ("quadro_rtx_6000", "gpu:quadro_rtx_6000:1", 24,  48),  # 192 GB / 4 GPUs
 ]
 
 
