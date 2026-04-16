@@ -27,7 +27,10 @@
       "Bash(powershell -Command \"Get-Content ''Q:\\\\mark_sheinin_lab\\\\DATA\\\\experiment-11\\\\empty--31-03-14-20-33\\\\err.log'' | Select-Object -Last 20\")",
       "Bash(dir \"Q:\\\\mark_sheinin_lab\\\\DATA\\\\experiment-12\\\\whiteboard_eraser_1000--31-03-16-58-16\")",
       "Bash(dir \"C:\\\\Users\\\\eitanturok\\\\experiments\\\\experiment-12\\\\whiteboard_eraser_1000--31-03-16-58-16\")",
-      "Bash(ssh *)"
+      "Bash(ssh *)",
+      "Bash(git push *)",
+      "Bash(find . *)",
+      "Bash(xargs cat *)"
     ]
   }
 }

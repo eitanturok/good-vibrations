@@ -64,8 +64,9 @@ jupyter notebook src/
 ssh ethantu@mcluster11.wisdom.weizmann.ac.il "cd mark_sheinin_lab/code/eitan/good-vibrations && git pull && python3 smart_sbatch.py --job-name my-job --loss focal --gamma 10 --speakers '[1,0,0,0]'"
 ```
 
-To tail logs after submitting, SSH in again and run:
+After submitting a job, always tell the user the exact commands to tail the logs. Use `err.log` (not `out.log`) for errors:
 ```bash
+ssh ethantu@mcluster11.wisdom.weizmann.ac.il "tail -f mark_sheinin_lab/code/eitan/good-vibrations/logs/<timestamp>/err.log"
 ssh ethantu@mcluster11.wisdom.weizmann.ac.il "tail -f mark_sheinin_lab/code/eitan/good-vibrations/logs/<timestamp>/out.log"
 ```
 
