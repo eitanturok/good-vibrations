@@ -573,7 +573,7 @@ def get_parser():
     parser.add_argument('--seq-num-layers', type=int, default=2)
 
     # training
-    parser.add_argument('--batch-size', type=int, default=256)
+    parser.add_argument('--batch-size', type=int, default=128)
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--lr', type=float, default=1e-4)
 
