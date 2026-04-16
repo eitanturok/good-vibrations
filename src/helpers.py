@@ -29,7 +29,7 @@ def load_from_hf(run_name: str | None = None, repo_id: str = "eturok-weizmann/go
     model.load_state_dict(torch.load(path, map_location="cpu", weights_only=True))
     return model.eval()
 
-def plot_memory(run_id: str, entity: str = "eturok", project: str = "good-vibrations"):
+def plot_memory(run_id: str, entity: str = "eturok", project: str = "good-vibrations", log_to_wandb: bool = False):
     """Fetch memory metrics from a W&B run and return an interactive Plotly stacked area chart.
 
     GPU panel: stacked area = weights / optimizer / gradients / other (steady-state at batch_end).
@@ -134,6 +134,8 @@ def plot_memory(run_id: str, entity: str = "eturok", project: str = "good-vibrat
     fig.update_yaxes(title_text='GB', rangemode='tozero', row=1, col=1)
     fig.update_yaxes(title_text='GB', rangemode='tozero', row=2, col=1)
     fig.update_xaxes(title_text='Step', row=2, col=1)
+    if log_to_wandb:
+        wandb.log({'memory/breakdown': wandb.Plotly(fig)})
     return fig
 
 
