@@ -18,7 +18,7 @@ PARTITIONS = [
 GPUS = [
     ("l40s",            "gpu:L40S:1",            48, 48),
     ("quadro_rtx_8000", "gpu:quadro_rtx_8000:1", 48, 48),  # 384 GB / 8 GPUs
-    ("a10",             "gpu:a10:1",             24, 64),  # 256 GB / 4 GPUs
+    ("a10",             "gpu:a10:1",             24, 60),  # 256 GB / 4 GPUs
     ("quadro_rtx_6000", "gpu:quadro_rtx_6000:1", 24, 48),  # 192 GB / 4 GPUs
 ]
 
