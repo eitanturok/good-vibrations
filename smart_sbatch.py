@@ -72,10 +72,13 @@ def main():
     ap = argparse.ArgumentParser(description="Submit a Slurm job using best available resources")
     ap.add_argument("--job-name", default="job")
     ap.add_argument("--dry-run", action="store_true", help="Print the sbatch script without submitting")
+    ap.add_argument("--gpu", default=None, choices=[name for name, _, _ in GPUS], help="Force a specific GPU type instead of auto-picking")
     args, model_args = ap.parse_known_args()
 
     print("Checking cluster state...")
     partition, gres, max_time = pick()
+    if args.gpu:
+        gres = next(flag for name, flag, _ in GPUS if name == args.gpu)
     if not partition:
         print("All slots full. Try again later.")
         sys.exit(1)
