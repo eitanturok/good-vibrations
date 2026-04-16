@@ -20,7 +20,7 @@ from composer.callbacks import CheckpointSaver
 from icecream import install
 install()
 
-from helpers import BestMetricCheckpointSaver, MaskVisualizationCallback
+from helpers import BestMetricCheckpointSaver, MaskVisualizationCallback, MemoryCallback
 
 # **** Modal ****
 
@@ -622,6 +622,9 @@ def train(**kwargs):
     resume_saver = CheckpointSaver(folder=f'hf://{args.data_dir}/checkpoints/{run_id}', save_interval=args.checkpoint_interval, num_checkpoints_to_keep=1, overwrite=True)
     best_saver = BestMetricCheckpointSaver(metric_name=args.best_metric, higher_is_better=args.best_metric_higher_is_better, folder=f'hf://{args.data_dir}/checkpoints/{run_id}/best', save_interval=args.eval_interval, num_checkpoints_to_keep=1, overwrite=True)
     mask_viz = MaskVisualizationCallback(n_samples=args.eval_batch_size, save_dir="visualizations", train_viz_interval=args.mask_viz_train_interval)
+    dataset = train_loader.dataset.dataset
+    dataset_gb = (dataset.shifts.nbytes + dataset.masks.nbytes) / 1e9
+    mem_cb = MemoryCallback(dataset_gb=dataset_gb)
     ic(config)
 
     trainer = Trainer(
@@ -629,7 +632,7 @@ def train(**kwargs):
         max_duration=args.max_duration, eval_interval=args.eval_interval,
         optimizers=optimizer, device=device, seed=args.seed,
         loggers=logger, log_to_console=True, auto_log_hparams=True, save_metrics=True,
-        callbacks=[mask_viz, resume_saver, best_saver],
+        callbacks=[mask_viz, resume_saver, best_saver, mem_cb],
     )
 
     trainer.fit()

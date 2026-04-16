@@ -2,6 +2,7 @@ import os, time
 from pathlib import Path
 from typing import Any, Callable, Optional, Union
 
+import psutil
 import torch
 import wandb
 import matplotlib
@@ -131,7 +132,60 @@ class BestMetricCheckpointSaver(CheckpointSaver):
         val = self._get_metric_value(state)
         if val is not None and self._is_improved(val):
             self.best = val
+            baseline = torch.cuda.memory_allocated() / 1e9
+            torch.cuda.reset_peak_memory_stats()
             super().epoch_checkpoint(state, logger)
+            spike = torch.cuda.max_memory_allocated() / 1e9 - baseline
+            print(f"checkpoint memory spike: {spike:.2f} GB")
+            if wandb.run:
+                wandb.log({'memory/gpu/checkpoint_spike_gb': spike}, step=state.timestamp.batch.value)
+
+
+class MemoryCallback(Callback):
+    """Logs GPU and CPU memory breakdown every batch to stdout and wandb under memory/."""
+
+    def __init__(self, dataset_gb: float):
+        self.dataset_gb = dataset_gb
+        self._peak_forward = 0.0
+        self._peak_backward = 0.0
+
+    def before_train_batch(self, state, logger):
+        torch.cuda.reset_peak_memory_stats()
+
+    def after_forward(self, state, logger):
+        self._peak_forward = torch.cuda.max_memory_allocated() / 1e9
+
+    def after_backward(self, state, logger):
+        self._peak_backward = torch.cuda.max_memory_allocated() / 1e9
+
+    def batch_end(self, state, logger):
+        model = state.model
+        optimizer = state.optimizers[0]
+        weights_gb = sum(p.data.nbytes for p in model.parameters()) / 1e9
+        grads_gb   = sum(p.grad.nbytes for p in model.parameters() if p.grad is not None) / 1e9
+        opt_gb     = sum(v.nbytes for s in optimizer.state.values()
+                         for v in s.values() if isinstance(v, torch.Tensor)) / 1e9
+        act_gb     = max(0.0, self._peak_forward - weights_gb)
+        vm = psutil.virtual_memory()
+        gpu_total_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
+        log = {
+            'memory/gpu/weights_gb':       weights_gb,
+            'memory/gpu/gradients_gb':     grads_gb,
+            'memory/gpu/optimizer_gb':     opt_gb,
+            'memory/gpu/activations_gb':   act_gb,
+            'memory/gpu/peak_forward_gb':  self._peak_forward,
+            'memory/gpu/peak_backward_gb': self._peak_backward,
+            'memory/gpu/allocated_gb':     torch.cuda.memory_allocated() / 1e9,
+            'memory/gpu/reserved_gb':      torch.cuda.memory_reserved() / 1e9,
+            'memory/gpu/total_gb':         gpu_total_gb,
+            'memory/cpu/dataset_gb':       self.dataset_gb,
+            'memory/cpu/ram_used_gb':      vm.used / 1e9,
+            'memory/cpu/ram_available_gb': vm.available / 1e9,
+            'memory/cpu/ram_total_gb':     vm.total / 1e9,
+        }
+        print({k: f"{v:.2f}" for k, v in log.items()})
+        if wandb.run:
+            wandb.log(log, step=state.timestamp.batch.value)
 
 
 class MaskVisualizationCallback(Callback):
