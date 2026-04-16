@@ -106,6 +106,7 @@ def main():
         curl -LsSf https://astral.sh/uv/install.sh | sh
         source $HOME/.local/bin/env
         source $HOME/mark_sheinin_lab/code/eitan/.secrets
+        export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
         {model_cmd}
     """)
