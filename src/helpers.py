@@ -29,6 +29,114 @@ def load_from_hf(run_name: str | None = None, repo_id: str = "eturok-weizmann/go
     model.load_state_dict(torch.load(path, map_location="cpu", weights_only=True))
     return model.eval()
 
+def plot_memory(run_id: str, entity: str = "eturok", project: str = "good-vibrations"):
+    """Fetch memory metrics from a W&B run and return an interactive Plotly stacked area chart.
+
+    GPU panel: stacked area = weights / optimizer / gradients / other (steady-state at batch_end).
+               Dashed lines show peak_forward and peak_backward so the activation overhead is visible.
+    CPU panel: stacked area = dataset / other RAM.
+    Hover shows per-component values at each step.
+
+    Returns a plotly.graph_objects.Figure. Call fig.show() or fig.write_html('mem.html').
+    """
+    import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
+
+    gpu_keys = ['memory/gpu/weights_gb', 'memory/gpu/optimizer_gb', 'memory/gpu/gradients_gb',
+                'memory/gpu/allocated_gb', 'memory/gpu/peak_forward_gb', 'memory/gpu/peak_backward_gb',
+                'memory/gpu/total_gb']
+    cpu_keys = ['memory/cpu/dataset_gb', 'memory/cpu/ram_used_gb', 'memory/cpu/ram_total_gb']
+    rows = fetch_wandb_history(run_id, keys=['_step'] + gpu_keys + cpu_keys, entity=entity, project=project)
+    rows = [r for r in rows if 'memory/gpu/allocated_gb' in r]
+
+    steps    = [r['_step'] for r in rows]
+    def col(k): return [r.get(k) or 0.0 for r in rows]
+
+    weights      = col('memory/gpu/weights_gb')
+    optimizer    = col('memory/gpu/optimizer_gb')
+    gradients    = col('memory/gpu/gradients_gb')
+    allocated    = col('memory/gpu/allocated_gb')
+    peak_fwd     = col('memory/gpu/peak_forward_gb')
+    peak_bwd     = col('memory/gpu/peak_backward_gb')
+    gpu_total    = col('memory/gpu/total_gb')
+
+    dataset      = col('memory/cpu/dataset_gb')
+    ram_used     = col('memory/cpu/ram_used_gb')
+    ram_total    = col('memory/cpu/ram_total_gb')
+
+    # "other" fills the gap between tracked components and total allocated
+    other_gpu = [max(0.0, a - w - o - g) for a, w, o, g in zip(allocated, weights, optimizer, gradients)]
+    other_cpu = [max(0.0, u - d) for u, d in zip(ram_used, dataset)]
+
+    fig = make_subplots(
+        rows=2, cols=1, shared_xaxes=True,
+        subplot_titles=('GPU Memory', 'CPU (RAM) Memory'),
+        vertical_spacing=0.12,
+    )
+
+    # ── GPU stacked area (steady-state at batch_end) ──────────────────────────
+    # stacking order: weights → optimizer → gradients → other
+    # weights is the stable foundation; other is the catch-all on top
+    for name, values, color in [
+        ('Weights',   weights,   '#1565C0'),  # dark blue  – stable, never changes
+        ('Optimizer', optimizer, '#2E7D32'),  # dark green – grows then stabilises
+        ('Gradients', gradients, '#E65100'),  # dark orange – present between bwd and zero_grad
+        ('Other',     other_gpu, '#9E9E9E'),  # grey – misc CUDA allocs
+    ]:
+        fig.add_trace(go.Scatter(
+            x=steps, y=values, name=name, legendgroup='gpu',
+            mode='lines', stackgroup='gpu',
+            line=dict(width=0), fillcolor=color,
+            hovertemplate=f'<b>{name}</b>: %{{y:.3f}} GB<extra></extra>',
+        ), row=1, col=1)
+
+    # peak lines — show activation overhead as gap between peak_fwd and the stacked base
+    for name, values, color, dash in [
+        ('Peak forward (incl. activations)', peak_fwd, '#42A5F5', 'dot'),
+        ('Peak backward',                    peak_bwd, '#EF5350', 'solid'),
+    ]:
+        fig.add_trace(go.Scatter(
+            x=steps, y=values, name=name, legendgroup='gpu',
+            mode='lines', line=dict(color=color, width=1.5, dash=dash),
+            hovertemplate=f'<b>{name}</b>: %{{y:.3f}} GB<extra></extra>',
+        ), row=1, col=1)
+
+    fig.add_trace(go.Scatter(
+        x=steps, y=gpu_total, name='GPU Capacity', legendgroup='gpu',
+        mode='lines', line=dict(color='black', width=2, dash='dash'),
+        hovertemplate='<b>GPU Capacity</b>: %{y:.1f} GB<extra></extra>',
+    ), row=1, col=1)
+
+    # ── CPU stacked area ──────────────────────────────────────────────────────
+    for name, values, color in [
+        ('Dataset', dataset,   '#1565C0'),
+        ('Other',   other_cpu, '#9E9E9E'),
+    ]:
+        fig.add_trace(go.Scatter(
+            x=steps, y=values, name=f'CPU: {name}', legendgroup='cpu',
+            mode='lines', stackgroup='cpu',
+            line=dict(width=0), fillcolor=color,
+            hovertemplate=f'<b>{name}</b>: %{{y:.3f}} GB<extra></extra>',
+        ), row=2, col=1)
+
+    fig.add_trace(go.Scatter(
+        x=steps, y=ram_total, name='RAM Capacity', legendgroup='cpu',
+        mode='lines', line=dict(color='black', width=2, dash='dash'),
+        hovertemplate='<b>RAM Capacity</b>: %{y:.1f} GB<extra></extra>',
+    ), row=2, col=1)
+
+    fig.update_layout(
+        title=f'Memory Breakdown — Run {run_id}',
+        hovermode='x unified',
+        height=700,
+        legend=dict(tracegroupgap=20),
+    )
+    fig.update_yaxes(title_text='GB', rangemode='tozero', row=1, col=1)
+    fig.update_yaxes(title_text='GB', rangemode='tozero', row=2, col=1)
+    fig.update_xaxes(title_text='Step', row=2, col=1)
+    return fig
+
+
 def fetch_wandb_history(run_id: str, keys: list[str] | None = None,
                         entity: str = "eturok", project: str = "good-vibrations") -> list[dict]:
     """Return logged history rows for a run, sorted by step.
