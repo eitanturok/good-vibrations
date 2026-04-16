@@ -952,6 +952,28 @@ def get_num_samples_in_batch(batch):
     return int(batch[0].shape[0])
 
 
+def split_batch(batch, microbatch_size):
+    if microbatch_size is None:
+        return [batch]
+
+    fft_patches, mask, floor_x, floor_y, meta = batch
+    microbatches = []
+    batch_size = fft_patches.shape[0]
+    for start in range(0, batch_size, microbatch_size):
+        end = min(start + microbatch_size, batch_size)
+        meta_slice = {k: v[start:end] for k, v in meta.items()}
+        microbatches.append(
+            (
+                fft_patches[start:end],
+                mask[start:end],
+                floor_x[start:end],
+                floor_y[start:end],
+                meta_slice,
+            )
+        )
+    return microbatches
+
+
 def get_parser():
     parser = argparse.ArgumentParser()
 
@@ -1180,10 +1202,14 @@ def train(**kwargs):
         run_name=run_id,
         model=model,
         train_dataloader=DataSpec(
-            train_loader, get_num_samples_in_batch=get_num_samples_in_batch
+            train_loader,
+            get_num_samples_in_batch=get_num_samples_in_batch,
+            split_batch=split_batch,
         ),
         eval_dataloader=DataSpec(
-            test_loader, get_num_samples_in_batch=get_num_samples_in_batch
+            test_loader,
+            get_num_samples_in_batch=get_num_samples_in_batch,
+            split_batch=split_batch,
         ),
         max_duration=args.max_duration,
         eval_interval=args.eval_interval,
