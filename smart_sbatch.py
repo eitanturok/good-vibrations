@@ -13,11 +13,13 @@ PARTITIONS = [
     ("long.q",   2, 4, "12:00:00"),
 ]
 # Preference order: best GPU first
+# (name, gres_flag, vram_gb, max_ram_gb)
+# max_ram_gb = node_total_ram / num_gpus_on_node, i.e. fair-share RAM per GPU slot
 GPUS = [
-    ("l40s",            "gpu:L40S:1",            48),
-    ("quadro_rtx_8000", "gpu:quadro_rtx_8000:1", 48),
-    ("a10",             "gpu:a10:1",             24),
-    ("quadro_rtx_6000", "gpu:quadro_rtx_6000:1", 24),
+    ("l40s",            "gpu:L40S:1",            48, 48),
+    ("quadro_rtx_8000", "gpu:quadro_rtx_8000:1", 48, 48),  # 384 GB / 8 GPUs
+    ("a10",             "gpu:a10:1",             24, 64),  # 256 GB / 4 GPUs
+    ("quadro_rtx_6000", "gpu:quadro_rtx_6000:1", 24, 48),  # 192 GB / 4 GPUs
 ]
 
 
@@ -39,7 +41,7 @@ def job_counts():
 
 
 def best_gpu(partition):
-    """Returns (gres_flag, vram_gb) for the best GPU with an idle/mix node in partition."""
+    """Returns (gres_flag, vram_gb, ram_gb) for the best GPU with an idle/mix node in partition."""
     idle = set()
     for line in sh(f"sinfo -p {partition} -h -o '%G %t'").splitlines():
         parts = line.split()
@@ -48,24 +50,24 @@ def best_gpu(partition):
         gres, state = parts
         if state in ("idle", "mix") and gres.startswith("gpu:"):
             idle.add(gres.split(":")[1].lower())
-    for name, flag, vram in GPUS:
+    for name, flag, vram, ram in GPUS:
         if name in idle:
-            return flag, vram
-    return GPUS[-1][1], GPUS[-1][2]  # no idle GPU; submit anyway and wait in queue
+            return flag, vram, ram
+    return GPUS[-1][1], GPUS[-1][2], GPUS[-1][3]  # no idle GPU; submit anyway and wait in queue
 
 
 def pick():
-    """Returns (partition, gres_flag, max_time) or (None, None, None) if all full."""
+    """Returns (partition, gres_flag, ram_gb, max_time) or (None, None, None, None) if all full."""
     counts = job_counts()
     for part, max_run, max_sub, max_time in PARTITIONS:
         running, submitted = counts.get(part, (0, 0))
         if running >= max_run or submitted >= max_sub:
             print(f"  {part}: full ({running}/{max_run} running, {submitted}/{max_sub} queued)")
             continue
-        gres, vram = best_gpu(part)
-        print(f"  {part}: {max_run - running} slot(s) free → {gres} ({vram}GB VRAM)")
-        return part, gres, max_time
-    return None, None, None
+        gres, vram, ram = best_gpu(part)
+        print(f"  {part}: {max_run - running} slot(s) free → {gres} ({vram}GB VRAM, {ram}GB RAM)")
+        return part, gres, ram, max_time
+    return None, None, None, None
 
 
 def main():
@@ -76,9 +78,9 @@ def main():
     args, model_args = ap.parse_known_args()
 
     print("Checking cluster state...")
-    partition, gres, max_time = pick()
+    partition, gres, ram, max_time = pick()
     if args.gpu:
-        gres = next(flag for name, flag, _ in GPUS if name == args.gpu)
+        gres, _, ram = next((flag, vram, r) for name, flag, vram, r in GPUS if name == args.gpu)
     if not partition:
         print("All slots full. Try again later.")
         sys.exit(1)
@@ -94,7 +96,7 @@ def main():
         #SBATCH --partition={partition}
         #SBATCH --ntasks=1
         #SBATCH --cpus-per-task=4
-        #SBATCH --mem=64G
+        #SBATCH --mem={ram}G
         #SBATCH --gres={gres}
         #SBATCH --time={max_time}
         #SBATCH --job-name={args.job_name}
