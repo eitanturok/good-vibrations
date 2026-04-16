@@ -94,7 +94,7 @@ def main():
         #SBATCH --partition={partition}
         #SBATCH --ntasks=1
         #SBATCH --cpus-per-task=4
-        #SBATCH --mem=128G
+        #SBATCH --mem=64G
         #SBATCH --gres={gres}
         #SBATCH --time={max_time}
         #SBATCH --job-name={args.job_name}
