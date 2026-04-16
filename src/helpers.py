@@ -165,9 +165,9 @@ class MaskVisualizationCallback(Callback):
         log = {}
         for i in range(n):
             # continuous prob map (no threshold)
-            fig, (ax0, ax1) = plt.subplots(1, 2, figsize=(8, 4))  
+            fig, (ax0, ax1) = plt.subplots(1, 2, figsize=(8, 4))
             ax0.imshow(true[i], vmin=0, vmax=1, cmap='gray'); ax0.set_title('True Mask'); ax0.axis('off')
-            ax1.imshow(probs[i], vmin=0, vmax=1, cmap='hot'); ax1.set_title('Pred Mask (prob)'); ax1.axis('off')
+            ax1.imshow(probs[i], vmin=0, vmax=1, cmap='gray'); ax1.set_title('Pred Mask (prob)'); ax1.axis('off')
             fig.suptitle(f'Epoch {epoch}, {split.capitalize()} Sample {i}, Prob'); fig.tight_layout()
             log.setdefault(f'mask_viz/{split}/prob', []).append(wandb.Image(fig, caption=f'sample {i}')); plt.close(fig)
             # binarized at each threshold

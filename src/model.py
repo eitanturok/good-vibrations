@@ -222,35 +222,10 @@ def get_dataloaders(repo_id:str, patch_size:int=256, disc_mask_h:int=40, disc_ma
 
 # ***** metrics *****
 
-def _tag(m, metric_name:str, pred_type:str, pos:str|None=None):
-    m.metric_name = metric_name
-    m.pred_type = pred_type     # 'x', 'y', or 'mask'
-    m.pos = pos                 # 'x', 'y', or None (for profile axis)
-    return m
-
 def create_metrics(nx: int, ny: int):
-    return {
-        "position/x/acc":   _tag(MulticlassAccuracy(num_classes=nx), 'Accuracy', 'x'),
-        "position/y/acc":   _tag(MulticlassAccuracy(num_classes=ny), 'Accuracy', 'y'),
-        "position/x/rmse":  _tag(MeanSquaredError(squared=False),    'rMSE', 'x'),
-        "position/y/rmse":  _tag(MeanSquaredError(squared=False),    'rMSE', 'y'),
-        "position/x/ce":    _tag(MeanMetric(), 'CE', 'x'),
-        "position/y/ce":    _tag(MeanMetric(), 'CE', 'y'),
-        "mask/iou":         _tag(MeanMetric(), 'IoU', 'mask'),
-        "mask/ce":          _tag(MeanMetric(), 'WeightedCE', 'mask'),
-        "mask/dice":        _tag(MeanMetric(), 'SoftDice',   'mask'),
-        "mask/x/dice":      _tag(MeanMetric(), 'SoftDice', 'mask', 'x'),
-        "mask/y/dice":      _tag(MeanMetric(), 'SoftDice', 'mask', 'y'),
-    }
+    return {"mse": MeanSquaredError()}
 
 # **** loss ****
-
-# def sord_loss(predictions, targets, cost_matrix):
-#     """SORD loss with soft labels based on ordinal distance."""
-#     soft_labels = torch.exp(-cost_matrix[targets])
-#     soft_labels = F.normalize(soft_labels, p=1, dim=1)
-#     log_predictions = F.log_softmax(predictions, dim=-1)
-#     return -(soft_labels * log_predictions).sum(dim=1).mean()
 
 def soft_dice_fn(logits, targets, axis=None):
     """Computes Soft Dice for the full mask, or just along X or Y directions.
@@ -309,9 +284,8 @@ def boundary_loss_fn(mask_logits, target, kernel_size=3):
     return F.binary_cross_entropy_with_logits(mask_logits, target, weight=weight)
 
 def mse_loss_fn(mask_logits, target):
-    """MSE on probabilities (after sigmoid). Using raw logits breaks semantics: logits are unbounded
-    but targets are in [0,1], making the 'optimal' logit prediction the target value itself
-    rather than the inverse-sigmoid of it. Sigmoid first ensures gradients flow correctly."""
+    """MSE on probabilities (after sigmoid). Averaged over all elements (B, H, W) so it is the percent
+    of total pixels that are wrong, making it stable across different disc_mask_h / disc_mask_w."""
     return F.mse_loss(mask_logits.sigmoid(), target)
 
 def tversky_loss_fn(mask_logits, target, alpha=0.3, beta=0.7):
@@ -555,25 +529,6 @@ class SignalTransformer(ComposerModel):
         x_logits, y_logits, _, mask_logits = outputs
         metric_name, pred_type, pos = getattr(metric, 'metric_name', None), getattr(metric, 'pred_type', None), getattr(metric, 'pos', None)
 
-        if pred_type == 'x':
-            if metric_name == 'rMSE': metric.update(x_logits.argmax(-1), floor_x_true)
-            elif metric_name == 'CE': metric.update(F.cross_entropy(x_logits, floor_x_true))
-            elif metric_name == 'Accuracy': metric.update(x_logits, floor_x_true) # multiclass accuracy
-            else: raise ValueError(f"did not recognize {metric_name=}")
-        elif pred_type == 'y':
-            if metric_name == 'rMSE': metric.update(y_logits.argmax(-1), floor_y_true)
-            elif metric_name == 'CE': metric.update(F.cross_entropy(y_logits, floor_y_true))
-            elif metric_name == 'Accuracy': metric.update(y_logits, floor_y_true)
-            else: raise ValueError(f"did not recognize {metric_name=}")
-        elif pred_type == 'mask':
-            if metric_name == 'SoftDice':
-                axis = 1 if pos == 'x' else (2 if pos == 'y' else None)
-                metric.update(soft_dice_fn(mask_logits, mask_true, axis=axis))
-            elif metric_name == 'IoU': metric.update(soft_iou_fn(mask_logits, mask_true))
-            elif metric_name == 'WeightedCE': metric.update(focal_loss_fn(mask_logits, mask_true) if FOCAL else weighted_cross_entropy_fn(mask_logits, mask_true))
-            else: raise ValueError(f"did not recognize {metric_name=}")
-        else:
-            raise ValueError(f"did not recognize {pred_type=}")
 
     def eval_forward(self, batch, outputs=None):
         return outputs if outputs is not None else self.forward(batch)
@@ -631,7 +586,7 @@ def get_parser():
     parser.add_argument('--mask-viz-train-interval', type=int, default=10)
     parser.add_argument('--mask-viz-thresholds', type=str, default='0.3,0.5,0.7,0.9')
     parser.add_argument('--run-name', type=str, default=None)
-    parser.add_argument('--best-metric', type=str, default='x/MulticlassAccuracy', help='Eval metric key to gate best-checkpoint saving on')
+    parser.add_argument('--best-metric', type=str, default='mse', help='Eval metric key to gate best-checkpoint saving on')
     parser.add_argument('--best-metric-higher-is-better', action='store_true', default=False, help='Set if larger metric values are better (e.g. accuracy)')
     parser.add_argument('--checkpoint-interval', type=str, default='100ep', help='Interval for saving checkpoints to HF; see https://modal.com/docs/guide/checkpoints#checkpoint-intervals for supported formats')
 
@@ -652,6 +607,10 @@ def train(**kwargs):
     args.__dict__.update(kwargs)        # apply overrides
     global SORD, MASK, POSITION, ROPE, DISCRETIZED_MASK, FOCAL, AUGMENT, HARD_MASK # environment variables
     SORD, MASK, POSITION, ROPE, DISCRETIZED_MASK, FOCAL, AUGMENT, HARD_MASK = args.sord, args.mask_loss, args.position_loss, args.rope, args.discretized_mask, args.focal, args.augment, args.hard_mask
+
+    if args.run_name is None:
+        from datetime import datetime
+        args.run_name = f"{args.loss}-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
 
     seed_all(args.seed) # must seed before initializing model + dataloader
     import json
