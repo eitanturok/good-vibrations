@@ -1017,7 +1017,7 @@ def get_parser():
     parser.add_argument(
         "--speakers",
         type=str,
-        default=None,
+        default="[0,1,0,0]",
         help="JSON list of speakers to include, e.g. '[[0,1,0,0],[1,0,0,0]]'",
     )
     parser.add_argument(
