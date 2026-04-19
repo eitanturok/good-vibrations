@@ -36,6 +36,10 @@ def sh(cmd: str) -> str:
     return result.stdout
 
 
+def shell_join(parts: List[str]) -> str:
+    return " ".join(shlex.quote(part) for part in parts)
+
+
 def parse_args():
     ap = argparse.ArgumentParser(
         description="Submit a Slurm job using the best available resources"
@@ -128,7 +132,7 @@ def build_log_dir() -> Path:
 
 
 def build_model_command(model_args: List[str]) -> str:
-    return shlex.join(["uv", "run", "python", "src/model.py", *model_args])
+    return shell_join(["uv", "run", "python", "src/model.py", *model_args])
 
 
 def build_resubmit_command(args, model_args: List[str]) -> str:
@@ -147,7 +151,7 @@ def build_resubmit_command(args, model_args: List[str]) -> str:
         cmd.extend(["--time", args.time])
     if args.gpu:
         cmd.extend(["--gpu", args.gpu])
-    return shlex.join(cmd + model_args).replace(
+    return shell_join(cmd + model_args).replace(
         dependency_placeholder, "afterany:${SLURM_JOB_ID}"
     )
 
