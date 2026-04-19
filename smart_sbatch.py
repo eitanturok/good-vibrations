@@ -56,7 +56,6 @@ def parse_args():
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--gpu", choices=[name for name, *_ in GPUS])
     ap.add_argument("--dependency", default=None)
-    ap.add_argument("--signal-seconds", type=int, default=600)
     ap.add_argument("--time", default=None, help="Override Slurm walltime, e.g. 00:15:00")
     return ap.parse_known_args()
 
@@ -152,8 +151,6 @@ def build_resubmit_command(args, model_args: List[str]) -> str:
         args.job_name,
         "--dependency",
         dependency_placeholder,
-        "--signal-seconds",
-        str(args.signal_seconds),
     ]
     if args.time:
         cmd.extend(["--time", args.time])
@@ -169,7 +166,6 @@ def build_script(args, model_args: List[str], partition: str, gres: str, ram: in
     model_cmd = build_model_command(model_args)
     resubmit_cmd = build_resubmit_command(args, model_args)
     walltime = args.time or max_time
-    resubmit_delay = max(0, parse_walltime_seconds(walltime) - args.signal_seconds)
     return textwrap.dedent(
         f"""#!/bin/bash
 #SBATCH --partition={partition}
@@ -178,7 +174,6 @@ def build_script(args, model_args: List[str], partition: str, gres: str, ram: in
 #SBATCH --mem={ram}G
 #SBATCH --gres={gres}
 #SBATCH --time={walltime}
-#SBATCH --signal=B:USR1@{args.signal_seconds}
 #SBATCH --job-name={args.job_name}
 #SBATCH --output={log_dir.resolve()}/out.log
 #SBATCH --error={log_dir.resolve()}/err.log
@@ -192,9 +187,8 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 source $HOME/.local/bin/env
 source $HOME/mark_sheinin_lab/code/eitan/.secrets
 
-DONE_FLAG="$(mktemp)"
 RESUBMIT_JOB_FILE="$(mktemp)"
-rm -f "$DONE_FLAG" "$RESUBMIT_JOB_FILE"
+rm -f "$RESUBMIT_JOB_FILE"
 RESUBMITTED=0
 TIMEOUT_TERMINATING=0
 
@@ -221,10 +215,7 @@ handle_term_signal() {{
 trap handle_term_signal TERM
 
 (
-    sleep {resubmit_delay}
-    if [ ! -f "$DONE_FLAG" ]; then
-        schedule_resume
-    fi
+    schedule_resume
 ) &
 RESUBMIT_TIMER_PID=$!
 
@@ -232,7 +223,6 @@ TRAIN_EXIT=0
 {model_cmd} &
 TRAIN_PID=$!
 wait "$TRAIN_PID" || TRAIN_EXIT=$?
-touch "$DONE_FLAG"
 kill "$RESUBMIT_TIMER_PID" >/dev/null 2>&1 || true
 wait "$RESUBMIT_TIMER_PID" 2>/dev/null || true
 RESUBMIT_JOB_ID=""
