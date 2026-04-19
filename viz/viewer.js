@@ -249,14 +249,13 @@ function attachRunTooltip(canvas, sample, runId) {
     if (mode === 'diff') {
       if (gt) parts.push(`y: ${gt[i].toFixed(3)}`);
       if (pred) parts.push(`y_pred: ${pred[i].toFixed(3)}`);
-      if (gt && pred) parts.push(`y_pred - y: ${(pred[i] - gt[i]).toFixed(3)}`);
     } else {
       if (side !== 'pred' && gt) parts.push(`y: ${gt[i].toFixed(3)}`);
       if (side !== 'gt' && pred) parts.push(`y_pred: ${pred[i].toFixed(3)}`);
     }
     if (!parts.length) return;
 
-    tooltipEl.textContent = parts.join('  ');
+    tooltipEl.innerHTML = mode === 'diff' ? parts.join('<br>') : parts.join('  ');
     tooltipEl.style.display = 'block';
     tooltipEl.style.left = (e.clientX + 12) + 'px';
     tooltipEl.style.top  = (e.clientY + 12) + 'px';
@@ -573,10 +572,19 @@ function openFullscreen(idx) {
   // Overhead
   if (sample.overhead) {
     const sec = section('Overhead Image');
+    const wrap = document.createElement('div');
+    wrap.style.cssText = 'position:relative;display:inline-block;max-width:100%;';
     const img = document.createElement('img');
     img.src = sample.overhead;
     img.style.cssText = 'max-width:100%;display:block;';
-    sec.appendChild(img);
+    wrap.appendChild(img);
+    if (sample.speaker_overlay) {
+      const overlay = document.createElement('img');
+      overlay.src = sample.speaker_overlay;
+      overlay.style.cssText = 'position:absolute;top:0;left:0;width:100%;height:100%;';
+      wrap.appendChild(overlay);
+    }
+    sec.appendChild(wrap);
   }
 
   // Metadata
@@ -722,9 +730,15 @@ document.addEventListener('input', e => {
     state.opacityPred[runId] = parseFloat(el.value);
     reRenderColumn(runId);
   }
-  if (el.id === 'play-speed' && playInterval) {
-    clearInterval(playInterval);
-    playInterval = setInterval(playStep, parseInt(el.value));
+  if (el.id === 'play-speed') {
+    const ms = parseInt(el.value);
+    const fps = (1000 / ms).toFixed(ms >= 200 ? 1 : 0);
+    const fpsEl = document.getElementById('speed-fps');
+    if (fpsEl) fpsEl.textContent = `${fps} fps`;
+    if (playInterval) {
+      clearInterval(playInterval);
+      playInterval = setInterval(playStep, ms);
+    }
   }
   if (el.id === 'epoch-slider') {
     frameIdx = parseInt(el.value);
@@ -769,6 +783,11 @@ document.getElementById('close-dialog').addEventListener('click', () => {
   const nObjects = [...new Set(PAYLOAD.samples.map(s => s.n_objects))].sort((a, b) => a - b);
   const speakerKeys = [...new Set(PAYLOAD.samples.map(s => getSpeakerKey(s.speakers)).filter(Boolean))]
     .sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
+  const hasTrain = PAYLOAD.runs.some(run =>
+    Object.values(run.preds || {}).some(epochPreds =>
+      Object.values(epochPreds || {}).some(entry => entry?.split === 'train')
+    )
+  );
 
   const filterObj = document.getElementById('filter-object');
   filterObj.innerHTML = '<option value="">All</option>' +
@@ -782,6 +801,8 @@ document.getElementById('close-dialog').addEventListener('click', () => {
   filterSpeaker.innerHTML = '<option value="">All</option>' +
     speakerKeys.map(key => `<option value="${key}">${getSpeakerLabel(key)}</option>`).join('');
 
+  if (hasTrain) document.getElementById('filter-split').value = 'train';
+
   // Populate run selector
   const runSel = document.getElementById('run-selector');
   runSel.innerHTML = PAYLOAD.runs.map(r =>
@@ -789,4 +810,12 @@ document.getElementById('close-dialog').addEventListener('click', () => {
   ).join('');
 
   rebuild();
+
+  // Initialize speed label
+  const speedSlider = document.getElementById('play-speed');
+  const fpsEl = document.getElementById('speed-fps');
+  if (speedSlider && fpsEl) {
+    const ms = parseInt(speedSlider.value);
+    fpsEl.textContent = `${(1000 / ms).toFixed(1)} fps`;
+  }
 })();

@@ -13,6 +13,7 @@ import json
 import resource
 import sys
 import time
+import webbrowser
 from pathlib import Path
 
 import numpy as np
@@ -198,11 +199,16 @@ def load_run_data(run_id: str) -> dict:
     """Fetch W&B config + history + HF predictions. Returns serialisable dict."""
     t0 = time.perf_counter()
     print(f'  [run {run_id}] W&B metadata...')
-    api  = wandb.Api()
-    run  = api.run(f'{ENTITY}/{PROJECT}/{run_id}')
-    cfg  = run.config
-    run_name = run.name or run_id
-    run_config = {k: cfg.get(k) for k in ('loss', 'gamma', 'decoder', 'd_model', 'lr', 'seed', 'n_params')}
+    run_name = run_id
+    run_config = {}
+    try:
+        api = wandb.Api()
+        run = api.run(f'{ENTITY}/{PROJECT}/{run_id}')
+        cfg = run.config
+        run_name = run.name or run_id
+        run_config = {k: cfg.get(k) for k in ('loss', 'gamma', 'decoder', 'd_model', 'lr', 'seed', 'n_params')}
+    except Exception as e:
+        print(f'  [warn] W&B metadata unavailable for {run_id}: {e}')
     t0 = _t('W&B metadata', t0)
 
     print(f'  [run {run_id}] W&B history...')
@@ -210,19 +216,22 @@ def load_run_data(run_id: str) -> dict:
             'metrics/train/mask/iou', 'metrics/eval/mask/iou',
             'metrics/train/mask/mse', 'metrics/eval/mask/mse']
     metrics_by_epoch: dict[str, dict] = {}
-    for row in fetch_wandb_history(run_id, keys=keys):
-        epoch = row.get('epoch')
-        if epoch is None:
-            continue
-        e = str(int(epoch))
-        m = metrics_by_epoch.setdefault(e, {})
-        for src, dst in [('loss/train/total', 'loss'),
-                         ('metrics/train/mask/iou', 'train_iou'),
-                         ('metrics/eval/mask/iou',  'eval_iou'),
-                         ('metrics/train/mask/mse', 'train_mse'),
-                         ('metrics/eval/mask/mse',  'eval_mse')]:
-            if row.get(src) is not None:
-                m[dst] = row[src]
+    try:
+        for row in fetch_wandb_history(run_id, keys=keys):
+            epoch = row.get('epoch')
+            if epoch is None:
+                continue
+            e = str(int(epoch))
+            m = metrics_by_epoch.setdefault(e, {})
+            for src, dst in [('loss/train/total', 'loss'),
+                             ('metrics/train/mask/iou', 'train_iou'),
+                             ('metrics/eval/mask/iou',  'eval_iou'),
+                             ('metrics/train/mask/mse', 'train_mse'),
+                             ('metrics/eval/mask/mse',  'eval_mse')]:
+                if row.get(src) is not None:
+                    m[dst] = row[src]
+    except Exception as e:
+        print(f'  [warn] W&B history unavailable for {run_id}: {e}')
     t0 = _t('W&B history', t0)
 
     print(f'  [run {run_id}] predictions from HF Hub...')
@@ -471,7 +480,17 @@ def render_html(payload: dict, title: str = 'Good Vibrations Viewer') -> str:
     </div>
     <div id="bar-row2">
       <button id="play-btn">&#9654; Play</button>
-      <label id="speed-label">Speed <input id="play-speed" type="range" min="200" max="2000" step="100" value="800"></label>
+      <label id="speed-label">Speed: <span id="speed-fps">1.2 fps</span>
+        <input id="play-speed" type="range" min="50" max="2000" step="50" value="800" list="speed-ticks">
+        <datalist id="speed-ticks">
+          <option value="50"  label="20fps"></option>
+          <option value="100" label="10fps"></option>
+          <option value="200" label="5fps"></option>
+          <option value="500" label="2fps"></option>
+          <option value="1000" label="1fps"></option>
+          <option value="2000" label="0.5fps"></option>
+        </datalist>
+      </label>
       <label id="epoch-label-wrap">Epoch <input id="epoch-slider" type="range" min="0" max="0" step="1" value="0"></label>
       <span id="play-epoch-label"></span>
     </div>
@@ -503,6 +522,8 @@ def main():
                         help='Output HTML path')
     parser.add_argument('--no-show-speakers', action='store_true',
                         help='Disable padded overhead speaker overlays')
+    parser.add_argument('--no-open', action='store_true',
+                        help='Do not open the generated HTML in a browser')
     args = parser.parse_args()
 
     t0 = time.perf_counter()
@@ -519,9 +540,13 @@ def main():
     out = Path(args.output)
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(html, encoding='utf-8')
+    uri = out.resolve().as_uri()
+    opened = False if args.no_open else webbrowser.open(uri)
     size_mb = out.stat().st_size / 1e6
     total = time.perf_counter() - t0
     print(f'\nWritten: {out}  ({size_mb:.1f} MB)  total: {total:.1f}s')
+    print(f'URL: {uri}')
+    print(f'Opened browser: {opened}')
 
 
 if __name__ == '__main__':
