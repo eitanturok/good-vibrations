@@ -24,12 +24,12 @@ install()
 
 from helpers import (
     BestMetricCheckpointSaver,
+    HFUploaderCallback,
     MaskVisualizationCallback,
     MemoryCallback,
+    best_checkpoint_path,
     checkpoint_pattern_path,
-    hf_uri,
-    run_best_checkpoint_dir,
-    run_root_path,
+    run_predictions_dir,
     run_visualizations_dir,
     sample_npz_path,
 )
@@ -1178,29 +1178,29 @@ def train(**kwargs):
         init_kwargs={"config": config, "save_code": True},
     )
     resume_saver = CheckpointSaver(
-        folder=hf_uri(args.data_dir, "runs"),
-        filename=checkpoint_pattern_path(run_id).removeprefix(f"{run_root_path(run_id)}/"),
+        folder=".",
+        filename=checkpoint_pattern_path(run_id),
         save_interval=args.checkpoint_interval,
-        num_checkpoints_to_keep=1,
+        num_checkpoints_to_keep=-1,
         overwrite=True,
     )
     best_saver = BestMetricCheckpointSaver(
         metric_name=args.best_metric,
         higher_is_better=args.best_metric_higher_is_better,
-        folder=hf_uri(args.data_dir, "runs"),
-        filename="ckpt.pt",
+        folder=".",
+        filename=best_checkpoint_path(run_id),
         save_interval=args.eval_interval,
         num_checkpoints_to_keep=1,
         overwrite=True,
     )
     mask_viz = MaskVisualizationCallback(
         n_samples=args.eval_batch_size,
-        save_dir="visualizations",
+        save_dir=run_visualizations_dir(run_id),
         train_viz_interval=args.mask_viz_train_interval,
-        pred_save_path=args.data_dir,
-        viz_save_path=hf_uri(args.data_dir, run_visualizations_dir(run_id)),
+        pred_save_dir=run_predictions_dir(run_id),
         run_id=run_id,
     )
+    hf_uploader = HFUploaderCallback(repo_id=args.data_dir, run_id=run_id)
     dataset = train_loader.dataset.dataset
     dataset_gb = (dataset.shifts.nbytes + dataset.masks.nbytes) / 1e9
     mem_cb = MemoryCallback(dataset_gb=dataset_gb)
@@ -1228,7 +1228,7 @@ def train(**kwargs):
         log_to_console=True,
         auto_log_hparams=True,
         save_metrics=True,
-        callbacks=[mask_viz, resume_saver, best_saver, mem_cb],
+        callbacks=[mask_viz, resume_saver, best_saver, hf_uploader, mem_cb],
     )
 
     trainer.fit()

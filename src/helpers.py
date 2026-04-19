@@ -1,4 +1,4 @@
-import os, tempfile, time
+import os, time
 from pathlib import Path
 from typing import Any, Callable, Optional, Union
 
@@ -13,7 +13,6 @@ from composer import Callback
 from composer.callbacks import CheckpointSaver
 from composer.core import Event, State
 from composer.loggers import Logger
-from composer.utils import RemoteUploader
 from huggingface_hub import HfApi
 
 
@@ -43,23 +42,19 @@ def run_predictions_dir(run_id: str) -> str:
 
 
 def run_checkpoints_dir(run_id: str) -> str:
-    return f"{run_root_path(run_id)}/checkpoint"
+    return f"{run_root_path(run_id)}/checkpoints"
 
 
 def checkpoint_pattern_path(run_id: str) -> str:
     return f"{run_checkpoints_dir(run_id)}/ep{{epoch:07d}}_ba{{batch:010d}}.pt"
 
 
-def run_best_checkpoint_dir(run_id: str) -> str:
-    return f"{run_root_path(run_id)}/best"
-
-
-def best_checkpoint_path(run_id: str, filename: str = "ckpt.pt") -> str:
-    return f"{run_best_checkpoint_dir(run_id)}/{filename}"
+def best_checkpoint_path(run_id: str, filename: str = "best.pt") -> str:
+    return f"{run_root_path(run_id)}/{filename}"
 
 
 def run_visualizations_dir(run_id: str) -> str:
-    return f"{run_root_path(run_id)}/visualization"
+    return f"{run_root_path(run_id)}/visualizations"
 
 
 def load_from_hf(
@@ -231,6 +226,30 @@ class BestMetricCheckpointSaver(CheckpointSaver):
                     {"memory/gpu/checkpoint_spike_gb": spike},
                     step=state.timestamp.batch.value,
                 )
+
+
+class HFUploaderCallback(Callback):
+    def __init__(self, repo_id: str, run_id: str):
+        self.repo_id = repo_id.removeprefix("hf://")
+        self.run_id = run_id
+        self.local_run_dir = Path(run_root_path(run_id))
+        self._uploaded = False
+
+    def fit_end(self, state, logger):
+        del state, logger
+        if self._uploaded or not self.local_run_dir.exists():
+            return
+        print(
+            f"[HFUploaderCallback] uploading {self.local_run_dir} to "
+            f"hf://{self.repo_id}/{run_root_path(self.run_id)}"
+        )
+        HfApi().upload_folder(
+            folder_path=str(self.local_run_dir),
+            path_in_repo=run_root_path(self.run_id),
+            repo_id=self.repo_id,
+            repo_type="dataset",
+        )
+        self._uploaded = True
 
 
 class MemoryCallback(Callback):
@@ -443,32 +462,17 @@ class MaskVisualizationCallback(Callback):
         save_dir="visualizations",
         train_viz_interval=10,
         thresholds=[],
-        pred_save_path=None,
-        viz_save_path=None,
+        pred_save_dir=None,
         run_id=None,
     ):
         self.n_samples = n_samples
         self.save_dir = save_dir
         self.train_viz_interval = train_viz_interval
         self.thresholds = list(thresholds)
-        self.pred_save_path = (
-            pred_save_path  # HF repo ID, e.g. "eturok-weizmann/good-vibrations"
-        )
-        self.viz_save_path = viz_save_path
+        self.pred_save_dir = pred_save_dir
         self.run_id = run_id
         self._train_preds = []
         self._eval_preds = []  # accumulates across all eval batches
-        self._viz_uploader = None
-        self._viz_tmpdir = tempfile.TemporaryDirectory()
-
-    def init(self, state, logger):
-        del state, logger
-        if self.viz_save_path:
-            self._viz_uploader = RemoteUploader(
-                remote_folder=self.viz_save_path,
-                num_concurrent_uploads=4,
-            )
-            self._viz_uploader.init()
 
     def epoch_start(self, state, logger):
         del state, logger
@@ -476,23 +480,8 @@ class MaskVisualizationCallback(Callback):
 
     def batch_end(self, state, logger):
         del logger
-        if self._viz_uploader is not None:
-            self._viz_uploader.check_workers()
         if self._should_collect_train_preds(state):
             self._train_preds.append(self._batch_to_pred(state.batch, state.outputs))
-
-    def fit_end(self, state, logger):
-        del state, logger
-        if self._viz_uploader is not None:
-            self._viz_uploader.wait()
-
-    def post_close(self):
-        if self._viz_uploader is not None:
-            try:
-                self._viz_uploader.wait_and_close()
-            except Exception as e:
-                print(f"[MaskVisualizationCallback] Visualization upload failed: {e}")
-        self._viz_tmpdir.cleanup()
 
     def epoch_end(self, state, logger):
         del logger
@@ -530,9 +519,9 @@ class MaskVisualizationCallback(Callback):
         }
 
     def _save_predictions(self, preds_list, state, split):
-        if not self.pred_save_path or not self.run_id:
+        if not self.pred_save_dir or not self.run_id:
             return
-        import io, numpy as np
+        import numpy as np
 
         mask_true = np.concatenate([p["mask_true"] for p in preds_list])
         mask_logits = np.concatenate([p["mask_logits"] for p in preds_list])
@@ -543,9 +532,14 @@ class MaskVisualizationCallback(Callback):
         object_type = sum([p["object"] for p in preds_list], [])
         n_objects = sum([p["n_objects"] for p in preds_list], [])
 
-        buf = io.BytesIO()
+        epoch = state.timestamp.epoch.value
+        batch = state.timestamp.batch.value
+        local_path = Path(self.pred_save_dir) / Path(
+            prediction_npz_path(self.run_id, split, epoch, batch)
+        ).name
+        local_path.parent.mkdir(parents=True, exist_ok=True)
         np.savez(
-            buf,
+            local_path,
             mask_true=mask_true,
             mask_logits=mask_logits,
             mask_pred=mask_pred,
@@ -555,21 +549,6 @@ class MaskVisualizationCallback(Callback):
             object_type=np.array(object_type),
             n_objects=np.array(n_objects, dtype=int),
         )
-        buf.seek(0)
-
-        epoch = state.timestamp.epoch.value
-        batch = state.timestamp.batch.value
-        repo_id = self.pred_save_path.removeprefix("hf://")
-        path_in_repo = prediction_npz_path(self.run_id, split, epoch, batch)
-        try:
-            HfApi().upload_file(
-                path_or_fileobj=buf,
-                path_in_repo=path_in_repo,
-                repo_id=repo_id,
-                repo_type="dataset",
-            )
-        except Exception as e:
-            print(f"[MaskVisualizationCallback] Failed to save predictions: {e}")
 
     def _visualize(self, preds_list, state, split, use_all_samples):
         import numpy as np
@@ -599,7 +578,7 @@ class MaskVisualizationCallback(Callback):
                 f"Epoch {epoch}, {split.capitalize()} Sample {sample_ids[i]}, Prob"
             )
             fig.tight_layout()
-            self._upload_visualization(
+            self._save_visualization(
                 fig,
                 split=split,
                 kind="prob",
@@ -624,7 +603,7 @@ class MaskVisualizationCallback(Callback):
                     f"Epoch {epoch}, {split.capitalize()} Sample {sample_ids[i]}, threshold {t}"
                 )
                 fig.tight_layout()
-                self._upload_visualization(
+                self._save_visualization(
                     fig,
                     split=split,
                     kind=f"thresh{t}",
@@ -639,27 +618,21 @@ class MaskVisualizationCallback(Callback):
         if wandb.run and log:
             wandb.log(log, step=state.timestamp.batch.value)
 
-    def _upload_visualization(self, fig, split, kind, state, sample_idx):
-        if self._viz_uploader is None:
-            return
+    def _save_visualization(self, fig, split, kind, state, sample_idx):
         epoch = int(state.timestamp.epoch.value)
         batch = int(state.timestamp.batch.value)
-        filename = visualization_image_path(
-            self.run_id,
-            split=split,
-            kind=kind,
-            epoch=epoch,
-            batch=batch,
-            sample_idx=sample_idx,
-        ).removeprefix(f"{run_visualizations_dir(self.run_id)}/")
-        local_path = Path(self._viz_tmpdir.name) / filename
+        local_path = Path(
+            visualization_image_path(
+                self.run_id,
+                split=split,
+                kind=kind,
+                epoch=epoch,
+                batch=batch,
+                sample_idx=sample_idx,
+            )
+        )
         local_path.parent.mkdir(parents=True, exist_ok=True)
         fig.savefig(local_path, dpi=150, bbox_inches="tight")
-        self._viz_uploader.upload_file_async(
-            remote_file_name=filename,
-            file_path=local_path,
-            overwrite=True,
-        )
 
 
 def fetch_predictions(
