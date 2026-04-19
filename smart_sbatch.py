@@ -44,6 +44,7 @@ def parse_args():
     ap.add_argument("--gpu", choices=[name for name, *_ in GPUS])
     ap.add_argument("--dependency", default=None)
     ap.add_argument("--signal-seconds", type=int, default=600)
+    ap.add_argument("--time", default=None, help="Override Slurm walltime, e.g. 00:15:00")
     return ap.parse_known_args()
 
 
@@ -141,6 +142,8 @@ def build_resubmit_command(args, model_args: list[str]) -> str:
         "--signal-seconds",
         str(args.signal_seconds),
     ]
+    if args.time:
+        cmd.extend(["--time", args.time])
     if args.gpu:
         cmd.extend(["--gpu", args.gpu])
     return shlex.join(cmd + model_args).replace(
@@ -152,6 +155,7 @@ def build_script(args, model_args: list[str], partition: str, gres: str, ram: in
     repo_root = Path.cwd().resolve()
     model_cmd = build_model_command(model_args)
     resubmit_cmd = build_resubmit_command(args, model_args)
+    walltime = args.time or max_time
     return textwrap.dedent(
         f"""\
         #!/bin/bash
@@ -160,7 +164,7 @@ def build_script(args, model_args: list[str], partition: str, gres: str, ram: in
         #SBATCH --cpus-per-task=4
         #SBATCH --mem={ram}G
         #SBATCH --gres={gres}
-        #SBATCH --time={max_time}
+        #SBATCH --time={walltime}
         #SBATCH --signal=B:USR1@{args.signal_seconds}
         #SBATCH --job-name={args.job_name}
         #SBATCH --output={log_dir.resolve()}/out.log
