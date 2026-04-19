@@ -40,6 +40,14 @@ def shell_join(parts: List[str]) -> str:
     return " ".join(shlex.quote(part) for part in parts)
 
 
+def parse_walltime_seconds(walltime: str) -> int:
+    parts = [int(part) for part in walltime.split(":")]
+    if len(parts) != 3:
+        raise ValueError(f"Expected HH:MM:SS walltime, got {walltime!r}")
+    hours, minutes, seconds = parts
+    return hours * 3600 + minutes * 60 + seconds
+
+
 def parse_args():
     ap = argparse.ArgumentParser(
         description="Submit a Slurm job using the best available resources"
@@ -161,6 +169,7 @@ def build_script(args, model_args: List[str], partition: str, gres: str, ram: in
     model_cmd = build_model_command(model_args)
     resubmit_cmd = build_resubmit_command(args, model_args)
     walltime = args.time or max_time
+    resubmit_delay = max(0, parse_walltime_seconds(walltime) - args.signal_seconds)
     return textwrap.dedent(
         f"""#!/bin/bash
 #SBATCH --partition={partition}
@@ -183,14 +192,16 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 source $HOME/.local/bin/env
 source $HOME/mark_sheinin_lab/code/eitan/.secrets
 
-RESUBMITTED=0
-RESUBMIT_JOB_ID=""
-handle_timeout() {{
-    if [ "$RESUBMITTED" -eq 1 ]; then
+DONE_FLAG="$(mktemp)"
+RESUBMIT_JOB_FILE="$(mktemp)"
+rm -f "$DONE_FLAG" "$RESUBMIT_JOB_FILE"
+
+schedule_resume() {{
+    sleep {resubmit_delay}
+    if [ -f "$DONE_FLAG" ]; then
         return
     fi
-    RESUBMITTED=1
-    echo "[smart_sbatch] Caught SIGUSR1 for $SLURM_JOB_ID; scheduling resume job"
+    echo "[smart_sbatch] Scheduling resume job for $SLURM_JOB_ID"
     RESUBMIT_OUTPUT="$({resubmit_cmd} 2>&1)"
     RESUBMIT_STATUS=$?
     printf '%s\n' "$RESUBMIT_OUTPUT"
@@ -198,14 +209,19 @@ handle_timeout() {{
         echo "[smart_sbatch] Failed to submit resume job" >&2
         return
     fi
-    RESUBMIT_JOB_ID="$(printf '%s\n' "$RESUBMIT_OUTPUT" | awk '/Submitted batch job/ {{print $4}}' | tail -n 1)"
+    printf '%s\n' "$RESUBMIT_OUTPUT" | awk '/Submitted batch job/ {{print $4}}' | tail -n 1 > "$RESUBMIT_JOB_FILE"
 }}
-trap handle_timeout USR1
+schedule_resume &
+RESUBMIT_TIMER_PID=$!
 
 TRAIN_EXIT=0
 {model_cmd} || TRAIN_EXIT=$?
+touch "$DONE_FLAG"
+kill "$RESUBMIT_TIMER_PID" >/dev/null 2>&1 || true
+wait "$RESUBMIT_TIMER_PID" 2>/dev/null || true
 if [ "$TRAIN_EXIT" -eq 0 ]; then
-    if [ -n "$RESUBMIT_JOB_ID" ]; then
+    if [ -s "$RESUBMIT_JOB_FILE" ]; then
+        RESUBMIT_JOB_ID="$(cat "$RESUBMIT_JOB_FILE")"
         echo "[smart_sbatch] Training completed; cancelling queued resume job $RESUBMIT_JOB_ID"
         scancel "$RESUBMIT_JOB_ID" || true
     fi
