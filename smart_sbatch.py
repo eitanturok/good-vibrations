@@ -162,58 +162,57 @@ def build_script(args, model_args: List[str], partition: str, gres: str, ram: in
     resubmit_cmd = build_resubmit_command(args, model_args)
     walltime = args.time or max_time
     return textwrap.dedent(
-        f"""\
-        #!/bin/bash
-        #SBATCH --partition={partition}
-        #SBATCH --ntasks=1
-        #SBATCH --cpus-per-task=4
-        #SBATCH --mem={ram}G
-        #SBATCH --gres={gres}
-        #SBATCH --time={walltime}
-        #SBATCH --signal=B:USR1@{args.signal_seconds}
-        #SBATCH --job-name={args.job_name}
-        #SBATCH --output={log_dir.resolve()}/out.log
-        #SBATCH --error={log_dir.resolve()}/err.log
+        f"""#!/bin/bash
+#SBATCH --partition={partition}
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=4
+#SBATCH --mem={ram}G
+#SBATCH --gres={gres}
+#SBATCH --time={walltime}
+#SBATCH --signal=B:USR1@{args.signal_seconds}
+#SBATCH --job-name={args.job_name}
+#SBATCH --output={log_dir.resolve()}/out.log
+#SBATCH --error={log_dir.resolve()}/err.log
 
-        set -euo pipefail
+set -euo pipefail
 
-        cd {shlex.quote(str(repo_root))}
-        . /usr/local/lmod/lmod/init/bash
-        module load CUDA/12.2.2
-        curl -LsSf https://astral.sh/uv/install.sh | sh
-        source $HOME/.local/bin/env
-        source $HOME/mark_sheinin_lab/code/eitan/.secrets
+cd {shlex.quote(str(repo_root))}
+. /usr/local/lmod/lmod/init/bash
+module load CUDA/12.2.2
+curl -LsSf https://astral.sh/uv/install.sh | sh
+source $HOME/.local/bin/env
+source $HOME/mark_sheinin_lab/code/eitan/.secrets
 
-        RESUBMITTED=0
-        RESUBMIT_JOB_ID=""
-        handle_timeout() {{
-            if [ "$RESUBMITTED" -eq 1 ]; then
-                return
-            fi
-            RESUBMITTED=1
-            echo "[smart_sbatch] Caught SIGUSR1 for $SLURM_JOB_ID; scheduling resume job"
-            RESUBMIT_OUTPUT="$({resubmit_cmd} 2>&1)"
-            RESUBMIT_STATUS=$?
-            printf '%s\n' "$RESUBMIT_OUTPUT"
-            if [ "$RESUBMIT_STATUS" -ne 0 ]; then
-                echo "[smart_sbatch] Failed to submit resume job" >&2
-                return
-            fi
-            RESUBMIT_JOB_ID="$(printf '%s\n' "$RESUBMIT_OUTPUT" | awk '/Submitted batch job/ {{print $4}}' | tail -n 1)"
-        }}
-        trap handle_timeout USR1
+RESUBMITTED=0
+RESUBMIT_JOB_ID=""
+handle_timeout() {{
+    if [ "$RESUBMITTED" -eq 1 ]; then
+        return
+    fi
+    RESUBMITTED=1
+    echo "[smart_sbatch] Caught SIGUSR1 for $SLURM_JOB_ID; scheduling resume job"
+    RESUBMIT_OUTPUT="$({resubmit_cmd} 2>&1)"
+    RESUBMIT_STATUS=$?
+    printf '%s\n' "$RESUBMIT_OUTPUT"
+    if [ "$RESUBMIT_STATUS" -ne 0 ]; then
+        echo "[smart_sbatch] Failed to submit resume job" >&2
+        return
+    fi
+    RESUBMIT_JOB_ID="$(printf '%s\n' "$RESUBMIT_OUTPUT" | awk '/Submitted batch job/ {{print $4}}' | tail -n 1)"
+}}
+trap handle_timeout USR1
 
-        TRAIN_EXIT=0
-        {model_cmd} || TRAIN_EXIT=$?
-        if [ "$TRAIN_EXIT" -eq 0 ]; then
-            if [ -n "$RESUBMIT_JOB_ID" ]; then
-                echo "[smart_sbatch] Training completed; cancelling queued resume job $RESUBMIT_JOB_ID"
-                scancel "$RESUBMIT_JOB_ID" || true
-            fi
-            exit 0
-        fi
-        exit "$TRAIN_EXIT"
-        """
+TRAIN_EXIT=0
+{model_cmd} || TRAIN_EXIT=$?
+if [ "$TRAIN_EXIT" -eq 0 ]; then
+    if [ -n "$RESUBMIT_JOB_ID" ]; then
+        echo "[smart_sbatch] Training completed; cancelling queued resume job $RESUBMIT_JOB_ID"
+        scancel "$RESUBMIT_JOB_ID" || true
+    fi
+    exit 0
+fi
+exit "$TRAIN_EXIT"
+"""
     )
 
 
