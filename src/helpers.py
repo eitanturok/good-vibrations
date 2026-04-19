@@ -496,7 +496,10 @@ class MaskVisualizationCallback(Callback):
         self._eval_preds.append(self._batch_to_pred(state.batch, state.outputs))
 
     def _should_collect_train_preds(self, state):
-        return state.timestamp.epoch.value % self.train_viz_interval == 0
+        # During train batch callbacks, Composer's epoch timestamp counts completed
+        # epochs, so the current in-flight epoch is epoch.value + 1.
+        current_train_epoch = state.timestamp.epoch.value + 1
+        return current_train_epoch % self.train_viz_interval == 0
 
     def eval_end(self, state, logger):
         del logger
