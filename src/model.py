@@ -1235,7 +1235,7 @@ def train(**kwargs):
         seed=args.seed,
         loggers=logger,
         log_to_console=True,
-        auto_log_hparams=True,
+        auto_log_hparams=False,
         save_metrics=True,
         load_path=load_path,
         callbacks=[mask_viz, resume_saver, best_saver, hf_uploader, mem_cb],

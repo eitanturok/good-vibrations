@@ -185,19 +185,34 @@ def build_script(args, model_args: List[str], partition: str, gres: str, ram: in
         source $HOME/mark_sheinin_lab/code/eitan/.secrets
 
         RESUBMITTED=0
+        RESUBMIT_JOB_ID=""
         handle_timeout() {{
             if [ "$RESUBMITTED" -eq 1 ]; then
                 return
             fi
             RESUBMITTED=1
             echo "[smart_sbatch] Caught SIGUSR1 for $SLURM_JOB_ID; scheduling resume job"
-            if ! {resubmit_cmd}; then
+            RESUBMIT_OUTPUT="$({resubmit_cmd} 2>&1)"
+            RESUBMIT_STATUS=$?
+            printf '%s\n' "$RESUBMIT_OUTPUT"
+            if [ "$RESUBMIT_STATUS" -ne 0 ]; then
                 echo "[smart_sbatch] Failed to submit resume job" >&2
+                return
             fi
+            RESUBMIT_JOB_ID="$(printf '%s\n' "$RESUBMIT_OUTPUT" | awk '/Submitted batch job/ {{print $4}}' | tail -n 1)"
         }}
         trap handle_timeout USR1
 
-        {model_cmd}
+        TRAIN_EXIT=0
+        {model_cmd} || TRAIN_EXIT=$?
+        if [ "$TRAIN_EXIT" -eq 0 ]; then
+            if [ -n "$RESUBMIT_JOB_ID" ]; then
+                echo "[smart_sbatch] Training completed; cancelling queued resume job $RESUBMIT_JOB_ID"
+                scancel "$RESUBMIT_JOB_ID" || true
+            fi
+            exit 0
+        fi
+        exit "$TRAIN_EXIT"
         """
     )
 
