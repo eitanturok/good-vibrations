@@ -10,7 +10,6 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from composer import Callback
-from composer.callbacks import CheckpointSaver
 from composer.core import Event, State
 from composer.loggers import Logger
 from huggingface_hub import HfApi
@@ -183,25 +182,22 @@ def fetch_wandb_images(
     return paths
 
 
-class BestMetricCheckpointSaver(CheckpointSaver):
-    """Saves weights-only checkpoints only when a metric hits a new best.
+class BestMetricCheckpointSaver(Callback):
+    """Saves a weights-only checkpoint whenever a metric hits a new best.
 
-    Wraps Composer's CheckpointSaver (with weights_only=True) and gates
-    each save on whether the target eval metric has improved since the
-    last save.
+    Does NOT inherit from CheckpointSaver — intentionally a plain Callback so
+    Composer's Trainer does not mistake it for the primary checkpoint saver and
+    override save_folder / save_latest_filename for autoresume.
 
     Args:
-        metric_name: Key into state.eval_metrics['eval'], e.g. 'x/MulticlassAccuracy'.
-        higher_is_better: True if larger metric values are better (e.g. accuracy).
-                          False for losses/errors. Default: False.
-        **kwargs: Forwarded to CheckpointSaver (folder, save_interval, etc.).
-                  weights_only is always set to True.
+        metric_name: Key into state.eval_metrics['eval'], e.g. 'mse'.
+        save_path: Full path where the best checkpoint file is written.
+        higher_is_better: True if larger metric values are better. Default: False.
     """
 
-    def __init__(self, metric_name: str, higher_is_better: bool = False, **kwargs):
-        kwargs["weights_only"] = True
-        super().__init__(**kwargs)
+    def __init__(self, metric_name: str, save_path: str, higher_is_better: bool = False):
         self.metric_name = metric_name
+        self.save_path = save_path
         self.higher_is_better = higher_is_better
         self.best: Optional[float] = None
 
@@ -218,18 +214,21 @@ class BestMetricCheckpointSaver(CheckpointSaver):
 
     def epoch_checkpoint(self, state: State, logger: Logger):
         val = self._get_metric_value(state)
-        if val is not None and self._is_improved(val):
-            self.best = val
-            baseline = torch.cuda.memory_allocated() / 1e9
-            torch.cuda.reset_peak_memory_stats()
-            super().epoch_checkpoint(state, logger)
-            spike = torch.cuda.max_memory_allocated() / 1e9 - baseline
-            print(f"checkpoint memory spike: {spike:.2f} GB")
-            if wandb.run:
-                wandb.log(
-                    {"memory/gpu/checkpoint_spike_gb": spike},
-                    step=state.timestamp.batch.value,
-                )
+        if val is None or not self._is_improved(val):
+            return
+        self.best = val
+        path = Path(self.save_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        baseline = torch.cuda.memory_allocated() / 1e9
+        torch.cuda.reset_peak_memory_stats()
+        torch.save(state.model.state_dict(), str(path))
+        spike = torch.cuda.max_memory_allocated() / 1e9 - baseline
+        print(f"[BestMetricCheckpointSaver] new best {self.metric_name}={val:.4f}, saved to {path} (memory spike: {spike:.2f} GB)")
+        if wandb.run:
+            wandb.log(
+                {"memory/gpu/checkpoint_spike_gb": spike},
+                step=state.timestamp.batch.value,
+            )
 
 
 class HFUploaderCallback(Callback):

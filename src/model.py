@@ -10,7 +10,6 @@ from datasets import load_dataset
 from huggingface_hub import snapshot_download
 from scipy.signal import butter, sosfiltfilt
 from composer import Trainer
-from composer.callbacks import CheckpointSaver
 from composer.core import DataSpec
 from composer.models import ComposerModel
 from torchmetrics.regression import MeanSquaredError
@@ -1182,27 +1181,10 @@ def train(**kwargs):
             "resume": "allow",
         },
     )
-    # Explicit main checkpoint saver must be FIRST in callbacks so Composer uses
-    # it (not BestMetricCheckpointSaver) as the reference saver for autoresume.
-    # Composer picks self._checkpoint_saver = callbacks[0] that is a CheckpointSaver,
-    # then uses its folder/latest_filename to determine the autoresume path.
-    main_checkpoint = CheckpointSaver(
-        folder=run_root_path(run_id),
-        filename=checkpoint_pattern_path(run_id).removeprefix(f"{run_root_path(run_id)}/"),
-        latest_filename="checkpoints/latest-rank{rank}.pt",
-        overwrite=True,
-        save_interval=args.checkpoint_interval,
-        num_checkpoints_to_keep=-1,
-    )
     best_saver = BestMetricCheckpointSaver(
         metric_name=args.best_metric,
+        save_path=best_checkpoint_path(run_id),
         higher_is_better=args.best_metric_higher_is_better,
-        folder=".",
-        filename=best_checkpoint_path(run_id),
-        save_interval=args.eval_interval,
-        num_checkpoints_to_keep=1,
-        overwrite=True,
-        latest_filename=None,  # prevent creating ./latest-rank0.pt in repo root
     )
     mask_viz = MaskVisualizationCallback(
         n_samples=args.eval_batch_size,
@@ -1239,8 +1221,14 @@ def train(**kwargs):
         log_to_console=True,
         auto_log_hparams=False,
         save_metrics=True,
+        save_folder=run_root_path(run_id),
+        save_filename=checkpoint_pattern_path(run_id).removeprefix(f"{run_root_path(run_id)}/"),
+        save_latest_filename="checkpoints/latest-rank{rank}.pt",
+        save_overwrite=True,
+        save_interval=args.checkpoint_interval,
+        save_num_checkpoints_to_keep=-1,
         autoresume=True,
-        callbacks=[main_checkpoint, mask_viz, best_saver, hf_uploader, mem_cb],
+        callbacks=[mask_viz, best_saver, hf_uploader, mem_cb],
     )
 
     trainer.fit()
