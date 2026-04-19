@@ -62,6 +62,11 @@ def parse_args():
         default=None,
         help="Terminate the training process after HH:MM:SS and allow autoresume",
     )
+    ap.add_argument(
+        "--train-timeout-once",
+        action="store_true",
+        help="Apply --train-timeout only to the first submitted job, not resubmits",
+    )
     return ap.parse_known_args()
 
 
@@ -159,8 +164,10 @@ def build_resubmit_command(args, model_args: List[str]) -> str:
     ]
     if args.time:
         cmd.extend(["--time", args.time])
-    if args.train_timeout:
+    if args.train_timeout and not args.train_timeout_once:
         cmd.extend(["--train-timeout", args.train_timeout])
+    if args.train_timeout_once:
+        cmd.append("--train-timeout-once")
     if args.gpu:
         cmd.extend(["--gpu", args.gpu])
     return shell_join(cmd + model_args).replace(
@@ -259,7 +266,7 @@ RESUBMIT_JOB_ID=""
 if [ -s "$RESUBMIT_JOB_FILE" ]; then
     RESUBMIT_JOB_ID="$(cat "$RESUBMIT_JOB_FILE")"
 fi
-if [ "$TRAIN_EXIT" -eq 0 ]; then
+if [ "$TRAIN_EXIT" -eq 0 ] && [ "$TIMEOUT_TERMINATING" -eq 0 ] && [ "$TRAIN_TIMEOUT_TERMINATING" -eq 0 ]; then
     if [ -n "$RESUBMIT_JOB_ID" ]; then
         echo "[smart_sbatch] Training completed; cancelling queued resume job $RESUBMIT_JOB_ID"
         scancel "$RESUBMIT_JOB_ID" || true
