@@ -1053,7 +1053,7 @@ def get_parser():
     parser.add_argument("--lr", type=float, default=1e-4)
 
     # evaluation
-    parser.add_argument("--eval-batch-size", type=int, default=16)
+    parser.add_argument("--eval-batch-size", type=int, default=64)
     parser.add_argument("--max-duration", type=str, default="10_000ep")
     parser.add_argument("--eval-interval", type=str, default="10ep")
 
@@ -1178,7 +1178,7 @@ def train(**kwargs):
         init_kwargs={"config": config, "save_code": True},
     )
     resume_saver = CheckpointSaver(
-        folder=hf_uri(args.data_dir, run_root_path(run_id)),
+        folder=hf_uri(args.data_dir, "runs"),
         filename=checkpoint_pattern_path(run_id).removeprefix(f"{run_root_path(run_id)}/"),
         save_interval=args.checkpoint_interval,
         num_checkpoints_to_keep=1,
@@ -1187,7 +1187,7 @@ def train(**kwargs):
     best_saver = BestMetricCheckpointSaver(
         metric_name=args.best_metric,
         higher_is_better=args.best_metric_higher_is_better,
-        folder=hf_uri(args.data_dir, run_best_checkpoint_dir(run_id)),
+        folder=hf_uri(args.data_dir, "runs"),
         filename="ckpt.pt",
         save_interval=args.eval_interval,
         num_checkpoints_to_keep=1,

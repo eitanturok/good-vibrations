@@ -10,6 +10,7 @@ import argparse
 import base64
 import io
 import json
+import resource
 import sys
 import time
 from pathlib import Path
@@ -29,6 +30,7 @@ ENTITY = 'eturok'
 PROJECT = 'good-vibrations'
 HF_DATASET = 'eturok-weizmann/vibrations'
 HF_PREDS   = 'eturok-weizmann/vibrations'
+PROFILE_LOG_EVERY = 100
 
 
 # ── Data fetching ─────────────────────────────────────────────────
@@ -122,8 +124,22 @@ def shift_heatmap_b64(shifts: np.ndarray) -> str:
 
 def _t(label: str, t0: float) -> float:
     elapsed = time.perf_counter() - t0
-    print(f'  ✓ {label}: {elapsed:.1f}s')
+    print(f'  ✓ {label}: {elapsed:.1f}s  rss={_rss_mb():.1f} MB')
     return time.perf_counter()
+
+
+def _rss_mb() -> float:
+    scale = 1 if sys.platform == 'darwin' else 1024
+    return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / (1024 * scale)
+
+
+def _fmt_bytes(n: int | float) -> str:
+    n = float(n)
+    for unit in ('B', 'KB', 'MB', 'GB', 'TB'):
+        if n < 1024 or unit == 'TB':
+            return f'{n:.1f} {unit}'
+        n /= 1024
+    return f'{n:.1f} TB'
 
 
 def load_run_data(run_id: str) -> dict:
@@ -169,8 +185,16 @@ def load_run_data(run_id: str) -> dict:
     epochs_set = sorted(set(raw['train'].keys()) | set(raw['eval'].keys()))
     preds_by_epoch: dict[str, dict] = {}
     gt_masks: dict[str, str] = {}  # sample_idx str → b64
+    n_entries = 0
+    n_gt_encoded = 0
+    mask_bytes_raw = 0
+    mask_bytes_b64 = 0
+    t_encode = time.perf_counter()
+    t_metrics = 0.0
+    t_pred_b64 = 0.0
+    t_gt_b64 = 0.0
 
-    for epoch in epochs_set:
+    for epoch_i, epoch in enumerate(epochs_set, start=1):
         ep_str = str(epoch)
         preds_by_epoch[ep_str] = {}
         for split in ('train', 'eval'):
@@ -182,20 +206,48 @@ def load_run_data(run_id: str) -> dict:
                 idx  = str(int(npz['sample_idx'][i]))
                 pred = npz['mask_pred'][i]
                 gt   = npz['mask_true'][i]
+                t1 = time.perf_counter()
                 mse  = float(np.mean((gt - pred) ** 2))
                 pred_bin = pred > 0.5
                 gt_bin   = gt > 0.5
                 union = np.sum(pred_bin | gt_bin)
                 iou   = float(np.sum(pred_bin & gt_bin) / union) if union > 0 else 0.0
+                t_metrics += time.perf_counter() - t1
+                t1 = time.perf_counter()
+                pred_b64 = mask_to_b64(pred)
+                t_pred_b64 += time.perf_counter() - t1
                 preds_by_epoch[ep_str][idx] = {
-                    'pred':  mask_to_b64(pred),
+                    'pred':  pred_b64,
                     'split': split,
                     'mse':   round(mse, 4),
                     'iou':   round(iou, 3),
                 }
+                n_entries += 1
+                mask_bytes_raw += int(np.asarray(pred).nbytes + np.asarray(gt).nbytes)
+                mask_bytes_b64 += len(pred_b64)
                 if idx not in gt_masks:
-                    gt_masks[idx] = mask_to_b64(gt)
+                    t1 = time.perf_counter()
+                    gt_b64 = mask_to_b64(gt)
+                    t_gt_b64 += time.perf_counter() - t1
+                    gt_masks[idx] = gt_b64
+                    mask_bytes_b64 += len(gt_b64)
+                    n_gt_encoded += 1
+        if epoch_i % PROFILE_LOG_EVERY == 0 or epoch_i == len(epochs_set):
+            elapsed = time.perf_counter() - t_encode
+            print(
+                f'    [profile] epochs {epoch_i}/{len(epochs_set)}  '
+                f'entries={n_entries}  gt_masks={n_gt_encoded}  '
+                f'elapsed={elapsed:.1f}s  metrics={t_metrics:.1f}s  '
+                f'pred_b64={t_pred_b64:.1f}s  gt_b64={t_gt_b64:.1f}s  '
+                f'raw_masks={_fmt_bytes(mask_bytes_raw)}  b64_masks={_fmt_bytes(mask_bytes_b64)}'
+            )
     _t(f'mask encoding ({len(epochs_set)} epochs)', t0)
+    print(
+        f'  [run {run_id}] profile summary: '
+        f'epochs={len(epochs_set)} entries={n_entries} unique_gt_masks={n_gt_encoded} '
+        f'raw_mask_bytes={_fmt_bytes(mask_bytes_raw)} b64_bytes={_fmt_bytes(mask_bytes_b64)} '
+        f'metrics_time={t_metrics:.1f}s pred_b64_time={t_pred_b64:.1f}s gt_b64_time={t_gt_b64:.1f}s'
+    )
 
     return {
         'id':      run_id,
@@ -248,12 +300,22 @@ def build_payload(run_ids: list[str]) -> dict:
     # Build sample records
     print(f'[4/5] Assembling {len(all_idxs)} sample records...')
     samples: list[dict] = []
+    t_overhead_resize_encode = 0.0
+    t_audio_lookup = 0.0
+    overhead_bytes_b64 = 0
     for idx in all_idxs:
         s       = sample_by_idx[idx]
         overhead = overhead_imgs.get(idx)
         if overhead is None:
             overhead = Image.fromarray(np.full((196, 220, 3), 200, np.uint8))
         overhead_src_w, overhead_src_h = overhead.size
+        t1 = time.perf_counter()
+        overhead_b64 = encode_image_b64(overhead.resize((220, 196), Image.BILINEAR))
+        t_overhead_resize_encode += time.perf_counter() - t1
+        overhead_bytes_b64 += len(overhead_b64)
+        t1 = time.perf_counter()
+        chirp_audio = find_chirp_wav(s.get('experiment_config'))
+        t_audio_lookup += time.perf_counter() - t1
 
         samples.append({
             'idx':      idx,
@@ -262,13 +324,13 @@ def build_payload(run_ids: list[str]) -> dict:
             'x':        float(s.get('x_position') or 0),
             'y':        float(s.get('y_position') or 0),
             'speakers': s.get('speakers') or [],
-            'overhead': encode_image_b64(overhead.resize((220, 196), Image.BILINEAR)),
+            'overhead': overhead_b64,
             'overhead_src_w': overhead_src_w,
             'overhead_src_h': overhead_src_h,
             'gt_mask':  all_gt_masks.get(str(idx)),
             'mask_w':   20,
             'mask_h':   40,
-            'chirp_audio':    find_chirp_wav(s.get('experiment_config')),
+            'chirp_audio':    chirp_audio,
             'sonified_audio': None,  # populated only if --sonify flag added later
             'shift_heatmap':  None,  # populated only if --heatmaps flag added later
         })
@@ -280,6 +342,10 @@ def build_payload(run_ids: list[str]) -> dict:
         print('  [debug] viewer dimensions: '
               f"overhead_src={s0['overhead_src_w']}x{s0['overhead_src_h']} "
               f"overhead_canvas=220x196 run_mask={s0['mask_w']}x{s0['mask_h']}")
+    print(
+        f'  [profile] sample assembly summary: overhead_b64={_fmt_bytes(overhead_bytes_b64)} '
+        f'resize+encode={t_overhead_resize_encode:.1f}s audio_lookup={t_audio_lookup:.1f}s'
+    )
 
     t0 = _t('sample assembly', t0)
 
@@ -293,10 +359,18 @@ def build_payload(run_ids: list[str]) -> dict:
 # ── HTML rendering ────────────────────────────────────────────────
 
 def render_html(payload: dict, title: str = 'Good Vibrations Viewer') -> str:
-    viz_dir      = Path(__file__).parent
-    js           = (viz_dir / 'viewer.js').read_text()
-    css          = (viz_dir / 'viewer.css').read_text()
+    t0 = time.perf_counter()
+    viz_dir = Path(__file__).parent
+    js = (viz_dir / 'viewer.js').read_text()
+    css = (viz_dir / 'viewer.css').read_text()
+    t_assets = time.perf_counter() - t0
+    t1 = time.perf_counter()
     payload_json = json.dumps(payload, separators=(',', ':')).replace('</script>', '<\\/script>')
+    t_json = time.perf_counter() - t1
+    print(
+        f'  [profile] render_html assets={t_assets:.1f}s '
+        f'payload_json={t_json:.1f}s payload_size={_fmt_bytes(len(payload_json))}'
+    )
     return f'''<!doctype html>
 <html>
 <head>
