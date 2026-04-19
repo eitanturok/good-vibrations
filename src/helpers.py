@@ -49,6 +49,10 @@ def checkpoint_pattern_path(run_id: str) -> str:
     return f"{run_checkpoints_dir(run_id)}/ep{{epoch:07d}}_ba{{batch:010d}}.pt"
 
 
+def latest_checkpoint_path(run_id: str, rank: int = 0) -> str:
+    return f"{run_checkpoints_dir(run_id)}/latest-rank{rank}.pt"
+
+
 def best_checkpoint_path(run_id: str, filename: str = "best.pt") -> str:
     return f"{run_root_path(run_id)}/{filename}"
 
@@ -233,22 +237,50 @@ class HFUploaderCallback(Callback):
         self.repo_id = repo_id.removeprefix("hf://")
         self.run_id = run_id
         self.local_run_dir = Path(run_root_path(run_id))
+        self.local_predictions_dir = Path(run_predictions_dir(run_id))
+        self.local_visualizations_dir = Path(run_visualizations_dir(run_id))
+        self.local_best_path = Path(best_checkpoint_path(run_id))
+        self.local_latest_path = Path(latest_checkpoint_path(run_id))
         self._uploaded = False
 
     def fit_end(self, state, logger):
         del state, logger
         if self._uploaded or not self.local_run_dir.exists():
             return
-        print(
-            f"[HFUploaderCallback] uploading {self.local_run_dir} to "
-            f"hf://{self.repo_id}/{run_root_path(self.run_id)}"
-        )
-        HfApi().upload_folder(
-            folder_path=str(self.local_run_dir),
-            path_in_repo=run_root_path(self.run_id),
-            repo_id=self.repo_id,
-            repo_type="dataset",
-        )
+        api = HfApi()
+        remote_root = run_root_path(self.run_id)
+        if self.local_predictions_dir.exists():
+            print(f"[HFUploaderCallback] uploading predictions for {self.run_id}")
+            api.upload_folder(
+                folder_path=str(self.local_predictions_dir),
+                path_in_repo=run_predictions_dir(self.run_id),
+                repo_id=self.repo_id,
+                repo_type="dataset",
+            )
+        if self.local_visualizations_dir.exists():
+            print(f"[HFUploaderCallback] uploading visualizations for {self.run_id}")
+            api.upload_folder(
+                folder_path=str(self.local_visualizations_dir),
+                path_in_repo=run_visualizations_dir(self.run_id),
+                repo_id=self.repo_id,
+                repo_type="dataset",
+            )
+        if self.local_best_path.exists():
+            print(f"[HFUploaderCallback] uploading best checkpoint for {self.run_id}")
+            api.upload_file(
+                path_or_fileobj=str(self.local_best_path),
+                path_in_repo=str(Path(remote_root) / self.local_best_path.name),
+                repo_id=self.repo_id,
+                repo_type="dataset",
+            )
+        if self.local_latest_path.exists():
+            print(f"[HFUploaderCallback] uploading latest checkpoint for {self.run_id}")
+            api.upload_file(
+                path_or_fileobj=str(self.local_latest_path),
+                path_in_repo=latest_checkpoint_path(self.run_id),
+                repo_id=self.repo_id,
+                repo_type="dataset",
+            )
         self._uploaded = True
 
 

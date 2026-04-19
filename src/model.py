@@ -1,5 +1,5 @@
 import argparse, math, os, functools, json
-from datetime import datetime
+from pathlib import Path
 import modal
 
 import torch
@@ -29,6 +29,7 @@ from helpers import (
     MemoryCallback,
     best_checkpoint_path,
     checkpoint_pattern_path,
+    latest_checkpoint_path,
     run_predictions_dir,
     run_visualizations_dir,
     sample_npz_path,
@@ -1060,7 +1061,7 @@ def get_parser():
     # logging
     parser.add_argument("--mask-viz-train-interval", type=int, default=10)
     parser.add_argument("--mask-viz-thresholds", type=str, default="0.3,0.5,0.7,0.9")
-    parser.add_argument("--run-name", type=str, default=None)
+    parser.add_argument("--run-name", type=str, default="run")
     parser.add_argument(
         "--best-metric",
         type=str,
@@ -1077,7 +1078,7 @@ def get_parser():
         "--checkpoint-interval",
         type=str,
         default="100ep",
-        help="Interval for saving checkpoints to HF; see https://modal.com/docs/guide/checkpoints#checkpoint-intervals for supported formats",
+        help="Interval for saving local resume checkpoints",
     )
 
     # loss
@@ -1108,7 +1109,7 @@ def train(**kwargs):
         args.hard_mask,
     )
 
-    run_id = f"{args.run_name}-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+    run_id = args.run_name
     seed_all(args.seed)  # must seed before initializing model + dataloader
     speakers = json.loads(args.speakers) if args.speakers else None
     n_objects = args.n_objects
@@ -1175,11 +1176,19 @@ def train(**kwargs):
         "good-vibrations",
         group="loss",
         name=run_id,
-        init_kwargs={"config": config, "save_code": True},
+        init_kwargs={
+            "config": config,
+            "save_code": True,
+            "id": run_id,
+            "resume": "allow",
+        },
     )
+    latest_path = Path(latest_checkpoint_path(run_id))
+    load_path = str(latest_path) if latest_path.exists() else None
     resume_saver = CheckpointSaver(
         folder=".",
         filename=checkpoint_pattern_path(run_id),
+        latest_filename=latest_checkpoint_path(run_id),
         save_interval=args.checkpoint_interval,
         num_checkpoints_to_keep=-1,
         overwrite=True,
@@ -1228,6 +1237,7 @@ def train(**kwargs):
         log_to_console=True,
         auto_log_hparams=True,
         save_metrics=True,
+        load_path=load_path,
         callbacks=[mask_viz, resume_saver, best_saver, hf_uploader, mem_cb],
     )
 
