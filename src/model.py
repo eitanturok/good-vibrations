@@ -1048,12 +1048,12 @@ def get_parser():
     parser.add_argument("--seq-num-layers", type=int, default=2)
 
     # training
-    parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--lr", type=float, default=1e-4)
 
     # evaluation
-    parser.add_argument("--eval-batch-size", type=int, default=64)
+    parser.add_argument("--eval-batch-size", type=int, default=128)
     parser.add_argument("--max-duration", type=str, default="10_000ep")
     parser.add_argument("--eval-interval", type=str, default="10ep")
 
