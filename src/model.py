@@ -874,13 +874,6 @@ class SignalTransformer(ComposerModel):
             loss_fn = functools.partial(loss_fn, gamma_neg=gamma, gamma_pos=delta)
         self.loss_fn = loss_fn
 
-        # Prediction heads
-        self.mlp_head_floor_x = nn.Sequential(
-            nn.Linear(d_model, 32), nn.ReLU(), nn.Linear(32, self.floor_cols)
-        )
-        self.mlp_head_floor_y = nn.Sequential(
-            nn.Linear(d_model, 32), nn.ReLU(), nn.Linear(32, self.floor_rows)
-        )
         self.decoder = build_decoder(
             decoder, d_model, self.out_h, self.out_w, cross_attn_layers
         )
@@ -920,16 +913,14 @@ class SignalTransformer(ComposerModel):
         output = self.seq_trans(x)  # (B,L+1,D) -> (B,L+1,D)
         cls_embedding = output[:, 0, :]  # (B,D)
 
-        # Predict x position, y position, and segmentation mask
+        # Predict segmentation mask
         laser_feats = output[:, 1:, :]  # (B, L, D)
-        x_logits = self.mlp_head_floor_x(cls_embedding)
-        y_logits = self.mlp_head_floor_y(cls_embedding)
         mask_logits = self.decoder(cls_embedding, laser_feats)
-        return x_logits, y_logits, cls_embedding, mask_logits
+        return cls_embedding, mask_logits
 
     def loss(self, outputs, batch):
-        _, mask_true, floor_x_true, floor_y_true, *_ = batch
-        x_logits, y_logits, _, mask_logits = outputs
+        _, mask_true, *_ = batch
+        _, mask_logits = outputs
         return self.loss_fn(mask_logits, mask_true)
 
     def get_metrics(self, is_train=False):
@@ -937,7 +928,7 @@ class SignalTransformer(ComposerModel):
 
     def update_metric(self, batch, outputs, metric):
         _, mask_true, *_ = batch
-        _, _, _, mask_logits = outputs
+        _, mask_logits = outputs
         if isinstance(metric, MeanSquaredError):
             metric.update(mask_logits.sigmoid(), mask_true)
 

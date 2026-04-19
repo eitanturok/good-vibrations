@@ -288,6 +288,7 @@ class MemoryCallback(Callback):
 
     def __init__(self, dataset_gb: float):
         self.dataset_gb = dataset_gb
+        self._has_cuda = torch.cuda.is_available()
         self._peak_forward = 0.0
         self._peak_backward = 0.0
         # accumulated history — each append is one batch
@@ -303,13 +304,16 @@ class MemoryCallback(Callback):
         self._ram_total = []
 
     def before_train_batch(self, state, logger):
-        torch.cuda.reset_peak_memory_stats()
+        if self._has_cuda:
+            torch.cuda.reset_peak_memory_stats()
 
     def after_forward(self, state, logger):
-        self._peak_forward = torch.cuda.max_memory_allocated() / 1e9
+        if self._has_cuda:
+            self._peak_forward = torch.cuda.max_memory_allocated() / 1e9
 
     def after_backward(self, state, logger):
-        self._peak_backward = torch.cuda.max_memory_allocated() / 1e9
+        if self._has_cuda:
+            self._peak_backward = torch.cuda.max_memory_allocated() / 1e9
 
     def batch_end(self, state, logger):
         model = state.model
@@ -327,10 +331,14 @@ class MemoryCallback(Callback):
             )
             / 1e9
         )
-        allocated_gb = torch.cuda.memory_allocated() / 1e9
-        gpu_total_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
-        act_gb = max(0.0, self._peak_forward - weights_gb)
-        other_gpu = max(0.0, allocated_gb - weights_gb - opt_gb - grads_gb)
+        allocated_gb = torch.cuda.memory_allocated() / 1e9 if self._has_cuda else 0.0
+        gpu_total_gb = (
+            torch.cuda.get_device_properties(0).total_memory / 1e9 if self._has_cuda else 0.0
+        )
+        act_gb = max(0.0, self._peak_forward - weights_gb) if self._has_cuda else 0.0
+        other_gpu = (
+            max(0.0, allocated_gb - weights_gb - opt_gb - grads_gb) if self._has_cuda else 0.0
+        )
         vm = psutil.virtual_memory()
         other_cpu = max(0.0, vm.used / 1e9 - self.dataset_gb)
 
@@ -343,7 +351,7 @@ class MemoryCallback(Callback):
                 "memory/gpu/peak_forward_gb": self._peak_forward,
                 "memory/gpu/peak_backward_gb": self._peak_backward,
                 "memory/gpu/allocated_gb": allocated_gb,
-                "memory/gpu/reserved_gb": torch.cuda.memory_reserved() / 1e9,
+                "memory/gpu/reserved_gb": torch.cuda.memory_reserved() / 1e9 if self._has_cuda else 0.0,
                 "memory/gpu/total_gb": gpu_total_gb,
                 "memory/cpu/dataset_gb": self.dataset_gb,
                 "memory/cpu/ram_used_gb": vm.used / 1e9,

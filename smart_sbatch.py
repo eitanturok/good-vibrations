@@ -57,6 +57,11 @@ def parse_args():
     ap.add_argument("--gpu", choices=[name for name, *_ in GPUS])
     ap.add_argument("--dependency", default=None)
     ap.add_argument("--time", default=None, help="Override Slurm walltime, e.g. 00:15:00")
+    ap.add_argument(
+        "--train-timeout",
+        default=None,
+        help="Terminate the training process after HH:MM:SS and allow autoresume",
+    )
     return ap.parse_known_args()
 
 
@@ -154,6 +159,8 @@ def build_resubmit_command(args, model_args: List[str]) -> str:
     ]
     if args.time:
         cmd.extend(["--time", args.time])
+    if args.train_timeout:
+        cmd.extend(["--train-timeout", args.train_timeout])
     if args.gpu:
         cmd.extend(["--gpu", args.gpu])
     return shell_join(cmd + model_args).replace(
@@ -166,6 +173,9 @@ def build_script(args, model_args: List[str], partition: str, gres: str, ram: in
     model_cmd = build_model_command(model_args)
     resubmit_cmd = build_resubmit_command(args, model_args)
     walltime = args.time or max_time
+    train_timeout_seconds = (
+        parse_walltime_seconds(args.train_timeout) if args.train_timeout else None
+    )
     return textwrap.dedent(
         f"""#!/bin/bash
 #SBATCH --partition={partition}
@@ -189,6 +199,8 @@ source $HOME/mark_sheinin_lab/code/eitan/.secrets
 
 RESUBMIT_JOB_FILE="$(mktemp)"
 rm -f "$RESUBMIT_JOB_FILE"
+TRAIN_TIMEOUT_FILE="$(mktemp)"
+rm -f "$TRAIN_TIMEOUT_FILE"
 RESUBMITTED=0
 TIMEOUT_TERMINATING=0
 
@@ -222,9 +234,27 @@ RESUBMIT_TIMER_PID=$!
 TRAIN_EXIT=0
 {model_cmd} &
 TRAIN_PID=$!
+TRAIN_TIMEOUT_PID=""
+if [ -n "{train_timeout_seconds or ''}" ]; then
+    (
+        sleep {train_timeout_seconds or 0}
+        echo "[smart_sbatch] Terminating training after {args.train_timeout} to test autoresume"
+        touch "$TRAIN_TIMEOUT_FILE"
+        kill -TERM "$TRAIN_PID" >/dev/null 2>&1 || true
+    ) &
+    TRAIN_TIMEOUT_PID=$!
+fi
 wait "$TRAIN_PID" || TRAIN_EXIT=$?
 kill "$RESUBMIT_TIMER_PID" >/dev/null 2>&1 || true
 wait "$RESUBMIT_TIMER_PID" 2>/dev/null || true
+if [ -n "$TRAIN_TIMEOUT_PID" ]; then
+    kill "$TRAIN_TIMEOUT_PID" >/dev/null 2>&1 || true
+    wait "$TRAIN_TIMEOUT_PID" 2>/dev/null || true
+fi
+TRAIN_TIMEOUT_TERMINATING=0
+if [ -f "$TRAIN_TIMEOUT_FILE" ]; then
+    TRAIN_TIMEOUT_TERMINATING=1
+fi
 RESUBMIT_JOB_ID=""
 if [ -s "$RESUBMIT_JOB_FILE" ]; then
     RESUBMIT_JOB_ID="$(cat "$RESUBMIT_JOB_FILE")"
@@ -236,7 +266,7 @@ if [ "$TRAIN_EXIT" -eq 0 ]; then
     fi
     exit 0
 fi
-if [ -n "$RESUBMIT_JOB_ID" ] && [ "$TIMEOUT_TERMINATING" -eq 0 ]; then
+if [ -n "$RESUBMIT_JOB_ID" ] && [ "$TIMEOUT_TERMINATING" -eq 0 ] && [ "$TRAIN_TIMEOUT_TERMINATING" -eq 0 ]; then
     echo "[smart_sbatch] Training failed before timeout; cancelling queued resume job $RESUBMIT_JOB_ID"
     scancel "$RESUBMIT_JOB_ID" || true
 fi
