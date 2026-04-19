@@ -1,5 +1,4 @@
 import argparse, math, os, functools, json
-from pathlib import Path
 import modal
 
 import torch
@@ -16,7 +15,6 @@ from composer.models import ComposerModel
 from torchmetrics.regression import MeanSquaredError
 from composer.loggers import WandBLogger
 from composer.utils.reproducibility import seed_all
-from composer.callbacks import CheckpointSaver
 
 from icecream import install
 
@@ -29,8 +27,8 @@ from helpers import (
     MemoryCallback,
     best_checkpoint_path,
     checkpoint_pattern_path,
-    latest_checkpoint_path,
     run_predictions_dir,
+    run_root_path,
     run_visualizations_dir,
     sample_npz_path,
 )
@@ -1056,10 +1054,10 @@ def get_parser():
     # evaluation
     parser.add_argument("--eval-batch-size", type=int, default=128)
     parser.add_argument("--max-duration", type=str, default="10_000ep")
-    parser.add_argument("--eval-interval", type=str, default="10ep")
+    parser.add_argument("--eval-interval", type=str, default="100ep")
 
     # logging
-    parser.add_argument("--mask-viz-train-interval", type=int, default=10)
+    parser.add_argument("--mask-viz-train-interval", type=int, default=100)
     parser.add_argument("--mask-viz-thresholds", type=str, default="0.3,0.5,0.7,0.9")
     parser.add_argument("--run-name", type=str, default="run")
     parser.add_argument(
@@ -1183,16 +1181,6 @@ def train(**kwargs):
             "resume": "allow",
         },
     )
-    latest_path = Path(latest_checkpoint_path(run_id))
-    load_path = str(latest_path) if latest_path.exists() else None
-    resume_saver = CheckpointSaver(
-        folder=".",
-        filename=checkpoint_pattern_path(run_id),
-        latest_filename=latest_checkpoint_path(run_id),
-        save_interval=args.checkpoint_interval,
-        num_checkpoints_to_keep=-1,
-        overwrite=True,
-    )
     best_saver = BestMetricCheckpointSaver(
         metric_name=args.best_metric,
         higher_is_better=args.best_metric_higher_is_better,
@@ -1237,8 +1225,14 @@ def train(**kwargs):
         log_to_console=True,
         auto_log_hparams=False,
         save_metrics=True,
-        load_path=load_path,
-        callbacks=[mask_viz, resume_saver, best_saver, hf_uploader, mem_cb],
+        save_folder=run_root_path(run_id),
+        save_filename=checkpoint_pattern_path(run_id).removeprefix(f"{run_root_path(run_id)}/"),
+        save_latest_filename="checkpoints/latest-rank{rank}.pt",
+        save_overwrite=True,
+        save_interval=args.checkpoint_interval,
+        save_num_checkpoints_to_keep=-1,
+        autoresume=True,
+        callbacks=[mask_viz, best_saver, hf_uploader, mem_cb],
     )
 
     trainer.fit()

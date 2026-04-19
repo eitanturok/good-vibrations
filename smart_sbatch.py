@@ -196,7 +196,6 @@ DONE_FLAG="$(mktemp)"
 RESUBMIT_JOB_FILE="$(mktemp)"
 rm -f "$DONE_FLAG" "$RESUBMIT_JOB_FILE"
 RESUBMITTED=0
-TIMEOUT_TRIGGERED=0
 TIMEOUT_TERMINATING=0
 
 schedule_resume() {{
@@ -204,7 +203,6 @@ schedule_resume() {{
         return
     fi
     RESUBMITTED=1
-    TIMEOUT_TRIGGERED=1
     echo "[smart_sbatch] Scheduling resume job for $SLURM_JOB_ID"
     RESUBMIT_OUTPUT="$({resubmit_cmd} 2>&1)"
     RESUBMIT_STATUS=$?
@@ -216,21 +214,16 @@ schedule_resume() {{
     printf '%s\n' "$RESUBMIT_OUTPUT" | awk '/Submitted batch job/ {{print $4}}' | tail -n 1 > "$RESUBMIT_JOB_FILE"
 }}
 
-handle_timeout_signal() {{
-    schedule_resume
-}}
-
 handle_term_signal() {{
     TIMEOUT_TERMINATING=1
 }}
 
-trap handle_timeout_signal USR1
 trap handle_term_signal TERM
 
 (
     sleep {resubmit_delay}
     if [ ! -f "$DONE_FLAG" ]; then
-        kill -USR1 $$
+        schedule_resume
     fi
 ) &
 RESUBMIT_TIMER_PID=$!

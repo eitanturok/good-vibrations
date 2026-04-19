@@ -31,6 +31,13 @@ PROJECT = 'good-vibrations'
 HF_DATASET = 'eturok-weizmann/vibrations'
 HF_PREDS   = 'eturok-weizmann/vibrations'
 PROFILE_LOG_EVERY = 100
+ASSETS_DIR = Path(__file__).parent.parent / 'assets'
+SPEAKER_SOURCE = ASSETS_DIR / 'speaker.png'
+SPEAKER_DIR = ASSETS_DIR / 'speakers'
+OVERHEAD_SIZE = (220, 196)
+PADDED_SIZE = (286, 255)
+PADDED_BG = (232, 232, 232)
+SPEAKER_FILES = ('1000', '0100', '0010', '0001')
 
 
 # ── Data fetching ─────────────────────────────────────────────────
@@ -118,6 +125,51 @@ def shift_heatmap_b64(shifts: np.ndarray) -> str:
     grid = ((grid - grid.min()) / (grid.max() - grid.min() + 1e-8) * 255).astype(np.uint8)
     img  = Image.fromarray(grid).resize((80, 80), Image.NEAREST)
     return encode_image_b64(img, fmt='PNG')
+
+
+def speaker_mask(speakers) -> str:
+    values = list(speakers or [])[:4]
+    values.extend([0] * (4 - len(values)))
+    return ''.join('1' if int(v) else '0' for v in values)
+
+
+def pad_overhead_image(img: Image.Image) -> Image.Image:
+    canvas = Image.new('RGB', PADDED_SIZE, PADDED_BG)
+    inner = img.resize(OVERHEAD_SIZE, Image.BILINEAR)
+    x = (PADDED_SIZE[0] - OVERHEAD_SIZE[0]) // 2
+    y = (PADDED_SIZE[1] - OVERHEAD_SIZE[1]) // 2
+    canvas.paste(inner, (x, y))
+    return canvas
+
+
+def ensure_speaker_assets() -> dict[str, Image.Image]:
+    SPEAKER_DIR.mkdir(parents=True, exist_ok=True)
+    targets = {name: SPEAKER_DIR / f'{name}.png' for name in SPEAKER_FILES}
+    if not all(path.exists() for path in targets.values()):
+        src = Image.open(SPEAKER_SOURCE).convert('RGBA')
+        vertical = src.resize((44, 68), Image.LANCZOS)
+        placements = {
+            '1000': (vertical, (8, 91)),
+            '0100': (vertical, (44, 181)),
+            '0010': (vertical, (198, 181)),
+            '0001': (vertical, (234, 91)),
+        }
+        for name, path in targets.items():
+            overlay = Image.new('RGBA', PADDED_SIZE, (0, 0, 0, 0))
+            icon, pos = placements[name]
+            overlay.alpha_composite(icon, dest=pos)
+            overlay.save(path)
+    return {name: Image.open(path).convert('RGBA') for name, path in targets.items()}
+
+
+def build_speaker_overlay(mask: str, assets: dict[str, Image.Image]) -> str | None:
+    if '1' not in mask:
+        return None
+    overlay = Image.new('RGBA', PADDED_SIZE, (0, 0, 0, 0))
+    for bit, key in zip(mask, SPEAKER_FILES):
+        if bit == '1':
+            overlay.alpha_composite(assets[key])
+    return encode_image_b64(overlay, fmt='PNG')
 
 
 # ── Run data ──────────────────────────────────────────────────────
@@ -276,7 +328,7 @@ def load_run_data(run_id: str) -> dict:
 
 # ── Payload assembly ──────────────────────────────────────────────
 
-def build_payload(run_ids: list[str]) -> dict:
+def build_payload(run_ids: list[str], show_speakers: bool = True) -> dict:
     t_total = time.perf_counter()
     t0 = t_total
 
@@ -289,6 +341,8 @@ def build_payload(run_ids: list[str]) -> dict:
     print(f'[2/5] Overhead images ({len(all_idxs)} samples)...')
     overhead_imgs = fetch_overhead_images(all_idxs, repo_id=HF_DATASET)
     t0 = _t('overhead images', t0)
+
+    speaker_assets = ensure_speaker_assets() if show_speakers else None
 
     # Load all runs; collect GT masks from predictions
     runs: list[dict] = []
@@ -317,16 +371,22 @@ def build_payload(run_ids: list[str]) -> dict:
     t_overhead_resize_encode = 0.0
     t_audio_lookup = 0.0
     overhead_bytes_b64 = 0
+    speaker_overlay_bytes_b64 = 0
     for idx in all_idxs:
         s       = sample_by_idx[idx]
         overhead = overhead_imgs.get(idx)
         if overhead is None:
             overhead = Image.fromarray(np.full((196, 220, 3), 200, np.uint8))
         overhead_src_w, overhead_src_h = overhead.size
+        speakers = s.get('speakers') or []
+        speaker_key = speaker_mask(speakers)
         t1 = time.perf_counter()
-        overhead_b64 = encode_image_b64(overhead.resize((220, 196), Image.BILINEAR))
+        rendered_overhead = pad_overhead_image(overhead) if show_speakers else overhead.resize(OVERHEAD_SIZE, Image.BILINEAR)
+        overhead_b64 = encode_image_b64(rendered_overhead)
         t_overhead_resize_encode += time.perf_counter() - t1
         overhead_bytes_b64 += len(overhead_b64)
+        speaker_overlay = build_speaker_overlay(speaker_key, speaker_assets) if show_speakers and speaker_assets else None
+        speaker_overlay_bytes_b64 += len(speaker_overlay or '')
         t1 = time.perf_counter()
         chirp_audio = find_chirp_wav(s.get('experiment_config'))
         t_audio_lookup += time.perf_counter() - t1
@@ -337,8 +397,9 @@ def build_payload(run_ids: list[str]) -> dict:
             'n_objects': int(s.get('n_objects') or 1),
             'x':        float(s.get('x_position') or 0),
             'y':        float(s.get('y_position') or 0),
-            'speakers': s.get('speakers') or [],
+            'speakers': speakers,
             'overhead': overhead_b64,
+            'speaker_overlay': speaker_overlay,
             'overhead_src_w': overhead_src_w,
             'overhead_src_h': overhead_src_h,
             'gt_mask':  all_gt_masks.get(str(idx)),
@@ -358,6 +419,7 @@ def build_payload(run_ids: list[str]) -> dict:
               f"overhead_canvas=220x196 run_mask={s0['mask_w']}x{s0['mask_h']}")
     print(
         f'  [profile] sample assembly summary: overhead_b64={_fmt_bytes(overhead_bytes_b64)} '
+        f'speaker_overlay_b64={_fmt_bytes(speaker_overlay_bytes_b64)} '
         f'resize+encode={t_overhead_resize_encode:.1f}s audio_lookup={t_audio_lookup:.1f}s'
     )
 
@@ -439,6 +501,8 @@ def main():
                         help='W&B run IDs (default: last 3 runs)')
     parser.add_argument('--output', nargs='?', default='artifacts/viewer.html',
                         help='Output HTML path')
+    parser.add_argument('--no-show-speakers', action='store_true',
+                        help='Disable padded overhead speaker overlays')
     args = parser.parse_args()
 
     t0 = time.perf_counter()
@@ -446,7 +510,7 @@ def main():
     run_ids = args.runs or get_last_n_runs(3)
     print(f'Runs: {run_ids}\n')
 
-    payload = build_payload(run_ids)
+    payload = build_payload(run_ids, show_speakers=not args.no_show_speakers)
 
     print('Rendering HTML...')
     html = render_html(payload)

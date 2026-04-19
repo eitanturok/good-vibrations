@@ -417,10 +417,23 @@ function renderDatasetCell(td, sample) {
     title.textContent = 'overhead image';
     td.appendChild(title);
 
+    const wrap = document.createElement('div');
+    wrap.className = 'dataset-figure';
+    wrap.style.cssText = `width:${CELL_W}px;height:${CELL_H}px;`;
+
     const img = document.createElement('img');
     img.src = sample.overhead;
-    img.style.cssText = `width:${CELL_W}px;height:${CELL_H}px;display:block;margin:0 auto;`;
-    td.appendChild(img);
+    img.className = 'dataset-base';
+    wrap.appendChild(img);
+
+    if (sample.speaker_overlay) {
+      const overlay = document.createElement('img');
+      overlay.src = sample.speaker_overlay;
+      overlay.className = 'dataset-overlay';
+      wrap.appendChild(overlay);
+    }
+
+    td.appendChild(wrap);
   }
 
   if (sample.shift_heatmap) {
