@@ -269,8 +269,23 @@ def submit_script(script_path: Path, dependency: Optional[str]):
     )
 
 
+def find_fresh_run_name(base_name: str, is_resume: bool) -> str:
+    if is_resume:
+        return base_name
+    runs_dir = Path("runs")
+    if not (runs_dir / base_name).exists():
+        return base_name
+    for i in range(1, 100):
+        candidate = f"{base_name}-{i:02d}"
+        if not (runs_dir / candidate).exists():
+            print(f"WARNING: runs/{base_name}/ already exists. Using run name '{candidate}' to avoid overwriting.")
+            return candidate
+    return base_name
+
+
 def main():
     args, raw_model_args = parse_args()
+    args.job_name = find_fresh_run_name(args.job_name, is_resume=args.dependency is not None)
     model_args = normalize_model_args(raw_model_args, args.job_name)
 
     print("Checking cluster state...")
