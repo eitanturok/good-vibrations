@@ -937,13 +937,10 @@ class SignalTransformer(ComposerModel):
         return self.train_metrics if is_train else self.val_metrics
 
     def update_metric(self, batch, outputs, metric):
-        _, mask_true, floor_x_true, floor_y_true, *_ = batch
-        x_logits, y_logits, _, mask_logits = outputs
-        metric_name, pred_type, pos = (
-            getattr(metric, "metric_name", None),
-            getattr(metric, "pred_type", None),
-            getattr(metric, "pos", None),
-        )
+        _, mask_true, *_ = batch
+        _, _, _, mask_logits = outputs
+        if isinstance(metric, MeanSquaredError):
+            metric.update(mask_logits.sigmoid(), mask_true)
 
     def eval_forward(self, batch, outputs=None):
         return outputs if outputs is not None else self.forward(batch)
