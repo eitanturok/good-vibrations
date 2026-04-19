@@ -53,7 +53,17 @@ body {
 #play-btn:hover { background: #eee; }
 #play-speed { width: 80px; }
 #epoch-slider { width: 200px; }
-#play-epoch-label { font-size: 11px; color: #666; white-space: nowrap; }
+#play-epoch-label {
+  font-size: 18px;
+  font-weight: 700;
+  color: #111;
+  white-space: nowrap;
+  padding: 2px 10px;
+  border: 1px solid #ddd;
+  border-radius: 999px;
+  background: #f7f7f7;
+  letter-spacing: 0.2px;
+}
 
 #add-run-bar {
   display: flex;

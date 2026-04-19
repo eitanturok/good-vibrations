@@ -537,6 +537,7 @@ function rebuild() {
   buildHeader();
   applyFilters();
   syncEpochSlider();
+  updateEpochLabel();
 }
 
 // ── Fullscreen dialog ─────────────────────────────────────────────
@@ -627,6 +628,23 @@ function syncEpochSlider() {
   slider.value = frameIdx % (max + 1);
 }
 
+function updateEpochLabel() {
+  const label = document.getElementById('play-epoch-label');
+  if (!label) return;
+  const epochs = [...new Set(
+    state.activeRunIds
+      .map(id => state.epoch[id])
+      .filter(Boolean)
+  )];
+  if (!epochs.length) {
+    label.textContent = 'Epoch -';
+  } else if (epochs.length === 1) {
+    label.textContent = `Epoch ${epochs[0]}`;
+  } else {
+    label.textContent = `Epochs ${epochs.join(' · ')}`;
+  }
+}
+
 function applyFrame() {
   // Each run picks its epoch based on its own list length
   PAYLOAD.runs.forEach(r => {
@@ -638,13 +656,7 @@ function applyFrame() {
   });
   state.activeRunIds.forEach(reRenderColumn);
   syncEpochSlider();
-  // Update label
-  const label = document.getElementById('play-epoch-label');
-  if (label) {
-    label.textContent = state.activeRunIds
-      .map(id => { const r = runMap[id]; return (r && r.epochs.length) ? `${r.name || id}: ep ${state.epoch[id]}` : ''; })
-      .filter(Boolean).join('  ·  ');
-  }
+  updateEpochLabel();
 }
 
 function playStep() {
@@ -679,6 +691,7 @@ document.addEventListener('change', e => {
   if (el.classList.contains('epoch-select') && runId) {
     state.epoch[runId] = el.value;
     reRenderColumn(runId);
+    updateEpochLabel();
   }
   if (el.id === 'filter-split' || el.id === 'filter-object' || el.id === 'filter-nobjects' || el.id === 'filter-speaker') {
     applyFilters();
