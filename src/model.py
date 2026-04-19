@@ -22,7 +22,17 @@ from icecream import install
 
 install()
 
-from helpers import BestMetricCheckpointSaver, MaskVisualizationCallback, MemoryCallback
+from helpers import (
+    BestMetricCheckpointSaver,
+    MaskVisualizationCallback,
+    MemoryCallback,
+    checkpoint_pattern_path,
+    hf_uri,
+    run_best_checkpoint_dir,
+    run_root_path,
+    run_visualizations_dir,
+    sample_npz_path,
+)
 
 # **** Modal ****
 
@@ -217,15 +227,13 @@ class VibrationDataset(Dataset):
         )
 
         # load samples into RAM for fast access during training
-        sample_patterns = [f"data/sample_{idx}.npz" for idx in self.ds["sample_idx"]]
+        sample_patterns = [sample_npz_path(idx) for idx in self.ds["sample_idx"]]
         self.snapshot_dir = snapshot_download(
             repo_id, repo_type="dataset", allow_patterns=sample_patterns, token=token
         )
 
         def load_npz(sample_idx):
-            d = np.load(
-                os.path.join(self.snapshot_dir, f"data/sample_{sample_idx}.npz")
-            )
+            d = np.load(os.path.join(self.snapshot_dir, sample_npz_path(sample_idx)))
             return torch.from_numpy(d["shifts"].copy()), torch.from_numpy(
                 d["mask"].copy()
             )
@@ -1173,7 +1181,8 @@ def train(**kwargs):
         init_kwargs={"config": config, "save_code": True},
     )
     resume_saver = CheckpointSaver(
-        folder=f"hf://{args.data_dir}/checkpoints/{run_id}",
+        folder=hf_uri(args.data_dir, run_root_path(run_id)),
+        filename=checkpoint_pattern_path(run_id).removeprefix(f"{run_root_path(run_id)}/"),
         save_interval=args.checkpoint_interval,
         num_checkpoints_to_keep=1,
         overwrite=True,
@@ -1181,7 +1190,8 @@ def train(**kwargs):
     best_saver = BestMetricCheckpointSaver(
         metric_name=args.best_metric,
         higher_is_better=args.best_metric_higher_is_better,
-        folder=f"hf://{args.data_dir}/checkpoints/{run_id}/best",
+        folder=hf_uri(args.data_dir, run_best_checkpoint_dir(run_id)),
+        filename="ckpt.pt",
         save_interval=args.eval_interval,
         num_checkpoints_to_keep=1,
         overwrite=True,
@@ -1191,6 +1201,7 @@ def train(**kwargs):
         save_dir="visualizations",
         train_viz_interval=args.mask_viz_train_interval,
         pred_save_path=args.data_dir,
+        viz_save_path=hf_uri(args.data_dir, run_visualizations_dir(run_id)),
         run_id=run_id,
     )
     dataset = train_loader.dataset.dataset

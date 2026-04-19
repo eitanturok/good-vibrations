@@ -1,4 +1,4 @@
-import os, time
+import os, tempfile, time
 from pathlib import Path
 from typing import Any, Callable, Optional, Union
 
@@ -13,11 +13,53 @@ from composer import Callback
 from composer.callbacks import CheckpointSaver
 from composer.core import Event, State
 from composer.loggers import Logger
+from composer.utils import RemoteUploader
 from huggingface_hub import HfApi
+
+
+SAMPLE_FILENAME_WIDTH = 6
 
 
 def getenv(key: str, default: Any = 0):
     return type(default)(os.getenv(key, default))
+
+
+def sample_npz_path(sample_idx: int) -> str:
+    return f"data/sample_{int(sample_idx):0{SAMPLE_FILENAME_WIDTH}d}.npz"
+
+
+def hf_uri(repo_id: str, path_in_repo: str = "") -> str:
+    repo_id = repo_id.removeprefix("hf://").rstrip("/")
+    path_in_repo = path_in_repo.lstrip("/")
+    return f"hf://{repo_id}/{path_in_repo}" if path_in_repo else f"hf://{repo_id}"
+
+
+def run_root_path(run_id: str) -> str:
+    return f"runs/{run_id}"
+
+
+def run_predictions_dir(run_id: str) -> str:
+    return f"{run_root_path(run_id)}/predictions"
+
+
+def run_checkpoints_dir(run_id: str) -> str:
+    return f"{run_root_path(run_id)}/checkpoint"
+
+
+def checkpoint_pattern_path(run_id: str) -> str:
+    return f"{run_checkpoints_dir(run_id)}/ep{{epoch:07d}}_ba{{batch:010d}}.pt"
+
+
+def run_best_checkpoint_dir(run_id: str) -> str:
+    return f"{run_root_path(run_id)}/best"
+
+
+def best_checkpoint_path(run_id: str, filename: str = "ckpt.pt") -> str:
+    return f"{run_best_checkpoint_dir(run_id)}/{filename}"
+
+
+def run_visualizations_dir(run_id: str) -> str:
+    return f"{run_root_path(run_id)}/visualization"
 
 
 def load_from_hf(
@@ -40,6 +82,28 @@ def load_from_hf(
     model = SignalTransformer(**model_kwargs)
     model.load_state_dict(torch.load(path, map_location="cpu", weights_only=True))
     return model.eval()
+
+
+def prediction_npz_path(run_id: str, split: str, epoch: int, batch: int) -> str:
+    return (
+        f"{run_predictions_dir(run_id)}/"
+        f"{split}_ep{int(epoch):07d}_ba{int(batch):010d}.npz"
+    )
+
+
+def visualization_image_path(
+    run_id: str,
+    split: str,
+    kind: str,
+    epoch: int,
+    batch: int,
+    sample_idx: int,
+) -> str:
+    safe_kind = str(kind).replace(".", "p")
+    return (
+        f"{run_visualizations_dir(run_id)}/{split}/{safe_kind}/"
+        f"ep{int(epoch):07d}_ba{int(batch):010d}_sample{int(sample_idx):06d}.png"
+    )
 
 
 def fetch_wandb_history(
@@ -380,6 +444,7 @@ class MaskVisualizationCallback(Callback):
         train_viz_interval=10,
         thresholds=[],
         pred_save_path=None,
+        viz_save_path=None,
         run_id=None,
     ):
         self.n_samples = n_samples
@@ -389,37 +454,65 @@ class MaskVisualizationCallback(Callback):
         self.pred_save_path = (
             pred_save_path  # HF repo ID, e.g. "eturok-weizmann/good-vibrations"
         )
+        self.viz_save_path = viz_save_path
         self.run_id = run_id
-        self._last_train_batch = None
+        self._train_preds = []
         self._eval_preds = []  # accumulates across all eval batches
+        self._viz_uploader = None
+        self._viz_tmpdir = tempfile.TemporaryDirectory()
+
+    def init(self, state, logger):
+        del state, logger
+        if self.viz_save_path:
+            self._viz_uploader = RemoteUploader(
+                remote_folder=self.viz_save_path,
+                num_concurrent_uploads=4,
+            )
+            self._viz_uploader.init()
 
     def epoch_start(self, state, logger):
-        self._last_train_batch = None
+        del state, logger
+        self._train_preds = []
 
     def batch_end(self, state, logger):
-        if self._last_train_batch is None:
-            self._last_train_batch = (state.batch, state.outputs)
+        del logger
+        if self._viz_uploader is not None:
+            self._viz_uploader.check_workers()
+        if self._should_collect_train_preds(state):
+            self._train_preds.append(self._batch_to_pred(state.batch, state.outputs))
+
+    def fit_end(self, state, logger):
+        del state, logger
+        if self._viz_uploader is not None:
+            self._viz_uploader.wait()
+
+    def post_close(self):
+        if self._viz_uploader is not None:
+            try:
+                self._viz_uploader.wait_and_close()
+            except Exception as e:
+                print(f"[MaskVisualizationCallback] Visualization upload failed: {e}")
+        self._viz_tmpdir.cleanup()
 
     def epoch_end(self, state, logger):
-        if (
-            state.timestamp.epoch.value % self.train_viz_interval == 0
-            and self._last_train_batch is not None
-        ):
-            batch, outputs = self._last_train_batch
-            self._visualize(batch, outputs, state, "train")
-            self._save_predictions(
-                [self._batch_to_pred(batch, outputs)], state, "train"
-            )
+        del logger
+        if state.timestamp.epoch.value % self.train_viz_interval != 0 or not self._train_preds:
+            return
+        self._visualize(self._train_preds, state, "train", use_all_samples=True)
+        self._save_predictions(self._train_preds, state, "train")
 
     def eval_batch_end(self, state, logger):
+        del logger
         self._eval_preds.append(self._batch_to_pred(state.batch, state.outputs))
 
+    def _should_collect_train_preds(self, state):
+        return state.timestamp.epoch.value % self.train_viz_interval == 0
+
     def eval_end(self, state, logger):
+        del logger
         if not self._eval_preds:
             return
-        # use first accumulated batch for the W&B image visualization
-        first_batch, first_outputs = self._eval_preds[0]["_raw"]
-        self._visualize(first_batch, first_outputs, state, "eval")
+        self._visualize(self._eval_preds, state, "eval", use_all_samples=False)
         self._save_predictions(self._eval_preds, state, "eval")
         self._eval_preds = []
 
@@ -427,9 +520,8 @@ class MaskVisualizationCallback(Callback):
         _, true_masks, _, _, meta = batch
         _, _, _, mask_logits = outputs
         return {
-            "_raw": (batch, outputs),
             "mask_true": true_masks.detach().cpu().float().numpy(),
-            "mask_pred": mask_logits.sigmoid().detach().cpu().float().numpy(),
+            "mask_logits": mask_logits.detach().cpu().float().numpy(),
             "sample_idx": list(meta["sample_idx"]),
             "x_position": list(meta["x_position"]),
             "y_position": list(meta["y_position"]),
@@ -443,7 +535,8 @@ class MaskVisualizationCallback(Callback):
         import io, numpy as np
 
         mask_true = np.concatenate([p["mask_true"] for p in preds_list])
-        mask_pred = np.concatenate([p["mask_pred"] for p in preds_list])
+        mask_logits = np.concatenate([p["mask_logits"] for p in preds_list])
+        mask_pred = 1.0 / (1.0 + np.exp(-mask_logits))
         sample_idx = sum([p["sample_idx"] for p in preds_list], [])
         x_position = sum([p["x_position"] for p in preds_list], [])
         y_position = sum([p["y_position"] for p in preds_list], [])
@@ -454,6 +547,7 @@ class MaskVisualizationCallback(Callback):
         np.savez(
             buf,
             mask_true=mask_true,
+            mask_logits=mask_logits,
             mask_pred=mask_pred,
             sample_idx=np.array(sample_idx),
             x_position=np.array(x_position, dtype=float),
@@ -464,8 +558,9 @@ class MaskVisualizationCallback(Callback):
         buf.seek(0)
 
         epoch = state.timestamp.epoch.value
+        batch = state.timestamp.batch.value
         repo_id = self.pred_save_path.removeprefix("hf://")
-        path_in_repo = f"predictions/{self.run_id}/{split}_epoch_{epoch:05d}.npz"
+        path_in_repo = prediction_npz_path(self.run_id, split, epoch, batch)
         try:
             HfApi().upload_file(
                 path_or_fileobj=buf,
@@ -476,17 +571,19 @@ class MaskVisualizationCallback(Callback):
         except Exception as e:
             print(f"[MaskVisualizationCallback] Failed to save predictions: {e}")
 
-    def _visualize(self, batch, outputs, state, split):
-        _, true_masks, _, _, meta = batch
-        _, _, _, mask_logits = outputs
-        n = min(self.n_samples, true_masks.shape[0], mask_logits.shape[0])
-        probs = mask_logits[:n].sigmoid().detach().cpu().float().numpy()
-        true = true_masks[:n].detach().cpu().float().numpy()
+    def _visualize(self, preds_list, state, split, use_all_samples):
+        import numpy as np
+
+        true = np.concatenate([p["mask_true"] for p in preds_list])
+        logits = np.concatenate([p["mask_logits"] for p in preds_list])
+        probs = 1.0 / (1.0 + np.exp(-logits))
+        sample_ids = sum([p["sample_idx"] for p in preds_list], [])
+        n_total = min(len(sample_ids), true.shape[0], probs.shape[0])
+        n = n_total if use_all_samples else min(self.n_samples, n_total)
+        true = true[:n]
+        probs = probs[:n]
         epoch = state.timestamp.epoch.value
         os.makedirs(self.save_dir, exist_ok=True)
-        if not wandb.run:
-            return
-        sample_ids = meta["sample_idx"][:n]
         log = {}
         for i in range(n):
             caption = f"sample {sample_ids[i]}"
@@ -502,9 +599,17 @@ class MaskVisualizationCallback(Callback):
                 f"Epoch {epoch}, {split.capitalize()} Sample {sample_ids[i]}, Prob"
             )
             fig.tight_layout()
-            log.setdefault(f"mask_viz/{split}/prob", []).append(
-                wandb.Image(fig, caption=caption)
+            self._upload_visualization(
+                fig,
+                split=split,
+                kind="prob",
+                state=state,
+                sample_idx=int(sample_ids[i]),
             )
+            if wandb.run:
+                log.setdefault(f"mask_viz/{split}/prob", []).append(
+                    wandb.Image(fig, caption=caption)
+                )
             plt.close(fig)
             # binarized at each threshold
             for t in self.thresholds:
@@ -519,11 +624,42 @@ class MaskVisualizationCallback(Callback):
                     f"Epoch {epoch}, {split.capitalize()} Sample {sample_ids[i]}, threshold {t}"
                 )
                 fig.tight_layout()
-                log.setdefault(f"mask_viz/{split}/thresh{t}", []).append(
-                    wandb.Image(fig, caption=caption)
+                self._upload_visualization(
+                    fig,
+                    split=split,
+                    kind=f"thresh{t}",
+                    state=state,
+                    sample_idx=int(sample_ids[i]),
                 )
+                if wandb.run:
+                    log.setdefault(f"mask_viz/{split}/thresh{t}", []).append(
+                        wandb.Image(fig, caption=caption)
+                    )
                 plt.close(fig)
-        wandb.log(log, step=state.timestamp.batch.value)
+        if wandb.run and log:
+            wandb.log(log, step=state.timestamp.batch.value)
+
+    def _upload_visualization(self, fig, split, kind, state, sample_idx):
+        if self._viz_uploader is None:
+            return
+        epoch = int(state.timestamp.epoch.value)
+        batch = int(state.timestamp.batch.value)
+        filename = visualization_image_path(
+            self.run_id,
+            split=split,
+            kind=kind,
+            epoch=epoch,
+            batch=batch,
+            sample_idx=sample_idx,
+        ).removeprefix(f"{run_visualizations_dir(self.run_id)}/")
+        local_path = Path(self._viz_tmpdir.name) / filename
+        local_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(local_path, dpi=150, bbox_inches="tight")
+        self._viz_uploader.upload_file_async(
+            remote_file_name=filename,
+            file_path=local_path,
+            overwrite=True,
+        )
 
 
 def fetch_predictions(
@@ -550,29 +686,38 @@ def fetch_predictions(
 
     cache_dir = Path(cache_dir).expanduser()
     repo_id = data_dir.removeprefix("hf://")
-    prefix = f"predictions/{run_id}/"
+    prefix = f"{run_predictions_dir(run_id)}/"
 
-    files = [
-        f.rfilename
-        for f in list_repo_tree(repo_id, repo_type="dataset", recursive=True)
-        if f.rfilename.startswith(prefix) and f.rfilename.endswith(".npz")
-    ]
+    files = []
+    for f in list_repo_tree(repo_id, repo_type="dataset", recursive=True):
+        filename = getattr(f, "rfilename", None) or getattr(f, "path", None)
+        if filename and filename.startswith(prefix) and filename.endswith(".npz"):
+            files.append(filename)
 
     result = {"train": {}, "eval": {}}
     for fname in sorted(files):
-        # fname: predictions/{run_id}/eval_epoch_00150.npz
-        stem = Path(fname).stem  # "eval_epoch_00150"
-        split, _, epoch_str = stem.partition("_epoch_")
+        # fname: runs/{run_id}/predictions/eval_ep0000010_ba0000000050.npz
+        stem = Path(fname).stem
+        split, _, rest = stem.partition("_ep")
         if split not in result:
             continue
+        epoch_str, _, batch_str = rest.partition("_ba")
+        if not epoch_str or not batch_str:
+            continue
         epoch = int(epoch_str)
+        batch = int(batch_str)
         local = hf_hub_download(
             repo_id=repo_id,
             filename=fname,
             repo_type="dataset",
             cache_dir=str(cache_dir),
         )
-        result[split][epoch] = dict(np.load(local, allow_pickle=True))
+        payload = dict(np.load(local, allow_pickle=True))
+        payload["epoch"] = epoch
+        payload["batch"] = batch
+        prev = result[split].get(epoch)
+        if prev is None or batch >= int(prev.get("batch", -1)):
+            result[split][epoch] = payload
     return result
 
 

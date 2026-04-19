@@ -2,6 +2,7 @@ import argparse
 import io
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -13,9 +14,11 @@ from huggingface_hub import HfApi
 
 sys.path.insert(0, os.path.dirname(__file__))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'utils'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 from segment import segment_sample
 from watch import watch
 from status import claim, finish
+from helpers import sample_npz_path
 
 REMOTE_HOST = 'mcluster11'
 
@@ -31,6 +34,11 @@ def slurm_job_completed(sample_name):
 IMAGE_COLS = ["raw_image", "cropped_image", "overlay_image"]
 
 
+def sample_idx_from_path(path):
+    match = re.fullmatch(r"data/sample_(\d+)\.npz", path)
+    return int(match.group(1)) if match else None
+
+
 def to_webp(img):
     buf = io.BytesIO()
     img.convert("RGB").save(buf, format="WEBP", quality=85)
@@ -42,14 +50,17 @@ def upload_sample(repo_id, shifts, mask, data):
     api.create_repo(repo_id, repo_type="dataset", exist_ok=True)
 
     files = list(api.list_repo_files(repo_id, repo_type="dataset"))
-    idx = sum(1 for f in files if f.startswith("data/sample_") and f.endswith(".npz"))
+    existing_indices = {
+        sample_idx for f in files if (sample_idx := sample_idx_from_path(f)) is not None
+    }
+    idx = max(existing_indices, default=-1) + 1
 
     buf = io.BytesIO()
     np.savez_compressed(buf, shifts=shifts, mask=mask)
     buf.seek(0)
     api.upload_file(
         path_or_fileobj=buf,
-        path_in_repo=f"data/sample_{idx}.npz",
+        path_in_repo=sample_npz_path(idx),
         repo_id=repo_id,
         repo_type="dataset",
     )

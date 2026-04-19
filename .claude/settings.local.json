@@ -30,7 +30,8 @@
       "Bash(ssh *)",
       "Bash(git push *)",
       "Bash(find . *)",
-      "Bash(xargs cat *)"
+      "Bash(xargs cat *)",
+      "Bash(gh pr *)"
     ]
   }
 }
