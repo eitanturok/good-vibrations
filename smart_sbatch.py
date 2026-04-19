@@ -8,6 +8,7 @@ import sys
 import textwrap
 from datetime import datetime
 from pathlib import Path
+from typing import List, Optional
 
 
 PARTITIONS = [
@@ -48,8 +49,8 @@ def parse_args():
     return ap.parse_known_args()
 
 
-def strip_arg(tokens: list[str], flag: str) -> list[str]:
-    cleaned: list[str] = []
+def strip_arg(tokens: List[str], flag: str) -> List[str]:
+    cleaned: List[str] = []
     skip_next = False
     for token in tokens:
         if skip_next:
@@ -64,7 +65,7 @@ def strip_arg(tokens: list[str], flag: str) -> list[str]:
     return cleaned
 
 
-def normalize_model_args(model_args: list[str], job_name: str) -> list[str]:
+def normalize_model_args(model_args: List[str], job_name: str) -> List[str]:
     model_args = strip_arg(model_args, "--run-name")
     return model_args + ["--run-name", job_name]
 
@@ -96,7 +97,7 @@ def best_gpu(partition: str):
     return GPUS[-1][1], GPUS[-1][2], GPUS[-1][3]
 
 
-def pick_resources(forced_gpu: str | None):
+def pick_resources(forced_gpu: Optional[str]):
     counts = job_counts()
     for partition, max_running, max_submitted, max_time in PARTITIONS:
         running, submitted = counts.get(partition, (0, 0))
@@ -126,11 +127,11 @@ def build_log_dir() -> Path:
     return log_dir
 
 
-def build_model_command(model_args: list[str]) -> str:
+def build_model_command(model_args: List[str]) -> str:
     return shlex.join(["uv", "run", "python", "src/model.py", *model_args])
 
 
-def build_resubmit_command(args, model_args: list[str]) -> str:
+def build_resubmit_command(args, model_args: List[str]) -> str:
     dependency_placeholder = "__SLURM_DEPENDENCY__"
     cmd = [
         "python3",
@@ -151,7 +152,7 @@ def build_resubmit_command(args, model_args: list[str]) -> str:
     )
 
 
-def build_script(args, model_args: list[str], partition: str, gres: str, ram: int, max_time: str, log_dir: Path) -> str:
+def build_script(args, model_args: List[str], partition: str, gres: str, ram: int, max_time: str, log_dir: Path) -> str:
     repo_root = Path.cwd().resolve()
     model_cmd = build_model_command(model_args)
     resubmit_cmd = build_resubmit_command(args, model_args)
@@ -197,7 +198,7 @@ def build_script(args, model_args: list[str], partition: str, gres: str, ram: in
     )
 
 
-def submit_script(script_path: Path, dependency: str | None):
+def submit_script(script_path: Path, dependency: Optional[str]):
     cmd = ["sbatch"]
     if dependency:
         cmd.extend(["--dependency", dependency])
