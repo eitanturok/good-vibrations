@@ -195,12 +195,16 @@ source $HOME/mark_sheinin_lab/code/eitan/.secrets
 DONE_FLAG="$(mktemp)"
 RESUBMIT_JOB_FILE="$(mktemp)"
 rm -f "$DONE_FLAG" "$RESUBMIT_JOB_FILE"
+RESUBMITTED=0
+TIMEOUT_TRIGGERED=0
+TIMEOUT_TERMINATING=0
 
 schedule_resume() {{
-    sleep {resubmit_delay}
-    if [ -f "$DONE_FLAG" ]; then
+    if [ "$RESUBMITTED" -eq 1 ]; then
         return
     fi
+    RESUBMITTED=1
+    TIMEOUT_TRIGGERED=1
     echo "[smart_sbatch] Scheduling resume job for $SLURM_JOB_ID"
     RESUBMIT_OUTPUT="$({resubmit_cmd} 2>&1)"
     RESUBMIT_STATUS=$?
@@ -211,21 +215,47 @@ schedule_resume() {{
     fi
     printf '%s\n' "$RESUBMIT_OUTPUT" | awk '/Submitted batch job/ {{print $4}}' | tail -n 1 > "$RESUBMIT_JOB_FILE"
 }}
-schedule_resume &
+
+handle_timeout_signal() {{
+    schedule_resume
+}}
+
+handle_term_signal() {{
+    TIMEOUT_TERMINATING=1
+}}
+
+trap handle_timeout_signal USR1
+trap handle_term_signal TERM
+
+(
+    sleep {resubmit_delay}
+    if [ ! -f "$DONE_FLAG" ]; then
+        kill -USR1 $$
+    fi
+) &
 RESUBMIT_TIMER_PID=$!
 
 TRAIN_EXIT=0
-{model_cmd} || TRAIN_EXIT=$?
+{model_cmd} &
+TRAIN_PID=$!
+wait "$TRAIN_PID" || TRAIN_EXIT=$?
 touch "$DONE_FLAG"
 kill "$RESUBMIT_TIMER_PID" >/dev/null 2>&1 || true
 wait "$RESUBMIT_TIMER_PID" 2>/dev/null || true
+RESUBMIT_JOB_ID=""
+if [ -s "$RESUBMIT_JOB_FILE" ]; then
+    RESUBMIT_JOB_ID="$(cat "$RESUBMIT_JOB_FILE")"
+fi
 if [ "$TRAIN_EXIT" -eq 0 ]; then
-    if [ -s "$RESUBMIT_JOB_FILE" ]; then
-        RESUBMIT_JOB_ID="$(cat "$RESUBMIT_JOB_FILE")"
+    if [ -n "$RESUBMIT_JOB_ID" ]; then
         echo "[smart_sbatch] Training completed; cancelling queued resume job $RESUBMIT_JOB_ID"
         scancel "$RESUBMIT_JOB_ID" || true
     fi
     exit 0
+fi
+if [ -n "$RESUBMIT_JOB_ID" ] && [ "$TIMEOUT_TERMINATING" -eq 0 ]; then
+    echo "[smart_sbatch] Training failed before timeout; cancelling queued resume job $RESUBMIT_JOB_ID"
+    scancel "$RESUBMIT_JOB_ID" || true
 fi
 exit "$TRAIN_EXIT"
 """
