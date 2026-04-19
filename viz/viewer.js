@@ -278,7 +278,7 @@ function attachHeatmapTooltip(canvas, mask, maskW, maskH) {
 }
 
 // ── Table header ──────────────────────────────────────────────────
-const CELL_W = 220, CELL_H = 196;
+const CELL_W = 286, CELL_H = 255;
 
 function getCanvasSizeForMode(mode) {
   return {
@@ -419,7 +419,7 @@ function renderDatasetCell(td, sample) {
 
     const img = document.createElement('img');
     img.src = sample.overhead;
-    img.style.cssText = `width:${CELL_W}px;height:${CELL_H}px;display:block;`;
+    img.style.cssText = `width:${CELL_W}px;height:${CELL_H}px;display:block;margin:0 auto;`;
     td.appendChild(img);
   }
 

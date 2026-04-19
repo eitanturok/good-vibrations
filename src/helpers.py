@@ -659,30 +659,33 @@ def fetch_predictions(
     """
     import numpy as np
     from pathlib import Path
-    from huggingface_hub import hf_hub_download, list_repo_tree
+    from huggingface_hub import snapshot_download
 
     cache_dir = Path(cache_dir).expanduser()
     repo_id = data_dir.removeprefix("hf://")
     prefix = f"{run_predictions_dir(run_id)}/"
 
     t0 = time.perf_counter()
-    files = []
-    for f in list_repo_tree(repo_id, repo_type="dataset", recursive=True):
-        filename = getattr(f, "rfilename", None) or getattr(f, "path", None)
-        if filename and filename.startswith(prefix) and filename.endswith(".npz"):
-            files.append(filename)
+    snapshot_dir = Path(
+        snapshot_download(
+            repo_id=repo_id,
+            repo_type="dataset",
+            cache_dir=str(cache_dir),
+            allow_patterns=f"{prefix}/*.npz",
+        )
+    )
+    files = sorted(snapshot_dir.glob(f"{prefix}/*.npz"))
     t_tree = time.perf_counter() - t0
     print(
-        f"[fetch_predictions] run={run_id} repo={repo_id} tree_scan={t_tree:.1f}s files={len(files)}"
+        f"[fetch_predictions] run={run_id} repo={repo_id} snapshot={t_tree:.1f}s files={len(files)}"
     )
 
     result = {"train": {}, "eval": {}}
-    t_download = 0.0
     t_np_load = 0.0
     total_npz_bytes = 0
-    for file_i, fname in enumerate(sorted(files), start=1):
+    for file_i, local in enumerate(files, start=1):
         # fname: runs/{run_id}/predictions/eval_ep0000010_ba0000000050.npz
-        stem = Path(fname).stem
+        stem = local.stem
         split, _, rest = stem.partition("_ep")
         if split not in result:
             continue
@@ -691,15 +694,7 @@ def fetch_predictions(
             continue
         epoch = int(epoch_str)
         batch = int(batch_str)
-        t1 = time.perf_counter()
-        local = hf_hub_download(
-            repo_id=repo_id,
-            filename=fname,
-            repo_type="dataset",
-            cache_dir=str(cache_dir),
-        )
-        t_download += time.perf_counter() - t1
-        total_npz_bytes += Path(local).stat().st_size
+        total_npz_bytes += local.stat().st_size
         t1 = time.perf_counter()
         payload = dict(np.load(local, allow_pickle=True))
         t_np_load += time.perf_counter() - t1
@@ -711,12 +706,12 @@ def fetch_predictions(
         if file_i % 100 == 0 or file_i == len(files):
             print(
                 f"[fetch_predictions] progress run={run_id} files={file_i}/{len(files)} "
-                f"download={t_download:.1f}s np_load={t_np_load:.1f}s bytes={total_npz_bytes/1e6:.1f}MB"
+                f"snapshot={t_tree:.1f}s np_load={t_np_load:.1f}s bytes={total_npz_bytes/1e6:.1f}MB"
             )
     print(
         f"[fetch_predictions] summary run={run_id} files={len(files)} kept_epochs="
         f"train:{len(result['train'])} eval:{len(result['eval'])} "
-        f"download={t_download:.1f}s np_load={t_np_load:.1f}s total_bytes={total_npz_bytes/1e6:.1f}MB"
+        f"snapshot={t_tree:.1f}s np_load={t_np_load:.1f}s total_bytes={total_npz_bytes/1e6:.1f}MB"
     )
     return result
 

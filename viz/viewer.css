@@ -142,10 +142,10 @@ thead th:nth-child(1), thead th:nth-child(2) { z-index: 4; }
   border: none;
   background: none;
   cursor: pointer;
-  color: #aaa;
+  color: #c00;
   align-self: flex-end;
 }
-.close-col:hover { color: #c00; }
+.close-col:hover { color: #900; }
 
 /* ── Per-cell info row ──────────────────────────────────────────── */
 .cell-info {
@@ -207,6 +207,7 @@ audio { width: 100%; margin-top: 2px; }
 
 /* ── Fullscreen dialog ──────────────────────────────────────────── */
 dialog {
+  position: relative;
   width: 80vw;
   max-height: 90vh;
   overflow-y: auto;
@@ -217,15 +218,18 @@ dialog {
 }
 dialog::backdrop { background: rgba(0, 0, 0, 0.5); }
 #close-dialog {
-  float: right;
+  position: absolute;
+  top: 12px;
+  right: 12px;
   font: inherit;
-  padding: 4px 10px;
+  padding: 2px 8px;
   cursor: pointer;
-  border: 1px solid #ccc;
+  border: 1px solid #f1b5b5;
   border-radius: 4px;
-  background: #f4f4f4;
-  margin-bottom: 12px;
+  background: #fff5f5;
+  color: #c00;
 }
+#close-dialog:hover { background: #ffe5e5; color: #900; }
 #fullscreen-content { clear: both; }
 .fs-section { margin-bottom: 16px; }
 .fs-label { font-weight: 700; margin-bottom: 4px; }

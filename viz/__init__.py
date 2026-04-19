@@ -174,10 +174,24 @@ def load_run_data(run_id: str) -> dict:
     t0 = _t('W&B history', t0)
 
     print(f'  [run {run_id}] predictions from HF Hub...')
-    try:
-        raw = fetch_predictions(run_id, data_dir=HF_PREDS)
-    except Exception as e:
-        print(f'  [warn] no predictions found for {run_id}: {e}')
+    raw = None
+    pred_keys = []
+    for pred_key in [run_name, run_id]:
+        if pred_key in pred_keys:
+            continue
+        pred_keys.append(pred_key)
+        try:
+            print(f'    [lookup] predictions key={pred_key}')
+            candidate = fetch_predictions(pred_key, data_dir=HF_PREDS)
+            n_epochs = len(set(candidate['train'].keys()) | set(candidate['eval'].keys()))
+            if n_epochs > 0:
+                raw = candidate
+                print(f'    [lookup] found predictions under key={pred_key} ({n_epochs} epochs)')
+                break
+        except Exception as e:
+            print(f'    [lookup] failed for key={pred_key}: {e}')
+    if raw is None:
+        print(f'  [warn] no predictions found for any key in {pred_keys}')
         raw = {'train': {}, 'eval': {}}
     t0 = _t('HF predictions download', t0)
 
