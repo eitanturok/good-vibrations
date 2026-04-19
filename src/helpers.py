@@ -550,7 +550,7 @@ class MaskVisualizationCallback(Callback):
 
     def _batch_to_pred(self, batch, outputs):
         _, true_masks, _, _, meta = batch
-        _, _, _, mask_logits = outputs
+        _, mask_logits = outputs
         return {
             "mask_true": true_masks.detach().cpu().float().numpy(),
             "mask_logits": mask_logits.detach().cpu().float().numpy(),
