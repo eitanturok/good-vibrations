@@ -471,23 +471,24 @@ class MaskVisualizationCallback(Callback):
         self.thresholds = list(thresholds)
         self.pred_save_dir = pred_save_dir
         self.run_id = run_id
-        self._train_preds = []
+        self._train_preds = None
         self._eval_preds = []  # accumulates across all eval batches
 
     def epoch_start(self, state, logger):
         del state, logger
-        self._train_preds = []
+        self._train_preds = None
 
     def batch_end(self, state, logger):
         del logger
-        if self._should_collect_train_preds(state):
-            self._train_preds.append(self._batch_to_pred(state.batch, state.outputs))
+        if self._should_collect_train_preds(state) and self._train_preds is None:
+            # Reuse the first train batch's existing forward pass for logging.
+            self._train_preds = [self._batch_to_pred(state.batch, state.outputs)]
 
     def epoch_end(self, state, logger):
         del logger
         if state.timestamp.epoch.value % self.train_viz_interval != 0 or not self._train_preds:
             return
-        self._visualize(self._train_preds, state, "train", use_all_samples=True)
+        self._visualize(self._train_preds, state, "train", use_all_samples=False)
         self._save_predictions(self._train_preds, state, "train")
 
     def eval_batch_end(self, state, logger):
