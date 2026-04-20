@@ -682,3 +682,38 @@ This plan fixes the target design as follows:
 - use a split pipeline: remote raw/mp4 upload, local metadata/tensor upload
 
 This document should be updated whenever we intentionally change the design.
+
+---
+
+## Implementation Progress Log
+
+### Backfill pipeline (Phase 5)
+
+- [x] End-to-end backfill working via `backfill_laser_vibrations_one.py --sample-id N`
+- [x] `--create-pr` → `--no-create-pr`: direct commits work once using the correct org-scoped HF token
+- [x] HF token fix: local `get_token()` was returning a stale fine-grained token scoped to the `eturok` user, not the `eturok-weizmann` org. Fix: read `~/.cache/huggingface/token` directly in both backfill scripts.
+- [x] Stray `remote/experiment_config.json` fix: `load_remote_experiment_config` used to write the config to `root/"remote"/` inside the upload temp dir, which then got swept up by `upload_folder`. Fixed by parsing JSON in-memory via SSH `cat` with no disk write.
+- [x] `README.md` pushed to HF dataset with dataset card, column table, sample file table, and full `manifest.json` field descriptions
+
+### Dataset viewer
+
+- [x] Images render (WebP bytes embedded in parquet via `HFImage()`)
+- [x] Audio plays: `audio_file_name` and `speckle_shifts_fft_audio_file_name` embedded as WAV bytes via `HFAudio()`
+- [x] Video plays: `speckle_vibrations_file_name` embedded as MP4 bytes via `HFVideo()`
+- [x] Video codec fix: OpenCV writes `mp4v` (MPEG-4 Part 2) which browsers cannot play. Fixed by re-encoding to H.264 (`libx264`) via `imageio-ffmpeg`, which bundles its own ffmpeg binary so no system install needed on the cluster.
+- [x] `RowsPostProcessingError` fix: declaring `dtype: audio` in README YAML while the parquet stored plain strings caused HF post-processor to fail. Fixed by embedding actual bytes as structs and casting with `HFAudio()` / `HFVideo()`.
+
+### Speed optimizations
+
+Starting point: ~110s per sample.
+
+- [x] **Remove remote repo clone** (~40s saved): every run was doing `rm -rf` + `git clone` + `git pull` just to have a directory to run the uploader script from. The script is already piped over SSH, so the clone was entirely unnecessary. Now writes the script to `$HOME/tmp/upload_remote_speckle_assets.py` and runs it directly.
+- [x] **Parallel HF uploads** (~10s saved): replaced two sequential `upload_file` calls (raw npy + mp4) with a single `create_commit(num_threads=2, operations=[...])`. The HF API parallelizes LFS uploads internally — no custom threading needed.
+
+Current total: ~49s per sample.
+
+### Remaining bottlenecks (in priority order)
+
+- [ ] **`uv venv --clear`** (~5-8s): rebuilds the remote venv from scratch every run. Fix: drop `--clear`, let `uv pip install` update in place if deps changed.
+- [ ] **Duplicate dataset loads** (~6-12s): `load old dataset row` runs twice per sample — once in `backfill_laser_vibrations_one.py` for position inference, once in `backfill_laser_vibrations.py` for actual data. Fix: pass row + source dir as args to avoid reloading.
+- [ ] **MP4 round-trip through HF** (~2s): remote step uploads MP4, local step downloads it again to embed in parquet. Fix: restructure so video bytes flow directly without going through HF.

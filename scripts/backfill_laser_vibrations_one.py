@@ -178,7 +178,7 @@ def run_remote_speckle_upload(sample_id: int, source_experiment_dir: str, fps: f
             f'export HUGGINGFACE_HUB_TOKEN={shlex.quote(hf_token)}; '
             f'{REMOTE_UV_INSTALL}; '
             f'{REMOTE_UV} python install 3.10; '
-            f'{REMOTE_UV} venv --python 3.10 --clear {REMOTE_VENV}; '
+            f'{REMOTE_UV} venv --python 3.10 {REMOTE_VENV}; '
             f'{REMOTE_UV} pip install --python {REMOTE_VENV}/bin/python --only-binary=:all: {' '.join(REMOTE_PIP_PACKAGES)} >/dev/null; '
             f'{REMOTE_VENV}/bin/python {REMOTE_SCRIPT_PATH} ' + f"{' '.join(shlex.quote(a) for a in remote_args)}"
         )}"
