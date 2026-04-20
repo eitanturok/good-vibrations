@@ -11,7 +11,6 @@ from huggingface_hub import get_token
 
 
 REMOTE_HOST = "ethantu@mcluster11.wisdom.weizmann.ac.il"
-REMOTE_REPO = "mark_sheinin_lab/code/eitan/good-vibrations"
 REMOTE_MAMBA = "$HOME/bin/micromamba"
 REMOTE_ENV_PREFIX = "$HOME/micromamba/envs/laser-vibrations"
 REMOTE_UV_INSTALL = "curl -LsSf https://astral.sh/uv/install.sh | sh"
@@ -149,39 +148,23 @@ def load_remote_experiment_config(source_experiment_dir: str) -> dict:
     return json.loads(result.stdout)
 
 
+REMOTE_SCRIPT_PATH = "$HOME/tmp/upload_remote_speckle_assets.py"
+
+
 def run_remote_speckle_upload(sample_id: int, source_experiment_dir: str, fps: float, repo_id: str) -> None:
     hf_token = get_hf_token()
-    remote_run_repo = "$HOME/tmp/laser-vibrations-run/good-vibrations"
 
-    stage(
-        "prepare fresh remote repo clone",
-        lambda: subprocess.run(
-            [
-                "ssh",
-                REMOTE_HOST,
-                "bash -lc "
-                + shlex.quote(
-                    "mkdir -p $HOME/tmp/laser-vibrations-run && "
-                    "rm -rf $HOME/tmp/laser-vibrations-run/good-vibrations && "
-                    "git clone https://github.com/eitanturok/good-vibrations $HOME/tmp/laser-vibrations-run/good-vibrations && "
-                    "cd $HOME/tmp/laser-vibrations-run/good-vibrations && git pull"
-                ),
-            ],
-            check=True,
-        ),
-    )
     with open(Path(__file__).resolve().parent / "upload_remote_speckle_assets.py", "rb") as f:
         stage(
             "sync remote uploader script",
             lambda: subprocess.run(
-                ["ssh", REMOTE_HOST, f"cat > {remote_run_repo}/scripts/upload_remote_speckle_assets.py"],
+                ["ssh", REMOTE_HOST, f"mkdir -p $HOME/tmp && cat > {REMOTE_SCRIPT_PATH}"],
                 check=True,
                 stdin=f,
             ),
         )
 
     remote_args = [
-        "python", "scripts/upload_remote_speckle_assets.py",
         "--sample-id", str(sample_id),
         "--source-experiment-dir", source_experiment_dir,
         "--repo-id", repo_id,
@@ -197,8 +180,7 @@ def run_remote_speckle_upload(sample_id: int, source_experiment_dir: str, fps: f
             f'{REMOTE_UV} python install 3.10; '
             f'{REMOTE_UV} venv --python 3.10 --clear {REMOTE_VENV}; '
             f'{REMOTE_UV} pip install --python {REMOTE_VENV}/bin/python --only-binary=:all: {' '.join(REMOTE_PIP_PACKAGES)} >/dev/null; '
-            f'cd {remote_run_repo}; '
-            f'{REMOTE_VENV}/bin/python ' + f"{' '.join(shlex.quote(a) for a in remote_args[1:])}"
+            f'{REMOTE_VENV}/bin/python {REMOTE_SCRIPT_PATH} ' + f"{' '.join(shlex.quote(a) for a in remote_args)}"
         )}"
     )
     stage("remote upload raw/mp4 assets", lambda: subprocess.run(["ssh", REMOTE_HOST, remote_cmd], check=True))
