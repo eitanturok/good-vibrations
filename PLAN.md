@@ -6,6 +6,25 @@ Create a new Hugging Face dataset called `laser-vibrations` that preserves the f
 
 This plan is the source of truth for the next implementation steps.
 
+## Current Status
+
+- [x] `PLAN.md` created and kept as the live spec
+- [x] `viz2/` created as a copy of `viz/`
+- [x] `viz2` pointed at `eturok-weizmann/laser-vibrations`
+- [x] `laser-vibrations` created as a fresh HF dataset
+- [x] initial dataset scaffold upload works
+- [ ] first dummy sample uploaded in the new schema
+- [ ] `viz2` adapted to read the new dataset schema
+
+### Working Notes
+
+- direct writes to `laser-vibrations` require PR-style commits, so upload scripts should default to `create_pr=True`
+- a historical backfill cannot reliably use `sample_id` alone because the current dataset does not contain a stable mapping from `sample_id` to the original mraid20 experiment directory
+- therefore, the first backfill script will take both:
+  - `sample_id`
+  - `source_experiment_dir`
+- once we have a canonical mapping table, we can remove that extra input for bulk backfill
+
 ## Why We Are Doing This
 
 The current dataset structure is too narrow for the workflow we now want.
@@ -40,6 +59,16 @@ Reasoning:
 This means:
 - old dataset remains available for reference and fallback
 - new dataset is where we implement the richer pipeline and viewer integration
+
+Implementation note:
+- we will not bulk-copy the existing `vibrations` dataset into `laser-vibrations`
+- instead, `laser-vibrations` starts as a fresh dataset with the new schema
+- we will upload one dummy sample first, validate the design, and only then backfill historical samples selectively
+
+Reasoning:
+- full client-side copy is slow and wasteful for a large dataset
+- the new dataset layout is intentionally different, so a repo clone would copy the wrong structure
+- starting fresh keeps iteration fast and reduces migration risk
 
 ### 2. Separate Viewer Assets From Training Tensors
 
@@ -196,6 +225,11 @@ Expected contents:
 - `fs`
 - `min_freq`
 - `max_freq`
+- `n_samples`
+
+Reasoning:
+- the FFT audio preview uses IFFT reconstruction from the stored cropped FFT
+- to reconstruct the signal shape reliably, we need the original sample count
 
 ### `speckle_shifts_fft_audio.wav`
 
@@ -293,11 +327,13 @@ Final parquet columns:
 - `speakers`
 - `x_position`
 - `y_position`
-- `fps`
-- `experiment_config`
+- `raw_image`
+- `cropped_image`
+- `overlay_image`
 - `audio_file_name`
 - `speckle_vibrations_file_name`
 - `speckle_shifts_fft_audio_file_name`
+- `manifest_json`
 - `sample_dir`
 - `mask_path`
 - `speckle_vibrations_raw_path`
@@ -309,9 +345,15 @@ Final parquet columns:
 
 Reasoning:
 - HF viewer should be able to play the audio and MP4 by using the `*_file_name` fields
+- we still want the overhead and segmented images available in parquet because they are already useful for viewer flows and preserve continuity with the old dataset
 - training and tooling need string paths to the tensor artifacts
-- we still want simple scalar metadata for filtering and model setup
+- we still want simple scalar metadata for filtering and grouping in the viewer
+- the full `manifest_json` string gives a compact overview of the entire sample configuration directly in the dataset viewer
 - this keeps parquet narrow and avoids storing large binary tensors inline
+
+Tradeoff:
+- `manifest_json` is useful for human inspection in HF viewer, but it is not a good structured column for filtering or aggregation
+- therefore, only high-value viewer/filter fields should stay flattened in parquet, while detailed configuration should live in the manifest and be mirrored into `manifest_json` for visibility
 
 ### Viewer-Specific Notes
 
@@ -500,9 +542,13 @@ Deliverables:
 - create `viz2/` as a copy of `viz/`
 - point `viz2` at the new dataset `laser-vibrations`
 - preserve stage timing logs in the copied code and add more as needed
+- initialize the empty `laser-vibrations` dataset scaffold
 
 Why start here:
 - this gives us a safe sandbox without touching the currently used viewer
+
+Status:
+- done
 
 ### Phase 2: Dummy Sample End-To-End
 
@@ -521,6 +567,11 @@ Validation:
 
 Why this phase matters:
 - it validates the schema before we scale up or backfill old data
+- it avoids paying the cost of copying the entire old dataset before the new schema is proven
+
+Implementation note:
+- the first script for this phase will accept `sample_id` and `source_experiment_dir`
+- that is intentional because historical source mapping is not yet encoded in the old dataset
 
 ### Phase 3: `viz2` Reads New Dataset Assets
 
@@ -550,6 +601,7 @@ Deliverables:
 
 Why this phase matters:
 - we want the new dataset to contain the historical data too, not just future samples
+- we will backfill incrementally after the fresh dataset and dummy sample path are confirmed working
 
 ### Phase 6: Migrate Training
 
@@ -568,6 +620,7 @@ We explicitly do not want to do these immediately:
 - store raw recordings in HF viewer-facing form
 - derive assets lazily on click in the viewer
 - batch-backfill the full historical dataset before a single dummy sample works cleanly
+- fully clone the old `vibrations` HF dataset into `laser-vibrations` before validating the new schema
 
 ## Source Of Truth Summary
 
@@ -578,11 +631,15 @@ This plan fixes the target design as follows:
 - use parquet for metadata and viewer-facing file references
 - keep shared audio under `audio/`
 - keep per-sample structured assets under `samples/sample_xxxxxx/`
+- keep overhead image columns in parquet for continuity with the old dataset and viewer support
 - preserve the full intermediate processing pipeline
 - add `manifest.json` per sample
+- store `experiment_config` inside `manifest.json`, not as a separate parquet column
+- store the full manifest again as a parquet `manifest_json` string for viewer visibility
 - save crop params and prompt in `mask.npz`
 - save complex FFT directly in `speckle_shifts_fft.npz`
 - create FFT audio preview via IFFT, defaulting to `laser_idx=50`, `xy_idx=0`
 - log timings for every stage we implement
+- use PR-style HF uploads by default because direct commits to the dataset are blocked
 
 This document should be updated whenever we intentionally change the design.
