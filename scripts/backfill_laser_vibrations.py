@@ -2,6 +2,7 @@ import argparse
 import io
 import json
 import shlex
+import shutil
 import subprocess
 import textwrap
 import time
@@ -12,6 +13,7 @@ import cv2
 import numpy as np
 from datasets import Dataset, Image as HFImage, load_dataset
 from huggingface_hub import HfApi, hf_hub_download
+from PIL import Image
 from scipy.io.wavfile import write as wav_write
 from scipy.signal import butter, resample, sosfiltfilt
 
@@ -21,6 +23,7 @@ NEW_REPO_ID = "eturok-weizmann/laser-vibrations"
 REMOTE_HOST = "ethantu@mcluster11.wisdom.weizmann.ac.il"
 REPO_ROOT = Path(__file__).resolve().parent.parent
 LOCAL_AUDIO_ROOT = REPO_ROOT / "data" / "audio_samples"
+DEFAULT_SOURCE_DATA_ROOT = "/net/mraid20/ifs/wisdom/groups/mark_sheinin_lab/DATA"
 IMAGE_COLS = ["raw_image", "cropped_image", "overlay_image"]
 
 
@@ -62,6 +65,24 @@ def load_old_sample_row(sample_id: int, repo_id: str) -> dict:
     raise ValueError(f"Sample {sample_id} not found in {repo_id}")
 
 
+def load_old_position_grid(repo_id: str) -> tuple[np.ndarray, np.ndarray]:
+    cols = ["object", "x_position", "y_position"]
+    ds = load_dataset(repo_id, split="train", columns=cols, verification_mode="no_checks")
+    xs, ys = [], []
+    for row in ds:
+        if row.get("object") == "empty":
+            continue
+        x = float(row.get("x_position") or -1)
+        y = float(row.get("y_position") or -1)
+        if x >= 0:
+            xs.append(x)
+        if y >= 0:
+            ys.append(y)
+    unique_x = np.unique(np.round(np.asarray(xs, dtype=np.float64), 6))
+    unique_y = np.unique(np.round(np.asarray(ys, dtype=np.float64), 6))
+    return np.sort(unique_x), np.sort(unique_y)
+
+
 def download_old_sample_npz(sample_id: int, repo_id: str) -> dict:
     path = hf_hub_download(repo_id=repo_id, repo_type="dataset", filename=old_sample_npz_path(sample_id))
     npz = np.load(path, allow_pickle=True)
@@ -74,6 +95,15 @@ def stream_remote_file(remote_path: str, local_path: Path) -> Path:
     with local_path.open("wb") as f:
         subprocess.run(["ssh", REMOTE_HOST, remote_command], check=True, stdout=f)
     return local_path
+
+
+def copy_any_file(src: str | Path, dst: Path) -> Path:
+    src_path = Path(src)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    if src_path.exists():
+        shutil.copy2(src_path, dst)
+        return dst
+    return stream_remote_file(str(src), dst)
 
 
 def load_remote_experiment_config(remote_experiment_dir: str, local_dir: Path) -> dict:
@@ -98,6 +128,101 @@ def resolve_audio_file(experiment_config: dict) -> tuple[Path, str]:
     if not local_path.exists():
         raise FileNotFoundError(f"Audio file not found locally: {local_path}")
     return local_path, f"audio/{basename}"
+
+
+def speaker_code(speakers) -> str:
+    return "".join(str(int(x)) for x in (speakers or []))
+
+
+def downsample_grayscale(img: Image.Image, size: tuple[int, int] = (96, 96)) -> np.ndarray:
+    return np.asarray(img.convert("L").resize(size, Image.Resampling.BILINEAR), dtype=np.float32)
+
+
+def discover_source_experiment_dir(row: dict, source_data_root: str) -> str:
+    root = Path(source_data_root)
+    if not root.exists():
+        raise FileNotFoundError(f"Source data root does not exist locally: {root}")
+
+    obj = row.get("object", "")
+    spk = speaker_code(row.get("speakers"))
+    pattern = f"**/{obj}-*_{spk}--*" if obj else f"**/*_{spk}--*"
+
+    t0 = time.perf_counter()
+    candidates = sorted(p for p in root.glob(pattern) if p.is_dir())
+    print(f"[timing] discover candidates: {time.perf_counter() - t0:.2f}s (n={len(candidates)})")
+    if not candidates:
+        raise FileNotFoundError(f"No candidate experiment dirs found for object={obj!r} speakers={spk!r} under {root}")
+    if len(candidates) == 1:
+        print(f"[info] single candidate source dir: {candidates[0]}")
+        return str(candidates[0])
+
+    target = downsample_grayscale(row["raw_image"])
+    scores = []
+    t0 = time.perf_counter()
+    for cand in candidates:
+        img_path = cand / "box_overhead_image.png"
+        if not img_path.exists():
+            continue
+        with Image.open(img_path) as img:
+            arr = downsample_grayscale(img)
+        mad = float(np.mean(np.abs(arr - target)))
+        scores.append((mad, cand))
+    print(f"[timing] discover image matching: {time.perf_counter() - t0:.2f}s (n={len(scores)})")
+    if not scores:
+        raise FileNotFoundError("No candidates had box_overhead_image.png for image matching")
+
+    scores.sort(key=lambda x: x[0])
+    for mad, cand in scores[:5]:
+        print(f"[debug] source candidate MAD={mad:.4f} dir={cand}")
+    return str(scores[0][1])
+
+
+def discover_source_experiment_dir_from_grid(row: dict, source_data_root: str, unique_x: np.ndarray, unique_y: np.ndarray) -> str | None:
+    root = Path(source_data_root)
+    if not root.exists():
+        raise FileNotFoundError(f"Source data root does not exist locally: {root}")
+
+    obj = row.get("object", "")
+    if obj == "empty":
+        return None
+
+    x_val = float(row.get("x_position") or -1)
+    y_val = float(row.get("y_position") or -1)
+    if x_val < 0 or y_val < 0 or len(unique_x) == 0 or len(unique_y) == 0:
+        return None
+
+    x_idx = int(np.argmin(np.abs(unique_x - x_val)))
+    y_idx = int(np.argmin(np.abs(unique_y - y_val))) + 1
+    spk = speaker_code(row.get("speakers"))
+    pattern = f"**/{obj}-{x_idx:02d}x{y_idx:02d}y_{spk}--*"
+    t0 = time.perf_counter()
+    candidates = sorted(p for p in root.glob(pattern) if p.is_dir())
+    print(
+        f"[timing] discover grid candidates: {time.perf_counter() - t0:.2f}s "
+        f"(pattern={pattern}, n={len(candidates)}, x={x_val:.3f}->{x_idx:02d}, y={y_val:.3f}->{y_idx:02d})"
+    )
+    if len(candidates) == 1:
+        return str(candidates[0])
+    if len(candidates) > 1:
+        print("[warn] multiple grid candidates, will fall back to image matching within this subset")
+        target = downsample_grayscale(row["raw_image"])
+        scores = []
+        t0 = time.perf_counter()
+        for cand in candidates:
+            img_path = cand / "box_overhead_image.png"
+            if not img_path.exists():
+                continue
+            with Image.open(img_path) as img:
+                arr = downsample_grayscale(img)
+            mad = float(np.mean(np.abs(arr - target)))
+            scores.append((mad, cand))
+        print(f"[timing] grid fallback image matching: {time.perf_counter() - t0:.2f}s (n={len(scores)})")
+        if scores:
+            scores.sort(key=lambda x: x[0])
+            for mad, cand in scores[:5]:
+                print(f"[debug] grid candidate MAD={mad:.4f} dir={cand}")
+            return str(scores[0][1])
+    return None
 
 
 def save_mask_npz(path: Path, mask: np.ndarray, left: float, right: float, up: float, down: float, prompt: str | None) -> None:
@@ -285,6 +410,7 @@ def write_manifest(
     experiment_config: dict,
 ) -> dict:
     rel_dir = sample_dir_rel(sample_id)
+    source_experiment_path = Path(remote_experiment_dir)
     payload = {
         "sample_idx": int(sample_id),
         "audio_file_name": audio_file_name,
@@ -323,6 +449,7 @@ def write_manifest(
         "mask": {
             "path": f"{rel_dir}/mask.npz",
         },
+        "source_experiment_id": source_experiment_path.name,
         "source_experiment_dir": remote_experiment_dir,
     }
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
@@ -352,7 +479,9 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--sample-id", type=int, required=True)
-    parser.add_argument("--source-experiment-dir", required=True)
+    parser.add_argument("--source-experiment-dir", default=None)
+    parser.add_argument("--source-data-root", default=DEFAULT_SOURCE_DATA_ROOT)
+    parser.add_argument("--auto-discover-source", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--old-repo-id", default=OLD_REPO_ID)
     parser.add_argument("--new-repo-id", default=NEW_REPO_ID)
     parser.add_argument("--left", type=float, default=0.15)
@@ -379,7 +508,25 @@ def main() -> None:
 
     repo_files = stage("list new repo files", lambda: set(api.list_repo_files(args.new_repo_id, repo_type="dataset")))
     old_row = stage("load old dataset row", lambda: load_old_sample_row(args.sample_id, args.old_repo_id))
+    unique_x, unique_y = stage("load old dataset position grid", lambda: load_old_position_grid(args.old_repo_id))
+    print(f"[info] discovered position grid: n_x={len(unique_x)} n_y={len(unique_y)}")
     old_npz = stage("download old sample npz", lambda: download_old_sample_npz(args.sample_id, args.old_repo_id))
+
+    source_experiment_dir = args.source_experiment_dir
+    if source_experiment_dir is None and args.auto_discover_source:
+        source_experiment_dir = stage(
+            "auto-discover source experiment dir from position grid",
+            lambda: discover_source_experiment_dir_from_grid(old_row, args.source_data_root, unique_x, unique_y),
+        )
+        if source_experiment_dir is None:
+            print("[warn] position-grid discovery did not yield a unique match; falling back to image search")
+            source_experiment_dir = stage(
+                "auto-discover source experiment dir from image match",
+                lambda: discover_source_experiment_dir(old_row, args.source_data_root),
+            )
+    if source_experiment_dir is None:
+        raise ValueError("Either --source-experiment-dir must be provided or --auto-discover-source must remain enabled")
+    print(f"[info] using source experiment dir: {source_experiment_dir}")
 
     with TemporaryDirectory(prefix=f"laser-vibrations-{args.sample_id:06d}-") as tmp:
         root = Path(tmp)
@@ -389,17 +536,14 @@ def main() -> None:
 
         experiment_config = stage(
             "load remote experiment config",
-            lambda: load_remote_experiment_config(args.source_experiment_dir, root / "remote"),
+            lambda: load_remote_experiment_config(source_experiment_dir, root / "remote"),
         )
         audio_src, audio_rel = stage("resolve shared audio", lambda: resolve_audio_file(experiment_config))
         stage("stage shared audio", lambda: maybe_stage_audio(audio_src, audio_rel, args.new_repo_id, root, repo_files))
 
         raw_npy_path = stage(
             "download raw speckle recording",
-            lambda: stream_remote_file(
-                f"{args.source_experiment_dir}/frame-recording.npy",
-                sample_root / "speckle_vibrations_raw.npy",
-            ),
+            lambda: copy_any_file(Path(source_experiment_dir) / "frame-recording.npy", sample_root / "speckle_vibrations_raw.npy"),
         )
 
         frame_count, frame_height, frame_width = stage(
@@ -471,7 +615,7 @@ def main() -> None:
                 path=sample_root / "manifest.json",
                 sample_id=args.sample_id,
                 audio_file_name=audio_rel,
-                remote_experiment_dir=args.source_experiment_dir,
+                remote_experiment_dir=source_experiment_dir,
                 fps=fs,
                 frame_count=frame_count,
                 frame_height=frame_height,

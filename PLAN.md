@@ -19,11 +19,13 @@ This plan is the source of truth for the next implementation steps.
 ### Working Notes
 
 - direct writes to `laser-vibrations` require PR-style commits, so upload scripts should default to `create_pr=True`
-- a historical backfill cannot reliably use `sample_id` alone because the current dataset does not contain a stable mapping from `sample_id` to the original mraid20 experiment directory
-- therefore, the first backfill script will take both:
-  - `sample_id`
-  - `source_experiment_dir`
-- once we have a canonical mapping table, we can remove that extra input for bulk backfill
+- the first local backfill attempt was slow because it copied the large raw `frame-recording.npy` from `mcluster11` back to the local machine over SSH
+- backfill should therefore run on `mcluster11` whenever possible, because `mcluster11` already has fast local access to `/net/mraid20/.../DATA`
+- source experiment discovery should use the old dataset's continuous `x_position` and `y_position` as the primary signal
+- these continuous positions should be bucketed onto the discrete filename grid used in experiment directories, e.g. `cube-00x01y_0001--...`
+- overhead-image matching should remain only as a fallback if position bucketing is ambiguous or not available
+- `source_experiment_id` should be saved in the manifest in addition to `source_experiment_dir`
+- manual `source_experiment_dir` override should still be supported as a fallback
 
 ## Why We Are Doing This
 
@@ -268,6 +270,7 @@ Proposed structure:
   "sample_idx": 1,
   "audio_file_name": "audio/chirp_50_1000_3.0sec.wav",
   "sample_dir": "samples/sample_000001",
+  "experiment_config": {"...": "..."},
   "speckle_vibrations": {
     "file_name": "samples/sample_000001/speckle_vibrations.mp4",
     "raw_path": "samples/sample_000001/speckle_vibrations_raw.npy",
@@ -301,6 +304,7 @@ Proposed structure:
   "mask": {
     "path": "samples/sample_000001/mask.npz"
   },
+  "source_experiment_id": "cube-00x01y_0001--31-03-18-21-24",
   "source_experiment_dir": "..."
 }
 ```
@@ -570,8 +574,10 @@ Why this phase matters:
 - it avoids paying the cost of copying the entire old dataset before the new schema is proven
 
 Implementation note:
-- the first script for this phase will accept `sample_id` and `source_experiment_dir`
-- that is intentional because historical source mapping is not yet encoded in the old dataset
+- the backfill script should auto-discover the source experiment directory by bucketing the old dataset's continuous `x_position` and `y_position` onto the discrete filename grid
+- image matching should only be used as a fallback when the grid-based lookup is ambiguous
+- manual `source_experiment_dir` override should still be supported as a fallback
+- the heavy backfill work should run on `mcluster11`, not on the local machine
 
 ### Phase 3: `viz2` Reads New Dataset Assets
 
@@ -602,6 +608,10 @@ Deliverables:
 Why this phase matters:
 - we want the new dataset to contain the historical data too, not just future samples
 - we will backfill incrementally after the fresh dataset and dummy sample path are confirmed working
+
+Performance note:
+- backfill should prefer execution on `mcluster11` to avoid transferring large raw recordings over SSH to the local machine
+- timings should be printed for discovery, config load, raw file access, MP4 generation, FFT audio generation, parquet/manifest creation, and upload
 
 ### Phase 6: Migrate Training
 
@@ -636,10 +646,12 @@ This plan fixes the target design as follows:
 - add `manifest.json` per sample
 - store `experiment_config` inside `manifest.json`, not as a separate parquet column
 - store the full manifest again as a parquet `manifest_json` string for viewer visibility
+- store both `source_experiment_id` and `source_experiment_dir` in the manifest
 - save crop params and prompt in `mask.npz`
 - save complex FFT directly in `speckle_shifts_fft.npz`
 - create FFT audio preview via IFFT, defaulting to `laser_idx=50`, `xy_idx=0`
 - log timings for every stage we implement
 - use PR-style HF uploads by default because direct commits to the dataset are blocked
+- run backfill on `mcluster11` whenever possible so raw sample access stays close to `/net/mraid20`
 
 This document should be updated whenever we intentionally change the design.
