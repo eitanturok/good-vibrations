@@ -21,6 +21,8 @@ REMOTE_PIP_PACKAGES = [
     "numpy==1.26.4",
     "opencv-python-headless==4.10.0.84",
     "huggingface_hub==0.31.2",
+    "imageio==2.37.0",
+    "imageio-ffmpeg==0.5.1",
 ]
 
 

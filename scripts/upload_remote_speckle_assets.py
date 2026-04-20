@@ -1,5 +1,4 @@
 import argparse
-import subprocess
 import tempfile
 import time
 from pathlib import Path
@@ -69,27 +68,22 @@ def generate_speckle_preview(raw_npy_path: Path, out_path: Path, fps: float, max
     lo = float(np.percentile(probe, 5))
     hi = float(np.percentile(probe, 99.5))
     preview_fps = min(30.0, max(1.0, fps / step))
-    tmp_path = out_path.with_suffix(".tmp.mp4")
-    writer = cv2.VideoWriter(str(tmp_path), cv2.VideoWriter_fourcc(*"mp4v"), preview_fps, (preview_w, preview_h))
-    if not writer.isOpened():
-        raise RuntimeError(f"Failed to open VideoWriter for {tmp_path}")
-    try:
-        for i, idx in enumerate(selected_idxs):
-            frame = read_frame(raw_npy_path, offset, dtype, (frame_height, frame_width), idx)
-            frame_u8 = np.clip((frame.astype(np.float32) - lo) / max(hi - lo, 1e-6), 0, 1)
-            frame_u8 = (frame_u8 * 255).astype(np.uint8)
-            frame_bgr = cv2.cvtColor(frame_u8, cv2.COLOR_GRAY2BGR)
-            if (preview_w, preview_h) != (frame_width, frame_height):
-                frame_bgr = cv2.resize(frame_bgr, (preview_w, preview_h), interpolation=cv2.INTER_AREA)
-            cv2.putText(frame_bgr, f"frame {idx}", (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255, 255, 255), 2, cv2.LINE_AA)
-            writer.write(frame_bgr)
-    finally:
-        writer.release()
-    subprocess.run(
-        ["ffmpeg", "-y", "-i", str(tmp_path), "-vcodec", "libx264", "-pix_fmt", "yuv420p", str(out_path)],
-        check=True, capture_output=True,
-    )
-    tmp_path.unlink()
+
+    import imageio
+    frames_out = []
+    for i, idx in enumerate(selected_idxs):
+        frame = read_frame(raw_npy_path, offset, dtype, (frame_height, frame_width), idx)
+        frame_u8 = np.clip((frame.astype(np.float32) - lo) / max(hi - lo, 1e-6), 0, 1)
+        frame_u8 = (frame_u8 * 255).astype(np.uint8)
+        frame_bgr = cv2.cvtColor(frame_u8, cv2.COLOR_GRAY2BGR)
+        if (preview_w, preview_h) != (frame_width, frame_height):
+            frame_bgr = cv2.resize(frame_bgr, (preview_w, preview_h), interpolation=cv2.INTER_AREA)
+        cv2.putText(frame_bgr, f"frame {idx}", (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255, 255, 255), 2, cv2.LINE_AA)
+        frames_out.append(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB))
+    writer = imageio.get_writer(str(out_path), fps=preview_fps, codec="libx264", pixelformat="yuv420p", output_params=["-crf", "23"])
+    for f in frames_out:
+        writer.append_data(f)
+    writer.close()
     return frame_count, frame_height, frame_width
 
 
