@@ -5,7 +5,7 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-from huggingface_hub import HfApi
+from huggingface_hub import CommitOperationAdd, HfApi
 from numpy.lib import format as npy_format
 
 
@@ -109,25 +109,17 @@ def main() -> None:
             lambda: generate_speckle_preview(raw_path, preview_path, fps=args.fps),
         )
         stage(
-            "upload raw speckle recording",
-            lambda: api.upload_file(
-                path_or_fileobj=str(raw_path),
-                path_in_repo=f"{rel_dir}/speckle_vibrations_raw.npy",
+            "upload raw npy + mp4 in parallel",
+            lambda: api.create_commit(
                 repo_id=args.repo_id,
                 repo_type="dataset",
                 commit_message=f"Upload raw speckle assets for sample {args.sample_id:06d}",
                 create_pr=args.create_pr,
-            ),
-        )
-        stage(
-            "upload speckle preview mp4",
-            lambda: api.upload_file(
-                path_or_fileobj=str(preview_path),
-                path_in_repo=f"{rel_dir}/speckle_vibrations.mp4",
-                repo_id=args.repo_id,
-                repo_type="dataset",
-                commit_message=f"Upload speckle preview for sample {args.sample_id:06d}",
-                create_pr=args.create_pr,
+                num_threads=2,
+                operations=[
+                    CommitOperationAdd(path_in_repo=f"{rel_dir}/speckle_vibrations_raw.npy", path_or_fileobj=str(raw_path)),
+                    CommitOperationAdd(path_in_repo=f"{rel_dir}/speckle_vibrations.mp4", path_or_fileobj=str(preview_path)),
+                ],
             ),
         )
 
