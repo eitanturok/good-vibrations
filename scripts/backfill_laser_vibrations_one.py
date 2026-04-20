@@ -7,6 +7,7 @@ from pathlib import Path
 
 import numpy as np
 from datasets import load_dataset
+from huggingface_hub import get_token
 
 
 REMOTE_HOST = "ethantu@mcluster11.wisdom.weizmann.ac.il"
@@ -29,6 +30,13 @@ def stage(label, fn):
     dt = time.perf_counter() - t0
     print(f"[timing] {label}: {dt:.2f}s")
     return result
+
+
+def get_hf_token() -> str:
+    token = get_token()
+    if not token:
+        raise RuntimeError("No local Hugging Face token found; run `huggingface-cli login` first")
+    return token
 
 
 def speaker_code(speakers) -> str:
@@ -140,26 +148,54 @@ def load_remote_experiment_config(source_experiment_dir: str) -> dict:
 
 
 def run_remote_speckle_upload(sample_id: int, source_experiment_dir: str, fps: float, repo_id: str) -> None:
+    hf_token = get_hf_token()
+    remote_run_repo = "$HOME/tmp/laser-vibrations-run/good-vibrations"
+
+    stage(
+        "prepare fresh remote repo clone",
+        lambda: subprocess.run(
+            [
+                "ssh",
+                REMOTE_HOST,
+                "bash -lc "
+                + shlex.quote(
+                    "mkdir -p $HOME/tmp/laser-vibrations-run && "
+                    "rm -rf $HOME/tmp/laser-vibrations-run/good-vibrations && "
+                    "git clone https://github.com/eitanturok/good-vibrations $HOME/tmp/laser-vibrations-run/good-vibrations && "
+                    "cd $HOME/tmp/laser-vibrations-run/good-vibrations && git pull"
+                ),
+            ],
+            check=True,
+        ),
+    )
+    with open(Path(__file__).resolve().parent / "upload_remote_speckle_assets.py", "rb") as f:
+        stage(
+            "sync remote uploader script",
+            lambda: subprocess.run(
+                ["ssh", REMOTE_HOST, f"cat > {remote_run_repo}/scripts/upload_remote_speckle_assets.py"],
+                check=True,
+                stdin=f,
+            ),
+        )
+
     remote_args = [
         "python", "scripts/upload_remote_speckle_assets.py",
         "--sample-id", str(sample_id),
         "--source-experiment-dir", source_experiment_dir,
         "--repo-id", repo_id,
         "--fps", str(fps),
-        "--create-pr",
+        "--no-create-pr",
     ]
     remote_cmd = (
         f"bash -lc {shlex.quote(
             f'source /etc/profile >/dev/null 2>&1 || true; '
+            f'export HF_TOKEN={shlex.quote(hf_token)}; '
+            f'export HUGGINGFACE_HUB_TOKEN={shlex.quote(hf_token)}; '
             f'{REMOTE_UV_INSTALL}; '
             f'{REMOTE_UV} python install 3.10; '
-            f'{REMOTE_UV} venv --python 3.10 {REMOTE_VENV}; '
+            f'{REMOTE_UV} venv --python 3.10 --clear {REMOTE_VENV}; '
             f'{REMOTE_UV} pip install --python {REMOTE_VENV}/bin/python --only-binary=:all: {' '.join(REMOTE_PIP_PACKAGES)} >/dev/null; '
-            f'mkdir -p ~/tmp/laser-vibrations-run; '
-            f'rm -rf ~/tmp/laser-vibrations-run/good-vibrations; '
-            f'git clone https://github.com/eitanturok/good-vibrations ~/tmp/laser-vibrations-run/good-vibrations; '
-            f'cd ~/tmp/laser-vibrations-run/good-vibrations; '
-            f'git pull; '
+            f'cd {remote_run_repo}; '
             f'{REMOTE_VENV}/bin/python ' + f"{' '.join(shlex.quote(a) for a in remote_args[1:])}"
         )}"
     )
@@ -175,7 +211,7 @@ def run_local_backfill(sample_id: int, source_experiment_dir: str, repo_id_old: 
         "--old-repo-id", repo_id_old,
         "--new-repo-id", repo_id_new,
         "--skip-remote-speckle-assets",
-        "--create-pr",
+        "--no-create-pr",
     ]
     stage("local backfill remaining assets", lambda: subprocess.run(cmd, check=True))
 
