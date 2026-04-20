@@ -12,7 +12,7 @@ from tempfile import TemporaryDirectory
 
 import cv2
 import numpy as np
-from datasets import Dataset, Image as HFImage, load_dataset
+from datasets import Audio as HFAudio, Dataset, Image as HFImage, Video as HFVideo, load_dataset
 from huggingface_hub import HfApi, hf_hub_download
 from PIL import Image
 from scipy.io.wavfile import write as wav_write
@@ -367,9 +367,10 @@ def generate_speckle_preview(raw_npy_path: Path, out_path: Path, fps: float, max
     probe = np.asarray(selected[: min(len(selected), 50)])
     lo = float(np.percentile(probe, 5))
     hi = float(np.percentile(probe, 99.5))
-    writer = cv2.VideoWriter(str(out_path), cv2.VideoWriter_fourcc(*"mp4v"), max(1.0, fps / step), (preview_w, preview_h))
+    tmp_path = out_path.with_suffix(".tmp.mp4")
+    writer = cv2.VideoWriter(str(tmp_path), cv2.VideoWriter_fourcc(*"mp4v"), max(1.0, fps / step), (preview_w, preview_h))
     if not writer.isOpened():
-        raise RuntimeError(f"Failed to open VideoWriter for {out_path}")
+        raise RuntimeError(f"Failed to open VideoWriter for {tmp_path}")
     try:
         for i, frame in enumerate(selected):
             frame_u8 = np.clip((frame.astype(np.float32) - lo) / max(hi - lo, 1e-6), 0, 1)
@@ -381,6 +382,11 @@ def generate_speckle_preview(raw_npy_path: Path, out_path: Path, fps: float, max
             writer.write(frame_bgr)
     finally:
         writer.release()
+    subprocess.run(
+        ["ffmpeg", "-y", "-i", str(tmp_path), "-vcodec", "libx264", "-pix_fmt", "yuv420p", str(out_path)],
+        check=True, capture_output=True,
+    )
+    tmp_path.unlink()
     return frame_count, frame_height, frame_width
 
 
@@ -390,11 +396,25 @@ def to_webp(img) -> dict:
     return {"bytes": buf.getvalue(), "path": None}
 
 
+AUDIO_COLS = ["audio_file_name", "speckle_shifts_fft_audio_file_name"]
+VIDEO_COLS = ["speckle_vibrations_file_name"]
+
+
+def to_audio(path: Path) -> dict:
+    return {"bytes": path.read_bytes(), "path": path.name}
+
+
+def to_video(path: Path) -> dict:
+    return {"bytes": path.read_bytes(), "path": path.name}
+
+
 def write_parquet_row(
     path: Path,
     sample_id: int,
     row: dict,
-    audio_file_name: str,
+    audio_src: Path,
+    fft_audio_src: Path,
+    video_src: Path,
     manifest_payload: dict,
 ) -> None:
     rel_dir = sample_dir_rel(sample_id)
@@ -406,9 +426,9 @@ def write_parquet_row(
         "speakers": row.get("speakers", []),
         "x_position": row.get("x_position"),
         "y_position": row.get("y_position"),
-        "audio_file_name": audio_file_name,
-        "speckle_vibrations_file_name": f"{rel_dir}/speckle_vibrations.mp4",
-        "speckle_shifts_fft_audio_file_name": f"{rel_dir}/speckle_shifts_fft_audio.wav",
+        "audio_file_name": to_audio(audio_src),
+        "speckle_vibrations_file_name": to_video(video_src),
+        "speckle_shifts_fft_audio_file_name": to_audio(fft_audio_src),
         "manifest_json": json.dumps(manifest_payload),
         "sample_dir": rel_dir,
         "mask_path": f"{rel_dir}/mask.npz",
@@ -423,6 +443,10 @@ def write_parquet_row(
     ds = Dataset.from_list([record])
     for col in IMAGE_COLS:
         ds = ds.cast_column(col, HFImage())
+    for col in AUDIO_COLS:
+        ds = ds.cast_column(col, HFAudio())
+    for col in VIDEO_COLS:
+        ds = ds.cast_column(col, HFVideo())
     with path.open("wb") as f:
         ds.to_parquet(f)
 
@@ -585,6 +609,14 @@ def main() -> None:
                 "inspect remote raw speckle recording header",
                 lambda: inspect_remote_npy(f"{source_experiment_dir}/frame-recording.npy"),
             )
+            video_src = Path(stage(
+                "download speckle preview mp4 from HF",
+                lambda: hf_hub_download(
+                    repo_id=args.new_repo_id,
+                    repo_type="dataset",
+                    filename=f"{sample_dir_rel(args.sample_id)}/speckle_vibrations.mp4",
+                ),
+            ))
         else:
             raw_npy_path = stage(
                 "download raw speckle recording",
@@ -599,6 +631,7 @@ def main() -> None:
                     fps=float(experiment_config.get("FPS") or experiment_config.get("camera_FPS") or 1),
                 ),
             )
+            video_src = sample_root / "speckle_vibrations.mp4"
 
         shifts = np.asarray(old_npz["shifts"])
         mask = np.asarray(old_npz["mask"])
@@ -684,7 +717,9 @@ def main() -> None:
                 path=parquet_path,
                 sample_id=args.sample_id,
                 row=old_row,
-                audio_file_name=audio_rel,
+                audio_src=audio_src,
+                fft_audio_src=sample_root / "speckle_shifts_fft_audio.wav",
+                video_src=video_src,
                 manifest_payload=manifest_payload,
             ),
         )

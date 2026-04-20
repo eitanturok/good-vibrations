@@ -1,4 +1,5 @@
 import argparse
+import subprocess
 import tempfile
 import time
 from pathlib import Path
@@ -68,9 +69,10 @@ def generate_speckle_preview(raw_npy_path: Path, out_path: Path, fps: float, max
     lo = float(np.percentile(probe, 5))
     hi = float(np.percentile(probe, 99.5))
     preview_fps = min(30.0, max(1.0, fps / step))
-    writer = cv2.VideoWriter(str(out_path), cv2.VideoWriter_fourcc(*"mp4v"), preview_fps, (preview_w, preview_h))
+    tmp_path = out_path.with_suffix(".tmp.mp4")
+    writer = cv2.VideoWriter(str(tmp_path), cv2.VideoWriter_fourcc(*"mp4v"), preview_fps, (preview_w, preview_h))
     if not writer.isOpened():
-        raise RuntimeError(f"Failed to open VideoWriter for {out_path}")
+        raise RuntimeError(f"Failed to open VideoWriter for {tmp_path}")
     try:
         for i, idx in enumerate(selected_idxs):
             frame = read_frame(raw_npy_path, offset, dtype, (frame_height, frame_width), idx)
@@ -83,6 +85,11 @@ def generate_speckle_preview(raw_npy_path: Path, out_path: Path, fps: float, max
             writer.write(frame_bgr)
     finally:
         writer.release()
+    subprocess.run(
+        ["ffmpeg", "-y", "-i", str(tmp_path), "-vcodec", "libx264", "-pix_fmt", "yuv420p", str(out_path)],
+        check=True, capture_output=True,
+    )
+    tmp_path.unlink()
     return frame_count, frame_height, frame_width
 
 
