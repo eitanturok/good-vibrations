@@ -1045,10 +1045,10 @@ def get_parser():
     # evaluation
     parser.add_argument("--eval-batch-size", type=int, default=128)
     parser.add_argument("--max-duration", type=str, default="10_000ep")
-    parser.add_argument("--eval-interval", type=str, default="100ep")
+    parser.add_argument("--eval-interval", type=str, default="50ep")
 
     # logging
-    parser.add_argument("--mask-viz-train-interval", type=int, default=100)
+    parser.add_argument("--mask-viz-train-interval", type=int, default=50)
     parser.add_argument("--mask-viz-thresholds", type=str, default="0.3,0.5,0.7,0.9")
     parser.add_argument("--run-name", type=str, default="run")
     parser.add_argument(
@@ -1066,7 +1066,7 @@ def get_parser():
     parser.add_argument(
         "--checkpoint-interval",
         type=str,
-        default="100ep",
+        default="50ep",
         help="Interval for saving local resume checkpoints",
     )
 
