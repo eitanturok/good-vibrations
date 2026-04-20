@@ -70,7 +70,6 @@ def main() -> None:
     remote_cmd = (
         f"{REMOTE_UV_INSTALL} && "
         f"cd {shlex.quote(REMOTE_REPO)} && "
-        f"git pull && "
         f"{' '.join(shlex.quote(a) for a in remote_args)}"
     )
 

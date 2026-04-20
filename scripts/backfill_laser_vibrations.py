@@ -1,4 +1,5 @@
 import argparse
+import ast
 import io
 import json
 import shlex
@@ -97,6 +98,35 @@ def stream_remote_file(remote_path: str, local_path: Path) -> Path:
     return local_path
 
 
+def fetch_remote_bytes(remote_path: str, count: int, skip: int = 0) -> bytes:
+    remote_command = (
+        'sh -lc ' + shlex.quote(
+            f'dd if={shlex.quote(remote_path)} bs=1 skip={skip} count={count} 2>/dev/null'
+        )
+    )
+    result = subprocess.run(["ssh", REMOTE_HOST, remote_command], check=True, capture_output=True)
+    return result.stdout
+
+
+def inspect_remote_npy(remote_path: str) -> tuple[int, int, int]:
+    header_bytes = fetch_remote_bytes(remote_path, count=4096)
+    if header_bytes[:6] != b"\x93NUMPY":
+        raise ValueError(f"Remote file is not a .npy file: {remote_path}")
+    major = header_bytes[6]
+    if major == 1:
+        header_len = int.from_bytes(header_bytes[8:10], "little")
+        start = 10
+    else:
+        header_len = int.from_bytes(header_bytes[8:12], "little")
+        start = 12
+    header = header_bytes[start:start + header_len].decode("latin1")
+    payload = ast.literal_eval(header)
+    shape = payload["shape"]
+    if len(shape) != 3:
+        raise ValueError(f"Expected 3D raw recording, got shape={shape}")
+    return int(shape[0]), int(shape[1]), int(shape[2])
+
+
 def copy_any_file(src: str | Path, dst: Path) -> Path:
     src_path = Path(src)
     dst.parent.mkdir(parents=True, exist_ok=True)
@@ -178,10 +208,6 @@ def discover_source_experiment_dir(row: dict, source_data_root: str) -> str:
 
 
 def discover_source_experiment_dir_from_grid(row: dict, source_data_root: str, unique_x: np.ndarray, unique_y: np.ndarray) -> str | None:
-    root = Path(source_data_root)
-    if not root.exists():
-        raise FileNotFoundError(f"Source data root does not exist locally: {root}")
-
     obj = row.get("object", "")
     if obj == "empty":
         return None
@@ -194,12 +220,23 @@ def discover_source_experiment_dir_from_grid(row: dict, source_data_root: str, u
     x_idx = int(np.argmin(np.abs(unique_x - x_val)))
     y_idx = int(np.argmin(np.abs(unique_y - y_val))) + 1
     spk = speaker_code(row.get("speakers"))
-    pattern = f"**/{obj}-{x_idx:02d}x{y_idx:02d}y_{spk}--*"
+    basename_pattern = f"{obj}-{x_idx:02d}x{y_idx:02d}y_{spk}--*"
     t0 = time.perf_counter()
-    candidates = sorted(p for p in root.glob(pattern) if p.is_dir())
+    cmd = (
+        "python3 - <<'PY'\n"
+        "from pathlib import Path\n"
+        f"root = Path({source_data_root!r})\n"
+        f"pattern = {basename_pattern!r}\n"
+        "for p in sorted(root.rglob(pattern)):\n"
+        "    if p.is_dir():\n"
+        "        print(p)\n"
+        "PY"
+    )
+    result = subprocess.run(["ssh", REMOTE_HOST, cmd], check=True, text=True, capture_output=True)
+    candidates = [Path(line) for line in result.stdout.splitlines() if line.strip()]
     print(
         f"[timing] discover grid candidates: {time.perf_counter() - t0:.2f}s "
-        f"(pattern={pattern}, n={len(candidates)}, x={x_val:.3f}->{x_idx:02d}, y={y_val:.3f}->{y_idx:02d})"
+        f"(pattern={basename_pattern}, n={len(candidates)}, x={x_val:.3f}->{x_idx:02d}, y={y_val:.3f}->{y_idx:02d})"
     )
     if len(candidates) == 1:
         return str(candidates[0])
@@ -482,6 +519,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--source-experiment-dir", default=None)
     parser.add_argument("--source-data-root", default=DEFAULT_SOURCE_DATA_ROOT)
     parser.add_argument("--auto-discover-source", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--skip-remote-speckle-assets", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--old-repo-id", default=OLD_REPO_ID)
     parser.add_argument("--new-repo-id", default=NEW_REPO_ID)
     parser.add_argument("--left", type=float, default=0.15)
@@ -541,19 +579,25 @@ def main() -> None:
         audio_src, audio_rel = stage("resolve shared audio", lambda: resolve_audio_file(experiment_config))
         stage("stage shared audio", lambda: maybe_stage_audio(audio_src, audio_rel, args.new_repo_id, root, repo_files))
 
-        raw_npy_path = stage(
-            "download raw speckle recording",
-            lambda: copy_any_file(Path(source_experiment_dir) / "frame-recording.npy", sample_root / "speckle_vibrations_raw.npy"),
-        )
+        if args.skip_remote_speckle_assets:
+            frame_count, frame_height, frame_width = stage(
+                "inspect remote raw speckle recording header",
+                lambda: inspect_remote_npy(f"{source_experiment_dir}/frame-recording.npy"),
+            )
+        else:
+            raw_npy_path = stage(
+                "download raw speckle recording",
+                lambda: copy_any_file(Path(source_experiment_dir) / "frame-recording.npy", sample_root / "speckle_vibrations_raw.npy"),
+            )
 
-        frame_count, frame_height, frame_width = stage(
-            "generate speckle preview mp4",
-            lambda: generate_speckle_preview(
-                raw_npy_path=raw_npy_path,
-                out_path=sample_root / "speckle_vibrations.mp4",
-                fps=float(experiment_config.get("FPS") or experiment_config.get("camera_FPS") or 1),
-            ),
-        )
+            frame_count, frame_height, frame_width = stage(
+                "generate speckle preview mp4",
+                lambda: generate_speckle_preview(
+                    raw_npy_path=raw_npy_path,
+                    out_path=sample_root / "speckle_vibrations.mp4",
+                    fps=float(experiment_config.get("FPS") or experiment_config.get("camera_FPS") or 1),
+                ),
+            )
 
         shifts = np.asarray(old_npz["shifts"])
         mask = np.asarray(old_npz["mask"])

@@ -20,7 +20,34 @@ This plan is the source of truth for the next implementation steps.
 
 - direct writes to `laser-vibrations` require PR-style commits, so upload scripts should default to `create_pr=True`
 - the first local backfill attempt was slow because it copied the large raw `frame-recording.npy` from `mcluster11` back to the local machine over SSH
-- backfill should therefore run on `mcluster11` whenever possible, because `mcluster11` already has fast local access to `/net/mraid20/.../DATA`
+- transfer benchmarking showed that local SSH streaming is a real bottleneck:
+  - plain SSH byte streaming moved 512 MB in about 87s, roughly 5.9 MB/s
+  - chunked `dd` streaming was slower in this environment
+  - `rsync` started reasonably but failed mid-transfer and was not reliable enough to trust yet
+- the practical split is now:
+  - remote on `mcluster11`: upload `speckle_vibrations_raw.npy` and generate/upload `speckle_vibrations.mp4`
+  - local: upload mask, shifts, cleaned shifts, FFT, FFT audio, manifest, and parquet row
+- this avoids pulling the 2.9 GB raw recording to the local machine while still keeping the richer Python/dataframe logic local
+- on CentOS, the remote stage should use cluster modules plus a small venv instead of the full project environment:
+  - `module load GCC/12.2.0`
+  - `module load Python/3.10.8-GCCcore-12.2.0`
+  - `python -m venv ~/venvs/laser-vibrations`
+  - `pip install --only-binary=:all: numpy==1.26.4 opencv-python-headless==4.10.0.84 huggingface_hub==0.31.2`
+
+What did not work:
+- the first remote attempt used `uv` with a transient environment
+- that pulled in packages that tried to build from source on the cluster
+- builds failed because the default system toolchain was too old and lacked a working `g++`
+- the next remote attempt used the cluster's newer Python modules
+- those Python module builds crashed on this node with `Illegal instruction`, so they are not usable here
+- the next remote attempt used `micromamba`, but environment solving failed in this cluster setup
+
+New option we are taking instead:
+- install `uv`
+- use `uv python install 3.10` to fetch a standalone compatible interpreter
+- create a dedicated remote venv from that Python
+- install wheel-only packages into that env
+- use that env only for the remote raw/mp4 uploader
 - source experiment discovery should use the old dataset's continuous `x_position` and `y_position` as the primary signal
 - these continuous positions should be bucketed onto the discrete filename grid used in experiment directories, e.g. `cube-00x01y_0001--...`
 - overhead-image matching should remain only as a fallback if position bucketing is ambiguous or not available
@@ -577,7 +604,7 @@ Implementation note:
 - the backfill script should auto-discover the source experiment directory by bucketing the old dataset's continuous `x_position` and `y_position` onto the discrete filename grid
 - image matching should only be used as a fallback when the grid-based lookup is ambiguous
 - manual `source_experiment_dir` override should still be supported as a fallback
-- the heavy backfill work should run on `mcluster11`, not on the local machine
+- the single-sample orchestrator should take only `sample_id` and run the remote raw/mp4 stage first, then the local metadata/tensor stage
 
 ### Phase 3: `viz2` Reads New Dataset Assets
 
@@ -610,7 +637,7 @@ Why this phase matters:
 - we will backfill incrementally after the fresh dataset and dummy sample path are confirmed working
 
 Performance note:
-- backfill should prefer execution on `mcluster11` to avoid transferring large raw recordings over SSH to the local machine
+- raw video transfer should stay remote; only light metadata should cross SSH
 - timings should be printed for discovery, config load, raw file access, MP4 generation, FFT audio generation, parquet/manifest creation, and upload
 
 ### Phase 6: Migrate Training
@@ -652,6 +679,6 @@ This plan fixes the target design as follows:
 - create FFT audio preview via IFFT, defaulting to `laser_idx=50`, `xy_idx=0`
 - log timings for every stage we implement
 - use PR-style HF uploads by default because direct commits to the dataset are blocked
-- run backfill on `mcluster11` whenever possible so raw sample access stays close to `/net/mraid20`
+- use a split pipeline: remote raw/mp4 upload, local metadata/tensor upload
 
 This document should be updated whenever we intentionally change the design.
