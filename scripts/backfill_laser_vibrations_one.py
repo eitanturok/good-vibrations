@@ -33,10 +33,10 @@ def stage(label, fn):
 
 
 def get_hf_token() -> str:
-    token = get_token()
-    if not token:
-        raise RuntimeError("No local Hugging Face token found; run `huggingface-cli login` first")
-    return token
+    token_file = Path("~/.cache/huggingface/token").expanduser()
+    if token_file.exists():
+        return token_file.read_text().strip()
+    raise RuntimeError("No local Hugging Face token found; run `huggingface-cli login` first")
 
 
 def speaker_code(speakers) -> str:

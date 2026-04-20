@@ -136,12 +136,12 @@ def copy_any_file(src: str | Path, dst: Path) -> Path:
     return stream_remote_file(str(src), dst)
 
 
-def load_remote_experiment_config(remote_experiment_dir: str, local_dir: Path) -> dict:
-    config_path = stage(
-        "download experiment_config.json",
-        lambda: stream_remote_file(f"{remote_experiment_dir}/experiment_config.json", local_dir / "experiment_config.json"),
-    )
-    return json.loads(config_path.read_text(encoding="utf-8"))
+def load_remote_experiment_config(remote_experiment_dir: str) -> dict:
+    cmd = f"cat {shlex.quote(remote_experiment_dir + '/experiment_config.json')}"
+    t0 = time.perf_counter()
+    result = subprocess.run(["ssh", REMOTE_HOST, cmd], check=True, text=True, capture_output=True)
+    print(f"[timing] download experiment_config.json: {time.perf_counter() - t0:.2f}s")
+    return json.loads(result.stdout)
 
 
 def resolve_audio_file(experiment_config: dict) -> tuple[Path, str]:
@@ -542,7 +542,8 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    api = HfApi()
+    token = Path("~/.cache/huggingface/token").expanduser().read_text().strip()
+    api = HfApi(token=token)
 
     repo_files = stage("list new repo files", lambda: set(api.list_repo_files(args.new_repo_id, repo_type="dataset")))
     old_row = stage("load old dataset row", lambda: load_old_sample_row(args.sample_id, args.old_repo_id))
@@ -574,7 +575,7 @@ def main() -> None:
 
         experiment_config = stage(
             "load remote experiment config",
-            lambda: load_remote_experiment_config(source_experiment_dir, root / "remote"),
+            lambda: load_remote_experiment_config(source_experiment_dir),
         )
         audio_src, audio_rel = stage("resolve shared audio", lambda: resolve_audio_file(experiment_config))
         stage("stage shared audio", lambda: maybe_stage_audio(audio_src, audio_rel, args.new_repo_id, root, repo_files))

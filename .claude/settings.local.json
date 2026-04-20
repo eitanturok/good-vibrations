@@ -32,7 +32,9 @@
       "Bash(find . *)",
       "Bash(xargs cat *)",
       "Bash(gh pr *)",
-      "Bash(uv run *)"
+      "Bash(uv run *)",
+      "Bash(pip index *)",
+      "Bash(pip show *)"
     ]
   }
 }
