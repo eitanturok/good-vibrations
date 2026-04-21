@@ -27,11 +27,12 @@ REMOTE_HOST = "ethantu@mcluster11.wisdom.weizmann.ac.il"
 REPO_ROOT = Path(__file__).resolve().parent.parent
 LOCAL_AUDIO_ROOT = REPO_ROOT / "data" / "audio_samples"
 DEFAULT_SOURCE_DATA_ROOT = "/net/mraid20/ifs/wisdom/groups/mark_sheinin_lab/DATA"
-IMAGE_COLS = ["raw_image", "cropped_image", "overlay_image"]
+OLD_IMAGE_COLS = ["raw_image", "cropped_image", "overlay_image"]
+IMAGE_COLS = ["overhead_image", "cropped_overhead_image", "segmented_overhead_image"]
 IMAGE_NAMES = {
-    "raw_image": "raw.webp",
-    "cropped_image": "cropped.webp",
-    "overlay_image": "overlay.webp",
+    "overhead_image": ("raw_image", "raw.webp"),
+    "cropped_overhead_image": ("cropped_image", "cropped.webp"),
+    "segmented_overhead_image": ("overlay_image", "overlay.webp"),
 }
 
 
@@ -64,7 +65,7 @@ def load_old_sample_row(sample_id: int, repo_id: str) -> dict:
         "box_material",
         "x_position",
         "y_position",
-        *IMAGE_COLS,
+        *OLD_IMAGE_COLS,
     ]
     ds = load_dataset(repo_id, split="train", columns=columns, verification_mode="no_checks")
     for row in ds:
@@ -413,8 +414,8 @@ def generate_speckle_preview(raw_npy_path: Path, out_path: Path, fps: float, max
     return frame_count, frame_height, frame_width
 
 
-AUDIO_COLS = ["audio_file_name", "speckle_shifts_ifft_audio_file_name"]
-VIDEO_COLS = ["speckle_vibrations_file_name"]
+AUDIO_COLS = ["audio", "speckle_shifts_ifft_audio"]
+VIDEO_COLS = ["speckle_vibrations"]
 
 
 def to_audio(path: Path) -> dict:
@@ -444,19 +445,14 @@ def write_parquet_row(
         "speakers": row.get("speakers", []),
         "x_position": row.get("x_position"),
         "y_position": row.get("y_position"),
-        "audio_file_name": to_audio(audio_src),
-        "speckle_vibrations_file_name": to_video(video_src),
-        "speckle_shifts_ifft_audio_file_name": to_audio(fft_audio_src),
+        "audio": to_audio(audio_src),
+        "speckle_vibrations": to_video(video_src),
+        "speckle_shifts_ifft_audio": to_audio(fft_audio_src),
         "manifest_json": json.dumps(manifest_payload),
-        "sample_dir": rel_dir,
         "mask_path": f"{rel_dir}/mask.npz",
-        "speckle_vibrations_raw_path": f"{rel_dir}/speckle_vibrations_raw.npy",
-        "speckle_shifts_path": f"{rel_dir}/speckle_shifts.npz",
-        "speckle_shifts_clean_path": f"{rel_dir}/speckle_shifts_clean.npz",
-        "speckle_shifts_fft_path": f"{rel_dir}/speckle_shifts_fft.npz",
-        "raw_image": image_paths["raw_image"],
-        "cropped_image": image_paths["cropped_image"],
-        "overlay_image": image_paths["overlay_image"],
+        "overhead_image": image_paths["overhead_image"],
+        "cropped_overhead_image": image_paths["cropped_overhead_image"],
+        "segmented_overhead_image": image_paths["segmented_overhead_image"],
     }
     ds = Dataset.from_list([record])
     for col in IMAGE_COLS:
@@ -538,16 +534,16 @@ def image_key_from_experiment_dir(source_experiment_dir: str) -> str:
 def stage_shared_images(row: dict, image_key: str, root: Path, existing_files: set[str]) -> dict[str, str]:
     """Write shared overhead images to images/{image_key}/ once; return repo-relative paths."""
     paths = {}
-    for col, filename in IMAGE_NAMES.items():
+    for new_col, (old_col, filename) in IMAGE_NAMES.items():
         rel = f"images/{image_key}/{filename}"
-        paths[col] = rel
+        paths[new_col] = rel
         if rel in existing_files:
             print(f"[info] shared image already in repo, skipping: {rel}")
             continue
         dst = root / rel
         dst.parent.mkdir(parents=True, exist_ok=True)
         buf = io.BytesIO()
-        row[col].convert("RGB").save(buf, format="WEBP", quality=85)
+        row[old_col].convert("RGB").save(buf, format="WEBP", quality=85)
         dst.write_bytes(buf.getvalue())
     return paths
 
