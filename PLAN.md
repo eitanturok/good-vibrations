@@ -13,7 +13,7 @@ This plan is the source of truth for the next implementation steps.
 - [x] `viz2` pointed at `eturok-weizmann/laser-vibrations`
 - [x] `laser-vibrations` created as a fresh HF dataset
 - [x] initial dataset scaffold upload works
-- [x] first real sample (`sample_idx=2`) uploaded in the new schema
+- [x] first real sample (`sample_id=2`) uploaded in the new schema
 - [ ] `viz2` adapted to read the new dataset schema
 
 ### Working Notes
@@ -25,8 +25,8 @@ This plan is the source of truth for the next implementation steps.
   - chunked `dd` streaming was slower in this environment
   - `rsync` started reasonably but failed mid-transfer and was not reliable enough to trust yet
 - the practical split is now:
-  - remote on `mcluster11`: upload `speckle_vibrations_raw.npy` and generate/upload `speckle_vibrations.mp4`
-  - local: upload mask, shifts, cleaned shifts, FFT, FFT audio, manifest, and parquet row
+  - remote on `mcluster11`: upload `speckle_vibration_raw.npz` and generate/upload `speckle_vibrations.mp4`
+  - local: upload mask assets, shifts, cleaned shifts, FFT, IFFT audio, manifest, and the `metadata.jsonl` row
 - this avoids pulling the 2.9 GB raw recording to the local machine while still keeping the richer Python/dataframe logic local
 - on CentOS, the remote stage should use cluster modules plus a small venv instead of the full project environment:
   - `module load GCC/12.2.0`
@@ -48,13 +48,13 @@ New option we are taking instead:
 - create a dedicated remote venv from that Python
 - install wheel-only packages into that env
 - use that env only for the remote raw/mp4 uploader
-- source experiment discovery should use the old dataset's continuous `x_position` and `y_position` as the primary signal
-- these continuous positions should be bucketed onto the discrete filename grid used in experiment directories, e.g. `cube-00x01y_0001--...`
+- source experiment discovery should use the old dataset's continuous `x_position` and `y_position` as center-of-mass-style signals, not as user-entered placement coordinates
+- backfill should infer the new canonical user `x_position` and `y_position` from the experiment directory naming / discrete filename grid, e.g. `cube-00x01y_0001--...`
 - overhead-image matching should remain only as a fallback if position bucketing is ambiguous or not available
 - `source_experiment_id` should be saved in the manifest in addition to `source_experiment_dir`
 - manual `source_experiment_dir` override should still be supported as a fallback
 
-Confirmed working path and timing baseline for `sample_idx=2`:
+Confirmed working path and timing baseline for `sample_id=2`:
 - remote uploader script is synced to `mcluster11` and run there with a standalone `uv`-managed Python 3.10 environment
 - raw `.npy` never comes back to the local machine
 - remote timings:
@@ -64,7 +64,7 @@ Confirmed working path and timing baseline for `sample_idx=2`:
 - local timings:
   - old dataset row load: about `2.59s`
   - remote config fetch + raw header inspection: about `1.41s`
-  - tensor/manifest/parquet generation: all sub-second individually
+  - tensor/manifest/metadata generation: all sub-second individually
   - upload remaining local assets to HF: about `2.91s`
   - total local stage: about `11.38s`
 
@@ -115,16 +115,17 @@ Reasoning:
 
 ### 2. Separate Viewer Assets From Training Tensors
 
-We will not store everything inside Parquet.
+We will not store everything inside one tabular artifact.
 
 Instead:
-- `data/train-xxxx.parquet` will store metadata plus HF-viewable file references
-- shared audio files will live under `audio/`
-- per-sample assets will live under `samples/sample_xxxxxx/`
+- `data/metadata.jsonl` will store one row per sample with HF-viewable file references
+- shared audio files will live under `data/audio/`
+- shared overhead image groups will live under `data/image/`
+- per-sample assets will live under `data/<sample_id>/`
 
 Reasoning:
 - HF viewer works well with referenced audio/video assets
-- storing large tensors and raw recordings inside parquet is not ideal for append-only uploads or selective model loading
+- storing large tensors and raw recordings inside a tabular metadata file is not ideal for append-only uploads or selective model loading
 - training only needs a small subset of the sample assets
 - we want the media visible in HF, but we do not want model training to download those media files
 
@@ -142,12 +143,14 @@ Reasoning:
 We want the dataset to represent the processing pipeline explicitly.
 
 That pipeline is:
-1. `speckle_vibrations_raw.npy`
+1. `speckle_vibration_raw.npz`
 2. `speckle_vibrations.mp4`
 3. `speckle_shifts.npz`
 4. `speckle_shifts_clean.npz`
 5. `speckle_shifts_fft.npz`
-6. `mask.npz`
+6. `speckle_shifts_ifft_audio.wav`
+7. `mask.png`
+8. `mask.npz`
 
 Reasoning:
 - intermediate stages are valuable for debugging and validation
@@ -160,7 +163,7 @@ Reasoning:
 We want an audio sanity check derived from `speckle_shifts_fft.npz`.
 
 The preview file will be:
-- `speckle_shifts_fft_audio.wav`
+- `speckle_shifts_ifft_audio.wav`
 
 Generation method:
 - use inverse FFT on one chosen laser and one chosen axis
@@ -180,31 +183,82 @@ Reasoning:
 ## Final Target Repository Layout
 
 ```text
+README.md
 data/
-  train-0001.parquet
-  train-0002.parquet
-
-audio/
-  chirp_50_1000_3.0sec.wav
-  ...
-
-samples/
-  sample_000001/
-    manifest.json
-    mask.npz
-    speckle_vibrations_raw.npy
+  metadata.jsonl
+  audio/
+    chirp_50_1000_3.0sec.wav
+  image/
+    <object>-<x-position>-<y-position>-<n-objects>-<box-material>-<timestamp>/
+      raw_overhead.png
+      cropped_overhead.png
+      segmented_overhead.png
+      mask.png
+      mask.npz
+  0000001/
+    speckle_vibration_raw.npz
     speckle_vibrations.mp4
     speckle_shifts.npz
     speckle_shifts_clean.npz
     speckle_shifts_fft.npz
-    speckle_shifts_fft_audio.wav
-  sample_000002/
+    speckle_shifts_ifft_audio.wav
+    manifest.json
+  0000002/
     ...
 ```
 
+Naming rules:
+- sample directories use zero-padded integer ids such as `0000001`
+- shared image directories use `<object>-<x-position>-<y-position>-<n-objects>-<box-material>-<timestamp>`
+- `object`, `n-objects`, and `box-material` should be lowercased/normalized before path generation
+- `x-position` and `y-position` should be zero-padded to width 3
+- `timestamp` should be ordered `YYYY-MM-DD-HH-MM-SS` so lexical sort matches time order
+
+Coordinate rules:
+- `x_position` and `y_position` are user-provided integer placement coordinates recorded at acquisition time from the physical grid drawn in the box
+- image directory names must continue to use `x_position` and `y_position`
+- `x_com` and `y_com` are pixel-space values derived from the segmentation mask and must be stored separately in `manifest.json`
+- `x_com` and `y_com` may be floats because the mask can be discretized, binned, or averaged before center-of-mass computation
+- never treat `x_com` / `y_com` as interchangeable with `x_position` / `y_position`
+- historical datasets may have older `x_position` / `y_position` fields that really represent center-of-mass-style values; backfill should not copy those directly into the new canonical placement fields
+
+**metadata.jsonl structure:**
+
+```json
+{
+  "sample_id": 1,
+  "segmented_overhead_file_name": "https://huggingface.co/datasets/.../resolve/main/data/image/cube-003-007-1-cardboard-2026-04-21-10-05-33/segmented_overhead.png",
+  "speckle_vibrations_file_name": "https://huggingface.co/datasets/.../resolve/main/data/0000001/speckle_vibrations.mp4",
+  "speckle_shifts_ifft_audio_file_name": "https://huggingface.co/datasets/.../resolve/main/data/0000001/speckle_shifts_ifft_audio.wav",
+  "audio_file_name": "https://huggingface.co/datasets/.../resolve/main/data/audio/chirp_50_1000_3.0sec.wav",
+  "experiment_id": "cube-00x01y_0001--31-03-18-21-24",
+  "speakers": "0100",
+  "x_position": 3,
+  "y_position": 7,
+  "x_com": 3.1,
+  "y_com": 2.7,
+  "n_objects": 1,
+  "box_material": "cardboard",
+  "mask_file_name": "https://huggingface.co/datasets/.../resolve/main/data/image/cube-003-007-1-cardboard-2026-04-21-10-05-33/mask.png",
+  "experiment_dir": "experiment_15",
+  "manifest": "{\"sample_id\":1,...}"
+}
+```
+
+**Sharing strategy:**
+- Audio files (`data/audio/`) shared across ALL samples → stored once
+- Overhead images and masks (`data/image/`) shared across the same physical setup → stored once and referenced by many samples
+- Per-sample files (raw speckle capture, shifts, FFT, preview video, IFFT audio, manifest) stored in sample-specific directories
+
+**Key principles:**
+1. Each sample directory is named by `sample_id` (e.g., `0000001/`)
+2. FFT data (`speckle_shifts_fft.npz`) is stored per-sample as model input
+3. Shared assets use HF URLs in metadata, enabling viewer rendering without duplication
+4. JSONL approach enables append-only updates (add new sample directory + append row)
+
 ## Sample Asset Semantics
 
-### `speckle_vibrations_raw.npy`
+### `speckle_vibration_raw.npz`
 
 Meaning:
 - raw camera recording of the vibrating laser speckles
@@ -274,14 +328,23 @@ Reasoning:
 - the FFT audio preview uses IFFT reconstruction from the stored cropped FFT
 - to reconstruct the signal shape reliably, we need the original sample count
 
-### `speckle_shifts_fft_audio.wav`
+### `speckle_shifts_ifft_audio.wav`
 
 Meaning:
-- audio preview generated from one selected complex FFT trace using IFFT
+- audio preview generated from one selected recovered-shift trace using IFFT
 
 Role:
 - sanity check / inspection asset
 - playable in HF viewer and `viz2`
+
+### `mask.png`
+
+Meaning:
+- rendered image form of the segmentation mask for direct HF viewer display
+
+Role:
+- viewer/display artifact only
+- shown alongside `segmented_overhead_file_name`
 
 ### `mask.npz`
 
@@ -299,6 +362,7 @@ Expected contents:
 Reasoning:
 - we want the target mask to remain minimal but reproducible
 - crop parameters and prompt are required provenance for how the mask was created
+- the mask is also the source for derived geometry such as `x_com` and `y_com`, which should be recorded in the manifest
 
 ## Manifest Schema
 
@@ -317,18 +381,26 @@ Proposed structure:
 
 ```json
 {
-  "sample_idx": 1,
+  "sample_id": 1,
   "experiment_id": "cube-00x01y_0001--31-03-18-21-24",
-  "experiment_dir": "/net/mraid20/ifs/wisdom/groups/mark_sheinin_lab/DATA/experiment-15/cube-00x01y_0001--31-03-18-21-24",
+  "experiment_dir": "experiment_15",
+  "hf_repo": "eturok-weizmann/laser-vibrations",
   "sample": {
     "object": "cube",
     "n_objects": 1,
     "box_material": "cardboard",
-    "speakers": [0, 0, 0, 1]
+    "speakers": "0100",
+    "x_position": 3,
+    "y_position": 7,
+    "image_dir": "cube-003-007-1-cardboard-2026-04-21-10-05-33"
+  },
+  "segmentation": {
+    "x_com": 18.4,
+    "y_com": 9.7
   },
   "experiment_config": {
     "audio": {
-      "file_name": "audio/chirp_50_1000_3.0sec.wav",
+      "file_name": "data/audio/chirp_50_1000_3.0sec.wav",
       "sample_rate_hz": 44100,
       "duration_s": 3.0,
       "total_output_channels": 8
@@ -411,18 +483,6 @@ Proposed structure:
       "dtype": "uint8"
     }
   },
-  "artifacts": {
-    "overhead_image": ".../box_overhead_image.png",
-    "cropped_image": "...",
-    "overlay_image": "...",
-    "speckle_vibrations_raw": "samples/sample_000001/speckle_vibrations_raw.npy",
-    "speckle_vibrations_preview": "samples/sample_000001/speckle_vibrations.mp4",
-    "speckle_shifts": "samples/sample_000001/speckle_shifts.npz",
-    "speckle_shifts_clean": "samples/sample_000001/speckle_shifts_clean.npz",
-    "speckle_shifts_fft": "samples/sample_000001/speckle_shifts_fft.npz",
-    "speckle_shifts_ifft_audio": "samples/sample_000001/speckle_shifts_ifft_audio.wav",
-    "mask": "samples/sample_000001/mask.npz"
-  },
   "processing_config": {
     "speckle_vibrations_preview": {
       "max_frames": 300,
@@ -462,6 +522,25 @@ Proposed structure:
       "normalization": "peak_to_int16",
       "output_dtype": "int16",
       "zero_fill_uncropped_bins": true
+    }
+  },
+  "artifacts": {
+    "shared": {
+      "raw_overhead": "data/image/cube-003-007-1-cardboard-2026-04-21-10-05-33/raw_overhead.png",
+      "cropped_overhead": "data/image/cube-003-007-1-cardboard-2026-04-21-10-05-33/cropped_overhead.png",
+      "segmented_overhead": "data/image/cube-003-007-1-cardboard-2026-04-21-10-05-33/segmented_overhead.png",
+      "mask_png": "data/image/cube-003-007-1-cardboard-2026-04-21-10-05-33/mask.png",
+      "mask_npz": "data/image/cube-003-007-1-cardboard-2026-04-21-10-05-33/mask.npz",
+      "audio": "data/audio/chirp_50_1000_3.0sec.wav"
+    },
+    "sample": {
+      "speckle_vibration_raw": "data/0000001/speckle_vibration_raw.npz",
+      "speckle_vibrations": "data/0000001/speckle_vibrations.mp4",
+      "speckle_shifts": "data/0000001/speckle_shifts.npz",
+      "speckle_shifts_clean": "data/0000001/speckle_shifts_clean.npz",
+      "speckle_shifts_fft": "data/0000001/speckle_shifts_fft.npz",
+      "speckle_shifts_ifft_audio": "data/0000001/speckle_shifts_ifft_audio.wav",
+      "manifest": "data/0000001/manifest.json"
     }
   }
 }
@@ -513,62 +592,64 @@ Fields still required for full replay of `notebooks/11_multispeaker_record_data.
 - `processing_config.speckle_shifts_ifft_audio.output_dtype`
 - `processing_config.speckle_shifts_ifft_audio.zero_fill_uncropped_bins`
 
-### Why Keep A Manifest If We Already Have Parquet?
+### Why Keep A Manifest If We Already Have `metadata.jsonl`?
 
 Reasoning:
 - it gives each sample a local, self-contained description
-- it helps debugging if a parquet row and a sample directory ever get out of sync
-- it lets downstream scripts inspect a sample directory without first querying parquet
+- it helps debugging if a `metadata.jsonl` row and a sample directory ever get out of sync
+- it lets downstream scripts inspect a sample directory without first querying `metadata.jsonl`
 - it captures nested structure more naturally than flattening everything into columns
 
-## Parquet Schema
+## `metadata.jsonl` Schema
 
-Parquet is for sample-level metadata and HF-viewable asset references.
+We use JSONL instead of Parquet for the reasons outlined in the "Dataset upload structure discovery" section.
 
-We explicitly do not want frame shape/count fields in parquet. Those belong under `manifest.json -> speckle_vibrations`.
+Final columns (in order, with `_file_name` suffix for media columns):
+1. `sample_id`
+2. `segmented_overhead_file_name` - HF URL to segmented overhead image
+3. `speckle_vibrations_file_name` - HF URL to speckle vibration video
+4. `speckle_shifts_ifft_audio_file_name` - HF URL to audio derived from recovered shifts
+5. `audio_file_name` - HF URL to the shared chirp audio
+6. `experiment_id`
+7. `speakers` - bitstring such as `0100`
+8. `x_position` - integer user-provided placement coordinate
+9. `y_position` - integer user-provided placement coordinate
+10. `x_com` - float X center of mass in pixel space derived from the segmentation mask
+11. `y_com` - float Y center of mass in pixel space derived from the segmentation mask
+12. `n_objects`
+13. `box_material`
+14. `mask_file_name` - HF URL to `mask.png`
+15. `experiment_dir` - relative experiment directory label such as `experiment_15`
+16. `manifest` - JSON string form of `manifest.json`
 
-Final parquet columns:
-- `sample_idx`
-- `object`
-- `n_objects`
-- `box_material`
-- `speakers`
-- `x_position`
-- `y_position`
-- `raw_image`
-- `cropped_image`
-- `overlay_image`
-- `audio_file_name`
-- `speckle_vibrations_file_name`
-- `speckle_shifts_fft_audio_file_name`
-- `manifest_json`
-- `sample_dir`
-- `mask_path`
-- `speckle_vibrations_raw_path`
-- `speckle_shifts_path`
-- `speckle_shifts_clean_path`
-- `speckle_shifts_fft_path`
+Manifest requirement:
+- `manifest.json` should include `hf_repo` so artifact URLs and upload targets are reproducible from the start of the experiment
+- `manifest.json` should include derived segmentation center-of-mass fields `x_com` and `y_com`
+- `manifest.json` should make the unit distinction clear: grid coordinates for `x_position`/`y_position`, pixel coordinates for `x_com`/`y_com`
+
+We explicitly do NOT include:
+- `raw_overhead_file_name`, `cropped_overhead_file_name` - keep these in the shared image directory and manifest, not as flat viewer columns
+- tensor paths such as `speckle_shifts_fft.npz` - available in the manifest and sample directory
+- `manifest_file_name` - replaced by the embedded `manifest` string
 
 ### Why These Columns?
 
 Reasoning:
-- HF viewer should be able to play the audio and MP4 by using the `*_file_name` fields
-- we still want the overhead and segmented images available in parquet because they are already useful for viewer flows and preserve continuity with the old dataset
-- training and tooling need string paths to the tensor artifacts
-- we still want simple scalar metadata for filtering and grouping in the viewer
-- the full `manifest_json` string gives a compact overview of the entire sample configuration directly in the dataset viewer
-- this keeps parquet narrow and avoids storing large binary tensors inline
-
-Tradeoff:
-- `manifest_json` is useful for human inspection in HF viewer, but it is not a good structured column for filtering or aggregation
-- therefore, only high-value viewer/filter fields should stay flattened in parquet, while detailed configuration should live in the manifest and be mirrored into `manifest_json` for visibility
+- HF viewer auto-detects media types ONLY when column names end with `_file_name`
+- We store HF URLs (not relative paths) so the viewer can render directly
+- Training and tooling need URL references to fetch artifacts
+- Simple scalar metadata for filtering and grouping in the viewer
+- The full manifest still appears in the row via the `manifest` string column
+- therefore, only high-value viewer/filter fields should stay flattened in `metadata.jsonl`, while detailed configuration should live in the manifest
 
 ### Viewer-Specific Notes
 
-For HF viewer compatibility, the media fields should be relative repo paths:
-- `audio_file_name = audio/chirp_50_1000_3.0sec.wav`
-- `speckle_vibrations_file_name = samples/sample_000001/speckle_vibrations.mp4`
-- `speckle_shifts_fft_audio_file_name = samples/sample_000001/speckle_shifts_fft_audio.wav`
+For HF viewer compatibility, the media fields should be full HF URLs:
+- `audio_file_name = https://huggingface.co/datasets/<HF_REPO>/resolve/main/data/audio/chirp_50_1000_3.0sec.wav`
+- `segmented_overhead_file_name = https://huggingface.co/datasets/<HF_REPO>/resolve/main/data/image/<IMAGE_DIR>/segmented_overhead.png`
+- `mask_file_name = https://huggingface.co/datasets/<HF_REPO>/resolve/main/data/image/<IMAGE_DIR>/mask.png`
+- `speckle_vibrations_file_name = https://huggingface.co/datasets/<HF_REPO>/resolve/main/data/<SAMPLE_ID>/speckle_vibrations.mp4`
+- `speckle_shifts_ifft_audio_file_name = https://huggingface.co/datasets/<HF_REPO>/resolve/main/data/<SAMPLE_ID>/speckle_shifts_ifft_audio.wav`
 
 ## Multi-Machine Pipeline Model
 
@@ -595,11 +676,46 @@ The real pipeline spans several machines and storage locations.
 9. generate display assets
 10. upload all structured outputs to the new HF dataset
 
+### Notebook And Script Split
+
+Most acquisition logic should live in `scripts/record.py`.
+
+We should create a notebook that imports from `scripts/record.py` and is parameterized by:
+- `experiment_config.json`
+- `processing_config.json`
+- `experiment_dir`
+- `hf_repo`
+- `x_position`
+- `y_position`
+- `n_speakers`
+- `box_material`
+- `object`
+- `audio`
+
+The notebook should stay minimal and have five cells:
+1. init overhead camera and preview
+2. init laser camera, load or define ROIs, and preview them for manual inspection
+3. init audio and preview playback
+4. run acquisition and save artifacts incrementally
+5. inspect the generated manifest and metadata row before continuing
+
+Runtime expectation:
+- set `hf_repo` in the manifest at the beginning of the experiment, at the same time as `experiment_dir` and the sample position metadata
+- set user-supplied `x_position` and `y_position` in the manifest before recording starts
+- save the shared overhead image group into `data/image/<IMAGE_DIR>/` if it does not already exist
+- save all sample-specific artifacts into `data/<sample_id>/`
+- compute `x_com` and `y_com` from the segmentation mask once the mask exists and append them to `manifest.json`
+- update `manifest.json` incrementally as `experiment_config`, `processing_config`, outputs, and artifact paths become available
+
+Backfill expectation:
+- when backfilling old samples, derive canonical `x_position` and `y_position` from the experiment directory naming convention
+- treat the old dataset's `x_position` and `y_position` values as center-of-mass-style hints only
+
 ### Final Pipeline Artifacts By Stage
 
 #### Stage A: Capture
-- `box_overhead_image.png`
-- `speckle_vibrations_raw.npy`
+- `raw_overhead.png`
+- `speckle_vibration_raw.npz`
 - experiment config including exact audio path used
 
 #### Stage B: Recovery
@@ -609,27 +725,28 @@ The real pipeline spans several machines and storage locations.
 - `speckle_vibrations.mp4`
 - `speckle_shifts_clean.npz`
 - `speckle_shifts_fft.npz`
-- `speckle_shifts_fft_audio.wav`
+- `speckle_shifts_ifft_audio.wav`
 
 #### Stage D: Segmentation
+- `mask.png`
 - `mask.npz`
 
 #### Stage E: Packaging
 - `manifest.json`
-- parquet row
+- `metadata.jsonl` row
 - upload shared audio if needed
 
 ## Why Audio Should Be Shared
 
 Most or all current samples use the same chirp.
 
-So we will store shared audio files once under `audio/` and reference them from parquet and manifest.
+So we will store shared audio files once under `data/audio/` and reference them from `metadata.jsonl` and the manifest.
 
 Reasoning:
 - avoids duplicate uploads
 - avoids bloating the repository
 - keeps provenance explicit
-- still allows HF viewer playback if the parquet row points to the shared relative file path
+- still allows HF viewer playback because each JSONL row points to the shared HF URL
 
 ## Why We Keep `viz` Frozen And Build `viz2`
 
@@ -658,7 +775,7 @@ It should not:
 It should:
 - show chirp audio from uploaded sample metadata
 - show `speckle_vibrations.mp4`
-- show `speckle_shifts_fft_audio.wav`
+- show `speckle_shifts_ifft_audio.wav`
 - later show visual summaries of clean shifts and FFTs
 
 Interaction model:
@@ -673,7 +790,7 @@ Training should continue to use the current loader logic until the new dataset i
 
 ### Medium Term
 
-Training metadata load should come from parquet only, selecting only needed columns.
+Training metadata load should come from `metadata.jsonl`, selecting only needed columns.
 
 Training tensor download should fetch only:
 - `mask.npz`
@@ -682,7 +799,7 @@ Training tensor download should fetch only:
 It should not fetch:
 - audio
 - MP4 preview
-- FFT audio preview
+- IFFT audio preview
 - raw speckle recording
 
 ### Long Term
@@ -715,7 +832,7 @@ We should print timings for:
 - FFT conversion
 - FFT audio generation
 - segmentation
-- parquet row creation
+- `metadata.jsonl` row creation
 - upload step per asset
 - viewer payload build stages
 
@@ -764,14 +881,14 @@ Deliverables:
 - create one sample in the new structure
 - upload one shared audio file
 - upload one MP4 preview
-- upload one FFT audio preview
+- upload one IFFT audio preview
 - upload the tensor files and manifest
-- append one parquet row
+- append one `metadata.jsonl` row
 
 Validation:
 - HF viewer plays the chirp audio
 - HF viewer plays the speckle vibration MP4
-- HF viewer plays the FFT audio preview
+- HF viewer plays the IFFT audio preview
 
 Why this phase matters:
 - it validates the schema before we scale up or backfill old data
@@ -779,6 +896,7 @@ Why this phase matters:
 
 Implementation note:
 - the backfill script should auto-discover the source experiment directory by bucketing the old dataset's continuous `x_position` and `y_position` onto the discrete filename grid
+- after discovery, the new canonical `x_position` and `y_position` should come from the experiment directory naming rather than being copied directly from the old row
 - image matching should only be used as a fallback when the grid-based lookup is ambiguous
 - manual `source_experiment_dir` override should still be supported as a fallback
 - the single-sample orchestrator should take only `sample_id` and run the remote raw/mp4 stage first, then the local metadata/tensor stage
@@ -786,9 +904,9 @@ Implementation note:
 ### Phase 3: `viz2` Reads New Dataset Assets
 
 Deliverables:
-- `viz2` reads parquet columns from `laser-vibrations`
+- `viz2` reads `metadata.jsonl` rows from `laser-vibrations`
 - dataset popup shows uploaded sample audio
-- run/sample popup shows uploaded MP4 and FFT audio preview
+- run/sample popup shows uploaded MP4 and IFFT audio preview
 
 Why this phase matters:
 - confirms that our custom viewer is consuming the same canonical uploaded assets as HF viewer
@@ -798,6 +916,47 @@ Why this phase matters:
 Deliverables:
 - update upload scripts to generate and upload the new asset set for future samples
 - add per-stage timing logs to all major upload and packaging steps
+
+**New upload pattern:**
+```python
+from huggingface_hub import HfApi, create_repo
+
+api = HfApi()
+REPO_ID = "eturok-weizmann/laser-vibrations"
+
+# Create repo if it doesn't exist
+create_repo(REPO_ID, repo_type="dataset", exist_ok=True)
+
+# Upload folder (contains data/ with subdirs, audio/, image/, README.md)
+api.upload_folder(
+    folder_path="data",
+    repo_id=REPO_ID,
+    repo_type="dataset",
+)
+```
+
+The folder structure to upload:
+```
+data/
+  metadata.jsonl    → appended with new sample row (HF URLs)
+  audio/            → upload new audio if different from existing
+  image/            → upload if different from existing
+    <IMAGE_DIR>/
+      raw_overhead.png
+      cropped_overhead.png
+      segmented_overhead.png
+      mask.png
+      mask.npz
+  0000001/          → sample-specific files
+    manifest.json
+    speckle_vibration_raw.npz
+    speckle_vibrations.mp4
+    speckle_shifts_ifft_audio.wav
+    speckle_shifts_fft.npz
+    ...
+```
+
+**For backfill:** Use the same pattern - upload shared assets first (audio/image), then per-sample directories, then update metadata.jsonl.
 
 Why this phase matters:
 - new data should land in the final structure automatically
@@ -815,7 +974,7 @@ Why this phase matters:
 
 Performance note:
 - raw video transfer should stay remote; only light metadata should cross SSH
-- timings should be printed for discovery, config load, raw file access, MP4 generation, FFT audio generation, parquet/manifest creation, and upload
+- timings should be printed for discovery, config load, raw file access, MP4 generation, IFFT audio generation, `metadata.jsonl`/manifest creation, and upload
 
 ### Phase 6: Migrate Training
 
@@ -842,18 +1001,22 @@ This plan fixes the target design as follows:
 
 - new HF dataset name: `laser-vibrations`
 - keep `viz` frozen; build new work in `viz2`
-- use parquet for metadata and viewer-facing file references
-- keep shared audio under `audio/`
-- keep per-sample structured assets under `samples/sample_xxxxxx/`
-- keep overhead image columns in parquet for continuity with the old dataset and viewer support
+- use `data/metadata.jsonl` for metadata and viewer-facing file references
+- keep shared audio under `data/audio/`
+- keep shared overhead image groups under `data/image/<IMAGE_DIR>/`
+- keep per-sample structured assets under `data/<sample_id>/`
+- keep viewer-facing overhead image columns in `metadata.jsonl`
 - preserve the full intermediate processing pipeline
 - add `manifest.json` per sample
+- set `hf_repo` in the manifest at experiment start
+- keep `x_position`/`y_position` as user-supplied placement coordinates and store derived mask center of mass as `x_com`/`y_com` in the manifest
+- for backfill, infer canonical `x_position`/`y_position` from experiment directory naming and treat old dataset coordinates as center-of-mass hints
 - replace the vague flat `experiment_config` shape with a structured manifest built around acquisition and artifact stages
-- store the full manifest again as a parquet `manifest_json` string for viewer visibility
+- store the full manifest again as a `manifest` string in `metadata.jsonl` for viewer visibility
 - store both `source_experiment_id` and `source_experiment_dir` in the manifest
 - save crop params and prompt in `mask.npz`
 - save complex FFT directly in `speckle_shifts_fft.npz`
-- create FFT audio preview via IFFT, defaulting to `laser_idx=50`, `xy_idx=0`
+- create IFFT audio preview via IFFT, defaulting to `laser_idx=50`, `xy_idx=0`
 - log timings for every stage we implement
 - use PR-style HF uploads by default because direct commits to the dataset are blocked
 - use a split pipeline: remote raw/mp4 upload, local metadata/tensor upload
@@ -872,7 +1035,7 @@ That means the manifest should contain enough information to:
 - reproduce the downstream processing artifacts
 
 Fields still required for that goal:
-- `sample_idx` at the top level of the manifest
+- `sample_id` at the top level of the manifest
 - laser camera row LUT values actually sent to the camera, not just the derived row ranges
 - final selected column points used to build the 10x10 ROI grid
 - final full sensor ROI list `(x, y, w, h)` for all sensors
@@ -903,11 +1066,11 @@ This document should be updated whenever we intentionally change the design.
 
 ### Dataset viewer
 
-- [x] Images render (WebP bytes embedded in parquet via `HFImage()`)
-- [x] Audio plays: `audio_file_name` and `speckle_shifts_fft_audio_file_name` embedded as WAV bytes via `HFAudio()`
-- [x] Video plays: `speckle_vibrations_file_name` embedded as MP4 bytes via `HFVideo()`
+- [x] Images render when `*_file_name` image columns point to full HF URLs
+- [x] Audio plays for `audio_file_name` and `speckle_shifts_ifft_audio_file_name`
+- [x] Video plays for `speckle_vibrations_file_name`
 - [x] Video codec fix: OpenCV writes `mp4v` (MPEG-4 Part 2) which browsers cannot play. Fixed by re-encoding to H.264 (`libx264`) via `imageio-ffmpeg`, which bundles its own ffmpeg binary so no system install needed on the cluster.
-- [x] `RowsPostProcessingError` fix: declaring `dtype: audio` in README YAML while the parquet stored plain strings caused HF post-processor to fail. Fixed by embedding actual bytes as structs and casting with `HFAudio()` / `HFVideo()`.
+- [x] README YAML must declare media dtypes explicitly and the media columns must end with `_file_name`
 
 ### Speed optimizations
 
@@ -922,4 +1085,98 @@ Current total: ~49s per sample.
 
 - [x] **`uv venv --clear`** (~5-8s): dropped `--clear` so remote venv is reused across runs. `uv venv` prints a non-fatal "already exists" error but `uv pip install` still succeeds on the existing env.
 - [x] **Duplicate dataset loads** (~6-12s): merged `load_old_row` + position-grid scan in `_one.py` into a single dataset pass. Skipped redundant `load_old_position_grid` in `backfill_laser_vibrations.py` when `--source-experiment-dir` is already provided. `backfill_laser_vibrations.py` still loads once for images.
-- [ ] **MP4 round-trip through HF** (~2s): remote step uploads MP4, local step downloads it again to embed in parquet. Fix: restructure so video bytes flow directly without going through HF.
+- [ ] **MP4 round-trip through HF** (~2s): remote step uploads MP4, local step downloads it again while preparing metadata. Fix: keep the metadata pass URL-only.
+
+### Current HF Upload Contract
+
+**Problem:** HF dataset viewer does not reliably resolve relative file paths for shared media assets in JSONL rows.
+
+**Current rule:** use full Hugging Face URLs for every media field in `metadata.jsonl`.
+
+This is the current recommended approach because it:
+- keeps shared files stored once in the repo
+- lets HF render shared audio and image assets directly
+- keeps sample rows append-only
+- avoids path-resolution ambiguity in both HF viewer and Python tooling
+
+### Full `README.md` Front Matter
+
+This exact `README.md` front matter is part of the source of truth and should be copied into the dataset repo:
+
+```yaml
+---
+configs:
+  - config_name: default
+    data_files:
+      - data/metadata.jsonl
+dataset_info:
+  features:
+    - name: sample_id
+      dtype: int64
+    - name: segmented_overhead_file_name
+      dtype: image
+    - name: speckle_vibrations_file_name
+      dtype: video
+    - name: speckle_shifts_ifft_audio_file_name
+      dtype: audio
+    - name: audio_file_name
+      dtype: audio
+    - name: experiment_id
+      dtype: string
+    - name: speakers
+      dtype: string
+    - name: x_position
+      dtype: int64
+    - name: y_position
+      dtype: int64
+    - name: x_com
+      dtype: float64
+    - name: y_com
+      dtype: float64
+    - name: n_objects
+      dtype: int64
+    - name: box_material
+      dtype: string
+    - name: mask_file_name
+      dtype: image
+    - name: experiment_dir
+      dtype: string
+    - name: manifest
+      dtype: string
+---
+```
+
+Rules:
+- every renderable media column must end with `_file_name`
+- `x_com` and `y_com` should appear immediately after `x_position` and `y_position`
+- `mask_file_name` should appear after `box_material` to match the intended viewer column order
+- `manifest` is a plain string column and should contain the full serialized `manifest.json`
+- `manifest` must include the `artifacts.shared` and `artifacts.sample` blocks so the row alone tells us where all files live
+
+### Canonical `metadata.jsonl` Example
+
+```json
+{
+  "sample_id": 1,
+  "segmented_overhead_file_name": "https://huggingface.co/datasets/<HF_REPO>/resolve/main/data/image/<IMAGE_DIR>/segmented_overhead.png",
+  "speckle_vibrations_file_name": "https://huggingface.co/datasets/<HF_REPO>/resolve/main/data/0000001/speckle_vibrations.mp4",
+  "speckle_shifts_ifft_audio_file_name": "https://huggingface.co/datasets/<HF_REPO>/resolve/main/data/0000001/speckle_shifts_ifft_audio.wav",
+  "audio_file_name": "https://huggingface.co/datasets/<HF_REPO>/resolve/main/data/audio/chirp_50_1000_3.0sec.wav",
+  "experiment_id": "cube-00x01y_0001--31-03-18-21-24",
+  "speakers": "0100",
+  "x_position": 3,
+  "y_position": 7,
+  "x_com": 3.1,
+  "y_com": 2.7,
+  "n_objects": 1,
+  "box_material": "cardboard",
+  "mask_file_name": "https://huggingface.co/datasets/<HF_REPO>/resolve/main/data/image/<IMAGE_DIR>/mask.png",
+  "experiment_dir": "experiment_15",
+  "manifest": "{\"sample_id\":1,\"artifacts\":{\"shared\":{...},\"sample\":{...}}}"
+}
+```
+
+Rule:
+- `experiment_dir` should be a relative experiment identifier such as `experiment_15`, not an absolute filesystem path
+- `hf_repo` should be set when the experiment starts, alongside `experiment_dir` and sample position metadata, not inferred later during packaging
+- `x_position` and `y_position` are integer grid coordinates entered by the user; `x_com` and `y_com` are float pixel-space values derived later from the segmentation mask
