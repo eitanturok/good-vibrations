@@ -99,18 +99,18 @@ def discover_source_experiment_dir(sample_row: dict, source_data_root: str, x_id
     obj = sample_row.get("object", "")
     spk = speaker_code(sample_row.get("speakers"))
     basename_pattern = f"{obj}-{x_idx:02d}x{y_idx:02d}y_{spk}--*"
-    inner = (
-        "python3 -c "
-        + shlex.quote(
-            "from pathlib import Path; "
-            f"root = Path({source_data_root!r}); "
-            f"pattern = {basename_pattern!r}; "
-            "[print(p) for p in sorted(root.rglob(pattern)) if p.is_dir()]"
-        )
-    )
-    cmd = f"sh -lc {shlex.quote(inner)}"
     t0 = time.perf_counter()
-    result = subprocess.run(["ssh", REMOTE_HOST, cmd], check=True, text=True, capture_output=True)
+    script = (
+        "python3 - <<'PY'\n"
+        "from pathlib import Path\n"
+        f"root = Path({source_data_root!r})\n"
+        f"pattern = {basename_pattern!r}\n"
+        "for p in sorted(root.rglob(pattern)):\n"
+        "    if p.is_dir():\n"
+        "        print(p)\n"
+        "PY\n"
+    )
+    result = subprocess.run(["ssh", REMOTE_HOST, "bash", "-s"], input=script, check=True, text=True, capture_output=True)
     candidates = [line.strip() for line in result.stdout.splitlines() if line.strip()]
     print(
         f"[timing] discover source dir: {time.perf_counter() - t0:.2f}s "

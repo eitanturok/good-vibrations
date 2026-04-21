@@ -13,7 +13,7 @@ This plan is the source of truth for the next implementation steps.
 - [x] `viz2` pointed at `eturok-weizmann/laser-vibrations`
 - [x] `laser-vibrations` created as a fresh HF dataset
 - [x] initial dataset scaffold upload works
-- [ ] first dummy sample uploaded in the new schema
+- [x] first real sample (`sample_idx=2`) uploaded in the new schema
 - [ ] `viz2` adapted to read the new dataset schema
 
 ### Working Notes
@@ -53,6 +53,20 @@ New option we are taking instead:
 - overhead-image matching should remain only as a fallback if position bucketing is ambiguous or not available
 - `source_experiment_id` should be saved in the manifest in addition to `source_experiment_dir`
 - manual `source_experiment_dir` override should still be supported as a fallback
+
+Confirmed working path and timing baseline for `sample_idx=2`:
+- remote uploader script is synced to `mcluster11` and run there with a standalone `uv`-managed Python 3.10 environment
+- raw `.npy` never comes back to the local machine
+- remote timings:
+  - preview generation: about `1.33s`
+  - raw `.npy` + `.mp4` upload to HF: about `8.03s`
+  - total remote stage: about `19.91s`
+- local timings:
+  - old dataset row load: about `2.59s`
+  - remote config fetch + raw header inspection: about `1.41s`
+  - tensor/manifest/parquet generation: all sub-second individually
+  - upload remaining local assets to HF: about `2.91s`
+  - total local stage: about `11.38s`
 
 ## Why We Are Doing This
 
@@ -290,51 +304,214 @@ Reasoning:
 
 Each sample directory will contain `manifest.json` describing the canonical paths and processing choices for that sample.
 
+Design principle:
+- keep the manifest as simple as possible while still fully reproducible
+- prefer one field with a clear meaning over multiple "requested" / "actual" variants unless the distinction is truly necessary
+- organize the manifest around real pipeline stages and artifacts, not around implementation details
+- build `manifest.json` from one shared helper used by both:
+  - future runtime capture / processing
+  - historical backfill
+- this is required so manifest contents stay consistent across all samples
+
 Proposed structure:
 
 ```json
 {
   "sample_idx": 1,
-  "audio_file_name": "audio/chirp_50_1000_3.0sec.wav",
-  "sample_dir": "samples/sample_000001",
-  "experiment_config": {"...": "..."},
-  "speckle_vibrations": {
-    "file_name": "samples/sample_000001/speckle_vibrations.mp4",
-    "raw_path": "samples/sample_000001/speckle_vibrations_raw.npy",
-    "frame_count": 9000,
-    "frame_height": 300,
-    "frame_width": 1152,
-    "fps": 2500
+  "experiment_id": "cube-00x01y_0001--31-03-18-21-24",
+  "experiment_dir": "/net/mraid20/ifs/wisdom/groups/mark_sheinin_lab/DATA/experiment-15/cube-00x01y_0001--31-03-18-21-24",
+  "sample": {
+    "object": "cube",
+    "n_objects": 1,
+    "box_material": "cardboard",
+    "speakers": [0, 0, 0, 1]
   },
-  "speckle_shifts": {
-    "path": "samples/sample_000001/speckle_shifts.npz"
+  "experiment_config": {
+    "audio": {
+      "file_name": "audio/chirp_50_1000_3.0sec.wav",
+      "sample_rate_hz": 44100,
+      "duration_s": 3.0,
+      "total_output_channels": 8
+    },
+    "recording": {
+      "capture_seconds": 3.1
+    },
+    "overhead_camera": {
+      "frame_rate_fps": 30,
+      "exposure_ms": 30,
+      "pixel_clock_mhz": 86,
+      "gain": 60,
+      "runtime": {
+        "device_id": 0,
+        "color_mode": "IS_CM_SENSOR_RAW8",
+        "buffer_count": 40,
+        "rotation_degrees": 180,
+        "debayer_code": "COLOR_BAYER_BG2BGR"
+      }
+    },
+    "laser_camera": {
+      "runtime": {
+        "info_field": false,
+        "cxp_link_configuration": "CXP12_X4"
+      },
+      "calibration": {
+        "fps": 500,
+        "exposure_us": 30,
+        "gain": 3
+      },
+      "capture": {
+        "fps": 2500,
+        "exposure_us": 150,
+        "gain": 1,
+        "buffer_part_count": 3000
+      }
+    },
+    "laser_grid": {
+      "n_roi_rows": 10,
+      "n_roi_columns": 10,
+      "roi_row_height": 30,
+      "roi_column_width": 70
+    },
+    "preview": {
+      "overhead_resize_factor": 0.75,
+      "overhead_gamma": 1.0,
+      "laser_preview_gamma": 2.5,
+      "show_full_frame": 0,
+      "preview_level": 1,
+      "reset_rois": true
+    }
   },
-  "speckle_shifts_clean": {
-    "path": "samples/sample_000001/speckle_shifts_clean.npz",
-    "lowcut": 50,
-    "highcut": 1000,
-    "filter_order": 5,
-    "hann_applied": true
+  "experiment_output": {
+    "overhead_camera": {
+      "image_width": 2056,
+      "image_height": 1542
+    },
+    "laser_camera": {
+      "global_roi": [352, 0, 1152, 300],
+      "max_frame_rate_hz": 7970
+    },
+    "laser_grid": {
+      "total_image_height": 300,
+      "selected_row_points_image_xy": [[978, 65], [975, 171]],
+      "selected_column_centers_x": [387, 457],
+      "row_values_single_list": [25, 26, 27],
+      "global_crop_x": 352,
+      "global_crop_width": 1152,
+      "global_crop_height": 300,
+      "row_rois_y": [[50, 80], [156, 186]],
+      "sensor_grid_shape": [10, 10],
+      "sensor_rois_xywh": [[352, 0, 70, 30]]
+    },
+    "speckle_vibrations": {
+      "frame_count": 9000,
+      "frame_height": 300,
+      "frame_width": 1152,
+      "capture_seconds": 3.1,
+      "preview_fps": 30.0,
+      "dtype": "uint8"
+    }
   },
-  "speckle_shifts_fft": {
-    "path": "samples/sample_000001/speckle_shifts_fft.npz",
-    "min_freq": 50,
-    "max_freq": 1000,
-    "dtype": "complex64"
+  "artifacts": {
+    "overhead_image": ".../box_overhead_image.png",
+    "cropped_image": "...",
+    "overlay_image": "...",
+    "speckle_vibrations_raw": "samples/sample_000001/speckle_vibrations_raw.npy",
+    "speckle_vibrations_preview": "samples/sample_000001/speckle_vibrations.mp4",
+    "speckle_shifts": "samples/sample_000001/speckle_shifts.npz",
+    "speckle_shifts_clean": "samples/sample_000001/speckle_shifts_clean.npz",
+    "speckle_shifts_fft": "samples/sample_000001/speckle_shifts_fft.npz",
+    "speckle_shifts_ifft_audio": "samples/sample_000001/speckle_shifts_ifft_audio.wav",
+    "mask": "samples/sample_000001/mask.npz"
   },
-  "speckle_shifts_fft_audio": {
-    "file_name": "samples/sample_000001/speckle_shifts_fft_audio.wav",
-    "laser_idx": 50,
-    "xy_idx": 0,
-    "method": "ifft"
-  },
-  "mask": {
-    "path": "samples/sample_000001/mask.npz"
-  },
-  "source_experiment_id": "cube-00x01y_0001--31-03-18-21-24",
-  "source_experiment_dir": "..."
+  "processing_config": {
+    "speckle_vibrations_preview": {
+      "max_frames": 300,
+      "max_width": 960,
+      "percentile_low": 5,
+      "percentile_high": 99.5,
+      "codec": "libx264",
+      "pixelformat": "yuv420p",
+      "crf": 23,
+      "burn_frame_index": true
+    },
+    "speckle_shifts": {
+      "fs_hz": 2500
+    },
+    "speckle_shifts_clean": {
+      "filter_type": "butterworth",
+      "filter_mode": "bandpass",
+      "lowcut": 50,
+      "highcut": 1000,
+      "filter_order": 5,
+      "hann_applied": true,
+      "apply_order": "filter_then_hann"
+    },
+    "speckle_shifts_fft": {
+      "fft_kind": "rfft",
+      "fft_axis": 1,
+      "min_freq": 50,
+      "max_freq": 1000,
+      "dtype": "complex64",
+      "crop_after_fft": true
+    },
+    "speckle_shifts_ifft_audio": {
+      "laser_idx": 50,
+      "xy_idx": 0,
+      "method": "ifft",
+      "output_sample_rate_hz": 22050,
+      "normalization": "peak_to_int16",
+      "output_dtype": "int16",
+      "zero_fill_uncropped_bins": true
+    }
+  }
 }
 ```
+
+Notes on simplification:
+- do not store a separate `source_notebook`
+- in `audio`, keep only `file_name`; do not duplicate it with a recorded source path
+- speaker routing is already represented by `sample.speakers`, so do not duplicate it inside `audio`
+- for camera settings, log the values that were requested by the experiment code
+- put preview-only values in a dedicated `preview` block so they do not get mixed with acquisition settings
+- keep concrete observed outputs in a dedicated `experiment_output` block
+- `experiment_output` should contain outputs of setup or capture rather than direct requested inputs, for example:
+  - final global ROI
+  - final per-row and per-sensor ROI geometry
+  - frame count and saved array shape
+  - preview fps actually used for the saved MP4
+- `experiment_config` and `processing_config` together should be sufficient to rerun the acquisition and derivation logic without hidden notebook constants
+- `experiment_output` is still required because some critical values are produced by setup/capture rather than chosen up front, especially ROI geometry and saved frame statistics
+- do not duplicate near-identical requested/actual camera settings in the manifest unless we later discover a hardware mismatch that materially affects reproducibility
+- keep `calibration` nested under `laser_camera` because it is a distinct stage that affects how the acquisition was configured
+- `calibration` means the low-frame-rate laser-camera setup used before the final high-speed capture in order to find/set ROIs and verify alignment; it is separate from the final vibration capture settings
+- keep normal high-speed laser acquisition settings under `laser_camera.capture`
+- `sensor_rois_xywh` means the full list of final per-sensor `(x, y, w, h)` ROIs after combining row and column choices
+- group file paths under an explicit `artifacts` block
+- keep processing parameters together under a `processing_config` block
+
+Important saved-data constraint:
+- `metadata.npz` preserves selected row points and final ROIs, but does not preserve the original column click `(x, y)` points directly
+- therefore the manifest should store `selected_column_centers_x`, which can be reconstructed reliably from the saved final ROIs
+
+Additional ROI guidance:
+- ROI information is important enough to log in detail because it defines how the 10x10 laser sensor grid was constructed from the raw camera image
+- the manifest should keep both the human-selected inputs and the derived final geometry:
+  - selected row points
+  - selected column points
+  - the row value LUT / selected row indices used by the camera
+  - the global horizontal crop
+  - the per-row Y ranges
+  - the final per-sensor `(x, y, w, h)` ROIs
+
+Fields still required for full replay of `notebooks/11_multispeaker_record_data.ipynb` and backfill processing:
+- `experiment_config.recording.capture_seconds`
+- `experiment_config.overhead_camera.runtime`
+- `experiment_config.laser_camera.runtime`
+- `processing_config.speckle_vibrations_preview`
+- `processing_config.speckle_shifts_ifft_audio.output_sample_rate_hz`
+- `processing_config.speckle_shifts_ifft_audio.normalization`
+- `processing_config.speckle_shifts_ifft_audio.output_dtype`
+- `processing_config.speckle_shifts_ifft_audio.zero_fill_uncropped_bins`
 
 ### Why Keep A Manifest If We Already Have Parquet?
 
@@ -671,7 +848,7 @@ This plan fixes the target design as follows:
 - keep overhead image columns in parquet for continuity with the old dataset and viewer support
 - preserve the full intermediate processing pipeline
 - add `manifest.json` per sample
-- store `experiment_config` inside `manifest.json`, not as a separate parquet column
+- replace the vague flat `experiment_config` shape with a structured manifest built around acquisition and artifact stages
 - store the full manifest again as a parquet `manifest_json` string for viewer visibility
 - store both `source_experiment_id` and `source_experiment_dir` in the manifest
 - save crop params and prompt in `mask.npz`
@@ -680,6 +857,35 @@ This plan fixes the target design as follows:
 - log timings for every stage we implement
 - use PR-style HF uploads by default because direct commits to the dataset are blocked
 - use a split pipeline: remote raw/mp4 upload, local metadata/tensor upload
+- use one shared manifest builder for runtime capture and backfill so all samples are consistent
+
+### Rebuild Requirement
+
+The manifest should be rich enough that we can recreate the acquisition and packaging flow without relying on hidden notebook constants.
+
+That means the manifest should contain enough information to:
+- configure the overhead camera
+- configure the laser camera
+- reconstruct the ROI geometry
+- play the correct audio to the correct speakers
+- compute the expected number of laser frames
+- reproduce the downstream processing artifacts
+
+Fields still required for that goal:
+- `sample_idx` at the top level of the manifest
+- laser camera row LUT values actually sent to the camera, not just the derived row ranges
+- final selected column points used to build the 10x10 ROI grid
+- final full sensor ROI list `(x, y, w, h)` for all sensors
+- `n_capture_seconds`
+- audio output metadata needed by the playback function if it is not fixed in code:
+  - total output channels
+  - any non-default speaker mapping convention if applicable
+- any capture-mode flags that materially affect the saved raw recording, if they are not fixed by code defaults
+
+Fields that do not need to be in the manifest if they stay fixed in code and are not expected to vary between runs:
+- preview-only UI parameters
+- notebook file path
+- debug display settings
 
 This document should be updated whenever we intentionally change the design.
 

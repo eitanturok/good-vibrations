@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import textwrap
 import time
+import wave
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -142,6 +143,14 @@ def load_remote_experiment_config(remote_experiment_dir: str) -> dict:
     result = subprocess.run(["ssh", REMOTE_HOST, cmd], check=True, text=True, capture_output=True)
     print(f"[timing] download experiment_config.json: {time.perf_counter() - t0:.2f}s")
     return json.loads(result.stdout)
+
+
+def load_remote_run_opt(remote_experiment_dir: str) -> dict:
+    with TemporaryDirectory(prefix="laser-vibrations-meta-") as tmp:
+        local_path = Path(tmp) / "metadata.npz"
+        stream_remote_file(f"{remote_experiment_dir}/metadata.npz", local_path)
+        data = np.load(local_path, allow_pickle=True)
+        return data["run_opt"].item()
 
 
 def resolve_audio_file(experiment_config: dict) -> tuple[Path, str]:
@@ -396,7 +405,7 @@ def to_webp(img) -> dict:
     return {"bytes": buf.getvalue(), "path": None}
 
 
-AUDIO_COLS = ["audio_file_name", "speckle_shifts_fft_audio_file_name"]
+AUDIO_COLS = ["audio_file_name", "speckle_shifts_ifft_audio_file_name"]
 VIDEO_COLS = ["speckle_vibrations_file_name"]
 
 
@@ -428,7 +437,7 @@ def write_parquet_row(
         "y_position": row.get("y_position"),
         "audio_file_name": to_audio(audio_src),
         "speckle_vibrations_file_name": to_video(video_src),
-        "speckle_shifts_fft_audio_file_name": to_audio(fft_audio_src),
+        "speckle_shifts_ifft_audio_file_name": to_audio(fft_audio_src),
         "manifest_json": json.dumps(manifest_payload),
         "sample_dir": rel_dir,
         "mask_path": f"{rel_dir}/mask.npz",
@@ -454,7 +463,9 @@ def write_parquet_row(
 def write_manifest(
     path: Path,
     sample_id: int,
+    row: dict,
     audio_file_name: str,
+    audio_src: Path,
     remote_experiment_dir: str,
     fps: float,
     frame_count: int,
@@ -468,51 +479,31 @@ def write_manifest(
     max_freq: float,
     laser_idx: int,
     xy_idx: int,
+    fft_audio_out_sr: int,
     experiment_config: dict,
+    run_opt: dict,
 ) -> dict:
-    rel_dir = sample_dir_rel(sample_id)
-    source_experiment_path = Path(remote_experiment_dir)
-    payload = {
-        "sample_idx": int(sample_id),
-        "audio_file_name": audio_file_name,
-        "sample_dir": rel_dir,
-        "experiment_config": experiment_config,
-        "speckle_vibrations": {
-            "file_name": f"{rel_dir}/speckle_vibrations.mp4",
-            "raw_path": f"{rel_dir}/speckle_vibrations_raw.npy",
-            "frame_count": int(frame_count),
-            "frame_height": int(frame_height),
-            "frame_width": int(frame_width),
-            "fps": float(fps),
-        },
-        "speckle_shifts": {
-            "path": f"{rel_dir}/speckle_shifts.npz",
-        },
-        "speckle_shifts_clean": {
-            "path": f"{rel_dir}/speckle_shifts_clean.npz",
-            "lowcut": float(lowcut),
-            "highcut": float(highcut),
-            "filter_order": int(filter_order),
-            "hann_applied": bool(hann_applied),
-        },
-        "speckle_shifts_fft": {
-            "path": f"{rel_dir}/speckle_shifts_fft.npz",
-            "min_freq": float(min_freq),
-            "max_freq": float(max_freq),
-            "dtype": "complex128",
-        },
-        "speckle_shifts_fft_audio": {
-            "file_name": f"{rel_dir}/speckle_shifts_fft_audio.wav",
-            "laser_idx": int(laser_idx),
-            "xy_idx": int(xy_idx),
-            "method": "ifft",
-        },
-        "mask": {
-            "path": f"{rel_dir}/mask.npz",
-        },
-        "source_experiment_id": source_experiment_path.name,
-        "source_experiment_dir": remote_experiment_dir,
-    }
+    payload = build_manifest_payload(
+        sample_id=sample_id,
+        row=row,
+        audio_file_name=audio_file_name,
+        audio_src=audio_src,
+        remote_experiment_dir=remote_experiment_dir,
+        experiment_config=experiment_config,
+        run_opt=run_opt,
+        frame_count=frame_count,
+        frame_height=frame_height,
+        frame_width=frame_width,
+        lowcut=lowcut,
+        highcut=highcut,
+        filter_order=filter_order,
+        hann_applied=hann_applied,
+        min_freq=min_freq,
+        max_freq=max_freq,
+        laser_idx=laser_idx,
+        xy_idx=xy_idx,
+        fft_audio_out_sr=fft_audio_out_sr,
+    )
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     return payload
 
@@ -524,6 +515,227 @@ def maybe_stage_audio(audio_src: Path, audio_rel: str, repo_id: str, root: Path,
     dst = root / audio_rel
     dst.parent.mkdir(parents=True, exist_ok=True)
     dst.write_bytes(audio_src.read_bytes())
+
+
+def read_wav_metadata(path: Path) -> tuple[int, float]:
+    with wave.open(str(path), "rb") as wav_f:
+        sample_rate_hz = wav_f.getframerate()
+        duration_s = wav_f.getnframes() / sample_rate_hz if sample_rate_hz else 0.0
+    return int(sample_rate_hz), float(duration_s)
+
+
+def to_python(value):
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, np.ndarray):
+        return [to_python(v) for v in value.tolist()]
+    if isinstance(value, (list, tuple)):
+        return [to_python(v) for v in value]
+    if isinstance(value, dict):
+        return {str(k): to_python(v) for k, v in value.items()}
+    return value
+
+
+def build_row_values_single_list(roi_list: list[list[int]]) -> list[int]:
+    values = []
+    for start, end in roi_list:
+        values.extend(list(np.arange(int(start), int(end), 2) // 2))
+    return values
+
+
+def infer_selected_column_centers_x(sensor_rois_xywh: list[list[int]], n_cols: int) -> list[int]:
+    if not sensor_rois_xywh or n_cols <= 0:
+        return []
+    first_row = sensor_rois_xywh[:n_cols]
+    return [int(x + w // 2) for x, _, w, _ in first_row]
+
+
+def build_manifest_payload(
+    sample_id: int,
+    row: dict,
+    audio_file_name: str,
+    audio_src: Path,
+    remote_experiment_dir: str,
+    experiment_config: dict,
+    run_opt: dict,
+    frame_count: int,
+    frame_height: int,
+    frame_width: int,
+    lowcut: float,
+    highcut: float,
+    filter_order: int,
+    hann_applied: bool,
+    min_freq: float,
+    max_freq: float,
+    laser_idx: int,
+    xy_idx: int,
+    fft_audio_out_sr: int,
+) -> dict:
+    rel_dir = sample_dir_rel(sample_id)
+    sample_root = f"samples/sample_{sample_id:06d}"
+    source_experiment_path = Path(remote_experiment_dir)
+    sample_rate_hz, duration_s = read_wav_metadata(audio_src)
+    cam_params = to_python(run_opt.get("cam_params", {}))
+    multi_rois = to_python(run_opt.get("run_opt_multiROIs", {}))
+    roi_list = multi_rois.get("ROI_list", [])
+    sensor_rois = multi_rois.get("ROIs", [])
+    global_roi = cam_params.get("get_global_roi") or multi_rois.get("global_ROI")
+    global_crop_x = global_crop_width = global_crop_height = None
+    if global_roi:
+        global_crop_x = int(global_roi[0])
+        global_crop_width = int(global_roi[2])
+        global_crop_height = int(global_roi[3])
+    n_cols = int(experiment_config.get("N_ROI_COLUMNS", 0) or 0)
+
+    return {
+        "sample_idx": int(sample_id),
+        "experiment_id": source_experiment_path.name,
+        "experiment_dir": remote_experiment_dir,
+        "sample": {
+            "object": row.get("object", ""),
+            "n_objects": int(row.get("n_objects") or 1),
+            "box_material": row.get("box_material", ""),
+            "speakers": to_python(row.get("speakers", [])),
+        },
+        "experiment_config": {
+            "audio": {
+                "file_name": audio_file_name,
+                "sample_rate_hz": sample_rate_hz,
+                "duration_s": duration_s,
+                "total_output_channels": 8,
+            },
+            "recording": {
+                "capture_seconds": float(experiment_config.get("N_CAPTURE_SECONDS", 0.0)),
+            },
+            "overhead_camera": {
+                "frame_rate_fps": to_python(experiment_config.get("FRAME_RATE")),
+                "exposure_ms": to_python(experiment_config.get("EXPOSURE_MS")),
+                "pixel_clock_mhz": to_python(experiment_config.get("PIXEL_CLOCK")),
+                "gain": to_python(experiment_config.get("CAMERA_GAIN")),
+                "runtime": {
+                    "device_id": 0,
+                    "color_mode": "IS_CM_SENSOR_RAW8",
+                    "buffer_count": 40,
+                    "rotation_degrees": 180,
+                    "debayer_code": "COLOR_BAYER_BG2BGR",
+                },
+            },
+            "laser_camera": {
+                "runtime": {
+                    "info_field": False,
+                    "cxp_link_configuration": "CXP12_X4",
+                },
+                "calibration": {
+                    "fps": to_python(experiment_config.get("CALIBRATION_FPS")),
+                    "exposure_us": to_python(experiment_config.get("CALIBRATION_EXPOSURE")),
+                    "gain": to_python(experiment_config.get("CALIBRATION_GAIN")),
+                },
+                "capture": {
+                    "fps": to_python(experiment_config.get("FPS")),
+                    "exposure_us": to_python(experiment_config.get("EXPOSURE")),
+                    "gain": to_python(experiment_config.get("GAIN")),
+                    "buffer_part_count": to_python(experiment_config.get("BUFFER_PART_COUNT")),
+                },
+            },
+            "laser_grid": {
+                "n_roi_rows": to_python(experiment_config.get("N_ROI_ROWS")),
+                "n_roi_columns": to_python(experiment_config.get("N_ROI_COLUMNS")),
+                "roi_row_height": to_python(experiment_config.get("ROI_ROW_HEIGHT")),
+                "roi_column_width": to_python(experiment_config.get("ROI_COLUMN_WIDTH")),
+            },
+            "preview": {
+                "overhead_resize_factor": to_python(experiment_config.get("RESIZE_FACTOR")),
+                "overhead_gamma": to_python(experiment_config.get("GAMMA")),
+                "laser_preview_gamma": 2.5,
+                "show_full_frame": 0,
+                "preview_level": 1,
+                "reset_rois": True,
+            },
+        },
+        "experiment_output": {
+            "overhead_camera": {
+                "image_width": int(row["raw_image"].size[0]),
+                "image_height": int(row["raw_image"].size[1]),
+            },
+            "laser_camera": {
+                "global_roi": to_python(global_roi),
+                "max_frame_rate_hz": to_python(cam_params.get("get_max_frame_rate")),
+            },
+            "laser_grid": {
+                "total_image_height": to_python(multi_rois.get("total_image_height")),
+                "selected_row_points_image_xy": to_python(multi_rois.get("selected_row_points", [])),
+                "selected_column_centers_x": infer_selected_column_centers_x(sensor_rois, n_cols),
+                "row_values_single_list": build_row_values_single_list(roi_list),
+                "global_crop_x": global_crop_x,
+                "global_crop_width": global_crop_width,
+                "global_crop_height": global_crop_height,
+                "row_rois_y": to_python(roi_list),
+                "sensor_grid_shape": [int(experiment_config.get("N_ROI_ROWS", 0)), int(experiment_config.get("N_ROI_COLUMNS", 0))],
+                "sensor_rois_xywh": to_python(sensor_rois),
+            },
+            "speckle_vibrations": {
+                "frame_count": int(frame_count),
+                "frame_height": int(frame_height),
+                "frame_width": int(frame_width),
+                "capture_seconds": float(experiment_config.get("N_CAPTURE_SECONDS", 0.0)),
+                "preview_fps": 30.0,
+                "dtype": "uint8",
+            },
+        },
+        "artifacts": {
+            "overhead_image": f"{remote_experiment_dir}/box_overhead_image.png",
+            "cropped_image": None,
+            "overlay_image": None,
+            "speckle_vibrations_raw": f"{sample_root}/speckle_vibrations_raw.npy",
+            "speckle_vibrations_preview": f"{sample_root}/speckle_vibrations.mp4",
+            "speckle_shifts": f"{sample_root}/speckle_shifts.npz",
+            "speckle_shifts_clean": f"{sample_root}/speckle_shifts_clean.npz",
+            "speckle_shifts_fft": f"{sample_root}/speckle_shifts_fft.npz",
+            "speckle_shifts_ifft_audio": f"{sample_root}/speckle_shifts_ifft_audio.wav",
+            "mask": f"{sample_root}/mask.npz",
+        },
+        "processing_config": {
+            "speckle_vibrations_preview": {
+                "max_frames": 300,
+                "max_width": 960,
+                "percentile_low": 5,
+                "percentile_high": 99.5,
+                "codec": "libx264",
+                "pixelformat": "yuv420p",
+                "crf": 23,
+                "burn_frame_index": True,
+            },
+            "speckle_shifts": {
+                "fs_hz": float(fps),
+            },
+            "speckle_shifts_clean": {
+                "filter_type": "butterworth",
+                "filter_mode": "bandpass",
+                "lowcut": float(lowcut),
+                "highcut": float(highcut),
+                "filter_order": int(filter_order),
+                "hann_applied": bool(hann_applied),
+                "apply_order": "filter_then_hann",
+            },
+            "speckle_shifts_fft": {
+                "fft_kind": "rfft",
+                "fft_axis": 1,
+                "min_freq": float(min_freq),
+                "max_freq": float(max_freq),
+                "dtype": "complex128",
+                "crop_after_fft": True,
+            },
+            "speckle_shifts_ifft_audio": {
+                "laser_idx": int(laser_idx),
+                "xy_idx": int(xy_idx),
+                "method": "ifft",
+                "output_sample_rate_hz": int(fft_audio_out_sr),
+                "normalization": "peak_to_int16",
+                "output_dtype": "int16",
+                "zero_fill_uncropped_bins": True,
+            },
+        },
+    }
 
 
 def parse_args() -> argparse.Namespace:
@@ -600,6 +812,10 @@ def main() -> None:
         experiment_config = stage(
             "load remote experiment config",
             lambda: load_remote_experiment_config(source_experiment_dir),
+        )
+        run_opt = stage(
+            "load remote metadata.npz",
+            lambda: load_remote_run_opt(source_experiment_dir),
         )
         audio_src, audio_rel = stage("resolve shared audio", lambda: resolve_audio_file(experiment_config))
         stage("stage shared audio", lambda: maybe_stage_audio(audio_src, audio_rel, args.new_repo_id, root, repo_files))
@@ -680,7 +896,7 @@ def main() -> None:
                 n_samples=n_samples,
                 min_freq=args.min_freq,
                 max_freq=args.max_freq,
-                out_path=sample_root / "speckle_shifts_fft_audio.wav",
+                out_path=sample_root / "speckle_shifts_ifft_audio.wav",
                 laser_idx=args.fft_audio_laser_idx,
                 xy_idx=args.fft_audio_xy_idx,
                 out_sr=args.fft_audio_out_sr,
@@ -692,7 +908,9 @@ def main() -> None:
             lambda: write_manifest(
                 path=sample_root / "manifest.json",
                 sample_id=args.sample_id,
+                row=old_row,
                 audio_file_name=audio_rel,
+                audio_src=audio_src,
                 remote_experiment_dir=source_experiment_dir,
                 fps=fs,
                 frame_count=frame_count,
@@ -706,7 +924,9 @@ def main() -> None:
                 max_freq=args.max_freq,
                 laser_idx=args.fft_audio_laser_idx,
                 xy_idx=args.fft_audio_xy_idx,
+                fft_audio_out_sr=args.fft_audio_out_sr,
                 experiment_config=experiment_config,
+                run_opt=run_opt,
             ),
         )
 
@@ -718,7 +938,7 @@ def main() -> None:
                 sample_id=args.sample_id,
                 row=old_row,
                 audio_src=audio_src,
-                fft_audio_src=sample_root / "speckle_shifts_fft_audio.wav",
+                fft_audio_src=sample_root / "speckle_shifts_ifft_audio.wav",
                 video_src=video_src,
                 manifest_payload=manifest_payload,
             ),
