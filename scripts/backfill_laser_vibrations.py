@@ -2,6 +2,7 @@ import argparse
 import ast
 import io
 import json
+import re
 import shlex
 import shutil
 import subprocess
@@ -27,6 +28,11 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 LOCAL_AUDIO_ROOT = REPO_ROOT / "data" / "audio_samples"
 DEFAULT_SOURCE_DATA_ROOT = "/net/mraid20/ifs/wisdom/groups/mark_sheinin_lab/DATA"
 IMAGE_COLS = ["raw_image", "cropped_image", "overlay_image"]
+IMAGE_NAMES = {
+    "raw_image": "raw.webp",
+    "cropped_image": "cropped.webp",
+    "overlay_image": "overlay.webp",
+}
 
 
 def stage(label, fn):
@@ -407,12 +413,6 @@ def generate_speckle_preview(raw_npy_path: Path, out_path: Path, fps: float, max
     return frame_count, frame_height, frame_width
 
 
-def to_webp(img) -> dict:
-    buf = io.BytesIO()
-    img.convert("RGB").save(buf, format="WEBP", quality=85)
-    return {"bytes": buf.getvalue(), "path": None}
-
-
 AUDIO_COLS = ["audio_file_name", "speckle_shifts_ifft_audio_file_name"]
 VIDEO_COLS = ["speckle_vibrations_file_name"]
 
@@ -433,6 +433,7 @@ def write_parquet_row(
     fft_audio_src: Path,
     video_src: Path,
     manifest_payload: dict,
+    image_paths: dict[str, str],
 ) -> None:
     rel_dir = sample_dir_rel(sample_id)
     record = {
@@ -453,9 +454,9 @@ def write_parquet_row(
         "speckle_shifts_path": f"{rel_dir}/speckle_shifts.npz",
         "speckle_shifts_clean_path": f"{rel_dir}/speckle_shifts_clean.npz",
         "speckle_shifts_fft_path": f"{rel_dir}/speckle_shifts_fft.npz",
-        "raw_image": to_webp(row["raw_image"]),
-        "cropped_image": to_webp(row["cropped_image"]),
-        "overlay_image": to_webp(row["overlay_image"]),
+        "raw_image": image_paths["raw_image"],
+        "cropped_image": image_paths["cropped_image"],
+        "overlay_image": image_paths["overlay_image"],
     }
     ds = Dataset.from_list([record])
     for col in IMAGE_COLS:
@@ -489,6 +490,7 @@ def write_manifest(
     fft_audio_out_sr: int,
     experiment_config: dict,
     run_opt: dict,
+    image_key: str,
 ) -> dict:
     payload = build_manifest_payload(
         sample_id=sample_id,
@@ -510,6 +512,7 @@ def write_manifest(
         laser_idx=laser_idx,
         xy_idx=xy_idx,
         fft_audio_out_sr=fft_audio_out_sr,
+        image_key=image_key,
     )
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     return payload
@@ -522,6 +525,31 @@ def maybe_stage_audio(audio_src: Path, audio_rel: str, repo_id: str, root: Path,
     dst = root / audio_rel
     dst.parent.mkdir(parents=True, exist_ok=True)
     dst.write_bytes(audio_src.read_bytes())
+
+
+def image_key_from_experiment_dir(source_experiment_dir: str) -> str:
+    basename = Path(source_experiment_dir).name
+    m = re.match(r'^(.+-\d{2}x\d{2}y)', basename)
+    if m:
+        return m.group(1)
+    return basename.split("_")[0]
+
+
+def stage_shared_images(row: dict, image_key: str, root: Path, existing_files: set[str]) -> dict[str, str]:
+    """Write shared overhead images to images/{image_key}/ once; return repo-relative paths."""
+    paths = {}
+    for col, filename in IMAGE_NAMES.items():
+        rel = f"images/{image_key}/{filename}"
+        paths[col] = rel
+        if rel in existing_files:
+            print(f"[info] shared image already in repo, skipping: {rel}")
+            continue
+        dst = root / rel
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        buf = io.BytesIO()
+        row[col].convert("RGB").save(buf, format="WEBP", quality=85)
+        dst.write_bytes(buf.getvalue())
+    return paths
 
 
 def read_wav_metadata(path: Path) -> tuple[int, float]:
@@ -577,6 +605,7 @@ def build_manifest_payload(
     laser_idx: int,
     xy_idx: int,
     fft_audio_out_sr: int,
+    image_key: str,
 ) -> dict:
     rel_dir = sample_dir_rel(sample_id)
     sample_root = f"samples/sample_{sample_id:06d}"
@@ -690,9 +719,9 @@ def build_manifest_payload(
             },
         },
         "artifacts": {
-            "overhead_image": f"{remote_experiment_dir}/box_overhead_image.png",
-            "cropped_image": None,
-            "overlay_image": None,
+            "overhead_image": f"images/{image_key}/raw.webp",
+            "cropped_image": f"images/{image_key}/cropped.webp",
+            "overlay_image": f"images/{image_key}/overlay.webp",
             "speckle_vibrations_raw": f"{sample_root}/speckle_vibrations_raw.npy",
             "speckle_vibrations_preview": f"{sample_root}/speckle_vibrations.mp4",
             "speckle_shifts": f"{sample_root}/speckle_shifts.npz",
@@ -826,6 +855,9 @@ def main() -> None:
         )
         audio_src, audio_rel = stage("resolve shared audio", lambda: resolve_audio_file(experiment_config))
         stage("stage shared audio", lambda: maybe_stage_audio(audio_src, audio_rel, args.new_repo_id, root, repo_files))
+        image_key = image_key_from_experiment_dir(source_experiment_dir)
+        print(f"[info] image_key={image_key}")
+        image_paths = stage("stage shared images", lambda: stage_shared_images(old_row, image_key, root, repo_files))
 
         if args.skip_remote_speckle_assets:
             frame_count, frame_height, frame_width = stage(
@@ -933,6 +965,7 @@ def main() -> None:
                 fft_audio_out_sr=args.fft_audio_out_sr,
                 experiment_config=experiment_config,
                 run_opt=run_opt,
+                image_key=image_key,
             ),
         )
 
@@ -947,6 +980,7 @@ def main() -> None:
                 fft_audio_src=sample_root / "speckle_shifts_ifft_audio.wav",
                 video_src=video_src,
                 manifest_payload=manifest_payload,
+                image_paths=image_paths,
             ),
         )
 
