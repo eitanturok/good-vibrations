@@ -14,7 +14,7 @@ from tempfile import TemporaryDirectory
 
 import cv2
 import numpy as np
-from datasets import Dataset, load_dataset
+from datasets import Audio as HFAudio, Dataset, Image as HFImage, Video as HFVideo, load_dataset
 from huggingface_hub import HfApi, hf_hub_download
 from PIL import Image
 from scipy.io.wavfile import write as wav_write
@@ -413,11 +413,19 @@ def generate_speckle_preview(raw_npy_path: Path, out_path: Path, fps: float, max
     return frame_count, frame_height, frame_width
 
 
+def _img_bytes(img) -> bytes:
+    buf = io.BytesIO()
+    img.convert("RGB").save(buf, format="WEBP", quality=85)
+    return buf.getvalue()
+
+
 def write_parquet_row(
     path: Path,
     sample_id: int,
     row: dict,
-    audio_rel: str,
+    audio_src: Path,
+    fft_audio_src: Path,
+    video_src: Path,
     manifest_payload: dict,
     image_paths: dict[str, str],
 ) -> None:
@@ -430,14 +438,22 @@ def write_parquet_row(
         "speakers": row.get("speakers", []),
         "x_position": row.get("x_position"),
         "y_position": row.get("y_position"),
-        "audio_file_name": audio_rel,
-        "speckle_vibrations_file_name": f"{rel_dir}/speckle_vibrations.mp4",
-        "speckle_shifts_ifft_audio_file_name": f"{rel_dir}/speckle_shifts_ifft_audio.wav",
+        "audio": {"bytes": audio_src.read_bytes(), "path": audio_src.name},
+        "speckle_vibrations": {"bytes": video_src.read_bytes(), "path": video_src.name},
+        "speckle_shifts_ifft_audio": {"bytes": fft_audio_src.read_bytes(), "path": fft_audio_src.name},
         "manifest_json": json.dumps(manifest_payload),
         "mask_path": f"{rel_dir}/mask.npz",
-        **image_paths,
+        "overhead_image": {"bytes": _img_bytes(row["raw_image"]), "path": image_paths["overhead_image_file_name"]},
+        "cropped_overhead_image": {"bytes": _img_bytes(row["cropped_image"]), "path": image_paths["cropped_overhead_image_file_name"]},
+        "segmented_overhead_image": {"bytes": _img_bytes(row["overlay_image"]), "path": image_paths["segmented_overhead_image_file_name"]},
     }
     ds = Dataset.from_list([record])
+    ds = ds.cast_column("audio", HFAudio())
+    ds = ds.cast_column("speckle_vibrations", HFVideo())
+    ds = ds.cast_column("speckle_shifts_ifft_audio", HFAudio())
+    ds = ds.cast_column("overhead_image", HFImage())
+    ds = ds.cast_column("cropped_overhead_image", HFImage())
+    ds = ds.cast_column("segmented_overhead_image", HFImage())
     with path.open("wb") as f:
         ds.to_parquet(f)
 
@@ -952,7 +968,9 @@ def main() -> None:
                 path=parquet_path,
                 sample_id=args.sample_id,
                 row=old_row,
-                audio_rel=audio_rel,
+                audio_src=audio_src,
+                fft_audio_src=sample_root / "speckle_shifts_ifft_audio.wav",
+                video_src=video_src,
                 manifest_payload=manifest_payload,
                 image_paths=image_paths,
             ),
