@@ -9,6 +9,8 @@ import numpy as np
 from datasets import load_dataset
 
 
+REPO_ROOT = Path(__file__).resolve().parent.parent
+LOCAL_AUDIO_ROOT = REPO_ROOT / "data" / "audio_samples"
 REMOTE_HOST = "ethantu@mcluster11.wisdom.weizmann.ac.il"
 REMOTE_UV_INSTALL = "curl -LsSf https://astral.sh/uv/install.sh | sh"
 REMOTE_UV = "$HOME/.local/bin/uv"
@@ -130,9 +132,19 @@ def load_remote_experiment_config(source_experiment_dir: str) -> dict:
 
 
 REMOTE_SCRIPT_PATH = "$HOME/tmp/upload_remote_speckle_assets.py"
+REMOTE_AUDIO_PATH = "$HOME/tmp/chirp_audio.wav"
 
 
-def run_remote_speckle_upload(sample_id: int, source_experiment_dir: str, fps: float, repo_id: str) -> None:
+def resolve_audio_path(cfg: dict) -> Path | None:
+    raw = cfg.get("AUDIO_FILE") or cfg.get("audio_file") or cfg.get("audio")
+    if not raw:
+        return None
+    basename = Path(str(raw).replace("\\", "/")).name
+    local_path = LOCAL_AUDIO_ROOT / basename
+    return local_path if local_path.exists() else None
+
+
+def run_remote_speckle_upload(sample_id: int, source_experiment_dir: str, fps: float, repo_id: str, audio_src: Path | None = None) -> None:
     hf_token = get_hf_token()
 
     with open(Path(__file__).resolve().parent / "upload_remote_speckle_assets.py", "rb") as f:
@@ -145,6 +157,17 @@ def run_remote_speckle_upload(sample_id: int, source_experiment_dir: str, fps: f
             ),
         )
 
+    if audio_src is not None:
+        with open(audio_src, "rb") as f:
+            stage(
+                "sync audio file to cluster",
+                lambda: subprocess.run(
+                    ["ssh", REMOTE_HOST, f"cat > {REMOTE_AUDIO_PATH}"],
+                    check=True,
+                    stdin=f,
+                ),
+            )
+
     remote_args = [
         "--sample-id", str(sample_id),
         "--source-experiment-dir", source_experiment_dir,
@@ -152,6 +175,8 @@ def run_remote_speckle_upload(sample_id: int, source_experiment_dir: str, fps: f
         "--fps", str(fps),
         "--no-create-pr",
     ]
+    if audio_src is not None:
+        remote_args += ["--audio-path", REMOTE_AUDIO_PATH]
     remote_cmd = (
         f"bash -lc {shlex.quote(
             f'source /etc/profile >/dev/null 2>&1 || true; '
@@ -169,7 +194,7 @@ def run_remote_speckle_upload(sample_id: int, source_experiment_dir: str, fps: f
 
 def run_local_backfill(sample_id: int, source_experiment_dir: str, repo_id_old: str, repo_id_new: str) -> None:
     cmd = [
-        "python",
+        "uv", "run", "python",
         "scripts/backfill_laser_vibrations.py",
         "--sample-id", str(sample_id),
         "--source-experiment-dir", source_experiment_dir,
@@ -196,8 +221,10 @@ def main() -> None:
     cfg = load_remote_experiment_config(source_experiment_dir)
     fps = float(cfg.get("FPS") or 0)
     print(f"[info] source fps={fps}")
+    audio_src = resolve_audio_path(cfg)
+    print(f"[info] audio_src={audio_src}")
 
-    run_remote_speckle_upload(args.sample_id, source_experiment_dir, fps, args.new_repo_id)
+    run_remote_speckle_upload(args.sample_id, source_experiment_dir, fps, args.new_repo_id, audio_src=audio_src)
     run_local_backfill(args.sample_id, source_experiment_dir, args.old_repo_id, args.new_repo_id)
 
 

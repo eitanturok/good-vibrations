@@ -1,4 +1,5 @@
 import argparse
+import subprocess
 import tempfile
 import time
 from pathlib import Path
@@ -93,6 +94,7 @@ def main() -> None:
     parser.add_argument("--source-experiment-dir", required=True)
     parser.add_argument("--repo-id", default=DEFAULT_REPO_ID)
     parser.add_argument("--fps", type=float, required=True)
+    parser.add_argument("--audio-path", default=None)
     parser.add_argument("--create-pr", action=argparse.BooleanOptionalAction, default=True)
     args = parser.parse_args()
 
@@ -108,6 +110,29 @@ def main() -> None:
             "generate speckle preview mp4",
             lambda: generate_speckle_preview(raw_path, preview_path, fps=args.fps),
         )
+
+        if args.audio_path:
+            import imageio_ffmpeg
+            muxed_path = Path(tmp) / "speckle_vibrations_audio.mp4"
+            stage(
+                "mux audio into preview mp4",
+                lambda: subprocess.run(
+                    [
+                        imageio_ffmpeg.get_ffmpeg_exe(), "-y",
+                        "-i", str(preview_path),
+                        "-i", args.audio_path,
+                        "-c:v", "copy",
+                        "-c:a", "aac",
+                        "-map", "0:v",
+                        "-map", "1:a",
+                        str(muxed_path),
+                    ],
+                    check=True,
+                    capture_output=True,
+                ),
+            )
+            preview_path = muxed_path
+
         stage(
             "upload raw npy + mp4 in parallel",
             lambda: api.create_commit(
