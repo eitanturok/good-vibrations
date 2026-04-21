@@ -958,7 +958,8 @@ def main() -> None:
             manifest_payload=manifest_payload,
             image_paths=image_paths,
         )
-        metadata_df = metadata_df[metadata_df["sample_idx"] != int(args.sample_id)]
+        if "sample_idx" in metadata_df.columns:
+            metadata_df = metadata_df[metadata_df["sample_idx"] != int(args.sample_id)]
         metadata_df = pd.concat([metadata_df, pd.DataFrame([new_row])], ignore_index=True)
         stage("write metadata.parquet", lambda: metadata_df.to_parquet(root / "metadata.parquet", index=False))
 
