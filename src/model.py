@@ -5,9 +5,10 @@ import torch
 import numpy as np
 from torch import nn
 from torch.nn import functional as F
-from torch.utils.data import Dataset, DataLoader, random_split
+from torch.utils.data import Dataset, DataLoader, Subset
 from datasets import load_dataset
 from huggingface_hub import snapshot_download
+from sklearn.model_selection import GroupShuffleSplit
 from scipy.signal import butter, sosfiltfilt
 from composer import Trainer
 from composer.core import DataSpec
@@ -373,8 +374,6 @@ def make_collate(
         return torch.stack(fft_patches), mask, floor_x, floor_y, meta
 
     return collate
-
-
 def get_dataloaders(
     repo_id: str,
     patch_size: int = 256,
@@ -404,12 +403,20 @@ def get_dataloaders(
         speakers=speakers,
         n_objects=n_objects,
     )
-    test_size = int(len(dataset) * test_split)
-    print(f"{len(dataset) - test_size} train samples\n{test_size} test samples")
     generator = torch.Generator().manual_seed(seed)
-    train_set, test_set = random_split(
-        dataset, [len(dataset) - test_size, test_size], generator=generator
+    groups = [
+        (round(float(x), 6), round(float(y), 6))
+        for x, y in zip(dataset.ds["x_position"], dataset.ds["y_position"])
+    ]
+    splitter = GroupShuffleSplit(n_splits=1, test_size=test_split, random_state=seed)
+    train_indices, test_indices = next(splitter.split(np.arange(len(dataset)), groups=groups))
+    train_positions = len(set(groups[i] for i in train_indices))
+    test_positions = len(set(groups[i] for i in test_indices))
+    print(
+        f"Position split: {len(train_indices)} train samples across {train_positions} positions, "
+        f"{len(test_indices)} test samples across {test_positions} positions"
     )
+    train_set, test_set = Subset(dataset, train_indices), Subset(dataset, test_indices)
     train_collate_fn, test_collate_fn = (
         make_collate(
             patch_size, augment=AUGMENT, generator=generator, normalize=normalize
