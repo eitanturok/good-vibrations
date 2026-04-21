@@ -2,7 +2,6 @@ import argparse
 import ast
 import io
 import json
-import os
 import re
 import shlex
 import shutil
@@ -15,8 +14,8 @@ from tempfile import TemporaryDirectory
 
 import cv2
 import numpy as np
-from datasets import Audio as HFAudio, Dataset, Video as HFVideo, load_dataset
-from huggingface_hub import HfApi, hf_hub_download
+from datasets import Audio as HFAudio, Dataset, Image as HFImage, Video as HFVideo, load_dataset
+from huggingface_hub import CommitOperationAdd, HfApi, hf_hub_download
 from PIL import Image
 from scipy.io.wavfile import write as wav_write
 from scipy.signal import butter, resample, sosfiltfilt
@@ -429,7 +428,6 @@ def to_video(path: Path) -> dict:
 
 def write_parquet_row(
     path: Path,
-    root: Path,
     sample_id: int,
     row: dict,
     audio_src: Path,
@@ -457,17 +455,14 @@ def write_parquet_row(
         "segmented_overhead_image": image_paths["segmented_overhead_image"],
     }
     ds = Dataset.from_list([record])
+    for col in IMAGE_COLS:
+        ds = ds.cast_column(col, HFImage())
     for col in AUDIO_COLS:
         ds = ds.cast_column(col, HFAudio())
     for col in VIDEO_COLS:
         ds = ds.cast_column(col, HFVideo())
-    orig_cwd = os.getcwd()
-    try:
-        os.chdir(root)
-        with path.open("wb") as f:
-            ds.to_parquet(f)
-    finally:
-        os.chdir(orig_cwd)
+    with path.open("wb") as f:
+        ds.to_parquet(f)
 
 
 def write_manifest(
@@ -536,21 +531,32 @@ def image_key_from_experiment_dir(source_experiment_dir: str) -> str:
     return basename.split("_")[0]
 
 
-def stage_shared_images(row: dict, image_key: str, root: Path, existing_files: set[str]) -> dict[str, str]:
-    """Write shared overhead images to images/{image_key}/ once; return repo-relative paths."""
-    paths = {}
+def upload_shared_images(row: dict, image_key: str, repo_id: str, existing_files: set[str], api: HfApi) -> dict[str, str]:
+    """Upload shared overhead images to HF once; return HF resolve URLs for use in parquet Image columns."""
+    hf_base = f"https://huggingface.co/datasets/{repo_id}/resolve/main"
+    urls = {}
+    operations = []
     for new_col, (old_col, filename) in IMAGE_NAMES.items():
         rel = f"images/{image_key}/{filename}"
-        paths[new_col] = rel
+        urls[new_col] = f"{hf_base}/{rel}"
         if rel in existing_files:
             print(f"[info] shared image already in repo, skipping: {rel}")
             continue
-        dst = root / rel
-        dst.parent.mkdir(parents=True, exist_ok=True)
+        img = row[old_col]
+        if img is None:
+            continue
         buf = io.BytesIO()
-        row[old_col].convert("RGB").save(buf, format="WEBP", quality=85)
-        dst.write_bytes(buf.getvalue())
-    return paths
+        img.convert("RGB").save(buf, format="WEBP", quality=85)
+        operations.append(CommitOperationAdd(path_in_repo=rel, path_or_fileobj=buf.getvalue()))
+    if operations:
+        api.create_commit(
+            repo_id=repo_id,
+            repo_type="dataset",
+            commit_message=f"Upload shared overhead images for {image_key}",
+            operations=operations,
+            create_pr=False,
+        )
+    return urls
 
 
 def read_wav_metadata(path: Path) -> tuple[int, float]:
@@ -858,7 +864,7 @@ def main() -> None:
         stage("stage shared audio", lambda: maybe_stage_audio(audio_src, audio_rel, args.new_repo_id, root, repo_files))
         image_key = image_key_from_experiment_dir(source_experiment_dir)
         print(f"[info] image_key={image_key}")
-        image_paths = stage("stage shared images", lambda: stage_shared_images(old_row, image_key, root, repo_files))
+        image_paths = stage("upload shared images", lambda: upload_shared_images(old_row, image_key, args.new_repo_id, repo_files, api))
 
         if args.skip_remote_speckle_assets:
             frame_count, frame_height, frame_width = stage(
@@ -975,7 +981,6 @@ def main() -> None:
             "write parquet row",
             lambda: write_parquet_row(
                 path=parquet_path,
-                root=root,
                 sample_id=args.sample_id,
                 row=old_row,
                 audio_src=audio_src,
