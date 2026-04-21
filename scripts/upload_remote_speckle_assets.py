@@ -67,7 +67,7 @@ def generate_speckle_preview(raw_npy_path: Path, out_path: Path, fps: float, max
     )
     lo = float(np.percentile(probe, 5))
     hi = float(np.percentile(probe, 99.5))
-    preview_fps = min(30.0, max(1.0, fps / step))
+    preview_fps = max(1.0, fps / step)
 
     import imageio
     frames_out = []

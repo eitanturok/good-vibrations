@@ -271,6 +271,15 @@ def discover_source_experiment_dir_from_grid(row: dict, source_data_root: str, u
     return None
 
 
+def get_capture_fps(experiment_config: dict, run_opt: dict | None = None) -> float:
+    if run_opt is not None:
+        cam_params = run_opt.get("cam_params", {})
+        fps = cam_params.get("get_frame_rate")
+        if fps:
+            return float(fps)
+    return float(experiment_config.get("FPS") or experiment_config.get("camera_FPS") or 0)
+
+
 def save_mask_npz(path: Path, mask: np.ndarray, left: float, right: float, up: float, down: float, prompt: str | None) -> None:
     np.savez_compressed(path, mask=mask, left=left, right=right, up=up, down=down, prompt=prompt)
 
@@ -467,7 +476,6 @@ def write_manifest(
     audio_file_name: str,
     audio_src: Path,
     remote_experiment_dir: str,
-    fps: float,
     frame_count: int,
     frame_height: int,
     frame_width: int,
@@ -539,7 +547,7 @@ def to_python(value):
 def build_row_values_single_list(roi_list: list[list[int]]) -> list[int]:
     values = []
     for start, end in roi_list:
-        values.extend(list(np.arange(int(start), int(end), 2) // 2))
+        values.extend(int(v) for v in np.arange(int(start), int(end), 2) // 2)
     return values
 
 
@@ -706,7 +714,7 @@ def build_manifest_payload(
                 "burn_frame_index": True,
             },
             "speckle_shifts": {
-                "fs_hz": float(fps),
+                "fs_hz": get_capture_fps(experiment_config, run_opt),
             },
             "speckle_shifts_clean": {
                 "filter_type": "butterworth",
@@ -844,14 +852,14 @@ def main() -> None:
                 lambda: generate_speckle_preview(
                     raw_npy_path=raw_npy_path,
                     out_path=sample_root / "speckle_vibrations.mp4",
-                    fps=float(experiment_config.get("FPS") or experiment_config.get("camera_FPS") or 1),
+                    fps=get_capture_fps(experiment_config, run_opt),
                 ),
             )
             video_src = sample_root / "speckle_vibrations.mp4"
 
         shifts = np.asarray(old_npz["shifts"])
         mask = np.asarray(old_npz["mask"])
-        fs = float(experiment_config.get("FPS") or experiment_config.get("camera_FPS") or 0)
+        fs = get_capture_fps(experiment_config, run_opt)
 
         stage("save mask.npz", lambda: save_mask_npz(sample_root / "mask.npz", mask, args.left, args.right, args.up, args.down, args.prompt))
         stage("save speckle_shifts.npz", lambda: save_shifts_npz(sample_root / "speckle_shifts.npz", shifts, fs))
@@ -912,7 +920,6 @@ def main() -> None:
                 audio_file_name=audio_rel,
                 audio_src=audio_src,
                 remote_experiment_dir=source_experiment_dir,
-                fps=fs,
                 frame_count=frame_count,
                 frame_height=frame_height,
                 frame_width=frame_width,
