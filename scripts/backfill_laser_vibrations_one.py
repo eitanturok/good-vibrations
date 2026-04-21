@@ -132,7 +132,7 @@ def load_remote_experiment_config(source_experiment_dir: str) -> dict:
 
 
 REMOTE_SCRIPT_PATH = "$HOME/tmp/upload_remote_speckle_assets.py"
-REMOTE_AUDIO_PATH = "$HOME/tmp/chirp_audio.wav"
+REMOTE_AUDIO_PATH = "/tmp/chirp_audio.wav"
 
 
 def resolve_audio_path(cfg: dict) -> Path | None:
@@ -162,7 +162,7 @@ def run_remote_speckle_upload(sample_id: int, source_experiment_dir: str, fps: f
             stage(
                 "sync audio file to cluster",
                 lambda: subprocess.run(
-                    ["ssh", REMOTE_HOST, f"cat > {REMOTE_AUDIO_PATH}"],
+                    ["ssh", REMOTE_HOST, f"mkdir -p /tmp && cat > {REMOTE_AUDIO_PATH}"],
                     check=True,
                     stdin=f,
                 ),
