@@ -15,7 +15,7 @@ from tempfile import TemporaryDirectory
 
 import cv2
 import numpy as np
-from datasets import Audio as HFAudio, Dataset, Image as HFImage, Video as HFVideo, load_dataset
+from datasets import Audio as HFAudio, Dataset, Video as HFVideo, load_dataset
 from huggingface_hub import HfApi, hf_hub_download
 from PIL import Image
 from scipy.io.wavfile import write as wav_write
@@ -457,8 +457,6 @@ def write_parquet_row(
         "segmented_overhead_image": image_paths["segmented_overhead_image"],
     }
     ds = Dataset.from_list([record])
-    for col in IMAGE_COLS:
-        ds = ds.cast_column(col, HFImage())
     for col in AUDIO_COLS:
         ds = ds.cast_column(col, HFAudio())
     for col in VIDEO_COLS:
