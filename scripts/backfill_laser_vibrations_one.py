@@ -194,7 +194,7 @@ def main() -> None:
     source_experiment_dir = discover_source_experiment_dir(row, args.source_data_root, x_idx, y_idx)
     print(f"[info] source_experiment_dir={source_experiment_dir}")
     cfg = load_remote_experiment_config(source_experiment_dir)
-    fps = float(cfg.get("FPS") or cfg.get("camera_FPS") or 0)
+    fps = float(cfg.get("FPS") or 0)
     print(f"[info] source fps={fps}")
 
     run_remote_speckle_upload(args.sample_id, source_experiment_dir, fps, args.new_repo_id)

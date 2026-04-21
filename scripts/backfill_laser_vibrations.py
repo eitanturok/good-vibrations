@@ -273,11 +273,10 @@ def discover_source_experiment_dir_from_grid(row: dict, source_data_root: str, u
 
 def get_capture_fps(experiment_config: dict, run_opt: dict | None = None) -> float:
     if run_opt is not None:
-        cam_params = run_opt.get("cam_params", {})
-        fps = cam_params.get("get_frame_rate")
+        fps = run_opt.get("cam_params", {}).get("get_frame_rate")
         if fps:
             return float(fps)
-    return float(experiment_config.get("FPS") or experiment_config.get("camera_FPS") or 0)
+    return float(experiment_config.get("FPS") or 0)
 
 
 def save_mask_npz(path: Path, mask: np.ndarray, left: float, right: float, up: float, down: float, prompt: str | None) -> None:
