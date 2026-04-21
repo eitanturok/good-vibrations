@@ -205,10 +205,11 @@ class BestMetricCheckpointSaver(Callback):
         m = state.eval_metrics.get("eval", {}).get(self.metric_name)
         if m is None:
             return None
-        return m.compute().item() if hasattr(m, "compute") else float(m)
+        val = m.compute().item() if hasattr(m, "compute") else float(m)
+        return val if math.isfinite(val) else None
 
     def _is_improved(self, val: float) -> bool:
-        if self.best is None or (val != val):  # first eval or NaN best
+        if self.best is None or not math.isfinite(self.best):
             return True
         return val > self.best if self.higher_is_better else val < self.best
 

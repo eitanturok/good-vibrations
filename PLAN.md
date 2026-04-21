@@ -714,6 +714,6 @@ Current total: ~49s per sample.
 
 ### Remaining bottlenecks (in priority order)
 
-- [ ] **`uv venv --clear`** (~5-8s): rebuilds the remote venv from scratch every run. Fix: drop `--clear`, let `uv pip install` update in place if deps changed.
-- [ ] **Duplicate dataset loads** (~6-12s): `load old dataset row` runs twice per sample — once in `backfill_laser_vibrations_one.py` for position inference, once in `backfill_laser_vibrations.py` for actual data. Fix: pass row + source dir as args to avoid reloading.
+- [x] **`uv venv --clear`** (~5-8s): dropped `--clear` so remote venv is reused across runs. `uv venv` prints a non-fatal "already exists" error but `uv pip install` still succeeds on the existing env.
+- [x] **Duplicate dataset loads** (~6-12s): merged `load_old_row` + position-grid scan in `_one.py` into a single dataset pass. Skipped redundant `load_old_position_grid` in `backfill_laser_vibrations.py` when `--source-experiment-dir` is already provided. `backfill_laser_vibrations.py` still loads once for images.
 - [ ] **MP4 round-trip through HF** (~2s): remote step uploads MP4, local step downloads it again to embed in parquet. Fix: restructure so video bytes flow directly without going through HF.

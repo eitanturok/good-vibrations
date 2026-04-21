@@ -571,12 +571,12 @@ def main() -> None:
 
     repo_files = stage("list new repo files", lambda: set(api.list_repo_files(args.new_repo_id, repo_type="dataset")))
     old_row = stage("load old dataset row", lambda: load_old_sample_row(args.sample_id, args.old_repo_id))
-    unique_x, unique_y = stage("load old dataset position grid", lambda: load_old_position_grid(args.old_repo_id))
-    print(f"[info] discovered position grid: n_x={len(unique_x)} n_y={len(unique_y)}")
     old_npz = stage("download old sample npz", lambda: download_old_sample_npz(args.sample_id, args.old_repo_id))
 
     source_experiment_dir = args.source_experiment_dir
     if source_experiment_dir is None and args.auto_discover_source:
+        unique_x, unique_y = stage("load old dataset position grid", lambda: load_old_position_grid(args.old_repo_id))
+        print(f"[info] discovered position grid: n_x={len(unique_x)} n_y={len(unique_y)}")
         source_experiment_dir = stage(
             "auto-discover source experiment dir from position grid",
             lambda: discover_source_experiment_dir_from_grid(old_row, args.source_data_root, unique_x, unique_y),

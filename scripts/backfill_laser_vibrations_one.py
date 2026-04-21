@@ -7,12 +7,9 @@ from pathlib import Path
 
 import numpy as np
 from datasets import load_dataset
-from huggingface_hub import get_token
 
 
 REMOTE_HOST = "ethantu@mcluster11.wisdom.weizmann.ac.il"
-REMOTE_MAMBA = "$HOME/bin/micromamba"
-REMOTE_ENV_PREFIX = "$HOME/micromamba/envs/laser-vibrations"
 REMOTE_UV_INSTALL = "curl -LsSf https://astral.sh/uv/install.sh | sh"
 REMOTE_UV = "$HOME/.local/bin/uv"
 REMOTE_VENV = "$HOME/venvs/laser-vibrations-uv"
@@ -44,32 +41,7 @@ def speaker_code(speakers) -> str:
     return "".join(str(int(x)) for x in (speakers or []))
 
 
-def load_old_row(sample_id: int, repo_id: str) -> dict:
-    cols = ["sample_idx", "object", "n_objects", "speakers", "box_material", "x_position", "y_position"]
-    ds = load_dataset(repo_id, split="train", columns=cols, verification_mode="no_checks")
-    for row in ds:
-        if int(row["sample_idx"]) == sample_id:
-            return dict(row)
-    raise ValueError(f"Sample {sample_id} not found in {repo_id}")
-
-
-def load_old_position_grid(repo_id: str) -> tuple[np.ndarray, np.ndarray]:
-    cols = ["object", "x_position", "y_position"]
-    ds = load_dataset(repo_id, split="train", columns=cols, verification_mode="no_checks")
-    xs, ys = [], []
-    for row in ds:
-        if row.get("object") == "empty":
-            continue
-        x = float(row.get("x_position") or -1)
-        y = float(row.get("y_position") or -1)
-        if x >= 0:
-            xs.append(x)
-        if y >= 0:
-            ys.append(y)
-    return np.sort(np.unique(np.round(np.asarray(xs), 6))), np.sort(np.unique(np.round(np.asarray(ys), 6)))
-
-
-def kmeans_1d(values, k: int, n_iter: int = 100) -> tuple[np.ndarray, np.ndarray]:
+def kmeans_1d(values: np.ndarray, k: int, n_iter: int = 100) -> tuple[np.ndarray, np.ndarray]:
     values = np.asarray(values, dtype=np.float64)
     centers = np.linspace(values.min(), values.max(), k)
     labels = np.zeros(len(values), dtype=np.int64)
@@ -91,26 +63,35 @@ def kmeans_1d(values, k: int, n_iter: int = 100) -> tuple[np.ndarray, np.ndarray
     return centers, labels
 
 
-def infer_discrete_position(sample_row: dict, repo_id: str) -> tuple[int, int]:
-    cols = ["sample_idx", "object", "x_position", "y_position"]
+def load_old_row_and_cluster_data(sample_id: int, repo_id: str) -> tuple[dict, list, list, list, list]:
+    cols = ["sample_idx", "object", "n_objects", "speakers", "box_material", "x_position", "y_position"]
     ds = load_dataset(repo_id, split="train", columns=cols, verification_mode="no_checks")
-    xs, ys, sample_ids = [], [], []
+    target_row = None
+    xs, ys, sample_ids, objects = [], [], [], []
     for row in ds:
-        if row.get("object") != sample_row.get("object"):
-            continue
-        if row.get("object") == "empty":
-            continue
-        xs.append(float(row["x_position"]))
-        ys.append(float(row["y_position"]))
-        sample_ids.append(int(row["sample_idx"]))
-    x_centers, x_labels = kmeans_1d(xs, 11)
-    y_centers, y_labels = kmeans_1d(ys, 12)
-    idx = sample_ids.index(int(sample_row["sample_idx"]))
+        if int(row["sample_idx"]) == sample_id:
+            target_row = dict(row)
+        if row.get("object") != "empty":
+            xs.append(float(row["x_position"]))
+            ys.append(float(row["y_position"]))
+            sample_ids.append(int(row["sample_idx"]))
+            objects.append(row.get("object", ""))
+    if target_row is None:
+        raise ValueError(f"Sample {sample_id} not found in {repo_id}")
+    return target_row, xs, ys, sample_ids, objects
+
+
+def infer_discrete_position(sample_row: dict, xs: list, ys: list, sample_ids: list, objects: list) -> tuple[int, int]:
+    target_obj = sample_row.get("object", "")
+    obj_xs = [x for x, obj in zip(xs, objects) if obj == target_obj]
+    obj_ys = [y for y, obj in zip(ys, objects) if obj == target_obj]
+    obj_ids = [sid for sid, obj in zip(sample_ids, objects) if obj == target_obj]
+    x_centers, x_labels = kmeans_1d(np.asarray(obj_xs), 11)
+    y_centers, y_labels = kmeans_1d(np.asarray(obj_ys), 12)
+    idx = obj_ids.index(int(sample_row["sample_idx"]))
     x_idx = int(x_labels[idx])
     y_idx = int(y_labels[idx]) + 1
     print(f"[info] inferred discrete position: x={x_idx:02d} y={y_idx:02d} from x={sample_row['x_position']:.3f} y={sample_row['y_position']:.3f}")
-    print(f"[debug] x_centers={np.round(x_centers, 2).tolist()}")
-    print(f"[debug] y_centers={np.round(y_centers, 2).tolist()}")
     return x_idx, y_idx
 
 
@@ -208,8 +189,8 @@ def main() -> None:
     parser.add_argument("--source-data-root", default="/net/mraid20/ifs/wisdom/groups/mark_sheinin_lab/DATA")
     args = parser.parse_args()
 
-    row = stage("load old dataset row", lambda: load_old_row(args.sample_id, args.old_repo_id))
-    x_idx, y_idx = stage("infer discrete source position", lambda: infer_discrete_position(row, args.old_repo_id))
+    row, xs, ys, sample_ids, objects = stage("load old dataset row + cluster data", lambda: load_old_row_and_cluster_data(args.sample_id, args.old_repo_id))
+    x_idx, y_idx = infer_discrete_position(row, xs, ys, sample_ids, objects)
     source_experiment_dir = discover_source_experiment_dir(row, args.source_data_root, x_idx, y_idx)
     print(f"[info] source_experiment_dir={source_experiment_dir}")
     cfg = load_remote_experiment_config(source_experiment_dir)
