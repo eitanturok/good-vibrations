@@ -2,6 +2,7 @@ import argparse
 import ast
 import io
 import json
+import os
 import re
 import shlex
 import shutil
@@ -428,6 +429,7 @@ def to_video(path: Path) -> dict:
 
 def write_parquet_row(
     path: Path,
+    root: Path,
     sample_id: int,
     row: dict,
     audio_src: Path,
@@ -461,8 +463,13 @@ def write_parquet_row(
         ds = ds.cast_column(col, HFAudio())
     for col in VIDEO_COLS:
         ds = ds.cast_column(col, HFVideo())
-    with path.open("wb") as f:
-        ds.to_parquet(f)
+    orig_cwd = os.getcwd()
+    try:
+        os.chdir(root)
+        with path.open("wb") as f:
+            ds.to_parquet(f)
+    finally:
+        os.chdir(orig_cwd)
 
 
 def write_manifest(
@@ -970,6 +977,7 @@ def main() -> None:
             "write parquet row",
             lambda: write_parquet_row(
                 path=parquet_path,
+                root=root,
                 sample_id=args.sample_id,
                 row=old_row,
                 audio_src=audio_src,
