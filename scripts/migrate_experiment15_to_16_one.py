@@ -3,6 +3,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -44,6 +45,14 @@ CANONICAL_AUDIO_F_END_HZ = 1000
 CANONICAL_AUDIO_GENERATION_METHOD = "logarithmic"
 CANONICAL_AUDIO_OUTPUT_DTYPE = "int16"
 CANONICAL_AUDIO_NORMALIZATION = "peak_to_int16"
+ASSETS_DIR = REPO_ROOT / "assets"
+SPEAKER_DIR = ASSETS_DIR / "speakers"
+SPEAKER_FILES = ("1000", "0100", "0010", "0001")
+OVERHEAD_SIZE = (220, 196)
+PADDED_SIZE = (286, 255)
+PADDED_BG = (232, 232, 232)
+
+DEFAULT_SEGMENT_PROMPT = "A black metal cube sitting on the floor of an open cardboard box from a bird's eye view."
 DEFAULT_SEGMENT_LEFT = 0.15
 DEFAULT_SEGMENT_RIGHT = 0.67
 DEFAULT_SEGMENT_UP = 0.08
@@ -86,10 +95,10 @@ def normalize_token(value: str) -> str:
     return "-".join(str(value).strip().lower().split())
 
 
-def parse_source_coordinates(source_dir_name: str) -> tuple[int, int]:
+def parse_source_coordinates(source_dir_name: str) -> tuple[int | None, int | None]:
     match = re.search(r"(?P<x>\d{2})x(?P<y>\d{2})y", source_dir_name)
     if match is None:
-        raise ValueError(f"Could not parse x/y coordinates from source dir name: {source_dir_name}")
+        return None, None
     return int(match.group("x")), int(match.group("y"))
 
 
@@ -297,8 +306,8 @@ def build_metadata_row(
         "audio_file_name": hf_file_url(hf_repo, audio_path),
         "experiment_id": experiment_id or "",
         "speakers": speakers or "",
-        "x_position": int(x_position) if x_position is not None else -1,
-        "y_position": int(y_position) if y_position is not None else -1,
+        "x_position": int(x_position) if x_position is not None else None,
+        "y_position": int(y_position) if y_position is not None else None,
         "x_com": x_com,
         "y_com": y_com,
         "n_objects": int(n_objects) if n_objects is not None else 0,
@@ -501,17 +510,33 @@ def remote_read_bytes(remote_path: str) -> bytes:
     return out.stdout
 
 
+def _local_md5(path: Path) -> str:
+    import hashlib
+    h = hashlib.md5()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _remote_md5(remote_path: str) -> str | None:
+    cmd = "bash -lc " + shlex.quote(f'md5sum {shlex.quote(remote_path)} 2>/dev/null || true')
+    out = subprocess.run(["ssh", REMOTE_HOST, cmd], capture_output=True, text=True)
+    line = out.stdout.strip()
+    return line.split()[0] if line else None
+
+
 def sync_file_to_remote(local_path: Path, remote_path: str, label: str) -> None:
+    t0 = time.perf_counter()
+    local_hash = _local_md5(local_path)
+    remote_hash = _remote_md5(remote_path)
+    if local_hash == remote_hash:
+        print(f"[timing] {label}: skipped (unchanged)", flush=True)
+        return
     with local_path.open("rb") as handle:
         remote_cmd = "bash -lc " + shlex.quote(f'mkdir -p "$(dirname {remote_path})" && cat > "{remote_path}"')
-        run(
-            label,
-            lambda: subprocess.run(
-                ["ssh", REMOTE_HOST, remote_cmd],
-                check=True,
-                stdin=handle,
-            ),
-        )
+        subprocess.run(["ssh", REMOTE_HOST, remote_cmd], check=True, stdin=handle)
+    print(f"[timing] {label}: {time.perf_counter() - t0:.2f}s", flush=True)
 
 
 def maybe_sync_modal_config_to_remote() -> bool:
@@ -584,7 +609,7 @@ def segment(cropped_overhead_path: Path, object_name: str, prompt: str | None, m
         with app.run():
             mask, _ = segment.remote(image_array, object_name, 'cardboard', prompt)
         mask = np.asarray(mask, dtype=np.float32)
-        np.savez_compressed(mask_path, mask=mask, prompt=prompt)
+        np.savez_compressed(mask_path, mask=mask)
         Image.fromarray((np.clip(mask, 0.0, 1.0) * 255).astype(np.uint8), mode='L').save(mask_png_path)
         """
     )
@@ -623,6 +648,47 @@ def overlay(cropped_overhead_path: Path, mask_path: Path, x_com: float | None, y
         draw.line([(x_com, y_com - radius), (x_com, y_com + radius)], fill=(255, 0, 0), width=4)
     image.save(segmented_overhead_path)
     return segmented_overhead_path
+
+
+def apply_speaker_overlay(img_path: Path, speakers: str) -> None:
+    from PIL import Image
+
+    inner = Image.open(img_path).convert("RGB")
+    inner_width, inner_height = inner.size
+
+    target_icon_height = int(inner_height * 0.40)
+    speaker_icon = Image.open(SPEAKER_DIR / "speaker.png").convert("RGBA")
+    orig_w, orig_h = speaker_icon.size
+    target_icon_width = int(orig_w * target_icon_height / orig_h)
+
+    padded_width = inner_width + target_icon_width
+    padded_height = inner_height + target_icon_height
+    canvas = Image.new("RGB", (padded_width, padded_height), PADDED_BG)
+
+    x = target_icon_width // 2
+    y = target_icon_height // 2
+    canvas.paste(inner, (x, y))
+
+    if "1" in speakers:
+        composite = canvas.convert("RGBA")
+        for bit, key, idx in zip(speakers, SPEAKER_FILES, range(4)):
+            if bit == "1":
+                icon_orig = Image.open(SPEAKER_DIR / "speaker.png").convert("RGBA")
+                icon_scaled = icon_orig.resize((target_icon_width, target_icon_height), Image.LANCZOS)
+                if key == "1000":
+                    px, py = 0, padded_height // 2 - icon_scaled.height // 2
+                elif key == "0100":
+                    px, py = padded_width // 3 - icon_scaled.width // 2, padded_height - icon_scaled.height
+                elif key == "0010":
+                    px, py = 2 * padded_width // 3 - icon_scaled.width // 2, padded_height - icon_scaled.height
+                elif key == "0001":
+                    px, py = padded_width - icon_scaled.width, padded_height // 2 - icon_scaled.height // 2
+                else:
+                    px, py = 0, 0
+                composite.alpha_composite(icon_scaled, (px, py))
+        canvas = composite.convert("RGB")
+
+    canvas.save(img_path)
 
 
 def finalize_remote_segmentation(new_dir: str, sample_context: dict, hf_repo: str, x_com: float | None, y_com: float | None) -> None:
@@ -739,6 +805,8 @@ def launch_remote(args: argparse.Namespace) -> None:
     sync_file_to_remote(REPO_ROOT / "pyproject.toml", "/home/ethantu/pyproject.toml", "sync pyproject.toml to mcluster11")
     sync_file_to_remote(REPO_ROOT / "uv.lock", "/home/ethantu/uv.lock", "sync uv.lock to mcluster11")
     sync_file_to_remote(REPO_ROOT / "utils" / "segment.py", "/home/ethantu/utils/segment.py", "sync utils/segment.py to mcluster11")
+    for speaker_file in SPEAKER_FILES:
+        sync_file_to_remote(SPEAKER_DIR / f"{speaker_file}.png", f"/home/ethantu/assets/speakers/{speaker_file}.png", f"sync speaker asset {speaker_file}.png to mcluster11")
     maybe_sync_modal_config_to_remote()
     if audio_local_path is not None:
         sync_file_to_remote(audio_local_path, REMOTE_AUDIO_PATH, "sync shared audio to mcluster11")
@@ -811,6 +879,25 @@ def next_sample_id(metadata_path: Path, sample_root: Path) -> int:
 
 def sample_dir_name(sample_id: int) -> str:
     return f"{sample_id:07d}"
+
+
+def load_saved_artifact_infos(sample_root: Path) -> tuple[dict, dict, dict, dict]:
+    import numpy as np
+    import scipy.io.wavfile
+
+    shifts = np.load(sample_root / "speckle_shifts.npz")
+    recovery_info = {"fs": float(shifts["fs"]), "shape": list(shifts["shifts"].shape)}
+
+    clean = np.load(sample_root / "speckle_shifts_clean.npz")
+    clean_info = {"shape": list(clean["shifts_clean"].shape), "fs": float(clean["fs"])}
+
+    fft = np.load(sample_root / "speckle_shifts_fft.npz")
+    fft_info = {"shape": list(fft["fft"].shape), "fs": float(fft["fs"]), "n_samples": int(fft["n_samples"])}
+
+    sr, wav_data = scipy.io.wavfile.read(sample_root / "speckle_shifts_ifft_audio.wav")
+    ifft_audio_info = {"sample_rate_hz": int(sr), "n_frames": int(len(wav_data))}
+
+    return recovery_info, clean_info, fft_info, ifft_audio_info
 
 
 def relative_posix(path: Path, root: Path) -> str:
@@ -998,7 +1085,7 @@ def generate_speckle_preview(raw_npy_path: Path, out_path: Path, fps: float, ove
         if audio_path is not None and audio_path.exists():
             mux_audio_into_video(video_only_path, audio_path, out_path, capture_duration_s)
         else:
-            video_only_path.replace(out_path)
+            shutil.move(str(video_only_path), str(out_path))
 
     return {
         "frame_count": int(frame_count),
@@ -1167,17 +1254,42 @@ def ifft_audio_preview_file(source_path: Path, dest_path: Path, processing_confi
     return {"sample_rate_hz": output_sample_rate_hz, "n_frames": int(len(audio_i16))}
 
 
-def build_image_dir_name(source_dir_name: str, object_name: str, x_position: int, y_position: int, n_objects: int, box_material: str) -> str:
-    return "-".join(
-        [
-            normalize_token(object_name),
-            f"{x_position:03d}x",
-            f"{y_position:03d}y",
-            normalize_token(str(n_objects)),
-            normalize_token(box_material),
-            parse_source_timestamp(source_dir_name),
-        ]
-    )
+DEFAULT_OBJECT_NAME = "OBJECT"
+DEFAULT_N_OBJECTS = 1
+DEFAULT_BOX_MATERIAL = "MATERIAL"
+
+
+def build_image_dir_name(
+    source_dir_name: str,
+    object_name: str | None = None,
+    x_position: int | str | None = None,
+    y_position: int | str | None = None,
+    n_objects: int | None = None,
+    box_material: str | None = None,
+    tags: list[str] | None = None,
+) -> str:
+    """Canonical image directory name.
+
+    Format: {object}-{x}x-{y}y-{n}obj-{material}[-tag...]-{timestamp}
+    Sentinel placeholders when values are absent: OBJECT, POSx, POSy, Xobj, MATERIAL.
+    """
+    obj = normalize_token(object_name) if object_name else DEFAULT_OBJECT_NAME
+    mat = normalize_token(box_material) if box_material else DEFAULT_BOX_MATERIAL
+    ts = parse_source_timestamp(source_dir_name)
+
+    if x_position is not None:
+        x_tok = f"{int(x_position):03d}x" if isinstance(x_position, int) else f"{x_position}x"
+    else:
+        x_tok = "POSx"
+    if y_position is not None:
+        y_tok = f"{int(y_position):03d}y" if isinstance(y_position, int) else f"{y_position}y"
+    else:
+        y_tok = "POSy"
+
+    n_tok = f"{int(n_objects)}obj" if n_objects is not None else "Xobj"
+    tag_tokens = [normalize_token(t) for t in (tags or []) if t]
+
+    return "-".join([obj, x_tok, y_tok, n_tok, mat, *tag_tokens, ts])
 
 
 def append_metadata_row(metadata_path: Path, row: dict) -> None:
@@ -1252,9 +1364,16 @@ def remote_worker(args: argparse.Namespace) -> None:
 
     speakers = parse_speakers_from_source_dir(args.source_dir_name)
     object_name = normalize_token(args.source_dir_name.split("-")[0])
-    n_objects = 1
-    box_material = "cardboard"
-    image_dir = build_image_dir_name(args.source_dir_name, object_name, source_x, source_y, n_objects, box_material)
+    n_objects = DEFAULT_N_OBJECTS
+    box_material = DEFAULT_BOX_MATERIAL
+    image_dir = build_image_dir_name(
+        args.source_dir_name,
+        object_name=object_name,
+        x_position=source_x,
+        y_position=source_y,
+        n_objects=n_objects,
+        box_material=box_material,
+    )
     image_root = new_dir / "data" / "image" / image_dir
     image_root.mkdir(parents=True, exist_ok=True)
 
@@ -1287,88 +1406,117 @@ def remote_worker(args: argparse.Namespace) -> None:
         "normalization": CANONICAL_AUDIO_NORMALIZATION,
     }
 
-    raw_npy_path = source_dir / "frame-recording.npy"
-    raw_artifact_name = "speckle_vibration_raw.npz" if args.compress_raw else "speckle_vibration_raw.npy"
-    raw_artifact_path = sample_root / raw_artifact_name
-    legacy_raw_artifact_path = sample_root / ("speckle_vibration_raw.npy" if args.compress_raw else "speckle_vibration_raw.npz")
-    if args.overwrite and legacy_raw_artifact_path.exists():
-        run("remove legacy raw artifact", lambda: legacy_raw_artifact_path.unlink())
-    run(
-        f"package {raw_artifact_name}",
-        lambda: save_raw_recording_artifact(raw_npy_path, raw_artifact_path, args.compress_raw, args.overwrite),
+    # Determine which raw artifact name exists (needed for manifest in both stages)
+    raw_artifact_name = (
+        "speckle_vibration_raw.npz"
+        if (sample_root / "speckle_vibration_raw.npz").exists()
+        else "speckle_vibration_raw.npy"
     )
 
-    preview_info = run(
-        "generate speckle_vibrations.mp4",
-        lambda: generate_speckle_preview(
-            raw_npy_path,
-            sample_root / "speckle_vibrations.mp4",
-            fps=float(processing_config["speckle_shifts"]["fs_hz"]),
-            overwrite=args.overwrite,
-            audio_path=audio_path_for_preview,
-        ),
-    )
+    if args.stage != "post_segment":
+        raw_npy_path = source_dir / "frame-recording.npy"
+        raw_artifact_name = "speckle_vibration_raw.npz" if args.compress_raw else "speckle_vibration_raw.npy"
+        raw_artifact_path = sample_root / raw_artifact_name
+        legacy_raw_artifact_path = sample_root / ("speckle_vibration_raw.npy" if args.compress_raw else "speckle_vibration_raw.npz")
+        if args.overwrite and legacy_raw_artifact_path.exists():
+            run("remove legacy raw artifact", lambda: legacy_raw_artifact_path.unlink())
+        run(
+            f"package {raw_artifact_name}",
+            lambda: save_raw_recording_artifact(raw_npy_path, raw_artifact_path, args.compress_raw, args.overwrite),
+        )
 
-    recovery_info = run(
-        "normalize RECOVERY.npz -> speckle_shifts.npz",
-        lambda: normalize_recovery_npz(
-            source_dir / "RECOVERY.npz",
-            source_dir / "metadata.npz",
-            sample_root / "speckle_shifts.npz",
-            args.overwrite,
-        ),
-    )
-    processing_config["speckle_shifts"]["fs_hz"] = recovery_info["fs"]
+        preview_info = run(
+            "generate speckle_vibrations.mp4",
+            lambda: generate_speckle_preview(
+                raw_npy_path,
+                sample_root / "speckle_vibrations.mp4",
+                fps=float(processing_config["speckle_shifts"]["fs_hz"]),
+                overwrite=args.overwrite,
+                audio_path=audio_path_for_preview,
+            ),
+        )
 
-    clean_info = run(
-        "compute speckle_shifts_clean.npz",
-        lambda: clean_shifts_file(
-            sample_root / "speckle_shifts.npz",
-            sample_root / "speckle_shifts_clean.npz",
-            processing_config,
-            args.overwrite,
-        ),
-    )
+        recovery_info = run(
+            "normalize RECOVERY.npz -> speckle_shifts.npz",
+            lambda: normalize_recovery_npz(
+                source_dir / "RECOVERY.npz",
+                source_dir / "metadata.npz",
+                sample_root / "speckle_shifts.npz",
+                args.overwrite,
+            ),
+        )
+        processing_config["speckle_shifts"]["fs_hz"] = recovery_info["fs"]
 
-    fft_info = run(
-        "compute speckle_shifts_fft.npz",
-        lambda: fft_shifts_file(
-            sample_root / "speckle_shifts_clean.npz",
-            sample_root / "speckle_shifts_fft.npz",
-            processing_config,
-            args.overwrite,
-        ),
-    )
+        clean_info = run(
+            "compute speckle_shifts_clean.npz",
+            lambda: clean_shifts_file(
+                sample_root / "speckle_shifts.npz",
+                sample_root / "speckle_shifts_clean.npz",
+                processing_config,
+                args.overwrite,
+            ),
+        )
 
-    ifft_audio_info = run(
-        "generate speckle_shifts_ifft_audio.wav",
-        lambda: ifft_audio_preview_file(
-            sample_root / "speckle_shifts_fft.npz",
-            sample_root / "speckle_shifts_ifft_audio.wav",
-            processing_config,
-            args.overwrite,
-        ),
-    )
+        fft_info = run(
+            "compute speckle_shifts_fft.npz",
+            lambda: fft_shifts_file(
+                sample_root / "speckle_shifts_clean.npz",
+                sample_root / "speckle_shifts_fft.npz",
+                processing_config,
+                args.overwrite,
+            ),
+        )
 
-    run(
-        "copy raw_overhead.png",
-        lambda: shutil.copy2(source_dir / "box_overhead_image.png", image_root / "raw_overhead.png")
-        if (args.overwrite or not (image_root / "raw_overhead.png").exists())
-        else None,
-    )
+        ifft_audio_info = run(
+            "generate speckle_shifts_ifft_audio.wav",
+            lambda: ifft_audio_preview_file(
+                sample_root / "speckle_shifts_fft.npz",
+                sample_root / "speckle_shifts_ifft_audio.wav",
+                processing_config,
+                args.overwrite,
+            ),
+        )
 
-    cropped_overhead_path = run(
-        "crop overhead image",
-        lambda: crop(args.left, args.right, args.up, args.down, image_root / "raw_overhead.png", image_root / "cropped_overhead.png"),
-    )
-    mask_path = run(
-        "segment cropped overhead",
-        lambda: segment(cropped_overhead_path, object_name, args.prompt, image_root / "mask.npz"),
-    )
+        run(
+            "copy raw_overhead.png",
+            lambda: shutil.copy2(source_dir / "box_overhead_image.png", image_root / "raw_overhead.png")
+            if (args.overwrite or not (image_root / "raw_overhead.png").exists())
+            else None,
+        )
+
+        run(
+            "crop overhead image",
+            lambda: crop(args.left, args.right, args.up, args.down, image_root / "raw_overhead.png", image_root / "cropped_overhead.png"),
+        )
+
+    if args.stage == "pre_segment":
+        print(f"[done] pre_segment sample_id={sample_id} image_root={image_root}", flush=True)
+        return
+
+    if args.stage == "post_segment":
+        recovery_info, clean_info, fft_info, ifft_audio_info = run(
+            "load artifact infos from saved files",
+            lambda: load_saved_artifact_infos(sample_root),
+        )
+        preview_info = {}
+
+    cropped_overhead_path = image_root / "cropped_overhead.png"
+    mask_path = image_root / "mask.npz"
+
+    if args.stage not in ("post_segment",):
+        mask_path = run(
+            "segment cropped overhead",
+            lambda: segment(cropped_overhead_path, object_name, args.prompt, image_root / "mask.npz"),
+        )
+
     x_com, y_com = run("compute mask center of mass", lambda: center_of_mass(mask_path))
     run(
         "render segmentation overlay",
         lambda: overlay(cropped_overhead_path, mask_path, x_com, y_com, image_root / "segmented_overhead.png"),
+    )
+    run(
+        "apply speaker overlay to segmented_overhead.png",
+        lambda: apply_speaker_overlay(image_root / "segmented_overhead.png", speakers),
     )
 
     experiment_output = run(
@@ -1398,8 +1546,8 @@ def remote_worker(args: argparse.Namespace) -> None:
                 "n_objects": n_objects,
                 "box_material": box_material,
                 "speakers": speakers,
-                "x_position": int(source_x),
-                "y_position": int(source_y),
+                "x_position": int(source_x) if source_x is not None else None,
+                "y_position": int(source_y) if source_y is not None else None,
                 "image_dir": image_dir,
             },
             "segmentation": {
@@ -1469,14 +1617,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hf-repo", default=DEFAULT_HF_REPO)
     parser.add_argument("--source-dir-name", default=None, help="Example: cube-00x01y_0001--31-03-18-21-24")
     parser.add_argument("--sample-id", type=int, default=None)
-    parser.add_argument("--stage", choices=["all", "discover", "init"], default="all")
+    parser.add_argument("--stage", choices=["all", "discover", "init", "pre_segment", "post_segment"], default="all")
     parser.add_argument("--overwrite", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--compress-raw", action="store_true")
     parser.add_argument("--left", type=float, default=DEFAULT_SEGMENT_LEFT)
     parser.add_argument("--right", type=float, default=DEFAULT_SEGMENT_RIGHT)
     parser.add_argument("--up", type=float, default=DEFAULT_SEGMENT_UP)
     parser.add_argument("--down", type=float, default=DEFAULT_SEGMENT_DOWN)
-    parser.add_argument("--prompt", default=None)
+    parser.add_argument("--prompt", default=DEFAULT_SEGMENT_PROMPT)
     parser.add_argument("--upload-to-hf", action="store_true")
     parser.add_argument("--remote-worker", action="store_true")
     parser.add_argument("--remote-audio-path", default=None)
