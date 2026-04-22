@@ -843,11 +843,37 @@ def launch_remote(args: argparse.Namespace) -> None:
 
 
 def upload_experiment_dir_to_hf(experiment_dir: Path, hf_repo: str) -> None:
+    import os
     from huggingface_hub import HfApi
 
     api = HfApi()
     api.create_repo(hf_repo, repo_type="dataset", exist_ok=True)
-    api.upload_folder(folder_path=str(experiment_dir), repo_id=hf_repo, repo_type="dataset", commit_message=f"Upload {experiment_dir.name}")
+
+    # Phase 1: everything except large raw npy files (avoids hf_transfer OOM)
+    api.upload_folder(
+        folder_path=str(experiment_dir),
+        repo_id=hf_repo,
+        repo_type="dataset",
+        commit_message=f"Upload {experiment_dir.name} (metadata and media)",
+        ignore_patterns=["**/speckle_vibration_raw.npy"],
+    )
+
+    # Phase 2: large raw npy files one at a time, no hf_transfer buffering
+    os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
+    existing_files = set(api.list_repo_files(hf_repo, repo_type="dataset"))
+    for npy_path in sorted(experiment_dir.rglob("speckle_vibration_raw.npy")):
+        rel = npy_path.relative_to(experiment_dir).as_posix()
+        if rel in existing_files:
+            print(f"[hf] skip {rel} (already uploaded)", flush=True)
+            continue
+        print(f"[hf] upload {rel} ...", flush=True)
+        api.upload_file(
+            path_or_fileobj=str(npy_path),
+            path_in_repo=rel,
+            repo_id=hf_repo,
+            repo_type="dataset",
+            commit_message=f"Upload {rel}",
+        )
 
 
 def read_json(path: Path) -> dict:
