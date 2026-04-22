@@ -91,7 +91,7 @@ def _sync_static_files() -> None:
 
     migrate_script = REPO_ROOT / "scripts" / "migrate_experiment15_to_16_one.py"
     sync(migrate_script, REMOTE_SCRIPT, "migrate script")
-    for key in ("1000", "0100", "0010", "0001"):
+    for key in ("1000", "0100", "0010", "0001", "speaker"):
         sync(REPO_ROOT / "assets" / "speakers" / f"{key}.png", f"/home/ethantu/assets/speakers/{key}.png", f"speaker {key}.png")
 
 
