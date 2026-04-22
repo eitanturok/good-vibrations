@@ -957,7 +957,13 @@ def save_raw_recording_artifact(source_npy: Path, dest_path: Path, compress_raw:
             zf.write(source_npy, arcname="frames.npy")
         return
 
-    shutil.copy2(source_npy, dest_path)
+    if dest_path.exists():
+        dest_path.unlink()
+    try:
+        os.link(source_npy, dest_path)
+    except OSError:
+        # Cross-device: fall back to copy
+        shutil.copy2(source_npy, dest_path)
 
 
 def inspect_npy_array(path: Path) -> tuple[tuple[int, ...], str, int]:
