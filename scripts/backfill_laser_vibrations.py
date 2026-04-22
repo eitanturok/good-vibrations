@@ -17,7 +17,7 @@ import numpy as np
 import pandas as pd
 from datasets import load_dataset
 from huggingface_hub import HfApi, hf_hub_download
-from PIL import Image
+from PIL import Image as PILImage
 from scipy.io.wavfile import write as wav_write
 from scipy.signal import butter, resample, sosfiltfilt
 
@@ -180,7 +180,7 @@ def speaker_code(speakers) -> str:
     return "".join(str(int(x)) for x in (speakers or []))
 
 
-def downsample_grayscale(img: Image.Image, size: tuple[int, int] = (96, 96)) -> np.ndarray:
+def downsample_grayscale(img: PILImage.Image, size: tuple[int, int] = (96, 96)) -> np.ndarray:
     return np.asarray(img.convert("L").resize(size, Image.Resampling.BILINEAR), dtype=np.float32)
 
 
@@ -209,7 +209,7 @@ def discover_source_experiment_dir(row: dict, source_data_root: str) -> str:
         img_path = cand / "box_overhead_image.png"
         if not img_path.exists():
             continue
-        with Image.open(img_path) as img:
+        with PILImage.open(img_path) as img:
             arr = downsample_grayscale(img)
         mad = float(np.mean(np.abs(arr - target)))
         scores.append((mad, cand))
@@ -265,7 +265,7 @@ def discover_source_experiment_dir_from_grid(row: dict, source_data_root: str, u
             img_path = cand / "box_overhead_image.png"
             if not img_path.exists():
                 continue
-            with Image.open(img_path) as img:
+            with PILImage.open(img_path) as img:
                 arr = downsample_grayscale(img)
             mad = float(np.mean(np.abs(arr - target)))
             scores.append((mad, cand))
@@ -416,10 +416,16 @@ def generate_speckle_preview(raw_npy_path: Path, out_path: Path, fps: float, max
 
 def load_or_create_metadata_df(repo_id: str, api: HfApi) -> pd.DataFrame:
     try:
-        local_path = hf_hub_download(repo_id=repo_id, repo_type="dataset", filename="metadata.parquet")
+        # Try data/train-0001.parquet first (new format)
+        local_path = hf_hub_download(repo_id=repo_id, repo_type="dataset", filename="data/train-0001.parquet")
         return pd.read_parquet(local_path)
     except Exception:
-        return pd.DataFrame()
+        try:
+            # Fall back to old format
+            local_path = hf_hub_download(repo_id=repo_id, repo_type="dataset", filename="metadata.parquet")
+            return pd.read_parquet(local_path)
+        except Exception:
+            return pd.DataFrame()
 
 
 def build_metadata_row(
@@ -438,12 +444,14 @@ def build_metadata_row(
         "speakers": row.get("speakers", []),
         "x_position": row.get("x_position"),
         "y_position": row.get("y_position"),
-        "audio_file_name": audio_rel,
-        "speckle_vibrations_file_name": f"{rel_dir}/speckle_vibrations.mp4",
-        "speckle_shifts_ifft_audio_file_name": f"{rel_dir}/speckle_shifts_ifft_audio.wav",
+        "audio": audio_rel,
+        "speckle_vibrations": f"{rel_dir}/speckle_vibrations.mp4",
+        "speckle_shifts_ifft_audio": f"{rel_dir}/speckle_shifts_ifft_audio.wav",
         "manifest_json": json.dumps(manifest_payload),
         "mask_path": f"{rel_dir}/mask.npz",
-        **image_paths,
+        "overhead_image": image_paths.get("overhead_image_file_name"),
+        "cropped_overhead_image": image_paths.get("cropped_overhead_image_file_name"),
+        "segmented_overhead_image": image_paths.get("segmented_overhead_image_file_name"),
     }
 
 
@@ -528,7 +536,7 @@ def stage_shared_images(row: dict, image_key: str, root: Path, existing_files: s
         dst = root / rel
         dst.parent.mkdir(parents=True, exist_ok=True)
         buf = io.BytesIO()
-        img.convert("RGB").save(buf, format="WEBP", quality=85)
+        PILImage.Image.fromarray(img).convert("RGB").save(buf, format="WEBP", quality=85)
         dst.write_bytes(buf.getvalue())
     return paths
 
@@ -961,7 +969,9 @@ def main() -> None:
         if "sample_idx" in metadata_df.columns:
             metadata_df = metadata_df[metadata_df["sample_idx"] != int(args.sample_id)]
         metadata_df = pd.concat([metadata_df, pd.DataFrame([new_row])], ignore_index=True)
-        stage("write metadata.parquet", lambda: metadata_df.to_parquet(root / "metadata.parquet", index=False))
+        data_dir = root / "data"
+        data_dir.mkdir(parents=True, exist_ok=True)
+        stage("write metadata.parquet", lambda: metadata_df.to_parquet(data_dir / "train-0001.parquet", index=False))
 
         stage(
             "upload folder to new dataset",

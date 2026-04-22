@@ -30,19 +30,19 @@ def build_readme() -> str:
         This dataset is the next-generation pipeline dataset for the Good Vibrations project.
 
         It is designed to store:
-- sample metadata in parquet shards under `data/`
-- shared audio assets under `audio/`
-- per-sample pipeline artifacts under `samples/sample_xxxxxx/`
+- sample metadata in `data/metadata.jsonl`
+- shared audio assets under `data/audio/`
+- shared overhead image groups under `data/image/`
+- per-sample pipeline artifacts under `data/<sample_id>/`
 
         Target sample assets include:
-- `mask.npz`
-- `speckle_vibrations_raw.npy`
-- `speckle_vibrations.mp4`
-- `speckle_shifts.npz`
-- `speckle_shifts_clean.npz`
-- `speckle_shifts_fft.npz`
-- `speckle_shifts_fft_audio.wav`
-- `manifest.json`
+- `speckle_vibration_raw.npz`
+        - `speckle_vibrations.mp4`
+        - `speckle_shifts.npz`
+        - `speckle_shifts_clean.npz`
+        - `speckle_shifts_fft.npz`
+- `speckle_shifts_ifft_audio.wav`
+        - `manifest.json`
 
         This repository is being initialized incrementally. The first goal is to validate the schema and viewer behavior with one dummy sample before backfilling historical data.
         """
@@ -50,14 +50,13 @@ def build_readme() -> str:
 
 
 def build_skeleton(root: Path) -> None:
-    (root / "data").mkdir(parents=True, exist_ok=True)
-    (root / "audio").mkdir(parents=True, exist_ok=True)
-    (root / "samples").mkdir(parents=True, exist_ok=True)
+    (root / "data" / "audio").mkdir(parents=True, exist_ok=True)
+    (root / "data" / "image").mkdir(parents=True, exist_ok=True)
 
     (root / "README.md").write_text(build_readme(), encoding="utf-8")
-    (root / "data" / ".gitkeep").write_text("", encoding="utf-8")
-    (root / "audio" / ".gitkeep").write_text("", encoding="utf-8")
-    (root / "samples" / ".gitkeep").write_text("", encoding="utf-8")
+    (root / "data" / "metadata.jsonl").write_text("", encoding="utf-8")
+    (root / "data" / "audio" / ".gitkeep").write_text("", encoding="utf-8")
+    (root / "data" / "image" / ".gitkeep").write_text("", encoding="utf-8")
 
 
 def main() -> None:
