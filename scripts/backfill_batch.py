@@ -18,13 +18,20 @@ Usage (one sample):
 
 Usage (multiple samples):
     python scripts/backfill_batch.py --samples cube-00x01y_0001--31-03-18-21-24:1 cube-01x02y_0001--01-04-10-00-00:2
+
+Usage (all unprocessed samples, with failure tracking):
+    python scripts/backfill_batch.py --all
+    python scripts/backfill_batch.py --all --upload-to-hf
 """
+import datetime
 import io
+import json
 import re
 import shlex
 import subprocess
 import sys
 import time
+import traceback
 from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 
@@ -45,6 +52,9 @@ OLD_DIR       = "/net/mraid20/ifs/wisdom/groups/mark_sheinin_lab/DATA/experiment
 NEW_DIR       = "/net/mraid20/ifs/wisdom/groups/mark_sheinin_lab/DATA/experiment-16"
 HF_REPO       = "eturok-weizmann/laser-vibrations"
 DEFAULT_PROMPT = "A black metal cube sitting on the floor of an open cardboard box from a bird's eye view."
+
+ASSIGNMENTS_FILE = REPO_ROOT / "backfill_assignments.jsonl"
+FAILURES_FILE    = REPO_ROOT / "backfill_failures.jsonl"
 
 
 # ── SSH helpers ───────────────────────────────────────────────────────────────
@@ -136,6 +146,75 @@ def _image_dir(
     )
 
 
+# ── --all mode helpers ────────────────────────────────────────────────────────
+
+def _list_source_dirs() -> list[str]:
+    """Return sorted list of all source dir names in OLD_DIR."""
+    raw = _ssh_fetch(f"ls {shlex.quote(OLD_DIR)}").decode()
+    return sorted(line.strip() for line in raw.splitlines() if line.strip())
+
+
+def _processed_experiment_ids() -> set[str]:
+    """Read experiment_ids already present in experiment-16 metadata.jsonl."""
+    try:
+        raw = _ssh_fetch(
+            f"cat {shlex.quote(NEW_DIR + '/data/metadata.jsonl')} 2>/dev/null || true"
+        ).decode()
+    except Exception:
+        return set()
+    ids = set()
+    for line in raw.splitlines():
+        line = line.strip()
+        if line:
+            try:
+                ids.add(json.loads(line)["experiment_id"])
+            except Exception:
+                pass
+    return ids
+
+
+def _load_or_create_assignments(source_dirs: list[str], start_id: int) -> list[tuple[str, int]]:
+    """
+    Load existing assignments from ASSIGNMENTS_FILE, appending new entries for any
+    source_dir not yet assigned. Returns the ordered list of (source_dir_name, sample_id)
+    for the given source_dirs.
+    """
+    existing: dict[str, int] = {}
+    if ASSIGNMENTS_FILE.exists():
+        for line in ASSIGNMENTS_FILE.read_text(encoding="utf-8").splitlines():
+            if line.strip():
+                rec = json.loads(line)
+                existing[rec["source_dir_name"]] = int(rec["sample_id"])
+
+    next_id = max([start_id - 1] + list(existing.values())) + 1
+    new_lines = []
+    for d in source_dirs:
+        if d not in existing:
+            existing[d] = next_id
+            new_lines.append(json.dumps({"source_dir_name": d, "sample_id": next_id}))
+            next_id += 1
+
+    if new_lines:
+        with ASSIGNMENTS_FILE.open("a", encoding="utf-8") as f:
+            f.write("\n".join(new_lines) + "\n")
+        print(f"[assignments] wrote {len(new_lines)} new entries to {ASSIGNMENTS_FILE}", flush=True)
+
+    return [(d, existing[d]) for d in source_dirs]
+
+
+def _log_failure(source_dir_name: str, sample_id: int, exc: Exception) -> None:
+    rec = {
+        "source_dir_name": source_dir_name,
+        "sample_id": sample_id,
+        "error": str(exc),
+        "traceback": traceback.format_exc(),
+        "timestamp": datetime.datetime.utcnow().isoformat(),
+    }
+    with FAILURES_FILE.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(rec) + "\n")
+    print(f"[FAILED] {source_dir_name} (sample_id={sample_id}): {exc}", flush=True)
+
+
 # ── Per-sample pipeline ───────────────────────────────────────────────────────
 
 def process_sample(source_dir_name: str, sample_id: int, segmenter: Segmenter,
@@ -190,39 +269,91 @@ def parse_args():
     import argparse
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument(
-        "--samples", nargs="+", required=True, metavar="DIR_NAME:SAMPLE_ID",
+        "--samples", nargs="+", metavar="DIR_NAME:SAMPLE_ID",
         help="e.g. cube-00x01y_0001--31-03-18-21-24:1",
+    )
+    p.add_argument(
+        "--all", action="store_true",
+        help="Discover and process all unprocessed experiment-15 dirs automatically",
+    )
+    p.add_argument(
+        "--upload-to-hf", action="store_true",
+        help="Run HF upload after all samples finish (only applies with --all)",
     )
     return p.parse_args()
 
 
-def main():
-    args = parse_args()
-    samples = []
-    for s in args.samples:
-        name, sid = s.rsplit(":", 1)
-        samples.append((name, int(sid)))
-
-    _sync_static_files()
-
+def _run_batch(samples: list[tuple[str, int]], on_failure=None) -> None:
+    """Core batch loop: process samples with pipelined pre_segment and optional per-sample error handler."""
     segmenter = Segmenter()
 
     with app.run(), ThreadPoolExecutor(max_workers=1) as executor:
-        # Kick off pre_segment for the first sample immediately
         pre_future = executor.submit(_run_remote_stage, "pre_segment", samples[0][0], samples[0][1])
 
         for i, (source_dir_name, sample_id) in enumerate(samples):
-            print(f"\n[batch] {source_dir_name} (sample_id={sample_id})", flush=True)
+            print(f"\n[batch] {source_dir_name} (sample_id={sample_id}) [{i+1}/{len(samples)}]", flush=True)
 
-            # Start pre_segment for the next sample in background (if there is one)
             next_future = None
             if i + 1 < len(samples):
                 next_name, next_id = samples[i + 1]
                 next_future = executor.submit(_run_remote_stage, "pre_segment", next_name, next_id)
 
-            process_sample(source_dir_name, sample_id, segmenter, pre_segment_future=pre_future)
+            try:
+                process_sample(source_dir_name, sample_id, segmenter, pre_segment_future=pre_future)
+            except Exception as exc:
+                if on_failure is not None:
+                    on_failure(source_dir_name, sample_id, exc)
+                else:
+                    raise
 
             pre_future = next_future
+
+
+def main():
+    args = parse_args()
+
+    if args.all:
+        _sync_static_files()
+
+        processed = _processed_experiment_ids()
+        all_dirs = _list_source_dirs()
+        remaining = [d for d in all_dirs if d not in processed]
+        print(f"[batch] {len(all_dirs)} total dirs, {len(processed)} already done, {len(remaining)} to process", flush=True)
+
+        if not remaining:
+            print("[batch] nothing to do", flush=True)
+            return
+
+        assignments = _load_or_create_assignments(remaining, start_id=len(processed) + 1)
+        print(f"[batch] sample_ids {assignments[0][1]}–{assignments[-1][1]}", flush=True)
+
+        _run_batch(assignments, on_failure=_log_failure)
+
+        failed = []
+        if FAILURES_FILE.exists():
+            for line in FAILURES_FILE.read_text(encoding="utf-8").splitlines():
+                if line.strip():
+                    failed.append(json.loads(line)["source_dir_name"])
+        print(f"\n[batch] done. {len(remaining) - len(failed)}/{len(remaining)} succeeded, {len(failed)} failed.", flush=True)
+        if failed:
+            print(f"[batch] failures written to {FAILURES_FILE}", flush=True)
+
+        if args.upload_to_hf:
+            from migrate_experiment15_to_16_one import upload_experiment_dir_to_hf
+            upload_experiment_dir_to_hf(Path(NEW_DIR), HF_REPO)
+
+    elif args.samples:
+        samples = []
+        for s in args.samples:
+            name, sid = s.rsplit(":", 1)
+            samples.append((name, int(sid)))
+
+        _sync_static_files()
+        _run_batch(samples)
+
+    else:
+        import argparse
+        raise argparse.ArgumentError(None, "one of --samples or --all is required")
 
 
 if __name__ == "__main__":
