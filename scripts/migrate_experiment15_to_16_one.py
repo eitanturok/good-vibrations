@@ -1292,18 +1292,9 @@ def build_image_dir_name(
 
 
 def append_metadata_row(metadata_path: Path, row: dict) -> None:
-    rows = []
-    if metadata_path.exists():
-        for line in metadata_path.read_text(encoding="utf-8").splitlines():
-            if not line.strip():
-                continue
-            payload = normalize_metadata_row(json.loads(line))
-            if int(payload.get("sample_id", -1)) == int(row["sample_id"]):
-                continue
-            rows.append(payload)
-    rows.append(normalize_metadata_row(row))
-    rows.sort(key=lambda item: int(item["sample_id"]))
-    metadata_path.write_text("\n".join(json.dumps(item, ensure_ascii=True) for item in rows) + "\n", encoding="utf-8")
+    metadata_path.parent.mkdir(parents=True, exist_ok=True)
+    with metadata_path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(normalize_metadata_row(row), ensure_ascii=True) + "\n")
 
 
 def remote_worker(args: argparse.Namespace) -> None:
