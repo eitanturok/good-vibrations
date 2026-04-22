@@ -1254,9 +1254,8 @@ def ifft_audio_preview_file(source_path: Path, dest_path: Path, processing_confi
     return {"sample_rate_hz": output_sample_rate_hz, "n_frames": int(len(audio_i16))}
 
 
-DEFAULT_OBJECT_NAME = "OBJECT"
 DEFAULT_N_OBJECTS = 1
-DEFAULT_BOX_MATERIAL = "MATERIAL"
+DEFAULT_BOX_MATERIAL = "cardboard"
 
 
 def build_image_dir_name(
@@ -1273,8 +1272,8 @@ def build_image_dir_name(
     Format: {object}-{x}x-{y}y-{n}obj-{material}[-tag...]-{timestamp}
     Sentinel placeholders when values are absent: OBJECT, POSx, POSy, Xobj, MATERIAL.
     """
-    obj = normalize_token(object_name) if object_name else DEFAULT_OBJECT_NAME
-    mat = normalize_token(box_material) if box_material else DEFAULT_BOX_MATERIAL
+    obj = normalize_token(object_name) if object_name else "OBJECT"
+    mat = normalize_token(box_material) if box_material else "MATERIAL"
     ts = parse_source_timestamp(source_dir_name)
 
     if x_position is not None:
