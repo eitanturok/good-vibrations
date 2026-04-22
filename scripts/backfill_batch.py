@@ -40,6 +40,7 @@ from migrate_experiment15_to_16_one import build_image_dir_name
 REMOTE_HOST   = "ethantu@mcluster11.wisdom.weizmann.ac.il"
 REMOTE_VENV   = "$HOME/venvs/experiment16-migrate"
 REMOTE_SCRIPT = "/home/ethantu/tmp/migrate_experiment15_to_16_one.py"
+REMOTE_AUDIO  = "/home/ethantu/tmp/chirp_50_1000_3.0sec.wav"
 OLD_DIR       = "/net/mraid20/ifs/wisdom/groups/mark_sheinin_lab/DATA/experiment-15"
 NEW_DIR       = "/net/mraid20/ifs/wisdom/groups/mark_sheinin_lab/DATA/experiment-16"
 HF_REPO       = "eturok-weizmann/laser-vibrations"
@@ -93,6 +94,8 @@ def _sync_static_files() -> None:
     sync(migrate_script, REMOTE_SCRIPT, "migrate script")
     for key in ("1000", "0100", "0010", "0001", "speaker"):
         sync(REPO_ROOT / "assets" / "speakers" / f"{key}.png", f"/home/ethantu/assets/speakers/{key}.png", f"speaker {key}.png")
+    audio_local = REPO_ROOT / "data" / "audio_samples" / "chirp_50_1000_3.0sec.wav"
+    sync(audio_local, REMOTE_AUDIO, "audio chirp")
 
 
 def _run_remote_stage(stage: str, source_dir_name: str, sample_id: int) -> None:
@@ -103,6 +106,7 @@ def _run_remote_stage(stage: str, source_dir_name: str, sample_id: int) -> None:
         "--source-dir-name", source_dir_name,
         "--sample-id", str(sample_id),
         "--stage", stage, "--overwrite",
+        "--remote-audio-path", REMOTE_AUDIO,
     ])
     _ssh_run(f"{REMOTE_VENV}/bin/python {quoted_args}")
 
