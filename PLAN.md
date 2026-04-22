@@ -25,7 +25,7 @@ This plan is the source of truth for the next implementation steps.
   - chunked `dd` streaming was slower in this environment
   - `rsync` started reasonably but failed mid-transfer and was not reliable enough to trust yet
 - the practical split is now:
-  - remote on `mcluster11`: upload `speckle_vibration_raw.npz` and generate/upload `speckle_vibrations.mp4`
+  - remote on `mcluster11`: upload `speckle_vibration_raw.npy` and generate/upload `speckle_vibrations.mp4`
   - local: upload mask assets, shifts, cleaned shifts, FFT, IFFT audio, manifest, and the `metadata.jsonl` row
 - this avoids pulling the 2.9 GB raw recording to the local machine while still keeping the richer Python/dataframe logic local
 - on CentOS, the remote stage should use cluster modules plus a small venv instead of the full project environment:
@@ -143,7 +143,7 @@ Reasoning:
 We want the dataset to represent the processing pipeline explicitly.
 
 That pipeline is:
-1. `speckle_vibration_raw.npz`
+1. `speckle_vibration_raw.npy`
 2. `speckle_vibrations.mp4`
 3. `speckle_shifts.npz`
 4. `speckle_shifts_clean.npz`
@@ -196,7 +196,7 @@ data/
       mask.png
       mask.npz
   0000001/
-    speckle_vibration_raw.npz
+    speckle_vibration_raw.npy
     speckle_vibrations.mp4
     speckle_shifts.npz
     speckle_shifts_clean.npz
@@ -240,7 +240,7 @@ Coordinate rules:
   "n_objects": 1,
   "box_material": "cardboard",
   "mask_file_name": "https://huggingface.co/datasets/.../resolve/main/data/image/cube-003-007-1-cardboard-2026-04-21-10-05-33/mask.png",
-  "experiment_dir": "experiment_15",
+  "experiment_dir": "experiment-16",
   "manifest": "{\"sample_id\":1,...}"
 }
 ```
@@ -258,7 +258,7 @@ Coordinate rules:
 
 ## Sample Asset Semantics
 
-### `speckle_vibration_raw.npz`
+### `speckle_vibration_raw.npy`
 
 Meaning:
 - raw camera recording of the vibrating laser speckles
@@ -267,6 +267,10 @@ Role:
 - scientific source artifact
 - input to recovery / PCKL
 - not directly displayed in HF viewer
+
+Storage note:
+- default backfill output should be the uncompressed `.npy` copy because it is much faster to produce on shared storage
+- backfill may optionally support a `--compress-raw` flag that writes `speckle_vibration_raw.npz` instead when smaller storage footprint is worth the extra runtime
 
 ### `speckle_vibrations.mp4`
 
@@ -383,7 +387,7 @@ Proposed structure:
 {
   "sample_id": 1,
   "experiment_id": "cube-00x01y_0001--31-03-18-21-24",
-  "experiment_dir": "experiment_15",
+  "experiment_dir": "experiment-16",
   "hf_repo": "eturok-weizmann/laser-vibrations",
   "sample": {
     "object": "cube",
@@ -402,11 +406,24 @@ Proposed structure:
     "audio": {
       "file_name": "data/audio/chirp_50_1000_3.0sec.wav",
       "sample_rate_hz": 44100,
-      "duration_s": 3.0,
-      "total_output_channels": 8
+      "duration_s": 3.2,
+      "total_output_channels": 8,
+      "wav_channels": 1,
+      "sample_width_bytes": 2,
+      "generation": {
+        "signal": "chirp",
+        "method": "logarithmic",
+        "chirp_duration_s": 3.0,
+        "silence_start_s": 0.1,
+        "silence_end_s": 0.1,
+        "f_start_hz": 50,
+        "f_end_hz": 1000,
+        "output_dtype": "int16",
+        "normalization": "peak_to_int16"
+      }
     },
     "recording": {
-      "capture_seconds": 3.1
+      "capture_seconds_requested": 3.1
     },
     "overhead_camera": {
       "frame_rate_fps": 30,
@@ -478,15 +495,30 @@ Proposed structure:
       "frame_count": 9000,
       "frame_height": 300,
       "frame_width": 1152,
-      "capture_seconds": 3.1,
-      "preview_fps": 30.0,
+      "preview_frame_count": 300,
+      "capture_fps_hz": 2500.0,
+      "capture_seconds_requested": 3.1,
+      "capture_seconds_observed": 3.6,
+      "preview_fps": 83.33333333333333,
+      "preview_width": 960,
+      "preview_height": 256,
+      "audio_embedded": true,
+      "audio_start_seconds": 0.0,
+      "audio_end_seconds": 3.6,
       "dtype": "uint8"
     }
   },
   "processing_config": {
+    "speckle_vibration_raw": {
+      "format": "npy",
+      "compressed": false
+    },
     "speckle_vibrations_preview": {
       "max_frames": 300,
       "max_width": 960,
+      "macro_block_size": 16,
+      "source_capture_fps_hz": 2500.0,
+      "preserve_physical_duration": true,
       "percentile_low": 5,
       "percentile_high": 99.5,
       "codec": "libx264",
@@ -525,23 +557,19 @@ Proposed structure:
     }
   },
   "artifacts": {
-    "shared": {
-      "raw_overhead": "data/image/cube-003-007-1-cardboard-2026-04-21-10-05-33/raw_overhead.png",
-      "cropped_overhead": "data/image/cube-003-007-1-cardboard-2026-04-21-10-05-33/cropped_overhead.png",
-      "segmented_overhead": "data/image/cube-003-007-1-cardboard-2026-04-21-10-05-33/segmented_overhead.png",
-      "mask_png": "data/image/cube-003-007-1-cardboard-2026-04-21-10-05-33/mask.png",
-      "mask_npz": "data/image/cube-003-007-1-cardboard-2026-04-21-10-05-33/mask.npz",
-      "audio": "data/audio/chirp_50_1000_3.0sec.wav"
-    },
-    "sample": {
-      "speckle_vibration_raw": "data/0000001/speckle_vibration_raw.npz",
-      "speckle_vibrations": "data/0000001/speckle_vibrations.mp4",
-      "speckle_shifts": "data/0000001/speckle_shifts.npz",
-      "speckle_shifts_clean": "data/0000001/speckle_shifts_clean.npz",
-      "speckle_shifts_fft": "data/0000001/speckle_shifts_fft.npz",
-      "speckle_shifts_ifft_audio": "data/0000001/speckle_shifts_ifft_audio.wav",
-      "manifest": "data/0000001/manifest.json"
-    }
+    "raw_overhead": "data/image/cube-003-007-1-cardboard-2026-04-21-10-05-33/raw_overhead.png",
+    "cropped_overhead": "data/image/cube-003-007-1-cardboard-2026-04-21-10-05-33/cropped_overhead.png",
+    "segmented_overhead": "data/image/cube-003-007-1-cardboard-2026-04-21-10-05-33/segmented_overhead.png",
+    "mask_png": "data/image/cube-003-007-1-cardboard-2026-04-21-10-05-33/mask.png",
+    "mask_npz": "data/image/cube-003-007-1-cardboard-2026-04-21-10-05-33/mask.npz",
+    "audio": "data/audio/chirp_50_1000_3.0sec.wav",
+    "speckle_vibration_raw": "data/0000001/speckle_vibration_raw.npy",
+    "speckle_vibrations": "data/0000001/speckle_vibrations.mp4",
+    "speckle_shifts": "data/0000001/speckle_shifts.npz",
+    "speckle_shifts_clean": "data/0000001/speckle_shifts_clean.npz",
+    "speckle_shifts_fft": "data/0000001/speckle_shifts_fft.npz",
+    "speckle_shifts_ifft_audio": "data/0000001/speckle_shifts_ifft_audio.wav",
+    "manifest": "data/0000001/manifest.json"
   }
 }
 ```
@@ -550,6 +578,8 @@ Notes on simplification:
 - do not store a separate `source_notebook`
 - in `audio`, keep only `file_name`; do not duplicate it with a recorded source path
 - speaker routing is already represented by `sample.speakers`, so do not duplicate it inside `audio`
+- the canonical chirp generation parameters should live under `experiment_config.audio.generation`
+- `experiment_config.audio.duration_s` should be the total WAV duration including silence padding, which is `3.2s` for `chirp_50_1000_3.0sec.wav`
 - for camera settings, log the values that were requested by the experiment code
 - put preview-only values in a dedicated `preview` block so they do not get mixed with acquisition settings
 - keep concrete observed outputs in a dedicated `experiment_output` block
@@ -565,27 +595,31 @@ Notes on simplification:
 - `calibration` means the low-frame-rate laser-camera setup used before the final high-speed capture in order to find/set ROIs and verify alignment; it is separate from the final vibration capture settings
 - keep normal high-speed laser acquisition settings under `laser_camera.capture`
 - `sensor_rois_xywh` means the full list of final per-sensor `(x, y, w, h)` ROIs after combining row and column choices
-- group file paths under an explicit `artifacts` block
+- group file paths under one flat `artifacts` block; do not split into `shared` and `sample`
 - keep processing parameters together under a `processing_config` block
 
 Important saved-data constraint:
 - `metadata.npz` preserves selected row points and final ROIs, but does not preserve the original column click `(x, y)` points directly
 - therefore the manifest should store `selected_column_centers_x`, which can be reconstructed reliably from the saved final ROIs
+- `metadata.npz` stores ROI/camera provenance under `run_opt`, especially `run_opt['cam_params']` and `run_opt['run_opt_multiROIs']`, not as top-level arrays
+- backfill should read those nested structures and promote the replay-relevant fields into `experiment_output`
+- the MP4 preview must preserve physical capture duration; compute preview FPS from source frame count, selected preview frame count, and laser capture FPS rather than clamping to a viewer-friendly FPS
 
 Additional ROI guidance:
 - ROI information is important enough to log in detail because it defines how the 10x10 laser sensor grid was constructed from the raw camera image
 - the manifest should keep both the human-selected inputs and the derived final geometry:
   - selected row points
-  - selected column points
+  - selected column centers reconstructed from final ROIs when original click points are unavailable
   - the row value LUT / selected row indices used by the camera
   - the global horizontal crop
   - the per-row Y ranges
   - the final per-sensor `(x, y, w, h)` ROIs
 
 Fields still required for full replay of `notebooks/11_multispeaker_record_data.ipynb` and backfill processing:
-- `experiment_config.recording.capture_seconds`
+- `experiment_config.recording.capture_seconds_requested`
 - `experiment_config.overhead_camera.runtime`
 - `experiment_config.laser_camera.runtime`
+- `processing_config.speckle_vibration_raw`
 - `processing_config.speckle_vibrations_preview`
 - `processing_config.speckle_shifts_ifft_audio.output_sample_rate_hz`
 - `processing_config.speckle_shifts_ifft_audio.normalization`
@@ -619,7 +653,7 @@ Final columns (in order, with `_file_name` suffix for media columns):
 12. `n_objects`
 13. `box_material`
 14. `mask_file_name` - HF URL to `mask.png`
-15. `experiment_dir` - relative experiment directory label such as `experiment_15`
+15. `experiment_dir` - relative experiment directory label such as `experiment-16`
 16. `manifest` - JSON string form of `manifest.json`
 
 Manifest requirement:
@@ -715,7 +749,7 @@ Backfill expectation:
 
 #### Stage A: Capture
 - `raw_overhead.png`
-- `speckle_vibration_raw.npz`
+- `speckle_vibration_raw.npy`
 - experiment config including exact audio path used
 
 #### Stage B: Recovery
@@ -853,7 +887,7 @@ Use explicit per-stage timing logs like:
 - possibly output sizes when relevant
 
 Example:
-- `Generated speckle_vibrations.mp4 in 3.2s (9000 frames -> 300 preview frames)`
+- `Generated speckle_vibrations.mp4 in 3.2s (9000 source frames -> 300 preview frames, preview_fps=83.33, capture_seconds_observed=3.6)`
 - `Uploaded sample assets in 8.4s (mp4=4.2MB, fft=2.1MB)`
 
 ## Implementation Strategy
@@ -949,7 +983,7 @@ data/
       mask.npz
   0000001/          → sample-specific files
     manifest.json
-    speckle_vibration_raw.npz
+    speckle_vibration_raw.npy
     speckle_vibrations.mp4
     speckle_shifts_ifft_audio.wav
     speckle_shifts_fft.npz
@@ -1151,7 +1185,7 @@ Rules:
 - `x_com` and `y_com` should appear immediately after `x_position` and `y_position`
 - `mask_file_name` should appear after `box_material` to match the intended viewer column order
 - `manifest` is a plain string column and should contain the full serialized `manifest.json`
-- `manifest` must include the `artifacts.shared` and `artifacts.sample` blocks so the row alone tells us where all files live
+- `manifest` must include one flat `artifacts` block so the row alone tells us where all files live
 
 ### Canonical `metadata.jsonl` Example
 
@@ -1171,12 +1205,12 @@ Rules:
   "n_objects": 1,
   "box_material": "cardboard",
   "mask_file_name": "https://huggingface.co/datasets/<HF_REPO>/resolve/main/data/image/<IMAGE_DIR>/mask.png",
-  "experiment_dir": "experiment_15",
-  "manifest": "{\"sample_id\":1,\"artifacts\":{\"shared\":{...},\"sample\":{...}}}"
+  "experiment_dir": "experiment-16",
+  "manifest": "{\"sample_id\":1,\"artifacts\":{\"raw_overhead\":\"...\",\"speckle_vibrations\":\"...\"}}"
 }
 ```
 
 Rule:
-- `experiment_dir` should be a relative experiment identifier such as `experiment_15`, not an absolute filesystem path
+- `experiment_dir` should be a relative experiment identifier such as `experiment-16`, not an absolute filesystem path
 - `hf_repo` should be set when the experiment starts, alongside `experiment_dir` and sample position metadata, not inferred later during packaging
 - `x_position` and `y_position` are integer grid coordinates entered by the user; `x_com` and `y_com` are float pixel-space values derived later from the segmentation mask
