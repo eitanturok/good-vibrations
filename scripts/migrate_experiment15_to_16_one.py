@@ -854,6 +854,7 @@ def upload_experiment_dir_to_hf(experiment_dir: Path, hf_repo: str) -> None:
         folder_path=str(experiment_dir),
         repo_id=hf_repo,
         repo_type="dataset",
+        num_workers=1,
     )
 
 

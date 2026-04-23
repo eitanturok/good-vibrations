@@ -371,10 +371,11 @@ def main():
             print(f"[batch] failures written to {FAILURES_FILE}", flush=True)
 
         if args.upload_to_hf:
-            # Upload must run on the cluster where the NAS path is accessible
+            # Upload must run on the cluster where the NAS path is accessible.
+            # HF_HUB_ENABLE_HF_TRANSFER=0 set at shell level so it takes effect before import.
             print("[batch] launching HF upload on cluster...", flush=True)
             _ssh_run(
-                f"{REMOTE_VENV}/bin/python {REMOTE_SCRIPT}"
+                f"HF_HUB_ENABLE_HF_TRANSFER=0 {REMOTE_VENV}/bin/python {REMOTE_SCRIPT}"
                 f" --new-dir {shlex.quote(NEW_DIR)}"
                 f" --hf-repo {shlex.quote(HF_REPO)}"
                 f" --upload-to-hf --remote-worker"
