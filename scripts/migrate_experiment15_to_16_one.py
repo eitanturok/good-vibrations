@@ -846,10 +846,14 @@ def upload_experiment_dir_to_hf(experiment_dir: Path, hf_repo: str) -> None:
     import os
     from huggingface_hub import HfApi
 
+    # Disable Rust hf_transfer for both phases — it allocates huge buffers and OOMs
+    # on memory-limited cluster nodes with large files.
+    os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
+
     api = HfApi()
     api.create_repo(hf_repo, repo_type="dataset", exist_ok=True)
 
-    # Phase 1: everything except large raw npy files (avoids hf_transfer OOM)
+    # Phase 1: everything except large raw npy files
     api.upload_folder(
         folder_path=str(experiment_dir),
         repo_id=hf_repo,
