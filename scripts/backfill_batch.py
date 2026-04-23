@@ -202,6 +202,20 @@ def _load_or_create_assignments(source_dirs: list[str], start_id: int) -> list[t
     return [(d, existing[d]) for d in source_dirs]
 
 
+def _missing_experiment_configs(source_dir_names: list[str]) -> set[str]:
+    """Return the subset of source_dir_names whose experiment_config.json is absent."""
+    names_list = " ".join(shlex.quote(n) for n in source_dir_names)
+    script = (
+        f"missing=(); "
+        f"for d in {names_list}; do "
+        f"  [ ! -f {shlex.quote(OLD_DIR)}/$d/experiment_config.json ] && missing+=($d); "
+        f"done; "
+        f"printf '%s\\n' \"${{missing[@]}}\""
+    )
+    raw = _ssh_fetch(script).decode()
+    return set(line.strip() for line in raw.splitlines() if line.strip())
+
+
 def _log_failure(source_dir_name: str, sample_id: int, exc: Exception) -> None:
     rec = {
         "source_dir_name": source_dir_name,
@@ -327,10 +341,24 @@ def main():
         assignments = _load_or_create_assignments(remaining, start_id=len(processed) + 1)
         print(f"[batch] sample_ids {assignments[0][1]}–{assignments[-1][1]}", flush=True)
 
+        # Pre-flight: find dirs missing experiment_config.json and skip them upfront
+        print("[batch] checking for missing experiment_config.json ...", flush=True)
+        missing_cfg = _missing_experiment_configs([d for d, _ in assignments])
+        if missing_cfg:
+            print(f"[batch] {len(missing_cfg)} dirs missing experiment_config.json — logging and skipping", flush=True)
+
         # Clear failures file at start of this run so counts reflect only the current attempt
         FAILURES_FILE.write_text("", encoding="utf-8")
 
-        _run_batch(assignments, on_failure=_log_failure)
+        for source_dir_name, sample_id in assignments:
+            if source_dir_name in missing_cfg:
+                _log_failure(source_dir_name, sample_id,
+                             FileNotFoundError(f"{OLD_DIR}/{source_dir_name}/experiment_config.json not found"))
+
+        runnable = [(d, sid) for d, sid in assignments if d not in missing_cfg]
+        print(f"[batch] {len(runnable)} samples to run", flush=True)
+
+        _run_batch(runnable, on_failure=_log_failure)
 
         failed = []
         if FAILURES_FILE.exists():
