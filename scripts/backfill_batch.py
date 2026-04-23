@@ -327,6 +327,9 @@ def main():
         assignments = _load_or_create_assignments(remaining, start_id=len(processed) + 1)
         print(f"[batch] sample_ids {assignments[0][1]}–{assignments[-1][1]}", flush=True)
 
+        # Clear failures file at start of this run so counts reflect only the current attempt
+        FAILURES_FILE.write_text("", encoding="utf-8")
+
         _run_batch(assignments, on_failure=_log_failure)
 
         failed = []
@@ -339,8 +342,14 @@ def main():
             print(f"[batch] failures written to {FAILURES_FILE}", flush=True)
 
         if args.upload_to_hf:
-            from migrate_experiment15_to_16_one import upload_experiment_dir_to_hf
-            upload_experiment_dir_to_hf(Path(NEW_DIR), HF_REPO)
+            # Upload must run on the cluster where the NAS path is accessible
+            print("[batch] launching HF upload on cluster...", flush=True)
+            _ssh_run(
+                f"{REMOTE_VENV}/bin/python {REMOTE_SCRIPT}"
+                f" --new-dir {shlex.quote(NEW_DIR)}"
+                f" --hf-repo {shlex.quote(HF_REPO)}"
+                f" --upload-to-hf --remote-worker"
+            )
 
     elif args.samples:
         samples = []
