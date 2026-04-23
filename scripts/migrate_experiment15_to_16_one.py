@@ -850,11 +850,14 @@ def upload_experiment_dir_to_hf(experiment_dir: Path, hf_repo: str) -> None:
 
     api = HfApi()
     api.create_repo(hf_repo, repo_type="dataset", exist_ok=True)
+    # Exclude raw npy files (3.1 GB each, not referenced in metadata.jsonl).
+    # Uploading them caused Rust allocator OOMs on memory-limited cluster nodes.
     api.upload_large_folder(
         folder_path=str(experiment_dir),
         repo_id=hf_repo,
         repo_type="dataset",
         num_workers=1,
+        ignore_patterns=["**/speckle_vibration_raw.npy"],
     )
 
 
