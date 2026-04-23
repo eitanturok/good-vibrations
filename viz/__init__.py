@@ -49,6 +49,21 @@ def get_last_n_runs(n=3):
     return [r.id for r in runs]
 
 
+def resolve_wandb_run(run_ref: str):
+    api = wandb.Api()
+    try:
+        return api.run(f'{ENTITY}/{PROJECT}/{run_ref}')
+    except Exception:
+        runs = list(api.runs(
+            f'{ENTITY}/{PROJECT}',
+            filters={'display_name': run_ref},
+            order='-created_at',
+        ))
+        if not runs:
+            raise
+        return runs[0]
+
+
 def load_hf_samples():
     """Return list of metadata dicts for all dataset samples."""
     ds = load_dataset(
@@ -195,16 +210,17 @@ def _fmt_bytes(n: int | float) -> str:
     return f'{n:.1f} TB'
 
 
-def load_run_data(run_id: str) -> dict:
+def load_run_data(run_id: str, max_epochs: int | None = None) -> dict:
     """Fetch W&B config + history + HF predictions. Returns serialisable dict."""
     t0 = time.perf_counter()
     print(f'  [run {run_id}] W&B metadata...')
     run_name = run_id
+    resolved_run_id = run_id
     run_config = {}
     try:
-        api = wandb.Api()
-        run = api.run(f'{ENTITY}/{PROJECT}/{run_id}')
+        run = resolve_wandb_run(run_id)
         cfg = run.config
+        resolved_run_id = run.id
         run_name = run.name or run_id
         run_config = {k: cfg.get(k) for k in ('loss', 'gamma', 'decoder', 'd_model', 'lr', 'seed', 'n_params')}
     except Exception as e:
@@ -217,7 +233,7 @@ def load_run_data(run_id: str) -> dict:
             'metrics/train/mask/mse', 'metrics/eval/mask/mse']
     metrics_by_epoch: dict[str, dict] = {}
     try:
-        for row in fetch_wandb_history(run_id, keys=keys):
+        for row in fetch_wandb_history(resolved_run_id, keys=keys):
             epoch = row.get('epoch')
             if epoch is None:
                 continue
@@ -237,13 +253,13 @@ def load_run_data(run_id: str) -> dict:
     print(f'  [run {run_id}] predictions from HF Hub...')
     raw = None
     pred_keys = []
-    for pred_key in [run_name, run_id]:
+    for pred_key in [run_name, run_id, resolved_run_id]:
         if pred_key in pred_keys:
             continue
         pred_keys.append(pred_key)
         try:
             print(f'    [lookup] predictions key={pred_key}')
-            candidate = fetch_predictions(pred_key, data_dir=HF_PREDS)
+            candidate = fetch_predictions(pred_key, data_dir=HF_PREDS, max_epochs=max_epochs)
             n_epochs = len(set(candidate['train'].keys()) | set(candidate['eval'].keys()))
             if n_epochs > 0:
                 raw = candidate
@@ -337,7 +353,7 @@ def load_run_data(run_id: str) -> dict:
 
 # ── Payload assembly ──────────────────────────────────────────────
 
-def build_payload(run_ids: list[str], show_speakers: bool = True) -> dict:
+def build_payload(run_ids: list[str], show_speakers: bool = True, max_epochs: int | None = None) -> dict:
     t_total = time.perf_counter()
     t0 = t_total
 
@@ -359,7 +375,7 @@ def build_payload(run_ids: list[str], show_speakers: bool = True) -> dict:
     for i, run_id in enumerate(run_ids):
         print(f'[3/5] Run {i+1}/{len(run_ids)}: {run_id}')
         t_run = time.perf_counter()
-        run_data = load_run_data(run_id)
+        run_data = load_run_data(run_id, max_epochs=max_epochs)
         new_gt = run_data.pop('_gt_masks', {})
         print(f'  [debug] gt masks from this run: {len(new_gt)}  '
               f'(sample idx examples: {list(new_gt.keys())[:5]})')
@@ -524,6 +540,8 @@ def main():
                         help='Disable padded overhead speaker overlays')
     parser.add_argument('--no-open', action='store_true',
                         help='Do not open the generated HTML in a browser')
+    parser.add_argument('--max-epochs', type=int, default=None,
+                        help='Limit each split to the latest N epochs')
     args = parser.parse_args()
 
     t0 = time.perf_counter()
@@ -531,7 +549,11 @@ def main():
     run_ids = args.runs or get_last_n_runs(3)
     print(f'Runs: {run_ids}\n')
 
-    payload = build_payload(run_ids, show_speakers=not args.no_show_speakers)
+    payload = build_payload(
+        run_ids,
+        show_speakers=not args.no_show_speakers,
+        max_epochs=args.max_epochs,
+    )
 
     print('Rendering HTML...')
     html = render_html(payload)

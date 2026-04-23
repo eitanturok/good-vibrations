@@ -53,8 +53,9 @@ NEW_DIR       = "/net/mraid20/ifs/wisdom/groups/mark_sheinin_lab/DATA/experiment
 HF_REPO       = "eturok-weizmann/laser-vibrations"
 DEFAULT_PROMPT = "A black metal cube sitting on the floor of an open cardboard box from a bird's eye view."
 
-ASSIGNMENTS_FILE = REPO_ROOT / "backfill_assignments.jsonl"
-FAILURES_FILE    = REPO_ROOT / "backfill_failures.jsonl"
+ASSIGNMENTS_FILE    = REPO_ROOT / "backfill_assignments.jsonl"
+FAILURES_FILE       = REPO_ROOT / "backfill_failures.jsonl"
+HF_UPLOAD_JOBS_FILE = REPO_ROOT / "backfill_hf_upload_jobs.jsonl"
 
 
 # ── SSH helpers ───────────────────────────────────────────────────────────────
@@ -217,6 +218,125 @@ def _missing_experiment_configs(source_dir_names: list[str]) -> set[str]:
     return set(line.strip() for line in raw.splitlines() if line.strip())
 
 
+def _ensure_hf_shared_files() -> None:
+    """Upload README.md and shared audio to HF if not already present.
+
+    These files must exist on HF before any sample rows are visible in the
+    dataset viewer — README.md defines the features schema, and data/audio/
+    holds the shared excitation WAV referenced by every metadata row.
+    """
+    script = (
+        f"import os, sys\n"
+        f"sys.path.insert(0, '/home/ethantu/tmp')\n"
+        f"os.environ['HF_HUB_DISABLE_XET'] = '1'\n"
+        f"from huggingface_hub import HfApi\n"
+        f"from migrate_experiment15_to_16_one import build_dataset_readme\n"
+        f"api = HfApi()\n"
+        f"existing = set(api.list_repo_files({HF_REPO!r}, repo_type='dataset'))\n"
+        f"# README always re-uploaded (content may have changed)\n"
+        f"api.upload_file(path_or_fileobj=build_dataset_readme().encode(),\n"
+        f"                path_in_repo='README.md', repo_id={HF_REPO!r},\n"
+        f"                repo_type='dataset', commit_message='Sync README')\n"
+        f"print('[hf-shared] uploaded README.md', flush=True)\n"
+        f"# Audio only uploaded if missing (content never changes)\n"
+        f"audio_repo = 'data/audio/chirp_50_1000_3.0sec.wav'\n"
+        f"audio_local = {NEW_DIR!r} + '/data/audio/chirp_50_1000_3.0sec.wav'\n"
+        f"if audio_repo not in existing and os.path.exists(audio_local):\n"
+        f"    api.upload_file(path_or_fileobj=audio_local, path_in_repo=audio_repo,\n"
+        f"                    repo_id={HF_REPO!r}, repo_type='dataset',\n"
+        f"                    commit_message='Add shared audio')\n"
+        f"    print('[hf-shared] uploaded audio', flush=True)\n"
+        f"else:\n"
+        f"    print('[hf-shared] audio already present', flush=True)\n"
+    )
+    _ssh_fetch(f"cat > /tmp/_ensure_hf_shared.py", stdin=script.encode())
+    _ssh_run(f"source /home/ethantu/venvs/experiment16-migrate/bin/activate && python3 /tmp/_ensure_hf_shared.py")
+
+
+def _processed_sample_ids() -> list[int]:
+    """Return sample_ids already written to experiment-16 metadata.jsonl."""
+    try:
+        raw = _ssh_fetch(
+            f"cat {shlex.quote(NEW_DIR + '/data/metadata.jsonl')} 2>/dev/null || true"
+        ).decode()
+    except Exception:
+        return []
+    ids = []
+    for line in raw.splitlines():
+        if line.strip():
+            try:
+                ids.append(int(json.loads(line)["sample_id"]))
+            except Exception:
+                pass
+    return sorted(ids)
+
+
+def _submitted_sample_ids() -> set[int]:
+    """Return all sample_ids already recorded in an HF upload job."""
+    if not HF_UPLOAD_JOBS_FILE.exists():
+        return set()
+    ids: set[int] = set()
+    for line in HF_UPLOAD_JOBS_FILE.read_text(encoding="utf-8").splitlines():
+        if line.strip():
+            try:
+                ids.update(json.loads(line).get("new_sample_ids", []))
+            except Exception:
+                pass
+    return ids
+
+
+def _hf_upload_job_running() -> bool:
+    """Return True if an hf-upload sbatch job is currently queued or running."""
+    out = _ssh_fetch("squeue -u ethantu --name=hf-upload -h").decode().strip()
+    return bool(out)
+
+
+def _submit_hf_upload_sbatch() -> str:
+    """Submit an HF upload sbatch job and return the job_id string."""
+    # HF_XET_CACHE must point to local disk (not NFS) on the compute node to avoid
+    # slow chunk writes over the network. /tmp is local on all cluster nodes.
+    wrap_cmd = (
+        f"HF_XET_HIGH_PERFORMANCE=1 HF_XET_CACHE=/tmp/hf_xet_cache"
+        f" /home/ethantu/venvs/experiment16-migrate/bin/python {REMOTE_SCRIPT}"
+        f" --new-dir {shlex.quote(NEW_DIR)}"
+        f" --hf-repo {shlex.quote(HF_REPO)}"
+        f" --upload-to-hf --remote-worker"
+    )
+    sbatch_cmd = (
+        f"sbatch --job-name=hf-upload --mem=32G --time=6:00:00 --partition=normal.q"
+        f" --output=/home/ethantu/tmp/hf_upload_sbatch_%j.log"
+        f" --wrap={shlex.quote(wrap_cmd)}"
+    )
+    out = _ssh_fetch(sbatch_cmd).decode().strip()
+    return out.split()[-1]  # "Submitted batch job 167295" → "167295"
+
+
+def _maybe_submit_hf_upload(processed_ids: list[int], threshold: int = 5) -> None:
+    """
+    Submit an HF upload sbatch job if enough new sample_ids have accumulated.
+
+    - Skips if an hf-upload job is already queued or running (prevents concurrent uploads).
+    - Records submitted jobs in HF_UPLOAD_JOBS_FILE so reruns don't double-count.
+    - upload_large_folder handles file-level dedup (skips already-committed files).
+    """
+    submitted = _submitted_sample_ids()
+    new_ids = sorted(sid for sid in processed_ids if sid not in submitted)
+    if len(new_ids) < threshold:
+        return
+    if _hf_upload_job_running():
+        print(f"[hf-upload] skipping — job already running ({len(new_ids)} samples pending)", flush=True)
+        return
+    job_id = _submit_hf_upload_sbatch()
+    rec = {
+        "job_id": job_id,
+        "submitted_at": datetime.datetime.utcnow().isoformat(),
+        "new_sample_ids": new_ids,
+    }
+    with HF_UPLOAD_JOBS_FILE.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(rec) + "\n")
+    print(f"[hf-upload] submitted sbatch job {job_id} ({len(new_ids)} new samples)", flush=True)
+
+
 def _log_failure(source_dir_name: str, sample_id: int, exc: Exception) -> None:
     rec = {
         "source_dir_name": source_dir_name,
@@ -295,11 +415,15 @@ def parse_args():
         "--upload-to-hf", action="store_true",
         help="Run HF upload after all samples finish (only applies with --all)",
     )
+    p.add_argument(
+        "--upload-pending", action="store_true",
+        help="Submit HF upload sbatch job for any processed samples not yet submitted, then exit",
+    )
     return p.parse_args()
 
 
-def _run_batch(samples: list[tuple[str, int]], on_failure=None) -> None:
-    """Core batch loop: process samples with pipelined pre_segment and optional per-sample error handler."""
+def _run_batch(samples: list[tuple[str, int]], on_failure=None, on_success=None) -> None:
+    """Core batch loop: process samples with pipelined pre_segment and optional per-sample callbacks."""
     segmenter = Segmenter()
 
     with app.run(), ThreadPoolExecutor(max_workers=1) as executor:
@@ -315,6 +439,8 @@ def _run_batch(samples: list[tuple[str, int]], on_failure=None) -> None:
 
             try:
                 process_sample(source_dir_name, sample_id, segmenter, pre_segment_future=pre_future)
+                if on_success is not None:
+                    on_success(source_dir_name, sample_id)
             except Exception as exc:
                 if on_failure is not None:
                     on_failure(source_dir_name, sample_id, exc)
@@ -327,8 +453,17 @@ def _run_batch(samples: list[tuple[str, int]], on_failure=None) -> None:
 def main():
     args = parse_args()
 
+    if args.upload_pending:
+        _sync_static_files()
+        _ensure_hf_shared_files()
+        processed = _processed_sample_ids()
+        print(f"[hf-upload] {len(processed)} samples processed on cluster", flush=True)
+        _maybe_submit_hf_upload(processed, threshold=1)
+        return
+
     if args.all:
         _sync_static_files()
+        _ensure_hf_shared_files()
 
         processed = _processed_experiment_ids()
         all_dirs = _list_source_dirs()
@@ -359,7 +494,23 @@ def main():
         runnable = [(d, sid) for d, sid in assignments if d not in missing_cfg]
         print(f"[batch] {len(runnable)} samples to run", flush=True)
 
-        _run_batch(runnable, on_failure=_log_failure)
+        # Upload any already-processed samples not yet submitted before starting
+        existing_ids = _processed_sample_ids()
+        if existing_ids:
+            _maybe_submit_hf_upload(existing_ids, threshold=1)
+
+        completed_ids: list[int] = []
+
+        def _on_success(_dir: str, sid: int) -> None:
+            completed_ids.append(sid)
+            if len(completed_ids) % 5 == 0:
+                _maybe_submit_hf_upload(completed_ids)
+
+        _run_batch(runnable, on_failure=_log_failure, on_success=_on_success)
+
+        # Upload any remainder not yet submitted (fewer than 5 at end of run)
+        if completed_ids:
+            _maybe_submit_hf_upload(completed_ids, threshold=1)
 
         failed = []
         if FAILURES_FILE.exists():
@@ -371,15 +522,10 @@ def main():
             print(f"[batch] failures written to {FAILURES_FILE}", flush=True)
 
         if args.upload_to_hf:
-            # Upload must run on the cluster where the NAS path is accessible.
-            # HF_HUB_ENABLE_HF_TRANSFER=0 set at shell level so it takes effect before import.
-            print("[batch] launching HF upload on cluster...", flush=True)
-            _ssh_run(
-                f"HF_HUB_ENABLE_HF_TRANSFER=0 {REMOTE_VENV}/bin/python {REMOTE_SCRIPT}"
-                f" --new-dir {shlex.quote(NEW_DIR)}"
-                f" --hf-repo {shlex.quote(HF_REPO)}"
-                f" --upload-to-hf --remote-worker"
-            )
+            # Periodic sbatch uploads (every 5 samples) already cover this.
+            # Run one final upload for any samples not yet submitted.
+            all_processed = _processed_sample_ids()
+            _maybe_submit_hf_upload(all_processed, threshold=1)
 
     elif args.samples:
         samples = []

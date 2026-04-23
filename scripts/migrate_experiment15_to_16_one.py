@@ -371,9 +371,246 @@ def build_dataset_readme() -> str:
 
         # Laser Vibrations
 
-        Viewer-facing metadata lives in `data/metadata.jsonl`.
-        Media columns use full Hugging Face URLs and follow this order:
-        `sample_id`, `segmented_overhead_file_name`, `speckle_vibrations_file_name`, `speckle_shifts_ifft_audio_file_name`, `audio_file_name`, `experiment_id`, `speakers`, `x_position`, `y_position`, `x_com`, `y_com`, `n_objects`, `box_material`, `mask_file_name`, `experiment_dir`, `manifest`.
+        Dataset of laser speckle vibration recordings used to locate objects hidden inside a cardboard box.
+        A 10×10 grid of lasers shines on the side of a box; as loudspeakers excite the box, each laser's
+        speckle pattern shifts in proportion to the local surface vibration. The goal is to reconstruct the
+        shape and location of an object inside the box from the vibration signals alone.
+
+        Per-sample viewer metadata lives in `data/metadata.jsonl`.
+        Full signal data and media files live in per-sample subdirectories under `data/`.
+
+        ---
+
+        # Dataset Columns
+
+        These are the columns shown in the HuggingFace dataset viewer, sourced from `data/metadata.jsonl`.
+
+        | Column | Type | Description |
+        |--------|------|-------------|
+        | `sample_id` | int | Unique sequential identifier for this sample |
+        | `segmented_overhead_file_name` | image | Overhead photo with segmentation mask overlay and speaker-angle annotations |
+        | `speckle_vibrations_file_name` | video | Slow-motion preview of the laser speckle pattern while the box vibrates |
+        | `speckle_shifts_ifft_audio_file_name` | audio | Vibration signal of a single laser point reconstructed as audio (inverse FFT) |
+        | `audio_file_name` | audio | Shared excitation chirp played through the loudspeakers during recording |
+        | `experiment_id` | string | Source directory name from experiment-15 (unique per recording) |
+        | `speakers` | string | 4-bit speaker activation code — e.g. `0001` means only speaker 4 was active |
+        | `x_position` | int | Object grid column index (0-indexed) |
+        | `y_position` | int | Object grid row index (0-indexed) |
+        | `x_com` | float | X centre-of-mass of the segmentation mask in the cropped overhead image (pixels) |
+        | `y_com` | float | Y centre-of-mass of the segmentation mask in the cropped overhead image (pixels) |
+        | `n_objects` | int | Number of objects inside the box |
+        | `box_material` | string | Box material, e.g. `cardboard` |
+        | `mask_file_name` | image | Binary segmentation mask of the object in the cropped overhead image |
+        | `experiment_dir` | string | Name of the experiment-16 target directory |
+        | `manifest` | string | Full JSON manifest for this sample (see [Section 3](#3-manifestjson-structure)) |
+
+        ---
+
+        # File Directory Structure
+
+        ```
+        experiment-16/
+        ├── README.md                            # This file (dataset card)
+        └── data/
+            ├── metadata.jsonl                   # One JSON row per sample (viewer-facing)
+            ├── audio/
+            │   └── chirp_50_1000_3.0sec.wav     # Shared excitation chirp (50–1000 Hz, 3 s)
+            ├── 0000001/                         # Per-sample directory (zero-padded 7-digit ID)
+            │   ├── manifest.json                # Full provenance + config for this sample
+            │   ├── speckle_vibration_raw.npy    # Raw laser camera frames  [100 lasers × T frames × 2 (XY)]
+            │   ├── speckle_shifts.npz           # Sub-pixel XY shifts per laser per frame
+            │   ├── speckle_shifts_clean.npz     # Bandpass-filtered + Hann-windowed shifts
+            │   ├── speckle_shifts_fft.npz       # FFT of cleaned shifts (frequency domain)
+            │   ├── speckle_shifts_ifft_audio.wav# Single-laser vibration reconstructed as audio
+            │   └── speckle_vibrations.mp4       # Slow-motion preview video of speckle motion
+            ├── 0000002/
+            │   └── ...
+            └── image/
+                └── <image_dir>/                 # Named: <object>-<x>x-<y>y-<n>obj-<material>-<date>
+                    ├── raw_overhead.png         # Full overhead photo before cropping
+                    ├── cropped_overhead.png     # Overhead cropped to the box region
+                    ├── segmented_overhead.png   # Overhead with mask overlay + speaker annotations
+                    ├── mask.png                 # Binary segmentation mask (white = object)
+                    └── mask.npz                 # Binary mask as compressed numpy array
+        ```
+
+        ---
+
+        # manifest.json Structure
+
+        Every sample directory contains a `manifest.json` that records full provenance, hardware config,
+        processing parameters, and artifact paths. The `manifest` column in `metadata.jsonl` is this
+        same document serialised as a JSON string.
+
+        ## Top-Level Keys
+
+        | Key | Type | Description |
+        |-----|------|-------------|
+        | `sample_id` | int | Unique sample identifier |
+        | `experiment_id` | string | Source recording directory name (from experiment-15) |
+        | `experiment_dir` | string | Target directory name (experiment-16) |
+        | `source_experiment_id` | string | Canonical source reference (same as `experiment_id`) |
+        | `source_experiment_dir` | string | Absolute NAS path to the source directory |
+        | `hf_repo` | string | HuggingFace repo this sample was uploaded to |
+        | `sample` | object | Physical setup — see [3.2](#32-sample) |
+        | `segmentation` | object | Segmentation result — see [3.3](#33-segmentation) |
+        | `experiment_config` | object | Merged hardware + recording config — see [3.4](#34-experiment_config) |
+        | `experiment_output` | object | Derived signal statistics — see [3.5](#35-experiment_output) |
+        | `processing_config` | object | Processing pipeline parameters — see [3.6](#36-processing_config) |
+        | `artifacts` | object | Relative repo paths to all files — see [3.7](#37-artifacts) |
+
+        ## `sample`
+
+        Physical setup at the time of recording.
+
+        | Key | Type | Description |
+        |-----|------|-------------|
+        | `object` | string | Object type inside the box, e.g. `cube` or `empty` |
+        | `n_objects` | int | Number of objects |
+        | `box_material` | string | Box material, e.g. `cardboard` |
+        | `speakers` | string | 4-bit code for active speakers, e.g. `0001` |
+        | `x_position` | int | Object grid column (0-indexed) |
+        | `y_position` | int | Object grid row (0-indexed) |
+        | `image_dir` | string | Image subdirectory name under `data/image/` |
+
+        ## `segmentation`
+
+        Result of the overhead-image segmentation step.
+
+        | Key | Type | Description |
+        |-----|------|-------------|
+        | `x_com` | float | X centre-of-mass of the mask in the cropped overhead image (pixels) |
+        | `y_com` | float | Y centre-of-mass of the mask in the cropped overhead image (pixels) |
+        | `status` | string | `completed` when segmentation succeeded |
+
+        ## `experiment_config`
+
+        Merged from the source `experiment_config.json` and hardware defaults.
+
+        | Key | Type | Description |
+        |-----|------|-------------|
+        | `audio.file_name` | string | Excitation audio file name |
+        | `audio.sample_rate_hz` | int | Audio sample rate (Hz) |
+        | `audio.duration_s` | float | Chirp duration (s) |
+        | `audio.generation.signal` | string | Signal type, e.g. `chirp` |
+        | `audio.generation.f_start_hz` | int | Chirp start frequency (Hz) |
+        | `audio.generation.f_end_hz` | int | Chirp end frequency (Hz) |
+        | `recording.capture_seconds_requested` | float | Requested recording duration (s) |
+        | `overhead_camera.frame_rate_fps` | int | Overhead camera frame rate (fps) |
+        | `overhead_camera.exposure_ms` | int | Overhead camera exposure time (ms) |
+        | `overhead_camera.gain` | int | Overhead camera sensor gain |
+        | `laser_camera.capture.fps` | float | Laser camera frame rate (fps) |
+        | `laser_camera.global_roi` | list[int] | Full-frame ROI `[x, y, w, h]` |
+        | `laser_grid.sensor_rois_xywh` | list[list[int]] | Per-laser bounding boxes `[[x,y,w,h], ...]` |
+
+        ## `experiment_output`
+
+        Derived statistics computed during processing.
+
+        | Key | Type | Description |
+        |-----|------|-------------|
+        | `overhead_camera.image_width` | int | Overhead image width (px) |
+        | `overhead_camera.image_height` | int | Overhead image height (px) |
+        | `laser_camera.max_frame_rate_hz` | int | Actual frame rate achieved |
+        | `laser_camera.global_roi` | list[int] | Actual ROI used `[x, y, w, h]` |
+        | `laser_grid.total_image_height` | int | Total laser camera frame height (px) |
+        | `laser_grid.n_lasers` | int | Number of laser points detected |
+        | `speckle_shifts.n_frames` | int | Number of frames captured |
+        | `speckle_shifts.duration_s` | float | Actual recording duration (s) |
+
+        ### 3.6 `processing_config`
+
+        Parameters used for each processing stage.
+
+        #### 3.6.1 Raw Data
+
+        | Key | Type | Description |
+        |-----|------|-------------|
+        | `speckle_vibration_raw.format` | string | Storage format: `npy` or `npz` |
+        | `speckle_vibration_raw.compressed` | bool | Whether the raw array is compressed |
+
+        #### 3.6.2 Shift Extraction
+
+        | Key | Type | Description |
+        |-----|------|-------------|
+        | `speckle_shifts.fs_hz` | float | Sampling rate of the shift signal (Hz) |
+
+        #### 3.6.3 Filtering (`speckle_shifts_clean`)
+
+        | Key | Type | Description |
+        |-----|------|-------------|
+        | `filter_type` | string | Filter design, e.g. `butterworth` |
+        | `filter_mode` | string | `bandpass`, `lowpass`, or `highpass` |
+        | `lowcut` | float | Low cutoff frequency (Hz) |
+        | `highcut` | float | High cutoff frequency (Hz) |
+        | `filter_order` | int | Filter order |
+        | `hann_applied` | bool | Whether a Hann window was applied after filtering |
+        | `apply_order` | string | `filter_then_hann` or `hann_then_filter` |
+
+        #### 3.6.4 FFT (`speckle_shifts_fft`)
+
+        | Key | Type | Description |
+        |-----|------|-------------|
+        | `fft_kind` | string | FFT variant, e.g. `rfft` |
+        | `fft_axis` | int | Axis along which FFT is computed |
+        | `min_freq` | float | Minimum frequency retained after crop (Hz) |
+        | `max_freq` | float | Maximum frequency retained after crop (Hz) |
+        | `dtype` | string | Complex dtype, e.g. `complex64` |
+        | `crop_after_fft` | bool | Whether to crop to `[min_freq, max_freq]` |
+
+        #### 3.6.5 Audio Preview (`speckle_shifts_ifft_audio`)
+
+        | Key | Type | Description |
+        |-----|------|-------------|
+        | `laser_idx` | int | Which laser (0-indexed) to use for the audio preview |
+        | `xy_idx` | int | Which shift channel: `0` = X, `1` = Y |
+        | `method` | string | Reconstruction method, e.g. `ifft` |
+        | `output_sample_rate_hz` | int | Output WAV sample rate (Hz) |
+        | `normalization` | string | Normalization method, e.g. `peak_to_int16` |
+        | `output_dtype` | string | Output sample dtype, e.g. `int16` |
+        | `zero_fill_uncropped_bins` | bool | Whether to zero-fill frequency bins outside crop range |
+
+        #### 3.6.6 Video Preview (`speckle_vibrations_preview`)
+
+        | Key | Type | Description |
+        |-----|------|-------------|
+        | `max_frames` | int | Maximum frames in the preview video |
+        | `max_width` | int | Maximum video width (px) |
+        | `codec` | string | Video codec, e.g. `libx264` |
+        | `crf` | int | Constant rate factor — lower = higher quality |
+        | `pixelformat` | string | Pixel format, e.g. `yuv420p` |
+        | `burn_frame_index` | bool | Whether the frame index is burned into the video |
+        | `preserve_physical_duration` | bool | Whether playback speed matches real time |
+
+        #### 3.6.7 Segmentation
+
+        | Key | Type | Description |
+        |-----|------|-------------|
+        | `segmentation.left` | float | Left crop fraction of the overhead image |
+        | `segmentation.right` | float | Right crop fraction |
+        | `segmentation.up` | float | Top crop fraction |
+        | `segmentation.down` | float | Bottom crop fraction |
+        | `segmentation.prompt` | string | Text prompt passed to the segmentation model |
+
+        ### 3.7 `artifacts`
+
+        Relative paths within the repo to every file produced for this sample.
+
+        | Key | File | Description |
+        |-----|------|-------------|
+        | `raw_overhead` | `data/image/<dir>/raw_overhead.png` | Full overhead photo before cropping |
+        | `cropped_overhead` | `data/image/<dir>/cropped_overhead.png` | Overhead cropped to box region |
+        | `segmented_overhead` | `data/image/<dir>/segmented_overhead.png` | Overhead with mask + speaker overlay |
+        | `mask_png` | `data/image/<dir>/mask.png` | Binary segmentation mask (PNG) |
+        | `mask_npz` | `data/image/<dir>/mask.npz` | Binary mask as compressed numpy array |
+        | `audio` | `data/audio/chirp_50_1000_3.0sec.wav` | Shared excitation chirp (all samples) |
+        | `speckle_vibration_raw` | `data/<id>/speckle_vibration_raw.npy` | Raw laser camera frames |
+        | `speckle_vibrations` | `data/<id>/speckle_vibrations.mp4` | Slow-motion speckle preview video |
+        | `speckle_shifts` | `data/<id>/speckle_shifts.npz` | Sub-pixel XY shifts per laser per frame |
+        | `speckle_shifts_clean` | `data/<id>/speckle_shifts_clean.npz` | Filtered + windowed shifts |
+        | `speckle_shifts_fft` | `data/<id>/speckle_shifts_fft.npz` | FFT of cleaned shifts |
+        | `speckle_shifts_ifft_audio` | `data/<id>/speckle_shifts_ifft_audio.wav` | Single-laser audio reconstruction |
+        | `manifest` | `data/<id>/manifest.json` | This manifest file |
         """
     )
 
@@ -842,20 +1079,78 @@ def launch_remote(args: argparse.Namespace) -> None:
     run("remote migrate sample into experiment-16", lambda: subprocess.run(["ssh", REMOTE_HOST, remote_cmd], check=True))
 
 
-def upload_experiment_dir_to_hf(experiment_dir: Path, hf_repo: str) -> None:
-    import os
-    from huggingface_hub import HfApi
+def _filtered_metadata_jsonl(experiment_dir: Path, hf_repo: str, api) -> bytes | None:
+    """Return metadata.jsonl content filtered to rows whose image dirs are on HF.
 
-    os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
+    Called after upload_large_folder so the committed file list is current.
+    Returns None if nothing to upload.
+    """
+    metadata_path = experiment_dir / "data" / "metadata.jsonl"
+    if not metadata_path.exists():
+        return None
+
+    existing = set(api.list_repo_files(hf_repo, repo_type="dataset"))
+
+    def repo_path_from_url(url: str) -> str | None:
+        marker = "/resolve/main/"
+        if not isinstance(url, str) or marker not in url:
+            return None
+        return url.split(marker, 1)[1]
+
+    def row_paths(row: dict) -> list[str]:
+        paths = []
+        for key in [
+            "segmented_overhead_file_name",
+            "mask_file_name",
+            "speckle_vibrations_file_name",
+            "speckle_shifts_ifft_audio_file_name",
+            "audio_file_name",
+        ]:
+            path = repo_path_from_url(row.get(key, ""))
+            if path:
+                paths.append(path)
+        return paths
+
+    rows = []
+    for line in metadata_path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        row = json.loads(line)
+        required_paths = row_paths(row)
+        if required_paths and all(path in existing for path in required_paths):
+            rows.append(line.strip())
+
+    if not rows:
+        return None
+    print(f"[hf] filtered metadata.jsonl: {len(rows)} rows with committed images", flush=True)
+    return ("\n".join(rows) + "\n").encode()
+
+
+def upload_experiment_dir_to_hf(experiment_dir: Path, hf_repo: str) -> None:
+    from huggingface_hub import HfApi
 
     api = HfApi()
     api.create_repo(hf_repo, repo_type="dataset", exist_ok=True)
+
+    # Phase 1: upload all files (resumable, handles large/raw npy files)
     api.upload_large_folder(
         folder_path=str(experiment_dir),
         repo_id=hf_repo,
         repo_type="dataset",
         num_workers=1,
     )
+
+    # Phase 2: overwrite metadata.jsonl with a version filtered to only rows
+    # whose image dirs are committed on HF, so the viewer never hits missing files.
+    filtered = _filtered_metadata_jsonl(experiment_dir, hf_repo, api)
+    if filtered:
+        api.upload_file(
+            path_or_fileobj=filtered,
+            path_in_repo="data/metadata.jsonl",
+            repo_id=hf_repo,
+            repo_type="dataset",
+            commit_message="Update metadata.jsonl to committed samples only",
+        )
 
 
 def read_json(path: Path) -> dict:

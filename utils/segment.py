@@ -22,39 +22,42 @@ image = (
 PROMPT = "A black metal cube sitting on the floor of an open cardboard box from a bird's eye view."
 
 
-@app.function(gpu="A10G", image=image, secrets=[modal.Secret.from_name("huggingface")])
-def segment(image, object, box_material="cardboard", prompt=None):
-    from sam3.model_builder import build_sam3_image_model
-    from sam3.model.sam3_image_processor import Sam3Processor
+@app.cls(gpu="A10G", image=image, secrets=[modal.Secret.from_name("huggingface")], min_containers=1)
+class Segmenter:
+    @modal.enter()
+    def load_model(self):
+        from sam3.model_builder import build_sam3_image_model
+        from sam3.model.sam3_image_processor import Sam3Processor
+        self.model = build_sam3_image_model()
+        self.processor = Sam3Processor(self.model)
+        self.processor.set_confidence_threshold(0.0)
 
-    import torch
-    model = build_sam3_image_model()
-    processor = Sam3Processor(model)
+    @modal.method()
+    def segment(self, image, object, box_material="cardboard", prompt=None):
+        import torch
+        if prompt is None:
+            prompt = PROMPT
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            state = self.processor.set_image(Image.fromarray(image))
+            out = self.processor.set_text_prompt(state=state, prompt=prompt)
 
-    processor.set_confidence_threshold(0.0)
-    if prompt is None:
-        prompt = PROMPT
-    with torch.autocast("cuda", dtype=torch.bfloat16):
-        state = processor.set_image(Image.fromarray(image))
-        out = processor.set_text_prompt(state=state, prompt=prompt)
+        n = len(out["scores"])
+        if n > 1:
+            idx = out["scores"].topk(1).indices
+            out["masks"]  = out["masks"][idx]
+            out["boxes"]  = out["boxes"][idx]
+            out["scores"] = out["scores"][idx]
 
-    n = len(out["scores"])
-    if n > 1:
-        idx = out["scores"].topk(1).indices
-        out["masks"]  = out["masks"][idx]
-        out["boxes"]  = out["boxes"][idx]
-        out["scores"] = out["scores"][idx]
+        print(f"detections: {min(1, n)}")
+        print(f"scores:     {out['scores'].tolist()}")
+        print(f"boxes:      {out['boxes'].tolist()}")
 
-    print(f"detections: {min(1, n)}")
-    print(f"scores:     {out['scores'].tolist()}")
-    print(f"boxes:      {out['boxes'].tolist()}")
+        mask = out["masks"][:, 0].any(dim=0)
 
-    mask = out["masks"][:, 0].any(dim=0)
+        overlay = np.zeros((*mask.shape, 4), dtype=np.float32)
+        overlay[mask.cpu().numpy()] = (0.0, 0.8, 0.2, 0.5)
 
-    overlay = np.zeros((*mask.shape, 4), dtype=np.float32)
-    overlay[mask.cpu().numpy()] = (0.0, 0.8, 0.2, 0.5)
-
-    return mask.cpu().numpy(), overlay
+        return mask.cpu().numpy(), overlay
 
 
 # ── Image helpers ─────────────────────────────────────────────────────────────
@@ -102,7 +105,8 @@ def segment_sample(sample_path=None, raw_image=None, left=0.15, right=0.67, up=0
         return mask, vision
 
     image_array = np.array(cropped_image.convert("RGB"), dtype=np.uint8)
-    with app.run(): mask, overlay = segment.remote(image_array, object, box_material, prompt)
+    segmenter = Segmenter()
+    with app.run(): mask, overlay = segmenter.segment.remote(image_array, object, box_material, prompt)
     y_pos, x_pos = center_of_mass(mask)
     vision |= {"x_position": x_pos, "y_position": y_pos, "overlay_image": plot_overlay_image(cropped_image, overlay, x_pos, y_pos)}
     return mask, vision

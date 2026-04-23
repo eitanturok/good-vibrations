@@ -1,4 +1,4 @@
-import os, time
+import os, shlex, subprocess, time
 from pathlib import Path
 from typing import Any, Callable, Optional, Union
 
@@ -16,6 +16,8 @@ from huggingface_hub import HfApi
 
 
 SAMPLE_FILENAME_WIDTH = 6
+CLUSTER_HOST = "ethantu@mcluster11.wisdom.weizmann.ac.il"
+CLUSTER_REPO_ROOT = "mark_sheinin_lab/code/eitan/good-vibrations"
 
 
 def getenv(key: str, default: Any = 0):
@@ -683,8 +685,9 @@ def fetch_predictions(
     run_id,
     data_dir="eturok-weizmann/good-vibrations",
     cache_dir="~/.cache/good-vibrations",
+    max_epochs=None,
 ):
-    """Download saved prediction npz files for a run from HF Hub.
+    """Load saved prediction npz files for a run from local disk or HF Hub.
 
     Returns:
         {'train': {epoch: dict}, 'eval': {epoch: dict}}
@@ -699,41 +702,179 @@ def fetch_predictions(
     """
     import numpy as np
     from pathlib import Path
-    from huggingface_hub import snapshot_download
+    from huggingface_hub import HfApi, hf_hub_download
+
+    def _local_prediction_dirs(base: Path) -> list[Path]:
+        run_str = str(run_id)
+        return [
+            base / run_predictions_dir(run_str),
+            base / run_str / "predictions",
+            base / "predictions" if base.name == run_str else None,
+        ]
+
+    def _parse_prediction_file(path_like) -> tuple[str, int, int] | None:
+        stem = Path(path_like).stem
+        split, _, rest = stem.partition("_ep")
+        if split not in {"train", "eval"}:
+            return None
+        epoch_str, _, batch_str = rest.partition("_ba")
+        if not epoch_str or not batch_str:
+            return None
+        return split, int(epoch_str), int(batch_str)
+
+    def _limit_files(paths: list[Path | str]) -> list[Path | str]:
+        if max_epochs is None:
+            return list(paths)
+        keep_by_split: dict[str, set[int]] = {"train": set(), "eval": set()}
+        parsed = []
+        for path in paths:
+            meta = _parse_prediction_file(path)
+            if meta is None:
+                continue
+            parsed.append((path, *meta))
+        for split in ("train", "eval"):
+            epochs = sorted({epoch for _, s, epoch, _ in parsed if s == split})
+            keep_by_split[split] = set(epochs[-int(max_epochs):])
+        return [
+            path
+            for path, split, epoch, _ in parsed
+            if epoch in keep_by_split[split]
+        ]
+
+    def _local_prediction_files() -> tuple[list[Path], str | None, float]:
+        t_local = time.perf_counter()
+        seen: set[Path] = set()
+        candidates: list[Path] = []
+
+        roots = [Path.cwd()]
+        data_path = Path(str(data_dir)).expanduser()
+        if data_path.exists():
+            roots.append(data_path)
+
+        for root in roots:
+            for candidate in _local_prediction_dirs(root):
+                if candidate is None:
+                    continue
+                candidate = candidate.resolve()
+                if candidate in seen:
+                    continue
+                seen.add(candidate)
+                candidates.append(candidate)
+                if candidate.is_dir():
+                    files = _limit_files(sorted(candidate.glob("*.npz")))
+                    if files:
+                        elapsed = time.perf_counter() - t_local
+                        return files, str(candidate), elapsed
+
+        elapsed = time.perf_counter() - t_local
+        return [], None, elapsed
+
+    def _fetch_cluster_prediction_files() -> tuple[list[Path], str | None, float]:
+        t_cluster = time.perf_counter()
+        local_root = cache_dir / "cluster-cache"
+        local_run_root = local_root / run_root_path(str(run_id))
+        local_predictions_dir = local_run_root / "predictions"
+        local_run_root.mkdir(parents=True, exist_ok=True)
+
+        remote_predictions_dir = f"{CLUSTER_REPO_ROOT}/{run_predictions_dir(str(run_id))}"
+        check = subprocess.run(
+            [
+                "ssh",
+                CLUSTER_HOST,
+                f'test -d "{remote_predictions_dir}"',
+            ],
+            capture_output=True,
+            text=True,
+        )
+        if check.returncode != 0:
+            return [], None, time.perf_counter() - t_cluster
+
+        local_root_q = shlex.quote(str(local_root))
+        remote_root_q = shlex.quote(CLUSTER_REPO_ROOT)
+        remote_rel_q = shlex.quote(run_predictions_dir(str(run_id)))
+        command = (
+            f'mkdir -p {local_root_q} && '
+            f'ssh {shlex.quote(CLUSTER_HOST)} '
+            f'"tar -C {remote_root_q} -cf - {remote_rel_q}" '
+            f'| tar -xf - -C {local_root_q}'
+        )
+        copy = subprocess.run(
+            ["bash", "-lc", command],
+            capture_output=True,
+            text=True,
+        )
+        if copy.returncode != 0:
+            raise RuntimeError(
+                f"Failed to copy cluster predictions for {run_id}: {copy.stderr.strip()}"
+            )
+
+        files = _limit_files(sorted(local_predictions_dir.glob("*.npz")))
+        elapsed = time.perf_counter() - t_cluster
+        return files, str(local_predictions_dir), elapsed
 
     cache_dir = Path(cache_dir).expanduser()
-    repo_id = data_dir.removeprefix("hf://")
-    prefix = f"{run_predictions_dir(run_id)}/"
+    files, local_dir, t_tree = _local_prediction_files()
+    source_desc = None
 
-    t0 = time.perf_counter()
-    snapshot_dir = Path(
-        snapshot_download(
-            repo_id=repo_id,
-            repo_type="dataset",
-            cache_dir=str(cache_dir),
-            allow_patterns=f"{prefix}/*.npz",
+    if files:
+        source_desc = f"local={local_dir}"
+        print(
+            f"[fetch_predictions] run={run_id} source={source_desc} scan={t_tree:.1f}s files={len(files)}"
         )
-    )
-    files = sorted(snapshot_dir.glob(f"{prefix}/*.npz"))
-    t_tree = time.perf_counter() - t0
-    print(
-        f"[fetch_predictions] run={run_id} repo={repo_id} snapshot={t_tree:.1f}s files={len(files)}"
-    )
+    else:
+        repo_id = str(data_dir).removeprefix("hf://")
+        prefix = f"{run_predictions_dir(run_id)}/"
+        t0 = time.perf_counter()
+        try:
+            api = HfApi()
+            repo_files = sorted(
+                f.path
+                for f in api.list_repo_tree(
+                    repo_id,
+                    repo_type="dataset",
+                    path_in_repo=prefix,
+                    recursive=False,
+                )
+                if getattr(f, "path", "").endswith(".npz")
+            )
+            repo_files = _limit_files(repo_files)
+            files = [
+                Path(
+                    hf_hub_download(
+                        repo_id=repo_id,
+                        repo_type="dataset",
+                        filename=path,
+                        cache_dir=str(cache_dir),
+                    )
+                )
+                for path in repo_files
+            ]
+        except Exception as e:
+            files = []
+            print(f"[fetch_predictions] run={run_id} repo lookup failed: {e}")
+        t_tree = time.perf_counter() - t0
+        source_desc = f"repo={repo_id}"
+        print(
+            f"[fetch_predictions] run={run_id} source={source_desc} scan={t_tree:.1f}s files={len(files)}"
+        )
+        if not files:
+            files, cluster_dir, t_cluster = _fetch_cluster_prediction_files()
+            if files:
+                t_tree = t_cluster
+                source_desc = f"cluster={cluster_dir}"
+                print(
+                    f"[fetch_predictions] run={run_id} source={source_desc} scan={t_tree:.1f}s files={len(files)}"
+                )
 
     result = {"train": {}, "eval": {}}
     t_np_load = 0.0
     total_npz_bytes = 0
     for file_i, local in enumerate(files, start=1):
         # fname: runs/{run_id}/predictions/eval_ep0000010_ba0000000050.npz
-        stem = local.stem
-        split, _, rest = stem.partition("_ep")
-        if split not in result:
+        parsed = _parse_prediction_file(local)
+        if parsed is None:
             continue
-        epoch_str, _, batch_str = rest.partition("_ba")
-        if not epoch_str or not batch_str:
-            continue
-        epoch = int(epoch_str)
-        batch = int(batch_str)
+        split, epoch, batch = parsed
         total_npz_bytes += local.stat().st_size
         t1 = time.perf_counter()
         payload = dict(np.load(local, allow_pickle=True))
@@ -746,12 +887,12 @@ def fetch_predictions(
         if file_i % 100 == 0 or file_i == len(files):
             print(
                 f"[fetch_predictions] progress run={run_id} files={file_i}/{len(files)} "
-                f"snapshot={t_tree:.1f}s np_load={t_np_load:.1f}s bytes={total_npz_bytes/1e6:.1f}MB"
+                f"source={source_desc} scan={t_tree:.1f}s np_load={t_np_load:.1f}s bytes={total_npz_bytes/1e6:.1f}MB"
             )
     print(
         f"[fetch_predictions] summary run={run_id} files={len(files)} kept_epochs="
         f"train:{len(result['train'])} eval:{len(result['eval'])} "
-        f"snapshot={t_tree:.1f}s np_load={t_np_load:.1f}s total_bytes={total_npz_bytes/1e6:.1f}MB"
+        f"source={source_desc} scan={t_tree:.1f}s np_load={t_np_load:.1f}s total_bytes={total_npz_bytes/1e6:.1f}MB"
     )
     return result
 

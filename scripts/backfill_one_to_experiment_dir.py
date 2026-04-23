@@ -343,8 +343,8 @@ def image_dir_name(row: dict, x_position: int, y_position: int) -> str:
     return "-".join(
         [
             normalize_token(row.get("object", "")),
-            f"{int(x_position):03d}",
-            f"{int(y_position):03d}",
+            f"{int(x_position):03d}x",
+            f"{int(y_position):03d}y",
             normalize_token(str(int(row.get("n_objects") or 1))),
             normalize_token(row.get("box_material", "")),
             timestamp,
