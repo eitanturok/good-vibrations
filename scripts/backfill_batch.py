@@ -204,15 +204,16 @@ def _load_or_create_assignments(source_dirs: list[str], start_id: int) -> list[t
 
 def _missing_experiment_configs(source_dir_names: list[str]) -> set[str]:
     """Return the subset of source_dir_names whose experiment_config.json is absent."""
-    names_list = " ".join(shlex.quote(n) for n in source_dir_names)
-    script = (
-        f"missing=(); "
-        f"for d in {names_list}; do "
-        f"  [ ! -f {shlex.quote(OLD_DIR)}/$d/experiment_config.json ] && missing+=($d); "
-        f"done; "
-        f"printf '%s\\n' \"${{missing[@]}}\""
+    py_script = (
+        f"import os\n"
+        f"base = {OLD_DIR!r}\n"
+        f"names = {source_dir_names!r}\n"
+        f"missing = [n for n in names if not os.path.exists(os.path.join(base, n, 'experiment_config.json'))]\n"
+        f"print('\\n'.join(missing))\n"
     )
-    raw = _ssh_fetch(script).decode()
+    # Write script to cluster tmp file then run it (avoids SSH command-length limits)
+    _ssh_fetch(f"cat > /tmp/_check_cfg.py", stdin=py_script.encode())
+    raw = _ssh_fetch("python3 /tmp/_check_cfg.py").decode()
     return set(line.strip() for line in raw.splitlines() if line.strip())
 
 
