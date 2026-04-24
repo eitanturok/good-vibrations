@@ -69,6 +69,7 @@ METADATA_COLUMN_ORDER = [
     "y_position",
     "x_com",
     "y_com",
+    "object",
     "n_objects",
     "box_material",
     "mask_file_name",
@@ -288,6 +289,7 @@ def build_metadata_row(
     y_position: int | None = None,
     x_com=None,
     y_com=None,
+    object_: str | None = None,
     n_objects: int | None = None,
     box_material: str | None = None,
     experiment_dir: str | None = None,
@@ -310,6 +312,7 @@ def build_metadata_row(
         "y_position": int(y_position) if y_position is not None else None,
         "x_com": x_com,
         "y_com": y_com,
+        "object": object_ or "",
         "n_objects": int(n_objects) if n_objects is not None else 0,
         "box_material": box_material or "",
         "mask_file_name": hf_file_url(hf_repo, mask_path),
@@ -357,6 +360,8 @@ def build_dataset_readme() -> str:
               dtype: float64
             - name: y_com
               dtype: float64
+            - name: object
+              dtype: string
             - name: n_objects
               dtype: int64
             - name: box_material
@@ -399,6 +404,7 @@ def build_dataset_readme() -> str:
         | `y_position` | int | Object grid row index (0-indexed) |
         | `x_com` | float | X centre-of-mass of the segmentation mask in the cropped overhead image (pixels) |
         | `y_com` | float | Y centre-of-mass of the segmentation mask in the cropped overhead image (pixels) |
+        | `object` | string | Object type inside the box, e.g. `cube` |
         | `n_objects` | int | Number of objects inside the box |
         | `box_material` | string | Box material, e.g. `cardboard` |
         | `mask_file_name` | image | Binary segmentation mask of the object in the cropped overhead image |
@@ -1920,6 +1926,7 @@ def remote_worker(args: argparse.Namespace) -> None:
             y_position=source_y,
             x_com=x_com,
             y_com=y_com,
+            object_=object_name,
             n_objects=n_objects,
             box_material=box_material,
             experiment_dir=new_dir.name,
