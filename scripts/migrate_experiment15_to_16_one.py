@@ -378,6 +378,7 @@ def build_dataset_readme() -> str:
 
         Per-sample viewer metadata lives in `data/metadata.jsonl`.
         Full signal data and media files live in per-sample subdirectories under `data/`.
+        Shared overhead images live under `image/` and the shared audio file under `audio/`.
 
         ---
 
@@ -411,10 +412,17 @@ def build_dataset_readme() -> str:
         ```
         experiment-16/
         ├── README.md                            # This file (dataset card)
+        ├── audio/
+        │   └── chirp_50_1000_3.0sec.wav         # Shared excitation chirp (50–1000 Hz, 3 s)
+        ├── image/
+        │   └── <image_dir>/                     # Named: <object>-<x>x-<y>y-<n>obj-<material>-<date>
+        │       ├── raw_overhead.png             # Full overhead photo before cropping
+        │       ├── cropped_overhead.png         # Overhead cropped to the box region
+        │       ├── segmented_overhead.png       # Overhead with mask overlay + speaker annotations
+        │       ├── mask.png                     # Binary segmentation mask (white = object)
+        │       └── mask.npz                     # Binary mask as compressed numpy array
         └── data/
             ├── metadata.jsonl                   # One JSON row per sample (viewer-facing)
-            ├── audio/
-            │   └── chirp_50_1000_3.0sec.wav     # Shared excitation chirp (50–1000 Hz, 3 s)
             ├── 0000001/                         # Per-sample directory (zero-padded 7-digit ID)
             │   ├── manifest.json                # Full provenance + config for this sample
             │   ├── speckle_vibration_raw.npy    # Raw laser camera frames  [100 lasers × T frames × 2 (XY)]
@@ -423,15 +431,8 @@ def build_dataset_readme() -> str:
             │   ├── speckle_shifts_fft.npz       # FFT of cleaned shifts (frequency domain)
             │   ├── speckle_shifts_ifft_audio.wav# Single-laser vibration reconstructed as audio
             │   └── speckle_vibrations.mp4       # Slow-motion preview video of speckle motion
-            ├── 0000002/
-            │   └── ...
-            └── image/
-                └── <image_dir>/                 # Named: <object>-<x>x-<y>y-<n>obj-<material>-<date>
-                    ├── raw_overhead.png         # Full overhead photo before cropping
-                    ├── cropped_overhead.png     # Overhead cropped to the box region
-                    ├── segmented_overhead.png   # Overhead with mask overlay + speaker annotations
-                    ├── mask.png                 # Binary segmentation mask (white = object)
-                    └── mask.npz                 # Binary mask as compressed numpy array
+            └── 0000002/
+                └── ...
         ```
 
         ---
