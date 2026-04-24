@@ -1126,11 +1126,28 @@ def _filtered_metadata_jsonl(experiment_dir: Path, hf_repo: str, api) -> bytes |
     return ("\n".join(rows) + "\n").encode()
 
 
+def _partial_sample_ignore_patterns(experiment_dir: Path) -> list[str]:
+    """Return ignore patterns for sample dirs that exist on disk but are not in metadata.jsonl."""
+    meta_path = experiment_dir / "data" / "metadata.jsonl"
+    if not meta_path.exists():
+        return []
+    completed = {"%07d" % int(json.loads(l)["sample_id"]) for l in meta_path.read_text().splitlines() if l.strip()}
+    partial = [
+        d.name for d in (experiment_dir / "data").iterdir()
+        if d.is_dir() and d.name.isdigit() and d.name not in completed
+    ]
+    if partial:
+        print(f"[hf] ignoring {len(partial)} partial sample dirs not in metadata.jsonl: {partial}", flush=True)
+    return [f"data/{d}/**" for d in partial]
+
+
 def upload_experiment_dir_to_hf(experiment_dir: Path, hf_repo: str) -> None:
     from huggingface_hub import HfApi
 
     api = HfApi()
     api.create_repo(hf_repo, repo_type="dataset", exist_ok=True)
+
+    partial_ignore = _partial_sample_ignore_patterns(experiment_dir)
 
     # Phase 1a: upload everything except the large raw .npy files first
     api.upload_large_folder(
@@ -1138,7 +1155,7 @@ def upload_experiment_dir_to_hf(experiment_dir: Path, hf_repo: str) -> None:
         repo_id=hf_repo,
         repo_type="dataset",
         num_workers=8,
-        ignore_patterns=["**/speckle_vibration_raw.npy"],
+        ignore_patterns=["**/speckle_vibration_raw.npy"] + partial_ignore,
     )
 
     # Phase 1b: upload raw .npy files in a second pass
@@ -1148,6 +1165,7 @@ def upload_experiment_dir_to_hf(experiment_dir: Path, hf_repo: str) -> None:
         repo_type="dataset",
         num_workers=8,
         allow_patterns=["**/speckle_vibration_raw.npy"],
+        ignore_patterns=partial_ignore,
     )
 
     # Phase 2: overwrite metadata.jsonl with a version filtered to only rows
