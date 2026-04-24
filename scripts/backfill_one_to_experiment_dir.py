@@ -436,11 +436,11 @@ def build_manifest(
         "artifacts": {
             "shared": {
                 "audio": audio_rel,
-                "raw_overhead": f"data/image/{image_dir}/raw_overhead.png",
-                "cropped_overhead": f"data/image/{image_dir}/cropped_overhead.png",
-                "segmented_overhead": f"data/image/{image_dir}/segmented_overhead.png",
-                "mask_png": f"data/image/{image_dir}/mask.png",
-                "mask_npz": f"data/image/{image_dir}/mask.npz",
+                "raw_overhead": f"image/{image_dir}/raw_overhead.png",
+                "cropped_overhead": f"image/{image_dir}/cropped_overhead.png",
+                "segmented_overhead": f"image/{image_dir}/segmented_overhead.png",
+                "mask_png": f"image/{image_dir}/mask.png",
+                "mask_npz": f"image/{image_dir}/mask.npz",
             },
             "sample": {
                 "speckle_vibration_raw": f"data/{sample_dir}/speckle_vibration_raw.npz",
@@ -473,7 +473,7 @@ def build_metadata_row(
 ) -> dict:
     return {
         "sample_id": int(sample_id),
-        "segmented_overhead_file_name": f"data/image/{image_dir}/segmented_overhead.png",
+        "segmented_overhead_file_name": f"image/{image_dir}/segmented_overhead.png",
         "speckle_vibrations_file_name": f"data/{sample_dir}/speckle_vibrations.mp4",
         "speckle_shifts_ifft_audio_file_name": f"data/{sample_dir}/speckle_shifts_ifft_audio.wav",
         "audio_file_name": audio_rel,
@@ -485,7 +485,7 @@ def build_metadata_row(
         "y_com": y_com,
         "n_objects": int(n_objects),
         "box_material": box_material,
-        "mask_file_name": f"data/image/{image_dir}/mask.png",
+        "mask_file_name": f"image/{image_dir}/mask.png",
         "experiment_dir": experiment_dir,
         "manifest": json.dumps(manifest, ensure_ascii=True),
     }
@@ -546,13 +546,13 @@ def main() -> None:
     sample_root.mkdir(parents=True, exist_ok=True)
 
     image_dir = image_dir_name(sample_row, x_position, y_position)
-    image_root = dest_experiment_root / "data" / "image" / image_dir
+    image_root = dest_experiment_root / "image" / image_dir
     image_root.mkdir(parents=True, exist_ok=True)
 
     stage(
         "copy shared audio",
-        lambda: (dest_experiment_root / "data" / audio_rel).write_bytes(audio_src.read_bytes())
-        if not (dest_experiment_root / "data" / audio_rel).exists()
+        lambda: (dest_experiment_root / audio_rel).write_bytes(audio_src.read_bytes())
+        if not (dest_experiment_root / audio_rel).exists()
         else None,
     )
     stage("save raw overhead image", lambda: save_image(image_root / "raw_overhead.png", sample_row["raw_image"]))
@@ -626,7 +626,7 @@ def main() -> None:
             y_position=y_position,
             x_com=x_com,
             y_com=y_com,
-            audio_rel=f"data/{audio_rel}",
+            audio_rel=audio_rel,
             image_dir=image_dir,
             sample_dir=sample_dir,
             fs=fs,
@@ -659,7 +659,7 @@ def main() -> None:
             n_objects=int(sample_row.get("n_objects") or 1),
             box_material=sample_row.get("box_material", ""),
             experiment_dir=args.experiment_dir,
-            audio_rel=f"data/{audio_rel}",
+            audio_rel=audio_rel,
             image_dir=image_dir,
             sample_dir=sample_dir,
             manifest=manifest,

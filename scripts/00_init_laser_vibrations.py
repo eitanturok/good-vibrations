@@ -31,8 +31,8 @@ def build_readme() -> str:
 
         It is designed to store:
 - sample metadata in `data/metadata.jsonl`
-- shared audio assets under `data/audio/`
-- shared overhead image groups under `data/image/`
+- shared audio assets under `audio/`
+- shared overhead image groups under `image/`
 - per-sample pipeline artifacts under `data/<sample_id>/`
 
         Target sample assets include:

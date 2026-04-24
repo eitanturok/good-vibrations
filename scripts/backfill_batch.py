@@ -222,7 +222,7 @@ def _ensure_hf_shared_files() -> None:
     """Upload README.md and shared audio to HF if not already present.
 
     These files must exist on HF before any sample rows are visible in the
-    dataset viewer — README.md defines the features schema, and data/audio/
+    dataset viewer — README.md defines the features schema, and audio/
     holds the shared excitation WAV referenced by every metadata row.
     """
     script = (
@@ -239,8 +239,8 @@ def _ensure_hf_shared_files() -> None:
         f"                repo_type='dataset', commit_message='Sync README')\n"
         f"print('[hf-shared] uploaded README.md', flush=True)\n"
         f"# Audio only uploaded if missing (content never changes)\n"
-        f"audio_repo = 'data/audio/chirp_50_1000_3.0sec.wav'\n"
-        f"audio_local = {NEW_DIR!r} + '/data/audio/chirp_50_1000_3.0sec.wav'\n"
+        f"audio_repo = 'audio/chirp_50_1000_3.0sec.wav'\n"
+        f"audio_local = {NEW_DIR!r} + '/audio/chirp_50_1000_3.0sec.wav'\n"
         f"if audio_repo not in existing and os.path.exists(audio_local):\n"
         f"    api.upload_file(path_or_fileobj=audio_local, path_in_repo=audio_repo,\n"
         f"                    repo_id={HF_REPO!r}, repo_type='dataset',\n"
@@ -356,7 +356,7 @@ def process_sample(source_dir_name: str, sample_id: int, segmenter: Segmenter,
                    pre_segment_future: Future | None = None) -> None:
     t0 = time.perf_counter()
     image_dir = _image_dir(source_dir_name)
-    remote_image_root = f"{NEW_DIR}/data/image/{image_dir}"
+    remote_image_root = f"{NEW_DIR}/image/{image_dir}"
     object_name = source_dir_name.split("-")[0].strip().lower()
 
     # 1. Wait for pre_segment to finish (may already be done if pipelined)

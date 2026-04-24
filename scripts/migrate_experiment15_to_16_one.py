@@ -31,7 +31,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 LOCAL_AUDIO_ROOT = REPO_ROOT / "data" / "audio_samples"
 CANONICAL_AUDIO_LOCAL_PATH = LOCAL_AUDIO_ROOT / "chirp_50_1000_3.0sec.wav"
 CANONICAL_AUDIO_FILE_NAME = "chirp_50_1000_3.0sec.wav"
-CANONICAL_AUDIO_REL = f"data/audio/{CANONICAL_AUDIO_FILE_NAME}"
+CANONICAL_AUDIO_REL = f"audio/{CANONICAL_AUDIO_FILE_NAME}"
 CANONICAL_AUDIO_SAMPLE_RATE_HZ = 44100
 CANONICAL_AUDIO_DURATION_S = 3.2
 CANONICAL_AUDIO_TOTAL_OUTPUT_CHANNELS = 8
@@ -471,7 +471,7 @@ def build_dataset_readme() -> str:
         | `speakers` | string | 4-bit code for active speakers, e.g. `0001` |
         | `x_position` | int | Object grid column (0-indexed) |
         | `y_position` | int | Object grid row (0-indexed) |
-        | `image_dir` | string | Image subdirectory name under `data/image/` |
+        | `image_dir` | string | Image subdirectory name under `image/` |
 
         ## `segmentation`
 
@@ -598,12 +598,12 @@ def build_dataset_readme() -> str:
 
         | Key | File | Description |
         |-----|------|-------------|
-        | `raw_overhead` | `data/image/<dir>/raw_overhead.png` | Full overhead photo before cropping |
-        | `cropped_overhead` | `data/image/<dir>/cropped_overhead.png` | Overhead cropped to box region |
-        | `segmented_overhead` | `data/image/<dir>/segmented_overhead.png` | Overhead with mask + speaker overlay |
-        | `mask_png` | `data/image/<dir>/mask.png` | Binary segmentation mask (PNG) |
-        | `mask_npz` | `data/image/<dir>/mask.npz` | Binary mask as compressed numpy array |
-        | `audio` | `data/audio/chirp_50_1000_3.0sec.wav` | Shared excitation chirp (all samples) |
+        | `raw_overhead` | `image/<dir>/raw_overhead.png` | Full overhead photo before cropping |
+        | `cropped_overhead` | `image/<dir>/cropped_overhead.png` | Overhead cropped to box region |
+        | `segmented_overhead` | `image/<dir>/segmented_overhead.png` | Overhead with mask + speaker overlay |
+        | `mask_png` | `image/<dir>/mask.png` | Binary segmentation mask (PNG) |
+        | `mask_npz` | `image/<dir>/mask.npz` | Binary mask as compressed numpy array |
+        | `audio` | `audio/chirp_50_1000_3.0sec.wav` | Shared excitation chirp (all samples) |
         | `speckle_vibration_raw` | `data/<id>/speckle_vibration_raw.npy` | Raw laser camera frames |
         | `speckle_vibrations` | `data/<id>/speckle_vibrations.mp4` | Slow-motion speckle preview video |
         | `speckle_shifts` | `data/<id>/speckle_shifts.npz` | Sub-pixel XY shifts per laser per frame |
@@ -805,10 +805,10 @@ def fetch_remote_sample_context(new_dir: str, experiment_id: str, sample_id: int
             'sample_id': int(row['sample_id']),
             'sample_dir': sample_dir,
             'image_dir': image_dir,
-            'image_root': str(new_dir / 'data' / 'image' / image_dir),
+            'image_root': str(new_dir / 'image' / image_dir),
             'manifest_path': str(manifest_path),
             'metadata_path': str(new_dir / 'data' / 'metadata.jsonl'),
-            'raw_overhead_path': str(new_dir / 'data' / 'image' / image_dir / 'raw_overhead.png'),
+            'raw_overhead_path': str(new_dir / 'image' / image_dir / 'raw_overhead.png'),
             'object': manifest['sample']['object'],
             'box_material': manifest['sample']['box_material'],
         }}))
@@ -938,10 +938,10 @@ def finalize_remote_segmentation(new_dir: str, sample_context: dict, hf_repo: st
         "y_com": y_com,
         "status": "completed",
     }
-    manifest_payload["artifacts"]["cropped_overhead"] = f"data/image/{image_dir}/cropped_overhead.png"
-    manifest_payload["artifacts"]["segmented_overhead"] = f"data/image/{image_dir}/segmented_overhead.png"
-    manifest_payload["artifacts"]["mask_png"] = f"data/image/{image_dir}/mask.png"
-    manifest_payload["artifacts"]["mask_npz"] = f"data/image/{image_dir}/mask.npz"
+    manifest_payload["artifacts"]["cropped_overhead"] = f"image/{image_dir}/cropped_overhead.png"
+    manifest_payload["artifacts"]["segmented_overhead"] = f"image/{image_dir}/segmented_overhead.png"
+    manifest_payload["artifacts"]["mask_png"] = f"image/{image_dir}/mask.png"
+    manifest_payload["artifacts"]["mask_npz"] = f"image/{image_dir}/mask.npz"
 
     metadata_rows = [json.loads(line) for line in remote_read_bytes(sample_context["metadata_path"]).decode("utf-8").splitlines() if line.strip()]
     target_sample_id = int(sample_context["sample_id"])
@@ -950,8 +950,8 @@ def finalize_remote_segmentation(new_dir: str, sample_context: dict, hf_repo: st
             continue
         row["x_com"] = x_com
         row["y_com"] = y_com
-        row["segmented_overhead_file_name"] = hf_file_url(hf_repo, f"data/image/{image_dir}/segmented_overhead.png")
-        row["mask_file_name"] = hf_file_url(hf_repo, f"data/image/{image_dir}/mask.png")
+        row["segmented_overhead_file_name"] = hf_file_url(hf_repo, f"image/{image_dir}/segmented_overhead.png")
+        row["mask_file_name"] = hf_file_url(hf_repo, f"image/{image_dir}/mask.png")
         row["manifest"] = json.dumps(manifest_payload, ensure_ascii=True)
 
     with tempfile.TemporaryDirectory(prefix="segment-finalize-") as tmp_dir:
@@ -1236,8 +1236,8 @@ def relative_posix(path: Path, root: Path) -> str:
 
 
 def ensure_scaffold(new_dir: Path) -> None:
-    (new_dir / "data" / "audio").mkdir(parents=True, exist_ok=True)
-    (new_dir / "data" / "image").mkdir(parents=True, exist_ok=True)
+    (new_dir / "audio").mkdir(parents=True, exist_ok=True)
+    (new_dir / "image").mkdir(parents=True, exist_ok=True)
     (new_dir / "data").mkdir(parents=True, exist_ok=True)
 
     readme = new_dir / "README.md"
@@ -1701,14 +1701,14 @@ def remote_worker(args: argparse.Namespace) -> None:
         n_objects=n_objects,
         box_material=box_material,
     )
-    image_root = new_dir / "data" / "image" / image_dir
+    image_root = new_dir / "image" / image_dir
     image_root.mkdir(parents=True, exist_ok=True)
 
     audio_rel = CANONICAL_AUDIO_REL
     audio_path_for_preview = None
     if args.remote_audio_path:
         audio_name = CANONICAL_AUDIO_FILE_NAME
-        audio_dest = new_dir / "data" / "audio" / audio_name
+        audio_dest = new_dir / "audio" / audio_name
         run(
             "copy shared audio",
             lambda: shutil.copy2(args.remote_audio_path, audio_dest) if (args.overwrite or not audio_dest.exists()) else None,
@@ -1886,11 +1886,11 @@ def remote_worker(args: argparse.Namespace) -> None:
             "experiment_output": experiment_output,
             "processing_config": processing_config,
             "artifacts": {
-                "raw_overhead": f"data/image/{image_dir}/raw_overhead.png",
-                "cropped_overhead": f"data/image/{image_dir}/cropped_overhead.png",
-                "segmented_overhead": f"data/image/{image_dir}/segmented_overhead.png",
-                "mask_png": f"data/image/{image_dir}/mask.png",
-                "mask_npz": f"data/image/{image_dir}/mask.npz",
+                "raw_overhead": f"image/{image_dir}/raw_overhead.png",
+                "cropped_overhead": f"image/{image_dir}/cropped_overhead.png",
+                "segmented_overhead": f"image/{image_dir}/segmented_overhead.png",
+                "mask_png": f"image/{image_dir}/mask.png",
+                "mask_npz": f"image/{image_dir}/mask.npz",
                 "audio": audio_rel or None,
                 "speckle_vibration_raw": f"data/{sample_dir}/{raw_artifact_name}",
                 "speckle_vibrations": f"data/{sample_dir}/speckle_vibrations.mp4",
@@ -1922,11 +1922,11 @@ def remote_worker(args: argparse.Namespace) -> None:
             n_objects=n_objects,
             box_material=box_material,
             experiment_dir=new_dir.name,
-            segmented_overhead_path=f"data/image/{image_dir}/segmented_overhead.png",
+            segmented_overhead_path=f"image/{image_dir}/segmented_overhead.png",
             speckle_vibrations_path=f"data/{sample_dir}/speckle_vibrations.mp4",
             speckle_shifts_ifft_audio_path=f"data/{sample_dir}/speckle_shifts_ifft_audio.wav",
             audio_path=audio_rel,
-            mask_path=f"data/image/{image_dir}/mask.png",
+            mask_path=f"image/{image_dir}/mask.png",
             manifest=manifest,
         ),
     )
