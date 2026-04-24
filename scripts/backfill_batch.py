@@ -44,10 +44,13 @@ sys.path.insert(0, str(REPO_ROOT / "scripts"))
 from utils.segment import app, Segmenter
 from migrate_experiment15_to_16_one import build_image_dir_name
 
-REMOTE_HOST   = "ethantu@mcluster11.wisdom.weizmann.ac.il"
-REMOTE_VENV   = "$HOME/venvs/experiment16-migrate"
-REMOTE_SCRIPT = "/home/ethantu/tmp/migrate_experiment15_to_16_one.py"
-REMOTE_AUDIO  = "/home/ethantu/tmp/chirp_50_1000_3.0sec.wav"
+REMOTE_HOST      = "ethantu@mcluster11.wisdom.weizmann.ac.il"
+REMOTE_VENV      = "$HOME/venvs/experiment16-migrate"
+REMOTE_SCRIPT    = "/home/ethantu/tmp/migrate_experiment15_to_16_one.py"
+REMOTE_AUDIO     = "/home/ethantu/tmp/chirp_50_1000_3.0sec.wav"
+REMOTE_README    = "/home/ethantu/tmp/hf_data/README.md"
+REMOTE_EXP_CFG   = "/home/ethantu/tmp/hf_data/base_experiment_config.json"
+REMOTE_PROC_CFG  = "/home/ethantu/tmp/hf_data/base_processing_config.json"
 OLD_DIR       = "/net/mraid20/ifs/wisdom/groups/mark_sheinin_lab/DATA/experiment-15"
 NEW_DIR       = "/net/mraid20/ifs/wisdom/groups/mark_sheinin_lab/DATA/experiment-16"
 HF_REPO       = "eturok-weizmann/laser-vibrations"
@@ -107,6 +110,9 @@ def _sync_static_files() -> None:
         sync(REPO_ROOT / "assets" / "speakers" / f"{key}.png", f"/home/ethantu/assets/speakers/{key}.png", f"speaker {key}.png")
     audio_local = REPO_ROOT / "data" / "audio_samples" / "chirp_50_1000_3.0sec.wav"
     sync(audio_local, REMOTE_AUDIO, "audio chirp")
+    sync(REPO_ROOT / "hf_data" / "README.md",                   REMOTE_README,   "hf_data README")
+    sync(REPO_ROOT / "hf_data" / "base_experiment_config.json", REMOTE_EXP_CFG,  "hf_data base_experiment_config")
+    sync(REPO_ROOT / "hf_data" / "base_processing_config.json", REMOTE_PROC_CFG, "hf_data base_processing_config")
 
 
 def _run_remote_stage(stage: str, source_dir_name: str, sample_id: int) -> None:
@@ -226,18 +232,31 @@ def _ensure_hf_shared_files() -> None:
     holds the shared excitation WAV referenced by every metadata row.
     """
     script = (
-        f"import os, sys\n"
-        f"sys.path.insert(0, '/home/ethantu/tmp')\n"
+        f"import os\n"
         f"os.environ['HF_HUB_DISABLE_XET'] = '1'\n"
         f"from huggingface_hub import HfApi\n"
-        f"from migrate_experiment15_to_16_one import build_dataset_readme\n"
         f"api = HfApi()\n"
         f"existing = set(api.list_repo_files({HF_REPO!r}, repo_type='dataset'))\n"
         f"# README always re-uploaded (content may have changed)\n"
-        f"api.upload_file(path_or_fileobj=build_dataset_readme().encode(),\n"
+        f"api.upload_file(path_or_fileobj={REMOTE_README!r},\n"
         f"                path_in_repo='README.md', repo_id={HF_REPO!r},\n"
         f"                repo_type='dataset', commit_message='Sync README')\n"
         f"print('[hf-shared] uploaded README.md', flush=True)\n"
+        f"# Config files always re-uploaded (content may have changed)\n"
+        f"api.upload_file(path_or_fileobj={REMOTE_EXP_CFG!r},\n"
+        f"                path_in_repo='base_experiment_config.json', repo_id={HF_REPO!r},\n"
+        f"                repo_type='dataset', commit_message='Sync base_experiment_config')\n"
+        f"print('[hf-shared] uploaded base_experiment_config.json', flush=True)\n"
+        f"api.upload_file(path_or_fileobj={REMOTE_PROC_CFG!r},\n"
+        f"                path_in_repo='base_processing_config.json', repo_id={HF_REPO!r},\n"
+        f"                repo_type='dataset', commit_message='Sync base_processing_config')\n"
+        f"print('[hf-shared] uploaded base_processing_config.json', flush=True)\n"
+        f"# Delete old data/ locations if they still exist\n"
+        f"for old in ('data/base_experiment_config.json', 'data/base_processing_config.json'):\n"
+        f"    if old in existing:\n"
+        f"        api.delete_file(path_in_repo=old, repo_id={HF_REPO!r}, repo_type='dataset',\n"
+        f"                        commit_message=f'Remove {{old}} (moved to top-level)')\n"
+        f"        print(f'[hf-shared] deleted {{old}}', flush=True)\n"
         f"# Audio only uploaded if missing (content never changes)\n"
         f"audio_repo = 'audio/chirp_50_1000_3.0sec.wav'\n"
         f"audio_local = {NEW_DIR!r} + '/audio/chirp_50_1000_3.0sec.wav'\n"

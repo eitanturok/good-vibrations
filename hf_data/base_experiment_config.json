@@ -1,0 +1,68 @@
+{
+  "audio": {
+    "file_name": "audio/chirp_50_1000_3.0sec.wav",
+    "sample_rate_hz": 44100,
+    "duration_s": 3.2,
+    "total_output_channels": 8,
+    "wav_channels": 1,
+    "sample_width_bytes": 2,
+    "generation": {
+      "signal": "chirp",
+      "method": "logarithmic",
+      "chirp_duration_s": 3.0,
+      "silence_start_s": 0.1,
+      "silence_end_s": 0.1,
+      "f_start_hz": 50,
+      "f_end_hz": 1000,
+      "output_dtype": "int16",
+      "normalization": "peak_to_int16"
+    }
+  },
+  "recording": {
+    "capture_seconds_requested": 3.1
+  },
+  "overhead_camera": {
+    "frame_rate_fps": 30,
+    "exposure_ms": 30,
+    "pixel_clock_mhz": 86,
+    "gain": 60,
+    "runtime": {
+      "device_id": 0,
+      "color_mode": "IS_CM_SENSOR_RAW8",
+      "buffer_count": 40,
+      "rotation_degrees": 180,
+      "debayer_code": "COLOR_BAYER_BG2BGR"
+    }
+  },
+  "laser_camera": {
+    "runtime": {
+      "info_field": false,
+      "cxp_link_configuration": "CXP12_X4"
+    },
+    "calibration": {
+      "fps": 500,
+      "exposure_us": 30,
+      "gain": 3
+    },
+    "capture": {
+      "fps": 2500,
+      "exposure_us": 150,
+      "gain": 1,
+      "buffer_part_count": 3000
+    }
+  },
+  "laser_grid": {
+    "n_roi_rows": 10,
+    "n_roi_columns": 10,
+    "roi_row_height": 30,
+    "roi_column_width": 70
+  },
+  "preview": {
+    "overhead_resize_factor": 0.75,
+    "overhead_gamma": 1.0,
+    "laser_preview_gamma": 2.5,
+    "show_full_frame": 0,
+    "preview_level": 1,
+    "reset_rois": true
+  }
+}

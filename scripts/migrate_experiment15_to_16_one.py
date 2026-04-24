@@ -329,6 +329,10 @@ def normalize_metadata_row(row: dict) -> dict:
 
 
 def build_dataset_readme() -> str:
+    return (REPO_ROOT / "hf_data" / "README.md").read_text(encoding="utf-8")
+
+
+def _build_dataset_readme_inline() -> str:
     return textwrap.dedent(
         """\
         ---
@@ -492,7 +496,7 @@ def build_dataset_readme() -> str:
 
         ## `experiment_config`
 
-        Merged from the source `experiment_config.json` and hardware defaults.
+        Merged from the source `base_experiment_config.json` and hardware defaults.
 
         | Key | Type | Description |
         |-----|------|-------------|
@@ -1254,19 +1258,16 @@ def ensure_scaffold(new_dir: Path) -> None:
     if not metadata_path.exists():
         metadata_path.write_text("", encoding="utf-8")
 
-    exp_cfg = new_dir / "data" / "base_experiment_config.json"
+    exp_cfg = new_dir / "base_experiment_config.json"
     exp_cfg.write_text(json.dumps(notebook_default_experiment_config(), indent=2), encoding="utf-8")
 
-    proc_cfg = new_dir / "data" / "base_processing_config.json"
+    proc_cfg = new_dir / "base_processing_config.json"
     proc_cfg.write_text(json.dumps(default_processing_config(), indent=2), encoding="utf-8")
 
-    legacy_exp_cfg = new_dir / "base_experiment_config.json"
-    if legacy_exp_cfg.exists():
-        legacy_exp_cfg.unlink()
-
-    legacy_proc_cfg = new_dir / "base_processing_config.json"
-    if legacy_proc_cfg.exists():
-        legacy_proc_cfg.unlink()
+    for old_cfg in (new_dir / "data" / "base_experiment_config.json",
+                    new_dir / "data" / "base_processing_config.json"):
+        if old_cfg.exists():
+            old_cfg.unlink()
 
 
 def inspect_source(source_dir: Path) -> dict:
