@@ -1132,12 +1132,22 @@ def upload_experiment_dir_to_hf(experiment_dir: Path, hf_repo: str) -> None:
     api = HfApi()
     api.create_repo(hf_repo, repo_type="dataset", exist_ok=True)
 
-    # Phase 1: upload all files (resumable, handles large/raw npy files)
+    # Phase 1a: upload everything except the large raw .npy files first
     api.upload_large_folder(
         folder_path=str(experiment_dir),
         repo_id=hf_repo,
         repo_type="dataset",
         num_workers=8,
+        ignore_patterns=["**/speckle_vibration_raw.npy"],
+    )
+
+    # Phase 1b: upload raw .npy files in a second pass
+    api.upload_large_folder(
+        folder_path=str(experiment_dir),
+        repo_id=hf_repo,
+        repo_type="dataset",
+        num_workers=8,
+        allow_patterns=["**/speckle_vibration_raw.npy"],
     )
 
     # Phase 2: overwrite metadata.jsonl with a version filtered to only rows
