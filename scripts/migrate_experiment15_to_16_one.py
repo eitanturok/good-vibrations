@@ -836,7 +836,7 @@ def crop(left: float, right: float, up: float, down: float, raw_overhead_path: P
     return cropped_overhead_path
 
 
-def segment(cropped_overhead_path: Path, object_name: str, prompt: str | None, mask_path: Path) -> Path:
+def segment(cropped_overhead_path: Path, object_: str, prompt: str | None, mask_path: Path) -> Path:
     code = textwrap.dedent(
         f"""
         import numpy as np
@@ -844,14 +844,14 @@ def segment(cropped_overhead_path: Path, object_name: str, prompt: str | None, m
         from utils.segment import app, segment
 
         cropped_overhead_path = {str(cropped_overhead_path)!r}
-        object_name = {object_name!r}
+        object_ = {object_!r}
         prompt = {prompt!r}
         mask_path = {str(mask_path)!r}
         mask_png_path = {str(mask_path.with_suffix('.png'))!r}
 
         image_array = np.asarray(Image.open(cropped_overhead_path).convert('RGB'), dtype=np.uint8)
         with app.run():
-            mask, _ = segment.remote(image_array, object_name, 'cardboard', prompt)
+            mask, _ = segment.remote(image_array, object_, 'cardboard', prompt)
         mask = np.asarray(mask, dtype=np.float32)
         np.savez_compressed(mask_path, mask=mask)
         Image.fromarray((np.clip(mask, 0.0, 1.0) * 255).astype(np.uint8), mode='L').save(mask_png_path)
@@ -1604,7 +1604,7 @@ DEFAULT_BOX_MATERIAL = "cardboard"
 
 def build_image_dir_name(
     source_dir_name: str,
-    object_name: str | None = None,
+    object_: str | None = None,
     x_position: int | str | None = None,
     y_position: int | str | None = None,
     n_objects: int | None = None,
@@ -1616,7 +1616,7 @@ def build_image_dir_name(
     Format: {object}-{x}x-{y}y-{n}obj-{material}[-tag...]-{timestamp}
     Sentinel placeholders when values are absent: OBJECT, POSx, POSy, Xobj, MATERIAL.
     """
-    obj = normalize_token(object_name) if object_name else "OBJECT"
+    obj = normalize_token(object_) if object_ else "OBJECT"
     mat = normalize_token(box_material) if box_material else "MATERIAL"
     ts = parse_source_timestamp(source_dir_name)
 
@@ -1697,12 +1697,12 @@ def remote_worker(args: argparse.Namespace) -> None:
     sample_root.mkdir(parents=True, exist_ok=True)
 
     speakers = parse_speakers_from_source_dir(args.source_dir_name)
-    object_name = normalize_token(args.source_dir_name.split("-")[0])
+    object_ = normalize_token(args.source_dir_name.split("-")[0])
     n_objects = DEFAULT_N_OBJECTS
     box_material = DEFAULT_BOX_MATERIAL
     image_dir = build_image_dir_name(
         args.source_dir_name,
-        object_name=object_name,
+        object_=object_,
         x_position=source_x,
         y_position=source_y,
         n_objects=n_objects,
@@ -1840,7 +1840,7 @@ def remote_worker(args: argparse.Namespace) -> None:
     if args.stage not in ("post_segment",):
         mask_path = run(
             "segment cropped overhead",
-            lambda: segment(cropped_overhead_path, object_name, args.prompt, image_root / "mask.npz"),
+            lambda: segment(cropped_overhead_path, object_, args.prompt, image_root / "mask.npz"),
         )
 
     x_com, y_com = run("compute mask center of mass", lambda: center_of_mass(mask_path))
@@ -1876,7 +1876,7 @@ def remote_worker(args: argparse.Namespace) -> None:
             "source_experiment_dir": str(source_dir),
             "hf_repo": args.hf_repo,
             "sample": {
-                "object": object_name,
+                "object": object_,
                 "n_objects": n_objects,
                 "box_material": box_material,
                 "speakers": speakers,
@@ -1926,7 +1926,7 @@ def remote_worker(args: argparse.Namespace) -> None:
             y_position=source_y,
             x_com=x_com,
             y_com=y_com,
-            object_=object_name,
+            object_=object_,
             n_objects=n_objects,
             box_material=box_material,
             experiment_dir=new_dir.name,
