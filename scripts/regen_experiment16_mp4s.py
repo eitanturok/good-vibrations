@@ -86,8 +86,9 @@ def generate_mp4(raw_npy_path: Path, out_path: Path, capture_fps: float) -> floa
         writer.release()
 
     import subprocess
+    import imageio_ffmpeg
     subprocess.run(
-        ["ffmpeg", "-y", "-i", str(tmp_path), "-vcodec", "libx264", "-pix_fmt", "yuv420p", str(out_path)],
+        [imageio_ffmpeg.get_ffmpeg_exe(), "-y", "-i", str(tmp_path), "-vcodec", "libx264", "-pix_fmt", "yuv420p", str(out_path)],
         check=True, capture_output=True,
     )
     tmp_path.unlink()
