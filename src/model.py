@@ -26,6 +26,7 @@ from helpers import (
     HFUploaderCallback,
     MaskVisualizationCallback,
     MemoryCallback,
+    StepTimeCallback,
     best_checkpoint_path,
     checkpoint_pattern_path,
     run_predictions_dir,
@@ -1195,6 +1196,7 @@ def train(**kwargs):
     dataset = train_loader.dataset.dataset
     dataset_gb = (dataset.shifts.nbytes + dataset.masks.nbytes) / 1e9
     mem_cb = MemoryCallback(dataset_gb=dataset_gb)
+    step_time_cb = StepTimeCallback()
     ic(config)
 
     trainer = Trainer(
@@ -1226,7 +1228,7 @@ def train(**kwargs):
         save_interval=args.checkpoint_interval,
         save_num_checkpoints_to_keep=-1,
         autoresume=True,
-        callbacks=[mask_viz, best_saver, hf_uploader, mem_cb],
+        callbacks=[mask_viz, best_saver, hf_uploader, mem_cb, step_time_cb],
     )
 
     trainer.fit()

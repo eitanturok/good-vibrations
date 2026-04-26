@@ -286,6 +286,18 @@ class HFUploaderCallback(Callback):
         self._uploaded = True
 
 
+class StepTimeCallback(Callback):
+    """Logs per-batch and cumulative train wall-clock time to the active logger."""
+
+    def batch_end(self, state: State, logger: Logger):
+        logger.log_metrics(
+            {
+                "time/train_step_sec": state.timestamp.batch_wct.total_seconds(),
+                "time/train_total_sec": state.timestamp.total_wct.total_seconds(),
+            }
+        )
+
+
 class MemoryCallback(Callback):
     """Logs GPU/CPU memory every batch and streams a Plotly stacked area chart to wandb."""
 
