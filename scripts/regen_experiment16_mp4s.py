@@ -27,11 +27,31 @@ def stage(label, fn):
     return result
 
 
+def read_npy_header(path: Path) -> tuple[tuple, np.dtype, int]:
+    from numpy.lib import format as npy_format
+    with path.open("rb") as f:
+        major, minor = npy_format.read_magic(f)
+        if (major, minor) == (1, 0):
+            shape, _, dtype = npy_format.read_array_header_1_0(f)
+        else:
+            shape, _, dtype = npy_format.read_array_header_2_0(f)
+        offset = f.tell()
+    return shape, np.dtype(dtype), offset
+
+
+def read_frame_at(path: Path, offset: int, dtype: np.dtype, frame_h: int, frame_w: int, idx: int) -> np.ndarray:
+    frame_size = frame_h * frame_w
+    byte_offset = offset + idx * frame_size * dtype.itemsize
+    with path.open("rb") as f:
+        f.seek(byte_offset)
+        return np.fromfile(f, dtype=dtype, count=frame_size).reshape(frame_h, frame_w)
+
+
 def generate_mp4(raw_npy_path: Path, out_path: Path, capture_fps: float) -> float:
-    frames = np.load(raw_npy_path, mmap_mode="r")
-    frame_count, frame_height, frame_width = frames.shape
+    shape, dtype, offset = read_npy_header(raw_npy_path)
+    frame_count, frame_height, frame_width = int(shape[0]), int(shape[1]), int(shape[2])
     step = max(1, frame_count // MAX_FRAMES)
-    selected = frames[::step]
+    selected_idxs = list(range(0, frame_count, step))
 
     preview_w, preview_h = frame_width, frame_height
     if frame_width > MAX_WIDTH:
@@ -39,7 +59,10 @@ def generate_mp4(raw_npy_path: Path, out_path: Path, capture_fps: float) -> floa
         preview_w = int(round(frame_width * scale))
         preview_h = int(round(frame_height * scale))
 
-    probe = np.asarray(selected[: min(len(selected), 50)])
+    probe = np.stack([
+        read_frame_at(raw_npy_path, offset, dtype, frame_height, frame_width, i)
+        for i in selected_idxs[: min(len(selected_idxs), 50)]
+    ])
     lo = float(np.percentile(probe, 5))
     hi = float(np.percentile(probe, 99.5))
 
@@ -50,13 +73,14 @@ def generate_mp4(raw_npy_path: Path, out_path: Path, capture_fps: float) -> floa
     if not writer.isOpened():
         raise RuntimeError(f"Failed to open VideoWriter for {tmp_path}")
     try:
-        for i, frame in enumerate(selected):
+        for i, idx in enumerate(selected_idxs):
+            frame = read_frame_at(raw_npy_path, offset, dtype, frame_height, frame_width, idx)
             frame_u8 = np.clip((frame.astype(np.float32) - lo) / max(hi - lo, 1e-6), 0, 1)
             frame_u8 = (frame_u8 * 255).astype(np.uint8)
             frame_bgr = cv2.cvtColor(frame_u8, cv2.COLOR_GRAY2BGR)
             if (preview_w, preview_h) != (frame_width, frame_height):
                 frame_bgr = cv2.resize(frame_bgr, (preview_w, preview_h), interpolation=cv2.INTER_AREA)
-            cv2.putText(frame_bgr, f"frame {i * step}", (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255, 255, 255), 2, cv2.LINE_AA)
+            cv2.putText(frame_bgr, f"frame {idx}", (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255, 255, 255), 2, cv2.LINE_AA)
             writer.write(frame_bgr)
     finally:
         writer.release()
