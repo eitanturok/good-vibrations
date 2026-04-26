@@ -5,6 +5,10 @@ from typing import Any, Callable, Optional, Union
 import psutil
 import torch
 import wandb
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 from composer import Callback
 from composer.core import Event, State
 from composer.loggers import Logger
@@ -602,51 +606,24 @@ class MaskVisualizationCallback(Callback):
     def _log_images(self, preds_list, state, logger, split):
         import numpy as np
 
+        del logger
         true = np.concatenate([p["mask_true"] for p in preds_list])
         logits = np.concatenate([p["mask_logits"] for p in preds_list])
         probs = 1.0 / (1.0 + np.exp(-logits))
         sample_ids = sum([p["sample_idx"] for p in preds_list], [])
-        x_positions = sum([p["x_position"] for p in preds_list], [])
-        y_positions = sum([p["y_position"] for p in preds_list], [])
-        objects = sum([p["object"] for p in preds_list], [])
-        n_objects = sum([p["n_objects"] for p in preds_list], [])
         n_total = min(len(sample_ids), true.shape[0], probs.shape[0])
         n = min(self.n_samples, n_total)
         true = true[:n]
         probs = probs[:n]
         sample_ids = sample_ids[:n]
         image_paths = self._get_cropped_image_paths(sample_ids)
-        epoch = int(state.timestamp.epoch.value)
-        rows = []
+        images = []
         for i in range(n):
-            panel = self._make_panel(image_paths[int(sample_ids[i])], true[i], probs[i])
-            rows.append(
-                [
-                    wandb.Image(panel),
-                    int(sample_ids[i]),
-                    epoch,
-                    split,
-                    str(objects[i]),
-                    int(n_objects[i]),
-                    float(x_positions[i]),
-                    float(y_positions[i]),
-                ]
-            )
-        if rows:
-            logger.log_table(
-                columns=[
-                    "image",
-                    "sample_idx",
-                    "epoch",
-                    "split",
-                    "object",
-                    "n_objects",
-                    "x_position",
-                    "y_position",
-                ],
-                rows=rows,
-                name=f"Images/{split}",
-            )
+            fig = self._make_figure(image_paths[int(sample_ids[i])], true[i], probs[i])
+            images.append(wandb.Image(fig, caption=f"sample {int(sample_ids[i])}"))
+            plt.close(fig)
+        if wandb.run and images:
+            wandb.log({f"Images/{split}": images}, step=state.timestamp.batch.value)
 
     def _get_cropped_image_paths(self, sample_ids):
         missing = []
@@ -663,7 +640,7 @@ class MaskVisualizationCallback(Callback):
                 image.save(paths[int(sample_id)])
         return paths
 
-    def _make_panel(self, image_path, true_mask, pred_mask):
+    def _make_figure(self, image_path, true_mask, pred_mask):
         import numpy as np
         from PIL import Image
 
@@ -671,11 +648,15 @@ class MaskVisualizationCallback(Callback):
         true_mask = self._resize_mask(true_mask, image.shape[:2])
         pred_mask = self._resize_mask(pred_mask, image.shape[:2])
 
-        true_img = self._mask_to_rgb(true_mask)
-        pred_img = self._mask_to_rgb(pred_mask)
-        masks = self._stack_h(true_img, pred_img)
-        overlay = self._overlay_mask(image, pred_mask)
-        return self._stack_h(masks, overlay)
+        fig, axes = plt.subplots(1, 2, figsize=(10, 4))
+        axes[0].imshow(self._stack_h(self._mask_to_rgb(true_mask), self._mask_to_rgb(pred_mask)))
+        axes[0].set_title("True Mask | Pred Mask")
+        axes[0].axis("off")
+        axes[1].imshow(self._overlay_mask(image, pred_mask))
+        axes[1].set_title("Pred Overlay")
+        axes[1].axis("off")
+        fig.tight_layout()
+        return fig
 
     def _resize_mask(self, mask, target_hw):
         import numpy as np
