@@ -508,8 +508,10 @@ class HFUploaderCallback(Callback):
 def _make_input_images(inputs: torch.Tensor, num_images: int):
     if inputs.shape[0] < num_images:
         num_images = inputs.shape[0]
-    images = inputs[0:num_images].detach().cpu().numpy()
-    return images
+    images = inputs[0:num_images].detach()
+    images = (images.clip(0.0, 1.0) * 255).to(torch.uint8)
+    images = images.unsqueeze(-1).repeat(1, 1, 1, 3)
+    return images.cpu().numpy()
 
 class MaskVisualizationCallback(Callback):
     def __init__(
@@ -569,6 +571,12 @@ class MaskVisualizationCallback(Callback):
         if state.eval_timestamp.get(TimeUnit.BATCH).value == 0:
             self._log_image(state, logger, 'Images/Eval')
             # self._save_prediction(state, 'eval')
+
+    def _mask_to_rgb(self, mask):
+        import numpy as np
+
+        gray = (np.clip(mask, 0.0, 1.0) * 255).astype(np.uint8)
+        return np.repeat(gray[..., None], 3, axis=-1)
 
 
 
