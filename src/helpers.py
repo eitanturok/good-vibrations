@@ -524,7 +524,7 @@ class MaskVisualizationCallback(Callback):
     def epoch_start(self, state, logger):
         del state, logger
 
-    def batch_end(self, state, logger):
+    def after_forward(self, state, logger):
         current_train_epoch = state.timestamp.epoch.value + 1
         if current_train_epoch % self.interval != 0:
             return
@@ -535,7 +535,7 @@ class MaskVisualizationCallback(Callback):
         self._log_images(pred, state, logger, "Train")
         self._save_predictions([pred], state, "train")
 
-    def eval_batch_end(self, state, logger):
+    def eval_after_forward(self, state, logger):
         if state.eval_timestamp.batch.value != 0:
             return
         pred = self._batch_to_pred(state.batch, state.outputs)
