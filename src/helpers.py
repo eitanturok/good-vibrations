@@ -1,4 +1,4 @@
-import os, shlex, subprocess, time, math, tempfile
+import os, shlex, subprocess, time, math
 from pathlib import Path
 from typing import Any, Callable, Optional, Union
 
@@ -525,8 +525,6 @@ class MaskVisualizationCallback(Callback):
         self.run_id = run_id
         self._train_preds = None
         self._eval_preds = []
-        self._image_cache_dir = Path(tempfile.gettempdir()) / "good-vibrations-mask-viz"
-        self._image_cache_dir.mkdir(parents=True, exist_ok=True)
 
     def epoch_start(self, state, logger):
         del state, logger
@@ -616,76 +614,27 @@ class MaskVisualizationCallback(Callback):
         true = true[:n]
         probs = probs[:n]
         sample_ids = sample_ids[:n]
-        image_paths = self._get_cropped_image_paths(sample_ids)
         images = []
         for i in range(n):
-            fig = self._make_figure(image_paths[int(sample_ids[i])], true[i], probs[i])
+            fig = self._make_figure(true[i], probs[i])
             images.append(wandb.Image(fig, caption=f"sample {int(sample_ids[i])}"))
             plt.close(fig)
         if wandb.run and images:
             wandb.log({f"Images/{split}": images}, step=state.timestamp.batch.value)
 
-    def _get_cropped_image_paths(self, sample_ids):
-        missing = []
-        paths = {}
-        for sample_id in sample_ids:
-            path = self._image_cache_dir / f"sample_{int(sample_id):06d}.png"
-            paths[int(sample_id)] = path
-            if not path.exists():
-                missing.append(int(sample_id))
-        if missing:
-            fetched = fetch_overhead_images(missing)
-            for sample_id, image in fetched.items():
-                paths[int(sample_id)].parent.mkdir(parents=True, exist_ok=True)
-                image.save(paths[int(sample_id)])
-        return paths
-
-    def _make_figure(self, image_path, true_mask, pred_mask):
-        import numpy as np
-        from PIL import Image
-
-        image = np.asarray(Image.open(image_path).convert("RGB"), dtype=np.uint8)
-        true_mask = self._resize_mask(true_mask, image.shape[:2])
-        pred_mask = self._resize_mask(pred_mask, image.shape[:2])
-
-        fig, axes = plt.subplots(1, 2, figsize=(10, 4))
-        axes[0].imshow(self._stack_h(self._mask_to_rgb(true_mask), self._mask_to_rgb(pred_mask)))
-        axes[0].set_title("True Mask | Pred Mask")
-        axes[0].axis("off")
-        axes[1].imshow(self._overlay_mask(image, pred_mask))
-        axes[1].set_title("Pred Overlay")
-        axes[1].axis("off")
+    def _make_figure(self, true_mask, pred_mask):
+        fig, ax = plt.subplots(1, 1, figsize=(8, 4))
+        ax.imshow(self._stack_h(self._mask_to_rgb(true_mask), self._mask_to_rgb(pred_mask)))
+        ax.set_title("True Mask | Pred Mask")
+        ax.axis("off")
         fig.tight_layout()
         return fig
-
-    def _resize_mask(self, mask, target_hw):
-        import numpy as np
-        import torch.nn.functional as F
-
-        mask = np.asarray(mask, dtype=np.float32)
-        if mask.shape == tuple(target_hw):
-            return np.clip(mask, 0.0, 1.0)
-        tensor = torch.from_numpy(mask)[None, None]
-        resized = F.interpolate(
-            tensor, size=tuple(target_hw), mode="bilinear", align_corners=False
-        )
-        return np.clip(resized[0, 0].numpy(), 0.0, 1.0)
 
     def _mask_to_rgb(self, mask):
         import numpy as np
 
         gray = (np.clip(mask, 0.0, 1.0) * 255).astype(np.uint8)
         return np.repeat(gray[..., None], 3, axis=-1)
-
-    def _overlay_mask(self, image, pred_mask):
-        import numpy as np
-
-        image_f = image.astype(np.float32) / 255.0
-        overlay_color = np.zeros_like(image_f)
-        overlay_color[..., 0] = 1.0
-        alpha = np.clip(pred_mask[..., None] * self.alpha, 0.0, 1.0)
-        blended = image_f * (1.0 - alpha) + overlay_color * alpha
-        return (np.clip(blended, 0.0, 1.0) * 255).astype(np.uint8)
 
     def _stack_h(self, left, right, gap=8):
         import numpy as np
