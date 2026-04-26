@@ -5,10 +5,6 @@ from typing import Any, Callable, Optional, Union
 import psutil
 import torch
 import wandb
-import matplotlib
-
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 from composer import Callback
 from composer.core import Event, State
 from composer.loggers import Logger
@@ -604,7 +600,6 @@ class MaskVisualizationCallback(Callback):
     def _log_images(self, preds_list, state, logger, split):
         import numpy as np
 
-        del logger
         true = np.concatenate([p["mask_true"] for p in preds_list])
         logits = np.concatenate([p["mask_logits"] for p in preds_list])
         probs = 1.0 / (1.0 + np.exp(-logits))
@@ -614,21 +609,19 @@ class MaskVisualizationCallback(Callback):
         true = true[:n]
         probs = probs[:n]
         sample_ids = sample_ids[:n]
-        images = []
+        panels = []
         for i in range(n):
-            fig = self._make_figure(true[i], probs[i])
-            images.append(wandb.Image(fig, caption=f"sample {int(sample_ids[i])}"))
-            plt.close(fig)
-        if wandb.run and images:
-            wandb.log({f"Images/{split}": images}, step=state.timestamp.batch.value)
+            panels.append(self._make_panel(true[i], probs[i]))
+        if panels:
+            logger.log_images(
+                panels,
+                name=f"Images/{split}",
+                channels_last=True,
+                use_table=True,
+            )
 
-    def _make_figure(self, true_mask, pred_mask):
-        fig, ax = plt.subplots(1, 1, figsize=(8, 4))
-        ax.imshow(self._stack_h(self._mask_to_rgb(true_mask), self._mask_to_rgb(pred_mask)))
-        ax.set_title("True Mask | Pred Mask")
-        ax.axis("off")
-        fig.tight_layout()
-        return fig
+    def _make_panel(self, true_mask, pred_mask):
+        return self._stack_h(self._mask_to_rgb(true_mask), self._mask_to_rgb(pred_mask))
 
     def _mask_to_rgb(self, mask):
         import numpy as np
