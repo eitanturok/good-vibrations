@@ -206,6 +206,7 @@ class VibrationDataset(Dataset):
             split=split,
             token=token,
             columns=[
+                "cropped_image",
                 "sample_idx",
                 "x_position",
                 "y_position",
@@ -299,6 +300,7 @@ class VibrationDataset(Dataset):
         return {
             "shifts": shifts,
             "mask": mask.float(),
+            "cropped_image": np.asarray(row["cropped_image"].convert("RGB"), dtype=np.uint8).copy(),
             "floor_x": floor_x,
             "floor_y": floor_y,
             "fps": row["fps"],
@@ -335,6 +337,7 @@ def make_collate(
             torch.stack([b["mask"] for b in batch]).float(),
         )
         meta = {
+            "cropped_image": [b["cropped_image"] for b in batch],
             "sample_idx": [b["sample_idx"] for b in batch],
             "x_position": [b["x_position"] for b in batch],
             "y_position": [b["y_position"] for b in batch],
@@ -1047,8 +1050,14 @@ def get_parser():
     parser.add_argument("--eval-interval", type=str, default="50ep")
 
     # logging
-    parser.add_argument("--mask-viz-train-interval", type=int, default=50)
-    parser.add_argument("--mask-viz-thresholds", type=str, default="0.3,0.5,0.7,0.9")
+    parser.add_argument(
+        "--mask-viz-interval",
+        "--mask-viz-train-interval",
+        dest="mask_viz_interval",
+        type=int,
+        default=50,
+    )
+    parser.add_argument("--mask-viz-alpha", type=float, default=0.4)
     parser.add_argument("--run-name", type=str, default="run")
     parser.add_argument(
         "--best-metric",
@@ -1157,6 +1166,8 @@ def train(**kwargs):
         "gamma": args.gamma,
         "max_duration": args.max_duration,
         "eval_interval": args.eval_interval,
+        "mask_viz_interval": args.mask_viz_interval,
+        "mask_viz_alpha": args.mask_viz_alpha,
         "decoder": args.decoder,
         "cross_attn_layers": args.cross_attn_layers,
     }
@@ -1178,8 +1189,8 @@ def train(**kwargs):
     )
     mask_viz = MaskVisualizationCallback(
         n_samples=args.eval_batch_size,
-        save_dir=run_visualizations_dir(run_id),
-        train_viz_interval=args.mask_viz_train_interval,
+        interval=args.mask_viz_interval,
+        alpha=args.mask_viz_alpha,
         pred_save_dir=run_predictions_dir(run_id),
         run_id=run_id,
     )

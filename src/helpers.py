@@ -5,10 +5,6 @@ from typing import Any, Callable, Optional, Union
 import psutil
 import torch
 import wandb
-import matplotlib
-
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 from composer import Callback
 from composer.core import Event, State
 from composer.loggers import Logger
@@ -513,20 +509,18 @@ class MaskVisualizationCallback(Callback):
     def __init__(
         self,
         n_samples=4,
-        save_dir="visualizations",
-        train_viz_interval=10,
-        thresholds=[],
+        interval=10,
+        alpha=0.4,
         pred_save_dir=None,
         run_id=None,
     ):
         self.n_samples = n_samples
-        self.save_dir = save_dir
-        self.train_viz_interval = train_viz_interval
-        self.thresholds = list(thresholds)
+        self.interval = interval
+        self.alpha = alpha
         self.pred_save_dir = pred_save_dir
         self.run_id = run_id
         self._train_preds = None
-        self._eval_preds = []  # accumulates across all eval batches
+        self._eval_preds = []
 
     def epoch_start(self, state, logger):
         del state, logger
@@ -535,14 +529,12 @@ class MaskVisualizationCallback(Callback):
     def batch_end(self, state, logger):
         del logger
         if self._should_collect_train_preds(state) and self._train_preds is None:
-            # Reuse the first train batch's existing forward pass for logging.
             self._train_preds = [self._batch_to_pred(state.batch, state.outputs)]
 
     def epoch_end(self, state, logger):
-        del logger
-        if state.timestamp.epoch.value % self.train_viz_interval != 0 or not self._train_preds:
+        if not self._train_preds:
             return
-        self._visualize(self._train_preds, state, "train", use_all_samples=False)
+        self._log_images(self._train_preds, state, logger, "Train")
         self._save_predictions(self._train_preds, state, "train")
 
     def eval_batch_end(self, state, logger):
@@ -550,16 +542,13 @@ class MaskVisualizationCallback(Callback):
         self._eval_preds.append(self._batch_to_pred(state.batch, state.outputs))
 
     def _should_collect_train_preds(self, state):
-        # During train batch callbacks, Composer's epoch timestamp counts completed
-        # epochs, so the current in-flight epoch is epoch.value + 1.
         current_train_epoch = state.timestamp.epoch.value + 1
-        return current_train_epoch % self.train_viz_interval == 0
+        return current_train_epoch % self.interval == 0
 
     def eval_end(self, state, logger):
-        del logger
         if not self._eval_preds:
             return
-        self._visualize(self._eval_preds, state, "eval", use_all_samples=False)
+        self._log_images(self._eval_preds, state, logger, "Eval")
         self._save_predictions(self._eval_preds, state, "eval")
         self._eval_preds = []
 
@@ -569,6 +558,7 @@ class MaskVisualizationCallback(Callback):
         return {
             "mask_true": true_masks.detach().cpu().float().numpy(),
             "mask_logits": mask_logits.detach().cpu().float().numpy(),
+            "cropped_image": list(meta["cropped_image"]),
             "sample_idx": list(meta["sample_idx"]),
             "x_position": list(meta["x_position"]),
             "y_position": list(meta["y_position"]),
@@ -608,90 +598,90 @@ class MaskVisualizationCallback(Callback):
             n_objects=np.array(n_objects, dtype=int),
         )
 
-    def _visualize(self, preds_list, state, split, use_all_samples):
+    def _log_images(self, preds_list, state, logger, split):
         import numpy as np
 
         true = np.concatenate([p["mask_true"] for p in preds_list])
         logits = np.concatenate([p["mask_logits"] for p in preds_list])
         probs = 1.0 / (1.0 + np.exp(-logits))
+        images = sum([p["cropped_image"] for p in preds_list], [])
         sample_ids = sum([p["sample_idx"] for p in preds_list], [])
-        n_total = min(len(sample_ids), true.shape[0], probs.shape[0])
-        n = n_total if use_all_samples else min(self.n_samples, n_total)
+        n_total = min(len(sample_ids), len(images), true.shape[0], probs.shape[0])
+        n = min(self.n_samples, n_total)
         true = true[:n]
         probs = probs[:n]
-        epoch = state.timestamp.epoch.value
-        os.makedirs(self.save_dir, exist_ok=True)
-        log = {}
+        panels = []
         for i in range(n):
-            caption = f"sample {sample_ids[i]}"
-            # continuous prob map (no threshold)
-            fig, (ax0, ax1) = plt.subplots(1, 2, figsize=(8, 4))
-            ax0.imshow(true[i], vmin=0, vmax=1, cmap="gray")
-            ax0.set_title("True Mask")
-            ax0.axis("off")
-            ax1.imshow(probs[i], vmin=0, vmax=1, cmap="gray")
-            ax1.set_title("Pred Mask (prob)")
-            ax1.axis("off")
-            fig.suptitle(
-                f"Epoch {epoch}, {split.capitalize()} Sample {sample_ids[i]}, Prob"
-            )
-            fig.tight_layout()
-            self._save_visualization(
-                fig,
-                split=split,
-                kind="prob",
-                state=state,
-                sample_idx=int(sample_ids[i]),
-            )
-            if wandb.run:
-                log.setdefault(f"mask_viz/{split}/prob", []).append(
-                    wandb.Image(fig, caption=caption)
-                )
-            plt.close(fig)
-            # binarized at each threshold
-            for t in self.thresholds:
-                fig, (ax0, ax1) = plt.subplots(1, 2, figsize=(8, 4))
-                ax0.imshow(true[i], vmin=0, vmax=1, cmap="gray")
-                ax0.set_title("true")
-                ax0.axis("off")
-                ax1.imshow((probs[i] > t).astype(float), vmin=0, vmax=1, cmap="gray")
-                ax1.set_title(f"Pred Mask (threshold {t})")
-                ax1.axis("off")
-                fig.suptitle(
-                    f"Epoch {epoch}, {split.capitalize()} Sample {sample_ids[i]}, threshold {t}"
-                )
-                fig.tight_layout()
-                self._save_visualization(
-                    fig,
-                    split=split,
-                    kind=f"thresh{t}",
-                    state=state,
-                    sample_idx=int(sample_ids[i]),
-                )
-                if wandb.run:
-                    log.setdefault(f"mask_viz/{split}/thresh{t}", []).append(
-                        wandb.Image(fig, caption=caption)
-                    )
-                plt.close(fig)
-        if wandb.run and log:
-            wandb.log(log, step=state.timestamp.batch.value)
+            panel = self._make_panel(images[i], true[i], probs[i])
+            panels.append(panel)
+        if panels:
+            logger.log_images(panels, name=f"Images/{split}", channels_last=True, use_table=True)
 
-    def _save_visualization(self, fig, split, kind, state, sample_idx):
-        epoch = int(state.timestamp.epoch.value)
-        batch = int(state.timestamp.batch.value)
-        local_path = Path(
-            visualization_image_path(
-                self.run_id,
-                split=split,
-                kind=kind,
-                epoch=epoch,
-                batch=batch,
-                sample_idx=sample_idx,
-            )
+    def _make_panel(self, image, true_mask, pred_mask):
+        import numpy as np
+
+        image = np.asarray(image, dtype=np.uint8)
+        true_mask = self._resize_mask(true_mask, image.shape[:2])
+        pred_mask = self._resize_mask(pred_mask, image.shape[:2])
+
+        true_img = self._mask_to_rgb(true_mask)
+        pred_img = self._mask_to_rgb(pred_mask)
+        masks = self._stack_h(true_img, pred_img)
+        overlay = self._overlay_mask(image, pred_mask)
+        return self._stack_h(masks, overlay)
+
+    def _resize_mask(self, mask, target_hw):
+        import numpy as np
+        import torch.nn.functional as F
+
+        mask = np.asarray(mask, dtype=np.float32)
+        if mask.shape == tuple(target_hw):
+            return np.clip(mask, 0.0, 1.0)
+        tensor = torch.from_numpy(mask)[None, None]
+        resized = F.interpolate(
+            tensor, size=tuple(target_hw), mode="bilinear", align_corners=False
         )
-        local_path.parent.mkdir(parents=True, exist_ok=True)
-        fig.savefig(local_path, dpi=150, bbox_inches="tight")
+        return np.clip(resized[0, 0].numpy(), 0.0, 1.0)
 
+    def _mask_to_rgb(self, mask):
+        import numpy as np
+
+        gray = (np.clip(mask, 0.0, 1.0) * 255).astype(np.uint8)
+        return np.repeat(gray[..., None], 3, axis=-1)
+
+    def _overlay_mask(self, image, pred_mask):
+        import numpy as np
+
+        image_f = image.astype(np.float32) / 255.0
+        overlay_color = np.zeros_like(image_f)
+        overlay_color[..., 0] = 1.0
+        alpha = np.clip(pred_mask[..., None] * self.alpha, 0.0, 1.0)
+        blended = image_f * (1.0 - alpha) + overlay_color * alpha
+        return (np.clip(blended, 0.0, 1.0) * 255).astype(np.uint8)
+
+    def _stack_h(self, left, right, gap=8):
+        import numpy as np
+
+        h = max(left.shape[0], right.shape[0])
+        left = self._pad_to_height(left, h)
+        right = self._pad_to_height(right, h)
+        spacer = np.full((h, gap, 3), 255, dtype=np.uint8)
+        return np.concatenate([left, spacer, right], axis=1)
+
+    def _pad_to_height(self, image, height):
+        import numpy as np
+
+        if image.shape[0] == height:
+            return image
+        pad = height - image.shape[0]
+        top = pad // 2
+        bottom = pad - top
+        return np.pad(
+            image,
+            ((top, bottom), (0, 0), (0, 0)),
+            mode="constant",
+            constant_values=255,
+        )
 
 def fetch_predictions(
     run_id,
