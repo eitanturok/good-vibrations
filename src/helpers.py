@@ -530,7 +530,7 @@ class MaskVisualizationCallback(Callback):
         self.pred_save_dir = pred_save_dir
         self.run_id = run_id
         self.last_train_time_value_logged = -1
-        self.last_train_epoch_logged = -1
+        self.last_eval_step_logged = -1
 
     def _prep_inputs(self, batch, outputs):
         _, true_masks, _, _, meta = batch
@@ -547,15 +547,14 @@ class MaskVisualizationCallback(Callback):
 
     def _log_image(self, state: State, logger: Logger, data_name: str):
         inputs = self._prep_inputs(state.batch, state.outputs)
+        n = min(len(inputs["sample_idx"]), len(inputs["mask_true"]), len(inputs["mask_pred"]))
+        panels = [
+            self._make_panel(inputs["mask_true"][i], inputs["mask_pred"][i])
+            for i in range(n)
+        ]
         logger.log_images(
-            inputs["mask_true"],
-            name=f"{data_name}/True Mask",
-            channels_last=True,
-            use_table=False,
-        )
-        logger.log_images(
-            inputs["mask_pred"],
-            name=f"{data_name}/Predicted Mask",
+            panels,
+            name=data_name,
             channels_last=True,
             use_table=False,
         )
@@ -568,15 +567,17 @@ class MaskVisualizationCallback(Callback):
             # self._save_prediction(state, 'train')
 
     def eval_after_forward(self, state: State, logger: Logger):
-        if state.eval_timestamp.get(TimeUnit.BATCH).value == 0:
-            self._log_image(state, logger, 'Images/Eval')
-            # self._save_prediction(state, 'eval')
+        eval_batch = state.eval_timestamp.get(TimeUnit.BATCH).value
+        train_step = state.timestamp.batch.value
+        if eval_batch != 0 or train_step == self.last_eval_step_logged:
+            return
+        self.last_eval_step_logged = train_step
+        self._log_image(state, logger, 'Images/Eval')
+        # self._save_prediction(state, 'eval')
 
-    def _mask_to_rgb(self, mask):
+    def _make_panel(self, true_mask, pred_mask):
         import numpy as np
-
-        gray = (np.clip(mask, 0.0, 1.0) * 255).astype(np.uint8)
-        return np.repeat(gray[..., None], 3, axis=-1)
+        return np.concatenate([true_mask, pred_mask], axis=1)
 
 
 
