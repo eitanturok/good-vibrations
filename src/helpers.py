@@ -606,16 +606,45 @@ class MaskVisualizationCallback(Callback):
         probs = 1.0 / (1.0 + np.exp(-logits))
         images = sum([p["cropped_image"] for p in preds_list], [])
         sample_ids = sum([p["sample_idx"] for p in preds_list], [])
+        x_positions = sum([p["x_position"] for p in preds_list], [])
+        y_positions = sum([p["y_position"] for p in preds_list], [])
+        objects = sum([p["object"] for p in preds_list], [])
+        n_objects = sum([p["n_objects"] for p in preds_list], [])
         n_total = min(len(sample_ids), len(images), true.shape[0], probs.shape[0])
         n = min(self.n_samples, n_total)
         true = true[:n]
         probs = probs[:n]
-        panels = []
+        epoch = int(state.timestamp.epoch.value)
+        rows = []
         for i in range(n):
             panel = self._make_panel(images[i], true[i], probs[i])
-            panels.append(panel)
-        if panels:
-            logger.log_images(panels, name=f"Images/{split}", channels_last=True, use_table=True)
+            rows.append(
+                [
+                    wandb.Image(panel),
+                    int(sample_ids[i]),
+                    epoch,
+                    split,
+                    str(objects[i]),
+                    int(n_objects[i]),
+                    float(x_positions[i]),
+                    float(y_positions[i]),
+                ]
+            )
+        if rows:
+            logger.log_table(
+                columns=[
+                    "image",
+                    "sample_idx",
+                    "epoch",
+                    "split",
+                    "object",
+                    "n_objects",
+                    "x_position",
+                    "y_position",
+                ],
+                rows=rows,
+                name=f"Images/{split}",
+            )
 
     def _make_panel(self, image, true_mask, pred_mask):
         import numpy as np
