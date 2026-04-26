@@ -1,4 +1,4 @@
-import os, shlex, subprocess, time
+import os, shlex, subprocess, time, math
 from pathlib import Path
 from typing import Any, Callable, Optional, Union
 
@@ -286,227 +286,227 @@ class HFUploaderCallback(Callback):
         self._uploaded = True
 
 
-class StepTimeCallback(Callback):
-    """Logs per-batch and cumulative train wall-clock time to the active logger."""
+# class StepTimeCallback(Callback):
+#     """Logs per-batch and cumulative train wall-clock time to the active logger."""
 
-    def batch_end(self, state: State, logger: Logger):
-        logger.log_metrics(
-            {
-                "time/train_step_sec": state.timestamp.batch_wct.total_seconds(),
-                "time/train_total_sec": state.timestamp.total_wct.total_seconds(),
-            }
-        )
+#     def batch_end(self, state: State, logger: Logger):
+#         logger.log_metrics(
+#             {
+#                 "time/train_step_sec": state.timestamp.batch_wct.total_seconds(),
+#                 "time/train_total_sec": state.timestamp.total_wct.total_seconds(),
+#             }
+#         )
 
 
-class MemoryCallback(Callback):
-    """Logs GPU/CPU memory every batch and streams a Plotly stacked area chart to wandb."""
+# class MemoryCallback(Callback):
+#     """Logs GPU/CPU memory every batch and streams a Plotly stacked area chart to wandb."""
 
-    def __init__(self, dataset_gb: float):
-        self.dataset_gb = dataset_gb
-        self._has_cuda = torch.cuda.is_available()
-        self._peak_forward = 0.0
-        self._peak_backward = 0.0
-        # accumulated history — each append is one batch
-        self._steps = []
-        self._weights = []
-        self._optimizer = []
-        self._gradients = []
-        self._other = []
-        self._peak_fwd = []
-        self._peak_bwd = []
-        self._gpu_total = []
-        self._cpu_other = []
-        self._ram_total = []
+#     def __init__(self, dataset_gb: float):
+#         self.dataset_gb = dataset_gb
+#         self._has_cuda = torch.cuda.is_available()
+#         self._peak_forward = 0.0
+#         self._peak_backward = 0.0
+#         # accumulated history — each append is one batch
+#         self._steps = []
+#         self._weights = []
+#         self._optimizer = []
+#         self._gradients = []
+#         self._other = []
+#         self._peak_fwd = []
+#         self._peak_bwd = []
+#         self._gpu_total = []
+#         self._cpu_other = []
+#         self._ram_total = []
 
-    def before_train_batch(self, state, logger):
-        if self._has_cuda:
-            torch.cuda.reset_peak_memory_stats()
+#     def before_train_batch(self, state, logger):
+#         if self._has_cuda:
+#             torch.cuda.reset_peak_memory_stats()
 
-    def after_forward(self, state, logger):
-        if self._has_cuda:
-            self._peak_forward = torch.cuda.max_memory_allocated() / 1e9
+#     def after_forward(self, state, logger):
+#         if self._has_cuda:
+#             self._peak_forward = torch.cuda.max_memory_allocated() / 1e9
 
-    def after_backward(self, state, logger):
-        if self._has_cuda:
-            self._peak_backward = torch.cuda.max_memory_allocated() / 1e9
+#     def after_backward(self, state, logger):
+#         if self._has_cuda:
+#             self._peak_backward = torch.cuda.max_memory_allocated() / 1e9
 
-    def batch_end(self, state, logger):
-        model = state.model
-        optimizer = state.optimizers[0]
-        weights_gb = sum(p.data.nbytes for p in model.parameters()) / 1e9
-        grads_gb = (
-            sum(p.grad.nbytes for p in model.parameters() if p.grad is not None) / 1e9
-        )
-        opt_gb = (
-            sum(
-                v.nbytes
-                for s in optimizer.state.values()
-                for v in s.values()
-                if isinstance(v, torch.Tensor)
-            )
-            / 1e9
-        )
-        allocated_gb = torch.cuda.memory_allocated() / 1e9 if self._has_cuda else 0.0
-        gpu_total_gb = (
-            torch.cuda.get_device_properties(0).total_memory / 1e9 if self._has_cuda else 0.0
-        )
-        act_gb = max(0.0, self._peak_forward - weights_gb) if self._has_cuda else 0.0
-        other_gpu = (
-            max(0.0, allocated_gb - weights_gb - opt_gb - grads_gb) if self._has_cuda else 0.0
-        )
-        vm = psutil.virtual_memory()
-        other_cpu = max(0.0, vm.used / 1e9 - self.dataset_gb)
+#     def batch_end(self, state, logger):
+#         model = state.model
+#         optimizer = state.optimizers[0]
+#         weights_gb = sum(p.data.nbytes for p in model.parameters()) / 1e9
+#         grads_gb = (
+#             sum(p.grad.nbytes for p in model.parameters() if p.grad is not None) / 1e9
+#         )
+#         opt_gb = (
+#             sum(
+#                 v.nbytes
+#                 for s in optimizer.state.values()
+#                 for v in s.values()
+#                 if isinstance(v, torch.Tensor)
+#             )
+#             / 1e9
+#         )
+#         allocated_gb = torch.cuda.memory_allocated() / 1e9 if self._has_cuda else 0.0
+#         gpu_total_gb = (
+#             torch.cuda.get_device_properties(0).total_memory / 1e9 if self._has_cuda else 0.0
+#         )
+#         act_gb = max(0.0, self._peak_forward - weights_gb) if self._has_cuda else 0.0
+#         other_gpu = (
+#             max(0.0, allocated_gb - weights_gb - opt_gb - grads_gb) if self._has_cuda else 0.0
+#         )
+#         vm = psutil.virtual_memory()
+#         other_cpu = max(0.0, vm.used / 1e9 - self.dataset_gb)
 
-        logger.log_metrics(
-            {
-                "memory/gpu/weights_gb": weights_gb,
-                "memory/gpu/gradients_gb": grads_gb,
-                "memory/gpu/optimizer_gb": opt_gb,
-                "memory/gpu/activations_gb": act_gb,
-                "memory/gpu/peak_forward_gb": self._peak_forward,
-                "memory/gpu/peak_backward_gb": self._peak_backward,
-                "memory/gpu/allocated_gb": allocated_gb,
-                "memory/gpu/reserved_gb": torch.cuda.memory_reserved() / 1e9 if self._has_cuda else 0.0,
-                "memory/gpu/total_gb": gpu_total_gb,
-                "memory/cpu/dataset_gb": self.dataset_gb,
-                "memory/cpu/ram_used_gb": vm.used / 1e9,
-                "memory/cpu/ram_available_gb": vm.available / 1e9,
-                "memory/cpu/ram_total_gb": vm.total / 1e9,
-            }
-        )
+#         logger.log_metrics(
+#             {
+#                 "memory/gpu/weights_gb": weights_gb,
+#                 "memory/gpu/gradients_gb": grads_gb,
+#                 "memory/gpu/optimizer_gb": opt_gb,
+#                 "memory/gpu/activations_gb": act_gb,
+#                 "memory/gpu/peak_forward_gb": self._peak_forward,
+#                 "memory/gpu/peak_backward_gb": self._peak_backward,
+#                 "memory/gpu/allocated_gb": allocated_gb,
+#                 "memory/gpu/reserved_gb": torch.cuda.memory_reserved() / 1e9 if self._has_cuda else 0.0,
+#                 "memory/gpu/total_gb": gpu_total_gb,
+#                 "memory/cpu/dataset_gb": self.dataset_gb,
+#                 "memory/cpu/ram_used_gb": vm.used / 1e9,
+#                 "memory/cpu/ram_available_gb": vm.available / 1e9,
+#                 "memory/cpu/ram_total_gb": vm.total / 1e9,
+#             }
+#         )
 
-        # accumulate and redraw chart
-        step = state.timestamp.batch.value
-        self._steps.append(step)
-        self._weights.append(weights_gb)
-        self._optimizer.append(opt_gb)
-        self._gradients.append(grads_gb)
-        self._other.append(other_gpu)
-        self._peak_fwd.append(self._peak_forward)
-        self._peak_bwd.append(self._peak_backward)
-        self._gpu_total.append(gpu_total_gb)
-        self._cpu_other.append(other_cpu)
-        self._ram_total.append(vm.total / 1e9)
+#         # accumulate and redraw chart
+#         step = state.timestamp.batch.value
+#         self._steps.append(step)
+#         self._weights.append(weights_gb)
+#         self._optimizer.append(opt_gb)
+#         self._gradients.append(grads_gb)
+#         self._other.append(other_gpu)
+#         self._peak_fwd.append(self._peak_forward)
+#         self._peak_bwd.append(self._peak_backward)
+#         self._gpu_total.append(gpu_total_gb)
+#         self._cpu_other.append(other_cpu)
+#         self._ram_total.append(vm.total / 1e9)
 
-        if wandb.run:
-            wandb.log({"memory/breakdown": wandb.Plotly(self._build_fig())}, step=step)
+#         if wandb.run:
+#             wandb.log({"memory/breakdown": wandb.Plotly(self._build_fig())}, step=step)
 
-    def _build_fig(self):
-        import plotly.graph_objects as go
-        from plotly.subplots import make_subplots
+#     def _build_fig(self):
+#         import plotly.graph_objects as go
+#         from plotly.subplots import make_subplots
 
-        fig = make_subplots(
-            rows=2,
-            cols=1,
-            shared_xaxes=True,
-            subplot_titles=("GPU Memory", "CPU (RAM) Memory"),
-            vertical_spacing=0.12,
-        )
-        s = self._steps
+#         fig = make_subplots(
+#             rows=2,
+#             cols=1,
+#             shared_xaxes=True,
+#             subplot_titles=("GPU Memory", "CPU (RAM) Memory"),
+#             vertical_spacing=0.12,
+#         )
+#         s = self._steps
 
-        for name, values, color in [
-            ("Weights", self._weights, "#1565C0"),  # dark blue  – stable foundation
-            (
-                "Optimizer",
-                self._optimizer,
-                "#2E7D32",
-            ),  # dark green – grows then stabilises
-            ("Gradients", self._gradients, "#E65100"),  # dark orange
-            ("Other", self._other, "#9E9E9E"),  # grey – misc CUDA allocs
-        ]:
-            fig.add_trace(
-                go.Scatter(
-                    x=s,
-                    y=values,
-                    name=name,
-                    legendgroup="gpu",
-                    mode="lines",
-                    stackgroup="gpu",
-                    line=dict(width=0),
-                    fillcolor=color,
-                    hovertemplate=f"<b>{name}</b>: %{{y:.3f}} GB<extra></extra>",
-                ),
-                row=1,
-                col=1,
-            )
+#         for name, values, color in [
+#             ("Weights", self._weights, "#1565C0"),  # dark blue  – stable foundation
+#             (
+#                 "Optimizer",
+#                 self._optimizer,
+#                 "#2E7D32",
+#             ),  # dark green – grows then stabilises
+#             ("Gradients", self._gradients, "#E65100"),  # dark orange
+#             ("Other", self._other, "#9E9E9E"),  # grey – misc CUDA allocs
+#         ]:
+#             fig.add_trace(
+#                 go.Scatter(
+#                     x=s,
+#                     y=values,
+#                     name=name,
+#                     legendgroup="gpu",
+#                     mode="lines",
+#                     stackgroup="gpu",
+#                     line=dict(width=0),
+#                     fillcolor=color,
+#                     hovertemplate=f"<b>{name}</b>: %{{y:.3f}} GB<extra></extra>",
+#                 ),
+#                 row=1,
+#                 col=1,
+#             )
 
-        for name, values, color, dash in [
-            ("Peak fwd (incl. activations)", self._peak_fwd, "#42A5F5", "dot"),
-            ("Peak bwd", self._peak_bwd, "#EF5350", "solid"),
-        ]:
-            fig.add_trace(
-                go.Scatter(
-                    x=s,
-                    y=values,
-                    name=name,
-                    legendgroup="gpu",
-                    mode="lines",
-                    line=dict(color=color, width=1.5, dash=dash),
-                    hovertemplate=f"<b>{name}</b>: %{{y:.3f}} GB<extra></extra>",
-                ),
-                row=1,
-                col=1,
-            )
+#         for name, values, color, dash in [
+#             ("Peak fwd (incl. activations)", self._peak_fwd, "#42A5F5", "dot"),
+#             ("Peak bwd", self._peak_bwd, "#EF5350", "solid"),
+#         ]:
+#             fig.add_trace(
+#                 go.Scatter(
+#                     x=s,
+#                     y=values,
+#                     name=name,
+#                     legendgroup="gpu",
+#                     mode="lines",
+#                     line=dict(color=color, width=1.5, dash=dash),
+#                     hovertemplate=f"<b>{name}</b>: %{{y:.3f}} GB<extra></extra>",
+#                 ),
+#                 row=1,
+#                 col=1,
+#             )
 
-        fig.add_trace(
-            go.Scatter(
-                x=s,
-                y=self._gpu_total,
-                name="GPU Capacity",
-                legendgroup="gpu",
-                mode="lines",
-                line=dict(color="black", width=2, dash="dash"),
-                hovertemplate="<b>GPU Capacity</b>: %{y:.1f} GB<extra></extra>",
-            ),
-            row=1,
-            col=1,
-        )
+#         fig.add_trace(
+#             go.Scatter(
+#                 x=s,
+#                 y=self._gpu_total,
+#                 name="GPU Capacity",
+#                 legendgroup="gpu",
+#                 mode="lines",
+#                 line=dict(color="black", width=2, dash="dash"),
+#                 hovertemplate="<b>GPU Capacity</b>: %{y:.1f} GB<extra></extra>",
+#             ),
+#             row=1,
+#             col=1,
+#         )
 
-        dataset_vals = [self.dataset_gb] * len(s)
-        for name, values, color in [
-            ("Dataset", dataset_vals, "#1565C0"),
-            ("Other", self._cpu_other, "#9E9E9E"),
-        ]:
-            fig.add_trace(
-                go.Scatter(
-                    x=s,
-                    y=values,
-                    name=f"CPU: {name}",
-                    legendgroup="cpu",
-                    mode="lines",
-                    stackgroup="cpu",
-                    line=dict(width=0),
-                    fillcolor=color,
-                    hovertemplate=f"<b>{name}</b>: %{{y:.3f}} GB<extra></extra>",
-                ),
-                row=2,
-                col=1,
-            )
+#         dataset_vals = [self.dataset_gb] * len(s)
+#         for name, values, color in [
+#             ("Dataset", dataset_vals, "#1565C0"),
+#             ("Other", self._cpu_other, "#9E9E9E"),
+#         ]:
+#             fig.add_trace(
+#                 go.Scatter(
+#                     x=s,
+#                     y=values,
+#                     name=f"CPU: {name}",
+#                     legendgroup="cpu",
+#                     mode="lines",
+#                     stackgroup="cpu",
+#                     line=dict(width=0),
+#                     fillcolor=color,
+#                     hovertemplate=f"<b>{name}</b>: %{{y:.3f}} GB<extra></extra>",
+#                 ),
+#                 row=2,
+#                 col=1,
+#             )
 
-        fig.add_trace(
-            go.Scatter(
-                x=s,
-                y=self._ram_total,
-                name="RAM Capacity",
-                legendgroup="cpu",
-                mode="lines",
-                line=dict(color="black", width=2, dash="dash"),
-                hovertemplate="<b>RAM Capacity</b>: %{y:.1f} GB<extra></extra>",
-            ),
-            row=2,
-            col=1,
-        )
+#         fig.add_trace(
+#             go.Scatter(
+#                 x=s,
+#                 y=self._ram_total,
+#                 name="RAM Capacity",
+#                 legendgroup="cpu",
+#                 mode="lines",
+#                 line=dict(color="black", width=2, dash="dash"),
+#                 hovertemplate="<b>RAM Capacity</b>: %{y:.1f} GB<extra></extra>",
+#             ),
+#             row=2,
+#             col=1,
+#         )
 
-        fig.update_layout(
-            title="Memory Breakdown",
-            hovermode="x unified",
-            height=700,
-            legend=dict(tracegroupgap=20),
-        )
-        fig.update_yaxes(title_text="GB", rangemode="tozero", row=1, col=1)
-        fig.update_yaxes(title_text="GB", rangemode="tozero", row=2, col=1)
-        fig.update_xaxes(title_text="Step", row=2, col=1)
-        return fig
+#         fig.update_layout(
+#             title="Memory Breakdown",
+#             hovermode="x unified",
+#             height=700,
+#             legend=dict(tracegroupgap=20),
+#         )
+#         fig.update_yaxes(title_text="GB", rangemode="tozero", row=1, col=1)
+#         fig.update_yaxes(title_text="GB", rangemode="tozero", row=2, col=1)
+#         fig.update_xaxes(title_text="Step", row=2, col=1)
+#         return fig
 
 
 class MaskVisualizationCallback(Callback):
