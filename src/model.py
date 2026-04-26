@@ -1216,7 +1216,7 @@ def train(**kwargs):
         save_interval=args.checkpoint_interval,
         save_num_checkpoints_to_keep=-1,
         autoresume=True,
-        callbacks=[mask_viz, best_saver, hf_uploader, RuntimeEstimator(time_unit="minutes"), SpeedMonitor(args.batch_size), OOMObserver(), NaNMonitor()],
+        callbacks=[mask_viz, best_saver, hf_uploader, RuntimeEstimator(time_unit="minutes"), SpeedMonitor(1), OOMObserver(), NaNMonitor()],
     )
 
     trainer.fit()
