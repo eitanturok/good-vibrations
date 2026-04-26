@@ -1,4 +1,4 @@
-import os, shlex, subprocess, time, math
+import os, shlex, subprocess, time, math, tempfile
 from pathlib import Path
 from typing import Any, Callable, Optional, Union
 
@@ -521,6 +521,8 @@ class MaskVisualizationCallback(Callback):
         self.run_id = run_id
         self._train_preds = None
         self._eval_preds = []
+        self._image_cache_dir = Path(tempfile.gettempdir()) / "good-vibrations-mask-viz"
+        self._image_cache_dir.mkdir(parents=True, exist_ok=True)
 
     def epoch_start(self, state, logger):
         del state, logger
@@ -558,7 +560,6 @@ class MaskVisualizationCallback(Callback):
         return {
             "mask_true": true_masks.detach().cpu().float().numpy(),
             "mask_logits": mask_logits.detach().cpu().float().numpy(),
-            "cropped_image": list(meta["cropped_image"]),
             "sample_idx": list(meta["sample_idx"]),
             "x_position": list(meta["x_position"]),
             "y_position": list(meta["y_position"]),
@@ -604,20 +605,21 @@ class MaskVisualizationCallback(Callback):
         true = np.concatenate([p["mask_true"] for p in preds_list])
         logits = np.concatenate([p["mask_logits"] for p in preds_list])
         probs = 1.0 / (1.0 + np.exp(-logits))
-        images = sum([p["cropped_image"] for p in preds_list], [])
         sample_ids = sum([p["sample_idx"] for p in preds_list], [])
         x_positions = sum([p["x_position"] for p in preds_list], [])
         y_positions = sum([p["y_position"] for p in preds_list], [])
         objects = sum([p["object"] for p in preds_list], [])
         n_objects = sum([p["n_objects"] for p in preds_list], [])
-        n_total = min(len(sample_ids), len(images), true.shape[0], probs.shape[0])
+        n_total = min(len(sample_ids), true.shape[0], probs.shape[0])
         n = min(self.n_samples, n_total)
         true = true[:n]
         probs = probs[:n]
+        sample_ids = sample_ids[:n]
+        image_paths = self._get_cropped_image_paths(sample_ids)
         epoch = int(state.timestamp.epoch.value)
         rows = []
         for i in range(n):
-            panel = self._make_panel(images[i], true[i], probs[i])
+            panel = self._make_panel(image_paths[int(sample_ids[i])], true[i], probs[i])
             rows.append(
                 [
                     wandb.Image(panel),
@@ -646,10 +648,26 @@ class MaskVisualizationCallback(Callback):
                 name=f"Images/{split}",
             )
 
-    def _make_panel(self, image, true_mask, pred_mask):
-        import numpy as np
+    def _get_cropped_image_paths(self, sample_ids):
+        missing = []
+        paths = {}
+        for sample_id in sample_ids:
+            path = self._image_cache_dir / f"sample_{int(sample_id):06d}.png"
+            paths[int(sample_id)] = path
+            if not path.exists():
+                missing.append(int(sample_id))
+        if missing:
+            fetched = fetch_overhead_images(missing)
+            for sample_id, image in fetched.items():
+                paths[int(sample_id)].parent.mkdir(parents=True, exist_ok=True)
+                image.save(paths[int(sample_id)])
+        return paths
 
-        image = np.asarray(image, dtype=np.uint8)
+    def _make_panel(self, image_path, true_mask, pred_mask):
+        import numpy as np
+        from PIL import Image
+
+        image = np.asarray(Image.open(image_path).convert("RGB"), dtype=np.uint8)
         true_mask = self._resize_mask(true_mask, image.shape[:2])
         pred_mask = self._resize_mask(pred_mask, image.shape[:2])
 

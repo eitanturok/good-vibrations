@@ -206,7 +206,6 @@ class VibrationDataset(Dataset):
             split=split,
             token=token,
             columns=[
-                "cropped_image",
                 "sample_idx",
                 "x_position",
                 "y_position",
@@ -300,7 +299,6 @@ class VibrationDataset(Dataset):
         return {
             "shifts": shifts,
             "mask": mask.float(),
-            "cropped_image": np.asarray(row["cropped_image"].convert("RGB"), dtype=np.uint8).copy(),
             "floor_x": floor_x,
             "floor_y": floor_y,
             "fps": row["fps"],
@@ -337,7 +335,6 @@ def make_collate(
             torch.stack([b["mask"] for b in batch]).float(),
         )
         meta = {
-            "cropped_image": [b["cropped_image"] for b in batch],
             "sample_idx": [b["sample_idx"] for b in batch],
             "x_position": [b["x_position"] for b in batch],
             "y_position": [b["y_position"] for b in batch],
