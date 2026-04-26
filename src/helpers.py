@@ -6,7 +6,7 @@ import psutil
 import torch
 import wandb
 from composer import Callback
-from composer.core import Event, State
+from composer.core import State, Time, TimeUnit
 from composer.loggers import Logger
 from huggingface_hub import HfApi
 
@@ -505,49 +505,37 @@ class HFUploaderCallback(Callback):
 #         return fig
 
 
+def _make_input_images(inputs: torch.Tensor, num_images: int):
+    if inputs.shape[0] < num_images:
+        num_images = inputs.shape[0]
+    images = inputs[0:num_images].detach().cpu().numpy()
+    return images
+
 class MaskVisualizationCallback(Callback):
     def __init__(
         self,
-        n_samples=4,
-        interval=10,
-        alpha=0.4,
+        num_images=4,
+        interval="10ep",
         pred_save_dir=None,
         run_id=None,
     ):
-        self.n_samples = n_samples
-        self.interval = interval
-        self.alpha = alpha
+        self.num_images = num_images
+        self.interval = Time.from_input(interval, TimeUnit.BATCH)
+        if self.interval.unit not in [TimeUnit.BATCH, TimeUnit.EPOCH]:
+            raise ValueError(
+                f"Invalid time unit for parameter interval: {self.interval.unit}"
+            )
         self.pred_save_dir = pred_save_dir
         self.run_id = run_id
+        self.last_train_time_value_logged = -1
         self.last_train_epoch_logged = -1
 
-    def epoch_start(self, state, logger):
-        del state, logger
-
-    def after_forward(self, state, logger):
-        current_train_epoch = state.timestamp.epoch.value + 1
-        if current_train_epoch % self.interval != 0:
-            return
-        if current_train_epoch == self.last_train_epoch_logged:
-            return
-        self.last_train_epoch_logged = current_train_epoch
-        pred = self._batch_to_pred(state.batch, state.outputs)
-        self._log_images(pred, state, logger, "Train")
-        self._save_predictions([pred], state, "train")
-
-    def eval_after_forward(self, state, logger):
-        if state.eval_timestamp.batch.value != 0:
-            return
-        pred = self._batch_to_pred(state.batch, state.outputs)
-        self._log_images(pred, state, logger, "Eval")
-        self._save_predictions([pred], state, "eval")
-
-    def _batch_to_pred(self, batch, outputs):
+    def _prep_inputs(self, batch, outputs):
         _, true_masks, _, _, meta = batch
         _, mask_logits = outputs
         return {
-            "mask_true": true_masks.detach().cpu().float().numpy(),
-            "mask_logits": mask_logits.detach().cpu().float().numpy(),
+            "mask_true": _make_input_images(true_masks, self.num_images),
+            "mask_pred": _make_input_images(mask_logits.sigmoid(), self.num_images),
             "sample_idx": list(meta["sample_idx"]),
             "x_position": list(meta["x_position"]),
             "y_position": list(meta["y_position"]),
@@ -555,91 +543,166 @@ class MaskVisualizationCallback(Callback):
             "n_objects": list(meta["n_objects"]),
         }
 
-    def _save_predictions(self, preds_list, state, split):
-        if not self.pred_save_dir or not self.run_id:
-            return
-        import numpy as np
-
-        mask_true = np.concatenate([p["mask_true"] for p in preds_list])
-        mask_logits = np.concatenate([p["mask_logits"] for p in preds_list])
-        mask_pred = 1.0 / (1.0 + np.exp(-mask_logits))
-        sample_idx = sum([p["sample_idx"] for p in preds_list], [])
-        x_position = sum([p["x_position"] for p in preds_list], [])
-        y_position = sum([p["y_position"] for p in preds_list], [])
-        object_type = sum([p["object"] for p in preds_list], [])
-        n_objects = sum([p["n_objects"] for p in preds_list], [])
-
-        epoch = state.timestamp.epoch.value
-        batch = state.timestamp.batch.value
-        local_path = Path(self.pred_save_dir) / Path(
-            prediction_npz_path(self.run_id, split, epoch, batch)
-        ).name
-        local_path.parent.mkdir(parents=True, exist_ok=True)
-        np.savez(
-            local_path,
-            mask_true=mask_true,
-            mask_logits=mask_logits,
-            mask_pred=mask_pred,
-            sample_idx=np.array(sample_idx),
-            x_position=np.array(x_position, dtype=float),
-            y_position=np.array(y_position, dtype=float),
-            object_type=np.array(object_type),
-            n_objects=np.array(n_objects, dtype=int),
+    def _log_image(self, state: State, logger: Logger, data_name: str):
+        inputs = self._prep_inputs(state.batch, state.outputs)
+        logger.log_images(
+            inputs["mask_true"],
+            name=f"{data_name}/True Mask",
+            channels_last=True,
+            use_table=False,
+        )
+        logger.log_images(
+            inputs["mask_pred"],
+            name=f"{data_name}/Predicted Mask",
+            channels_last=True,
+            use_table=False,
         )
 
-    def _log_images(self, pred, state, logger, split):
-        import numpy as np
+    def before_loss(self, state: State, logger: Logger):
+        current_time_value = state.timestamp.get(self.interval.unit).value
+        if current_time_value % self.interval.value == 0 and current_time_value != self.last_train_time_value_logged:
+            self.last_train_time_value_logged = current_time_value
+            self._log_image(state, logger, 'Images/Train')
+            # self._save_prediction(state, 'train')
 
-        true = pred["mask_true"]
-        logits = pred["mask_logits"]
-        probs = 1.0 / (1.0 + np.exp(-logits))
-        n_total = min(len(pred["sample_idx"]), true.shape[0], probs.shape[0])
-        n = min(self.n_samples, n_total)
-        true = true[:n]
-        probs = probs[:n]
-        panels = []
-        for i in range(n):
-            panels.append(self._make_panel(true[i], probs[i]))
-        if panels:
-            logger.log_images(
-                panels,
-                name=f"Images/{split}",
-                channels_last=True,
-                use_table=False,
-            )
+    def eval_after_forward(self, state: State, logger: Logger):
+        if state.eval_timestamp.get(TimeUnit.BATCH).value == 0:
+            self._log_image(state, logger, 'Images/Eval')
+            # self._save_prediction(state, 'eval')
 
-    def _make_panel(self, true_mask, pred_mask):
-        return self._stack_h(self._mask_to_rgb(true_mask), self._mask_to_rgb(pred_mask))
 
-    def _mask_to_rgb(self, mask):
-        import numpy as np
 
-        gray = (np.clip(mask, 0.0, 1.0) * 255).astype(np.uint8)
-        return np.repeat(gray[..., None], 3, axis=-1)
 
-    def _stack_h(self, left, right, gap=8):
-        import numpy as np
+# class MaskVisualizationCallback(Callback):
+#     def __init__(
+#         self,
+#         n_samples=4,
+#         interval=10,
+#         pred_save_dir=None,
+#         run_id=None,
+#     ):
+#         self.n_samples = n_samples
+#         self.interval = interval
+#         self.pred_save_dir = pred_save_dir
+#         self.run_id = run_id
+#         self.last_train_epoch_logged = -1
 
-        h = max(left.shape[0], right.shape[0])
-        left = self._pad_to_height(left, h)
-        right = self._pad_to_height(right, h)
-        spacer = np.full((h, gap, 3), 255, dtype=np.uint8)
-        return np.concatenate([left, spacer, right], axis=1)
+#     def after_forward(self, state, logger):
+#         current_train_epoch = state.timestamp.epoch.value + 1
+#         if current_train_epoch % self.interval != 0:
+#             return
+#         if current_train_epoch == self.last_train_epoch_logged:
+#             return
+#         self.last_train_epoch_logged = current_train_epoch
+#         pred = self._batch_to_pred(state.batch, state.outputs)
+#         self._log_images(pred, state, logger, "Train")
+#         self._save_predictions([pred], state, "train")
 
-    def _pad_to_height(self, image, height):
-        import numpy as np
+#     def eval_after_forward(self, state, logger):
+#         if state.eval_timestamp.batch.value != 0:
+#             return
+#         pred = self._batch_to_pred(state.batch, state.outputs)
+#         self._log_images(pred, state, logger, "Eval")
+#         self._save_predictions([pred], state, "eval")
 
-        if image.shape[0] == height:
-            return image
-        pad = height - image.shape[0]
-        top = pad // 2
-        bottom = pad - top
-        return np.pad(
-            image,
-            ((top, bottom), (0, 0), (0, 0)),
-            mode="constant",
-            constant_values=255,
-        )
+#     def _batch_to_pred(self, batch, outputs):
+#         _, true_masks, _, _, meta = batch
+#         _, mask_logits = outputs
+#         return {
+#             "mask_true": true_masks.detach().cpu().float().numpy(),
+#             "mask_logits": mask_logits.detach().cpu().float().numpy(),
+#             "sample_idx": list(meta["sample_idx"]),
+#             "x_position": list(meta["x_position"]),
+#             "y_position": list(meta["y_position"]),
+#             "object": list(meta["object"]),
+#             "n_objects": list(meta["n_objects"]),
+#         }
+
+#     def _save_predictions(self, preds_list, state, split):
+#         if not self.pred_save_dir or not self.run_id:
+#             return
+#         import numpy as np
+
+#         mask_true = np.concatenate([p["mask_true"] for p in preds_list])
+#         mask_logits = np.concatenate([p["mask_logits"] for p in preds_list])
+#         mask_pred = 1.0 / (1.0 + np.exp(-mask_logits))
+#         sample_idx = sum([p["sample_idx"] for p in preds_list], [])
+#         x_position = sum([p["x_position"] for p in preds_list], [])
+#         y_position = sum([p["y_position"] for p in preds_list], [])
+#         object_type = sum([p["object"] for p in preds_list], [])
+#         n_objects = sum([p["n_objects"] for p in preds_list], [])
+
+#         epoch = state.timestamp.epoch.value
+#         batch = state.timestamp.batch.value
+#         local_path = Path(self.pred_save_dir) / Path(
+#             prediction_npz_path(self.run_id, split, epoch, batch)
+#         ).name
+#         local_path.parent.mkdir(parents=True, exist_ok=True)
+#         np.savez(
+#             local_path,
+#             mask_true=mask_true,
+#             mask_logits=mask_logits,
+#             mask_pred=mask_pred,
+#             sample_idx=np.array(sample_idx),
+#             x_position=np.array(x_position, dtype=float),
+#             y_position=np.array(y_position, dtype=float),
+#             object_type=np.array(object_type),
+#             n_objects=np.array(n_objects, dtype=int),
+#         )
+
+#     def _log_images(self, pred, state, logger, split):
+#         import numpy as np
+
+#         true = pred["mask_true"]
+#         logits = pred["mask_logits"]
+#         probs = 1.0 / (1.0 + np.exp(-logits))
+#         n_total = min(len(pred["sample_idx"]), true.shape[0], probs.shape[0])
+#         n = min(self.n_samples, n_total)
+#         true = true[:n]
+#         probs = probs[:n]
+#         panels = []
+#         for i in range(n):
+#             panels.append(self._make_panel(true[i], probs[i]))
+#         if panels:
+#             logger.log_images(
+#                 panels,
+#                 name=f"Images/{split}",
+#                 channels_last=True,
+#                 use_table=False,
+#             )
+
+#     def _make_panel(self, true_mask, pred_mask):
+#         return self._stack_h(self._mask_to_rgb(true_mask), self._mask_to_rgb(pred_mask))
+
+#     def _mask_to_rgb(self, mask):
+#         import numpy as np
+
+#         gray = (np.clip(mask, 0.0, 1.0) * 255).astype(np.uint8)
+#         return np.repeat(gray[..., None], 3, axis=-1)
+
+#     def _stack_h(self, left, right, gap=8):
+#         import numpy as np
+
+#         h = max(left.shape[0], right.shape[0])
+#         left = self._pad_to_height(left, h)
+#         right = self._pad_to_height(right, h)
+#         spacer = np.full((h, gap, 3), 255, dtype=np.uint8)
+#         return np.concatenate([left, spacer, right], axis=1)
+
+#     def _pad_to_height(self, image, height):
+#         import numpy as np
+
+#         if image.shape[0] == height:
+#             return image
+#         pad = height - image.shape[0]
+#         top = pad // 2
+#         bottom = pad - top
+#         return np.pad(
+#             image,
+#             ((top, bottom), (0, 0), (0, 0)),
+#             mode="constant",
+#             constant_values=255,
+#         )
 
 def fetch_predictions(
     run_id,

@@ -28,7 +28,6 @@ from helpers import (
     MaskVisualizationCallback,
     best_checkpoint_path,
     checkpoint_pattern_path,
-    run_predictions_dir,
     run_root_path,
     run_visualizations_dir,
     sample_npz_path,
@@ -1051,10 +1050,9 @@ def get_parser():
         "--mask-viz-interval",
         "--mask-viz-train-interval",
         dest="mask_viz_interval",
-        type=int,
-        default=50,
+        type=str,
+        default="50ep",
     )
-    parser.add_argument("--mask-viz-alpha", type=float, default=0.4)
     parser.add_argument("--run-name", type=str, default="run")
     parser.add_argument(
         "--best-metric",
@@ -1164,7 +1162,6 @@ def train(**kwargs):
         "max_duration": args.max_duration,
         "eval_interval": args.eval_interval,
         "mask_viz_interval": args.mask_viz_interval,
-        "mask_viz_alpha": args.mask_viz_alpha,
         "decoder": args.decoder,
         "cross_attn_layers": args.cross_attn_layers,
     }
@@ -1185,11 +1182,8 @@ def train(**kwargs):
         higher_is_better=args.best_metric_higher_is_better,
     )
     mask_viz = MaskVisualizationCallback(
-        n_samples=args.eval_batch_size,
+        num_images=args.eval_batch_size,
         interval=args.mask_viz_interval,
-        alpha=args.mask_viz_alpha,
-        pred_save_dir=run_predictions_dir(run_id),
-        run_id=run_id,
     )
     hf_uploader = HFUploaderCallback(repo_id=args.data_dir, run_id=run_id)
     dataset = train_loader.dataset.dataset
