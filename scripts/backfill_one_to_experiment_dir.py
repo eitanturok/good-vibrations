@@ -165,7 +165,7 @@ def generate_speckle_preview(raw_npy_path: Path, out_path: Path, fps: float, max
     lo = float(np.percentile(probe, 5))
     hi = float(np.percentile(probe, 99.5))
     tmp_path = out_path.with_suffix(".tmp.mp4")
-    writer = cv2.VideoWriter(str(tmp_path), cv2.VideoWriter_fourcc(*"mp4v"), max(1.0, fps / step), (preview_w, preview_h))
+    writer = cv2.VideoWriter(str(tmp_path), cv2.VideoWriter_fourcc(*"mp4v"), min(30.0, max(1.0, fps / step)), (preview_w, preview_h))
     if not writer.isOpened():
         raise RuntimeError(f"Failed to open VideoWriter for {tmp_path}")
     try:
