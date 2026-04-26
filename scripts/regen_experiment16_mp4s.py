@@ -108,6 +108,7 @@ def main() -> None:
     parser.add_argument("--data-root", default=str(Path.home() / "mark_sheinin_lab/DATA/experiment-16/data"))
     parser.add_argument("--repo-id", default="eturok-weizmann/laser-vibrations")
     parser.add_argument("--sample-ids", nargs="*", type=int, default=None, help="Specific sample IDs to process (default: all)")
+    parser.add_argument("--skip-before", type=int, default=None, help="Skip sample IDs numerically less than this value (for resuming)")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
@@ -117,6 +118,8 @@ def main() -> None:
     sample_dirs = sorted(p for p in data_root.iterdir() if p.is_dir() and p.name.isdigit())
     if args.sample_ids:
         sample_dirs = [p for p in sample_dirs if int(p.name) in args.sample_ids]
+    if args.skip_before is not None:
+        sample_dirs = [p for p in sample_dirs if int(p.name) >= args.skip_before]
 
     print(f"[info] processing {len(sample_dirs)} samples from {data_root}")
 
