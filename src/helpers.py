@@ -521,6 +521,7 @@ class MaskVisualizationCallback(Callback):
         self.run_id = run_id
         self._train_preds = None
         self._eval_preds = []
+        self._tables = {}
 
     def epoch_start(self, state, logger):
         del state, logger
@@ -609,16 +610,28 @@ class MaskVisualizationCallback(Callback):
         true = true[:n]
         probs = probs[:n]
         sample_ids = sample_ids[:n]
-        panels = []
+        if not wandb.run:
+            return
+        table = self._get_table(split)
+        epoch = int(state.timestamp.epoch.value)
         for i in range(n):
-            panels.append(self._make_panel(true[i], probs[i]))
-        if panels:
-            logger.log_images(
-                panels,
-                name=f"Images/{split}",
-                channels_last=True,
-                use_table=True,
+            table.add_data(
+                wandb.Image(self._make_panel(true[i], probs[i])),
+                int(sample_ids[i]),
+                epoch,
+                split,
             )
+        wandb.log({f"Images/{split}": table}, step=state.timestamp.batch.value)
+
+    def _get_table(self, split):
+        table = self._tables.get(split)
+        if table is None:
+            table = wandb.Table(
+                columns=["image", "sample_idx", "epoch", "split"],
+                log_mode="MUTABLE",
+            )
+            self._tables[split] = table
+        return table
 
     def _make_panel(self, true_mask, pred_mask):
         return self._stack_h(self._mask_to_rgb(true_mask), self._mask_to_rgb(pred_mask))
