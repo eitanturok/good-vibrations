@@ -1,12 +1,17 @@
 """
 Re-generate speckle_vibrations.mp4 for all experiment-16 samples at 30fps and re-upload to HF.
 
+Batches multiple samples per commit to stay under HF's 128-commits/hour rate limit.
+
 Run on mcluster11 (where the raw .npy files live):
-    uv pip install opencv-python-headless huggingface_hub imageio imageio-ffmpeg numpy
-    python regen_experiment16_mp4s.py --data-root /path/to/experiment-16/data --repo-id eturok-weizmann/laser-vibrations
+    $HOME/venvs/laser-vibrations-uv/bin/python scripts/regen_experiment16_mp4s.py \
+        --data-root /home/ethantu/mark_sheinin_lab/DATA/experiment-16/data \
+        --repo-id eturok-weizmann/laser-vibrations
 """
 import argparse
 import json
+import shutil
+import sys
 import tempfile
 import time
 from pathlib import Path
@@ -20,11 +25,8 @@ MAX_FRAMES = 300
 MAX_WIDTH = 960
 
 
-def stage(label, fn):
-    t0 = time.perf_counter()
-    result = fn()
-    print(f"[timing] {label}: {time.perf_counter() - t0:.2f}s")
-    return result
+def log(msg: str) -> None:
+    print(msg, flush=True)
 
 
 def read_npy_header(path: Path) -> tuple[tuple, np.dtype, int]:
@@ -95,20 +97,42 @@ def generate_mp4(raw_npy_path: Path, out_path: Path, capture_fps: float) -> floa
     return preview_fps
 
 
-def update_manifest_preview_fps(manifest_path: Path, new_fps: float) -> None:
-    data = json.loads(manifest_path.read_text())
+def update_manifest_preview_fps(src: Path, dst: Path, new_fps: float) -> None:
+    data = json.loads(src.read_text())
     spv = data.get("experiment_output", {}).get("speckle_vibrations", {})
     if "preview_fps" in spv:
         spv["preview_fps"] = new_fps
-    manifest_path.write_text(json.dumps(data, indent=2))
+    dst.write_text(json.dumps(data, indent=2))
+
+
+def commit_with_retry(api: HfApi, repo_id: str, commit_message: str, ops: list) -> None:
+    for attempt in range(10):
+        try:
+            t0 = time.perf_counter()
+            api.create_commit(
+                repo_id=repo_id,
+                repo_type="dataset",
+                commit_message=commit_message,
+                create_pr=False,
+                operations=ops,
+            )
+            log(f"[timing] commit ({len(ops)} ops): {time.perf_counter() - t0:.2f}s")
+            return
+        except Exception as e:
+            if "429" in str(e) and attempt < 9:
+                log(f"[rate-limit] 429 on attempt {attempt+1}/10, waiting 3600s...")
+                time.sleep(3600)
+            else:
+                raise
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Re-generate experiment-16 speckle mp4s at 30fps and re-upload to HF.")
     parser.add_argument("--data-root", default=str(Path.home() / "mark_sheinin_lab/DATA/experiment-16/data"))
     parser.add_argument("--repo-id", default="eturok-weizmann/laser-vibrations")
-    parser.add_argument("--sample-ids", nargs="*", type=int, default=None, help="Specific sample IDs to process (default: all)")
-    parser.add_argument("--skip-before", type=int, default=None, help="Skip sample IDs numerically less than this value (for resuming)")
+    parser.add_argument("--batch-size", type=int, default=50, help="Samples per HF commit (default: 50)")
+    parser.add_argument("--sample-ids", nargs="*", type=int, default=None, help="Specific sample IDs to process")
+    parser.add_argument("--skip-before", type=int, default=None, help="Skip sample IDs less than this value (for resuming)")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
@@ -121,73 +145,69 @@ def main() -> None:
     if args.skip_before is not None:
         sample_dirs = [p for p in sample_dirs if int(p.name) >= args.skip_before]
 
-    print(f"[info] processing {len(sample_dirs)} samples from {data_root}")
+    n_batches = (len(sample_dirs) + args.batch_size - 1) // args.batch_size
+    log(f"[info] {len(sample_dirs)} samples → {n_batches} batches of {args.batch_size}")
 
-    for i, sample_dir in enumerate(sample_dirs):
-        sample_id = int(sample_dir.name)
-        raw_npy = sample_dir / "speckle_vibration_raw.npy"
-        manifest_path = sample_dir / "manifest.json"
-        hf_mp4_path = f"data/{sample_dir.name}/speckle_vibrations.mp4"
-        hf_manifest_path = f"data/{sample_dir.name}/manifest.json"
-
-        if not raw_npy.exists():
-            print(f"[warn] [{i+1}/{len(sample_dirs)}] sample {sample_id:07d}: raw npy not found, skipping")
-            continue
-
-        capture_fps = 2500.0
-        if manifest_path.exists():
-            try:
-                m = json.loads(manifest_path.read_text())
-                capture_fps = float(m.get("experiment_output", {}).get("speckle_vibrations", {}).get("capture_fps_hz") or 2500.0)
-            except Exception:
-                pass
-
-        print(f"[info] [{i+1}/{len(sample_dirs)}] sample {sample_id:07d}: capture_fps={capture_fps}")
+    for batch_num, batch_start in enumerate(range(0, len(sample_dirs), args.batch_size)):
+        batch = sample_dirs[batch_start: batch_start + args.batch_size]
+        first_id = int(batch[0].name)
+        last_id = int(batch[-1].name)
+        log(f"[batch {batch_num+1}/{n_batches}] samples {first_id:07d}–{last_id:07d} ({len(batch)} samples)")
 
         if args.dry_run:
-            step = max(1, 9000 // MAX_FRAMES)
-            print(f"  dry-run: would generate at fps={min(MAX_DISPLAY_FPS, capture_fps / step):.2f}, upload to {hf_mp4_path}")
+            for sample_dir in batch:
+                log(f"  dry-run: {sample_dir.name}/speckle_vibrations.mp4 @ {MAX_DISPLAY_FPS:.0f}fps")
             continue
 
-        with tempfile.TemporaryDirectory(prefix=f"regen-{sample_id:07d}-") as tmp:
-            out_mp4 = Path(tmp) / "speckle_vibrations.mp4"
-            actual_fps = stage(
-                f"generate mp4 sample {sample_id:07d}",
-                lambda: generate_mp4(raw_npy, out_mp4, capture_fps),
-            )
-            print(f"  preview_fps={actual_fps:.2f}")
+        with tempfile.TemporaryDirectory(prefix=f"regen-batch{batch_num+1}-") as tmp:
+            tmp_path = Path(tmp)
+            ops = []
 
-            ops = [CommitOperationAdd(path_in_repo=hf_mp4_path, path_or_fileobj=str(out_mp4))]
+            for j, sample_dir in enumerate(batch):
+                sample_id = int(sample_dir.name)
+                raw_npy = sample_dir / "speckle_vibration_raw.npy"
+                manifest_src = sample_dir / "manifest.json"
 
-            if manifest_path.exists():
-                updated_manifest = Path(tmp) / "manifest.json"
-                import shutil
-                shutil.copy2(manifest_path, updated_manifest)
-                update_manifest_preview_fps(updated_manifest, actual_fps)
-                ops.append(CommitOperationAdd(path_in_repo=hf_manifest_path, path_or_fileobj=str(updated_manifest)))
+                if not raw_npy.exists():
+                    log(f"  [warn] {sample_dir.name}: raw npy not found, skipping")
+                    continue
 
-            for attempt in range(10):
-                try:
-                    stage(
-                        f"upload sample {sample_id:07d}",
-                        lambda: api.create_commit(
-                            repo_id=args.repo_id,
-                            repo_type="dataset",
-                            commit_message=f"Regen speckle mp4 at {actual_fps:.0f}fps for sample {sample_id:07d}",
-                            create_pr=False,
-                            operations=ops,
-                        ),
-                    )
-                    break
-                except Exception as e:
-                    if "429" in str(e) and attempt < 9:
-                        wait = 3600
-                        print(f"[rate-limit] HF 429 on sample {sample_id:07d}, waiting {wait}s before retry {attempt+1}/9...")
-                        time.sleep(wait)
-                    else:
-                        raise
+                capture_fps = 2500.0
+                if manifest_src.exists():
+                    try:
+                        m = json.loads(manifest_src.read_text())
+                        capture_fps = float(m.get("experiment_output", {}).get("speckle_vibrations", {}).get("capture_fps_hz") or 2500.0)
+                    except Exception:
+                        pass
 
-    print(f"[done] processed {len(sample_dirs)} samples")
+                out_mp4 = tmp_path / f"{sample_dir.name}.mp4"
+                t0 = time.perf_counter()
+                actual_fps = generate_mp4(raw_npy, out_mp4, capture_fps)
+                log(f"  [{j+1}/{len(batch)}] {sample_dir.name}: generated at {actual_fps:.0f}fps ({time.perf_counter()-t0:.1f}s)")
+
+                ops.append(CommitOperationAdd(
+                    path_in_repo=f"data/{sample_dir.name}/speckle_vibrations.mp4",
+                    path_or_fileobj=str(out_mp4),
+                ))
+
+                if manifest_src.exists():
+                    updated_manifest = tmp_path / f"{sample_dir.name}_manifest.json"
+                    update_manifest_preview_fps(manifest_src, updated_manifest, actual_fps)
+                    ops.append(CommitOperationAdd(
+                        path_in_repo=f"data/{sample_dir.name}/manifest.json",
+                        path_or_fileobj=str(updated_manifest),
+                    ))
+
+            if ops:
+                log(f"[batch {batch_num+1}/{n_batches}] uploading {len(ops)} files...")
+                commit_with_retry(
+                    api, args.repo_id,
+                    f"Regen speckle mp4s at 30fps: samples {first_id:07d}–{last_id:07d}",
+                    ops,
+                )
+                log(f"[batch {batch_num+1}/{n_batches}] done")
+
+    log(f"[done] all {len(sample_dirs)} samples processed")
 
 
 if __name__ == "__main__":
