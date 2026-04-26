@@ -163,16 +163,26 @@ def main() -> None:
                 update_manifest_preview_fps(updated_manifest, actual_fps)
                 ops.append(CommitOperationAdd(path_in_repo=hf_manifest_path, path_or_fileobj=str(updated_manifest)))
 
-            stage(
-                f"upload sample {sample_id:07d}",
-                lambda: api.create_commit(
-                    repo_id=args.repo_id,
-                    repo_type="dataset",
-                    commit_message=f"Regen speckle mp4 at {actual_fps:.0f}fps for sample {sample_id:07d}",
-                    create_pr=False,
-                    operations=ops,
-                ),
-            )
+            for attempt in range(10):
+                try:
+                    stage(
+                        f"upload sample {sample_id:07d}",
+                        lambda: api.create_commit(
+                            repo_id=args.repo_id,
+                            repo_type="dataset",
+                            commit_message=f"Regen speckle mp4 at {actual_fps:.0f}fps for sample {sample_id:07d}",
+                            create_pr=False,
+                            operations=ops,
+                        ),
+                    )
+                    break
+                except Exception as e:
+                    if "429" in str(e) and attempt < 9:
+                        wait = 3600
+                        print(f"[rate-limit] HF 429 on sample {sample_id:07d}, waiting {wait}s before retry {attempt+1}/9...")
+                        time.sleep(wait)
+                    else:
+                        raise
 
     print(f"[done] processed {len(sample_dirs)} samples")
 
