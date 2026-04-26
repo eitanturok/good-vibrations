@@ -519,38 +519,28 @@ class MaskVisualizationCallback(Callback):
         self.alpha = alpha
         self.pred_save_dir = pred_save_dir
         self.run_id = run_id
-        self._train_preds = None
-        self._eval_preds = []
+        self.last_train_epoch_logged = -1
 
     def epoch_start(self, state, logger):
         del state, logger
-        self._train_preds = None
 
     def batch_end(self, state, logger):
-        del logger
-        if self._should_collect_train_preds(state) and self._train_preds is None:
-            self._train_preds = [self._batch_to_pred(state.batch, state.outputs)]
-
-    def epoch_end(self, state, logger):
-        if not self._train_preds:
+        current_train_epoch = state.timestamp.epoch.value + 1
+        if current_train_epoch % self.interval != 0:
             return
-        self._log_images(self._train_preds, state, logger, "Train")
-        self._save_predictions(self._train_preds, state, "train")
+        if current_train_epoch == self.last_train_epoch_logged:
+            return
+        self.last_train_epoch_logged = current_train_epoch
+        pred = self._batch_to_pred(state.batch, state.outputs)
+        self._log_images(pred, state, logger, "Train")
+        self._save_predictions([pred], state, "train")
 
     def eval_batch_end(self, state, logger):
-        del logger
-        self._eval_preds.append(self._batch_to_pred(state.batch, state.outputs))
-
-    def _should_collect_train_preds(self, state):
-        current_train_epoch = state.timestamp.epoch.value + 1
-        return current_train_epoch % self.interval == 0
-
-    def eval_end(self, state, logger):
-        if not self._eval_preds:
+        if state.eval_timestamp.batch.value != 0:
             return
-        self._log_images(self._eval_preds, state, logger, "Eval")
-        self._save_predictions(self._eval_preds, state, "eval")
-        self._eval_preds = []
+        pred = self._batch_to_pred(state.batch, state.outputs)
+        self._log_images(pred, state, logger, "Eval")
+        self._save_predictions([pred], state, "eval")
 
     def _batch_to_pred(self, batch, outputs):
         _, true_masks, _, _, meta = batch
@@ -597,14 +587,13 @@ class MaskVisualizationCallback(Callback):
             n_objects=np.array(n_objects, dtype=int),
         )
 
-    def _log_images(self, preds_list, state, logger, split):
+    def _log_images(self, pred, state, logger, split):
         import numpy as np
 
-        true = np.concatenate([p["mask_true"] for p in preds_list])
-        logits = np.concatenate([p["mask_logits"] for p in preds_list])
+        true = pred["mask_true"]
+        logits = pred["mask_logits"]
         probs = 1.0 / (1.0 + np.exp(-logits))
-        sample_ids = sum([p["sample_idx"] for p in preds_list], [])
-        n_total = min(len(sample_ids), true.shape[0], probs.shape[0])
+        n_total = min(len(pred["sample_idx"]), true.shape[0], probs.shape[0])
         n = min(self.n_samples, n_total)
         true = true[:n]
         probs = probs[:n]
