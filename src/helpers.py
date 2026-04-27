@@ -508,7 +508,7 @@ class HFUploaderCallback(Callback):
 def _make_input_images(inputs: torch.Tensor, num_images: int):
     if inputs.shape[0] < num_images:
         num_images = inputs.shape[0]
-    return inputs[:num_images].detach().cpu().numpy()
+    return inputs[:num_images].unsqueeze(-1).detach().cpu().numpy()
 
 class MaskVisualizationCallback(Callback):
     def __init__(
@@ -549,7 +549,7 @@ class MaskVisualizationCallback(Callback):
     def _log_image(self, state: State, logger: Logger, data_name: str):
         inputs = self._prep_inputs(state.batch, state.outputs)
         n = min(len(inputs["sample_idx"]), len(inputs["mask"]))
-        panels = [panel for panel in inputs["mask"][:n]]
+        panels = inputs["mask"][:n]
         logger.log_images(
             panels,
             name=data_name,
