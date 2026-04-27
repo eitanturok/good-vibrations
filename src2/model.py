@@ -271,12 +271,17 @@ def get_parser():
     parser.add_argument("--mask-logging-interval",  type=str,   default="5ep")
     return parser
 
-# @app.function(
-#     gpu="A100",
-#     timeout=86_400,  # maximum timeout is 24 hours or 86_400 seconds; see https://modal.com/docs/guide/timeouts#timeouts
-#     retries=3,
-# )
-def main(args):
+@app.function(
+    gpu="A100",
+    timeout=86_400,  # maximum timeout is 24 hours or 86_400 seconds; see https://modal.com/docs/guide/timeouts#timeouts
+    retries=3,
+)
+def train(**kwargs):
+
+    # parse args
+    args = get_parser().parse_args()  # get defaults
+    args.__dict__.update(kwargs)  # apply overrides from cli
+
     # set seeds for reproducibility before initializing model + dataloader
     seed_all(args.seed)
     generator = torch.Generator().manual_seed(args.seed)
@@ -289,7 +294,7 @@ def main(args):
     optimizer = torch.optim.Adam(model.parameters(), args.lr)
 
     # make callbacks
-    config = data_info | dict(gpu_name=torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu", num_parameters=sum([p_.numel() for p_ in model.parameters()]))
+    config = data_info | dict(args) | dict(gpu_name=torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu", num_parameters=sum([p_.numel() for p_ in model.parameters()]))
     logger = WandBLogger("laser-vibrations", group="speed", name=args.run_name, init_kwargs={"config": config, "save_code": True, "id": args.run_name, "resume": "allow"})
     callbacks=[SpeedMonitor(1), OOMObserver(), NaNMonitor(), RuntimeEstimator(time_unit="minutes"), MaskVisualizer(args.num_masks_logged, args.mask_logging_interval)]
 
@@ -298,41 +303,13 @@ def main(args):
                     save_metrics=True, log_to_console=True, loggers=logger, callbacks=callbacks)
 
     trainer.fit()
-    # ic(trainer.state.train_metrics, trainer.state.eval_metrics)
+    ic(trainer.state.train_metrics, trainer.state.eval_metrics)
     trainer.close()
 
-    # trainer = Trainer(
-    #         run_name=run_id,
-    #         model=model,
-    #         train_dataloader=DataSpec(
-    #             train_loader,
-    #             get_num_samples_in_batch=get_num_samples_in_batch,
-    #             split_batch=split_batch,
-    #         ),
-    #         eval_dataloader=DataSpec(
-    #             test_loader,
-    #             get_num_samples_in_batch=get_num_samples_in_batch,
-    #             split_batch=split_batch,
-    #         ),
-    #         max_duration=args.max_duration,
-    #         eval_interval=args.eval_interval,
-    #         optimizers=optimizer,
-    #         device=device,
-    #         seed=args.seed,
-    #         loggers=logger,
-    #         log_to_console=True,
-    #         auto_log_hparams=False,
-    #         save_metrics=True,
-    #         save_folder=run_root_path(run_id),
-    #         save_filename=checkpoint_pattern_path(run_id).removeprefix(f"{run_root_path(run_id)}/"),
-    #         save_latest_filename="checkpoints/latest-rank{rank}.pt",
-    #         save_overwrite=True,
-    #         save_interval=args.checkpoint_interval,
-    #         save_num_checkpoints_to_keep=-1,
-    #         autoresume=True,
-    #         callbacks=[mask_viz, best_saver, hf_uploader, RuntimeEstimator(time_unit="minutes"), SpeedMonitor(1), OOMObserver(), NaNMonitor()],
-    #     )
 
-if __name__ == '__main__':
-    args = get_parser().parse_args()
-    main(args)
+@app.local_entrypoint()
+def main(*args):
+    train.remote(**vars(get_parser().parse_args(args)))  # runs on Modal GPU
+
+if __name__ == "__main__":
+    train.local(**vars(get_parser().parse_args()))
