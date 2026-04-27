@@ -549,7 +549,7 @@ class MaskVisualizationCallback(Callback):
     def _log_image(self, state: State, logger: Logger, data_name: str):
         inputs = self._prep_inputs(state.batch, state.outputs)
         n = min(len(inputs["sample_idx"]), len(inputs["mask"]))
-        panels = inputs["mask"][:n]
+        panels = [panel for panel in inputs["mask"][:n]]
         logger.log_images(
             panels,
             name=data_name,
