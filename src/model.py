@@ -1138,6 +1138,12 @@ def train(**kwargs):
         cross_attn_layers=args.cross_attn_layers,
     )
     optimizer = torch.optim.Adam(model.parameters(), args.lr)
+    gpu_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu"
+    device_capability = (
+        ".".join(map(str, torch.cuda.get_device_capability(0)))
+        if torch.cuda.is_available()
+        else None
+    )
     config = {
         "n_params": count_parameters(model),
         **data_info,
@@ -1164,6 +1170,12 @@ def train(**kwargs):
         "eval_interval": args.eval_interval,
         "mask_viz_interval": args.mask_viz_interval,
         "mask_viz_num_images": args.mask_viz_num_images,
+        "gpu_name": gpu_name,
+        "cuda_device_count": torch.cuda.device_count() if torch.cuda.is_available() else 0,
+        "cuda_version": torch.version.cuda,
+        "device_capability": device_capability,
+        "slurm_job_id": os.getenv("SLURM_JOB_ID"),
+        "slurm_partition": os.getenv("SLURM_JOB_PARTITION"),
         "decoder": args.decoder,
         "cross_attn_layers": args.cross_attn_layers,
     }
