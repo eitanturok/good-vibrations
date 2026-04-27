@@ -555,6 +555,7 @@ class MaskVisualizationCallback(Callback):
         logger.log_images(
             panels,
             name=data_name,
+            step=state.timestamp.epoch.value,
             channels_last=True,
             use_table=False,
         )
