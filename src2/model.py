@@ -2,7 +2,6 @@ import argparse, os, json, math, warnings
 
 import torch
 import modal
-import wandb
 import numpy as np
 from torch import nn
 from sklearn.model_selection import train_test_split
@@ -18,6 +17,7 @@ from composer import Trainer, Callback, Logger
 from composer.loggers import WandBLogger
 from composer.callbacks import RuntimeEstimator, SpeedMonitor, OOMObserver, NaNMonitor, SystemMetricsMonitor
 from icecream import install; install()
+import wandb
 
 warnings.filterwarnings("ignore", message="The pynvml package is deprecated", category=FutureWarning) # suppress it
 
@@ -66,15 +66,16 @@ class MaskVisualizer(Callback):
         current_time_value = state.timestamp.get(self.interval.unit).value
         if current_time_value % self.interval.value == 0 and current_time_value != self.last_train_time_value_logged:
             self.last_train_time_value_logged = current_time_value
+            print('logging train image')
             self._log_image(state, logger, 'Images/Train')
 
     def eval_after_forward(self, state: State, logger: Logger):
         eval_batch = state.eval_timestamp.get(TimeUnit.BATCH).value
         train_step = state.timestamp.batch.value
-        if eval_batch != 0 or train_step == self.last_eval_step_logged: return
+        if eval_batch > 0 or train_step == self.last_eval_step_logged: return
         self.last_eval_step_logged = train_step
+        print('logging eval image')
         self._log_image(state, logger, 'Images/Eval')
-
 
 #***** Dataset *****
 
@@ -265,7 +266,7 @@ def get_parser():
     # train
     parser.add_argument("--batch-size",             type=int,   default=128)
     parser.add_argument("--lr",                     type=float, default=1e-4)
-    parser.add_argument("--max-duration",           type=str,   default="10ep")
+    parser.add_argument("--max-duration",           type=str,   default="20ep")
     # eval
     parser.add_argument("--eval-batch-size",        type=int,   default=128)
     parser.add_argument("--eval-interval",          type=str,   default="5ep")
