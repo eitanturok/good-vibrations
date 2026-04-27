@@ -1053,6 +1053,7 @@ def get_parser():
         type=str,
         default="50ep",
     )
+    parser.add_argument("--mask-viz-num-images", type=int, default=4)
     parser.add_argument("--run-name", type=str, default="run")
     parser.add_argument(
         "--best-metric",
@@ -1162,6 +1163,7 @@ def train(**kwargs):
         "max_duration": args.max_duration,
         "eval_interval": args.eval_interval,
         "mask_viz_interval": args.mask_viz_interval,
+        "mask_viz_num_images": args.mask_viz_num_images,
         "decoder": args.decoder,
         "cross_attn_layers": args.cross_attn_layers,
     }
@@ -1182,7 +1184,7 @@ def train(**kwargs):
         higher_is_better=args.best_metric_higher_is_better,
     )
     mask_viz = MaskVisualizationCallback(
-        num_images=args.eval_batch_size,
+        num_images=args.mask_viz_num_images,
         interval=args.mask_viz_interval,
     )
     hf_uploader = HFUploaderCallback(repo_id=args.data_dir, run_id=run_id)
