@@ -1,7 +1,8 @@
-import argparse, os, json, math
+import argparse, os, json, math, warnings
 
 import torch
 import modal
+import wandb
 import numpy as np
 from torch import nn
 from sklearn.model_selection import train_test_split
@@ -15,8 +16,10 @@ from torchmetrics.regression import MeanSquaredError
 from composer.core import State, Time, TimeUnit
 from composer import Trainer, Callback, Logger
 from composer.loggers import WandBLogger
-from composer.callbacks import RuntimeEstimator, SpeedMonitor, OOMObserver, NaNMonitor
+from composer.callbacks import RuntimeEstimator, SpeedMonitor, OOMObserver, NaNMonitor, SystemMetricsMonitor
 from icecream import install; install()
+
+warnings.filterwarnings("ignore", message="The pynvml package is deprecated", category=FutureWarning) # suppress it
 
 # **** Modal ****
 
@@ -28,7 +31,9 @@ image = (
     .apt_install("git")
     .env({"HF_HUB_CACHE": HF_CACHE_PATH, "HF_XET_HIGH_PERFORMANCE": "1"})
     # .uv_sync()
-    .uv_pip_install(['ipykernel', 'pip', 'datasets', 'ipywidgets', 'Pillow', 'torchcodec', 'torch>2.10', 'scikit-learn', "git+https://github.com/eitanturok/composer.git@hf-object-store", 'icecream', 'wandb', 'modal'])
+    .uv_pip_install(['ipykernel', 'pip', 'datasets', 'ipywidgets', 'Pillow', 'torchcodec', 'torch>2.10', 'scikit-learn', "git+https://github.com/eitanturok/composer.git@hf-object-store", 'icecream', 'wandb', 'modal', 'pynvml',
+                     'psutil'], # for wandb to properly log the systems pannels (gpu utilization, gpu memory, etc.)
+                    )
     .add_local_dir("src2", remote_path="/root")
 )
 
@@ -243,6 +248,7 @@ def get_parser():
     parser.add_argument("--seed",                   type=int,   default=42)
     parser.add_argument("--num-workers",            type=int,   default=8)
     # data
+    parser.add_argument("--n-samples",              type=int,   default=None)
     parser.add_argument("--repo-id",                type=str,   default="eturok-weizmann/laser-vibrations")
     parser.add_argument("--test-size",              type=float, default=0.2)
     parser.add_argument("--out-h",                  type=int,   default=40)
@@ -250,7 +256,6 @@ def get_parser():
     parser.add_argument("--patch-size",             type=int,   default=256)
     parser.add_argument("--speakers",               type=int,   default=None)
     parser.add_argument("--n-objects",              type=int,   default=None)
-    parser.add_argument("--n-samples",              type=int,   default=5)
     # model
     parser.add_argument("--d-model",                type=int,   default=128)
     parser.add_argument("--pnt-num-heads",          type=int,   default=2)
@@ -272,7 +277,7 @@ def get_parser():
     return parser
 
 @app.function(
-    gpu="A100",
+    gpu="A10",
     timeout=86_400,  # maximum timeout is 24 hours or 86_400 seconds; see https://modal.com/docs/guide/timeouts#timeouts
     retries=3,
 )
@@ -293,17 +298,16 @@ def train(**kwargs):
     model = VibrationTransformer(args.d_model, args.pnt_num_heads, args.pnt_num_layers, args.seq_num_heads, args.seq_num_layers, data_info)
     optimizer = torch.optim.Adam(model.parameters(), args.lr)
 
-    # make callbacks
-    config = data_info | dict(args) | dict(gpu_name=torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu", num_parameters=sum([p_.numel() for p_ in model.parameters()]))
-    logger = WandBLogger("laser-vibrations", group="speed", name=args.run_name, init_kwargs={"config": config, "save_code": True, "id": args.run_name, "resume": "allow"})
-    callbacks=[SpeedMonitor(1), OOMObserver(), NaNMonitor(), RuntimeEstimator(time_unit="minutes"), MaskVisualizer(args.num_masks_logged, args.mask_logging_interval)]
-
-    trainer = Trainer(run_name=args.run_name, model=model, optimizers=optimizer, train_dataloader=train_loader,
+    # make trainer
+    config = data_info | args.__dict__ | dict(gpu_name=torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu", num_parameters=sum([p_.numel() for p_ in model.parameters()]))
+    logger = WandBLogger("laser-vibrations", group="speed", name=args.run_name, init_kwargs={"settings": wandb.Settings(x_disable_stats=False), "config": config, "save_code": True, "id": args.run_name, "resume": "allow"})
+    callbacks=[SpeedMonitor(1), OOMObserver(), NaNMonitor(), RuntimeEstimator(time_unit="minutes"), SystemMetricsMonitor(), MaskVisualizer(args.num_masks_logged, args.mask_logging_interval)]
+    trainer = Trainer(run_name=args.run_name, model=model, optimizers=optimizer, train_dataloader=train_loader, auto_log_hparams=False,
                     eval_dataloader=eval_loader, max_duration=args.max_duration, seed=args.seed, eval_interval=args.eval_interval,
                     save_metrics=True, log_to_console=True, loggers=logger, callbacks=callbacks)
 
+    # train da model!!!
     trainer.fit()
-    ic(trainer.state.train_metrics, trainer.state.eval_metrics)
     trainer.close()
 
 
