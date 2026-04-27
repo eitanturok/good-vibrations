@@ -535,9 +535,12 @@ class MaskVisualizationCallback(Callback):
     def _prep_inputs(self, batch, outputs):
         _, true_masks, _, _, meta = batch
         _, mask_logits = outputs
+        num_images = min(len(meta["sample_idx"]), len(true_masks), len(mask_logits), self.num_images)
+        mask_true_and_pred = torch.cat(
+            [true_masks[:num_images], mask_logits[:num_images].sigmoid()], dim=2
+        )
         return {
-            "mask_true": _make_input_images(true_masks, self.num_images),
-            "mask_pred": _make_input_images(mask_logits.sigmoid(), self.num_images),
+            "mask": _make_input_images(mask_true_and_pred, num_images),
             "sample_idx": list(meta["sample_idx"]),
             "x_position": list(meta["x_position"]),
             "y_position": list(meta["y_position"]),
@@ -547,11 +550,8 @@ class MaskVisualizationCallback(Callback):
 
     def _log_image(self, state: State, logger: Logger, data_name: str):
         inputs = self._prep_inputs(state.batch, state.outputs)
-        n = min(len(inputs["sample_idx"]), len(inputs["mask_true"]), len(inputs["mask_pred"]))
-        panels = [
-            self._make_panel(inputs["mask_true"][i], inputs["mask_pred"][i])
-            for i in range(n)
-        ]
+        n = min(len(inputs["sample_idx"]), len(inputs["mask"]))
+        panels = inputs["mask"][:n]
         logger.log_images(
             panels,
             name=data_name,
@@ -575,12 +575,6 @@ class MaskVisualizationCallback(Callback):
         self.last_eval_step_logged = train_step
         self._log_image(state, logger, 'Images/Eval')
         # self._save_prediction(state, 'eval')
-
-    def _make_panel(self, true_mask, pred_mask):
-        import numpy as np
-        return np.concatenate([true_mask, pred_mask], axis=1)
-
-
 
 
 # class MaskVisualizationCallback(Callback):
