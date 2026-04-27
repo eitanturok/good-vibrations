@@ -1168,7 +1168,7 @@ def train(**kwargs):
         "cross_attn_layers": args.cross_attn_layers,
     }
     logger = WandBLogger(
-        "good-vibrations",
+        "laser-vibrations",
         group="speed",
         name=run_id,
         init_kwargs={
