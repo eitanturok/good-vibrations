@@ -508,10 +508,7 @@ class HFUploaderCallback(Callback):
 def _make_input_images(inputs: torch.Tensor, num_images: int):
     if inputs.shape[0] < num_images:
         num_images = inputs.shape[0]
-    images = inputs[0:num_images].detach()
-    images = (images.clip(0.0, 1.0) * 255).to(torch.uint8)
-    images = images.unsqueeze(-1).repeat(1, 1, 1, 3)
-    return images.cpu().numpy()
+    return inputs[:num_images].detach().cpu().numpy()
 
 class MaskVisualizationCallback(Callback):
     def __init__(
@@ -536,6 +533,7 @@ class MaskVisualizationCallback(Callback):
         _, true_masks, _, _, meta = batch
         _, mask_logits = outputs
         num_images = min(len(meta["sample_idx"]), len(true_masks), len(mask_logits), self.num_images)
+        # concatenate true and pred masks side by side for visualization
         mask_true_and_pred = torch.cat(
             [true_masks[:num_images], mask_logits[:num_images].sigmoid()], dim=2
         )
