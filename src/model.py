@@ -3,13 +3,12 @@ import modal
 
 import torch
 import numpy as np
+from PIL import Image
 from torch import nn
 from torch.nn import functional as F
 from torch.utils.data import Dataset, DataLoader, Subset
-from datasets import load_dataset
 from huggingface_hub import snapshot_download
 from sklearn.model_selection import train_test_split
-from scipy.signal import butter, sosfiltfilt
 from composer import Trainer
 from composer.core import DataSpec
 from composer.models import ComposerModel
@@ -30,7 +29,6 @@ from helpers import (
     checkpoint_pattern_path,
     run_root_path,
     run_visualizations_dir,
-    sample_npz_path,
 )
 
 # **** Modal ****
@@ -53,29 +51,6 @@ app = modal.App(
 )
 
 # ***** Dataset *****
-
-
-def clean_shifts(
-    shifts: torch.Tensor, fs: int, lowcut: float = 50.0, highcut: float | None = None
-) -> torch.Tensor:
-    # bandpass filter
-    if highcut is None:
-        highcut = fs / 2 - 10
-    shifts = shifts.numpy()  # (100, N_frames, 2)
-    sos = butter(5, [lowcut, highcut], fs=fs, btype="band", output="sos")
-    shifts = sosfiltfilt(sos, shifts, axis=1)
-    # hann window smoothing
-    window = np.hanning(shifts.shape[1])  # (N_frames,)
-    shifts = shifts * window[np.newaxis, :, np.newaxis]
-    return torch.from_numpy(shifts)
-
-
-def do_fft(shifts: torch.Tensor, fs: int, min_freq: int = 50, max_freq: int = 1000):
-    fft = torch.fft.rfft(shifts, dim=1)
-    freqs = torch.fft.rfftfreq(shifts.shape[1], d=1.0 / fs)
-    mask = (freqs >= min_freq) & (freqs <= max_freq)
-    fft, freqs = fft[:, mask, :], freqs[mask]
-    return fft, freqs
 
 
 # phase_sync
@@ -154,104 +129,117 @@ def interpolate(x, y, xs):
 
 
 def frequency_augmentation(
-    shifts: torch.Tensor,
-    fs: int,
-    min_freq: int = 100,
-    max_freq: int = 2500,
+    fft: torch.Tensor,
+    freqs: torch.Tensor,
     generator: torch.Generator | None = None,
 ):
-    # shifts: (B, n_lasers, n_timesteps, 2) — returns G: (B, n_timesteps)
-    B = shifts.shape[0]
-    x_points = torch.tensor([500, 1000, 1500, 2000, 2500], device=shifts.device)
-    y_points = torch.normal(
-        mean=1.0, std=1, size=(B, len(x_points)), generator=generator
-    )
-    domain = torch.linspace(min_freq, max_freq, 10000, device=shifts.device)
-    values = interpolate(x_points, y_points, domain)  # (B, 10000)
+    # fft: (B, n_lasers, n_freqs, 2) — returns multiplicative gains G: (B, n_freqs)
+    B = fft.shape[0]
+    freqs = freqs.to(device=fft.device, dtype=torch.float32)
+    x_points = torch.linspace(freqs[0], freqs[-1], 5, device=fft.device)
+    y_points = torch.randn(B, len(x_points), generator=generator, device=fft.device) + 1.0
+    values = interpolate(x_points, y_points, freqs)  # (B, n_freqs)
     lo, hi = (
         values.min(dim=-1, keepdim=True).values,
         values.max(dim=-1, keepdim=True).values,
     )
-    values = (values - lo) / (hi - lo) / 2.5 + 0.8  # (B, 10000), range [0.8, 1.2]
-    freq = torch.fft.fftfreq(shifts.shape[-2], 1 / fs, device=shifts.device)
-    valid = (freq >= min_freq) & (freq <= max_freq)
-    G = torch.zeros(B, len(freq), dtype=torch.float32, device=shifts.device)
-    G[:, valid] = values[:, torch.searchsorted(domain, freq[valid])]
-    return G  # (B, n_timesteps)
+    return (values - lo) / (hi - lo).clamp(min=1e-6) / 2.5 + 0.8  # (B, n_freqs), range [0.8, 1.2]
+
+
+def speaker_code(value):
+    if value is None or isinstance(value, str):
+        return value
+    return "".join(str(int(v)) for v in value)
+
+
+def fft_path(sample_id: int):
+    return f"data/{int(sample_id):07d}/speckle_shifts_fft.npz"
 
 
 class VibrationDataset(Dataset):
-    """
-    Downloads dataset from hf of (shift, mask) pairs
-    Download shifts.safetensors and mask.safetensors to CPU via hf_hub_download
-    Each __getitem__ reads only the pages for that tensor off disk — the OS never loads the full file into RAM.
-    """
-
     def __init__(
         self,
         repo_id: str,
-        split: str = "train",
         disc_mask_h: int = 40,
         disc_mask_w: int = 20,
-        patch_size: int = 256,
         floor_cols: int = 11,
         floor_rows: int = 12,
         token: str | None = None,
         speakers: list | None = None,
         n_objects: list | None = None,
     ):
-        self.ds = load_dataset(
+        metadata_dir = snapshot_download(
             repo_id,
-            split=split,
+            repo_type="dataset",
+            allow_patterns=["data/metadata.jsonl"],
             token=token,
-            columns=[
-                "sample_idx",
-                "x_position",
-                "y_position",
-                "object",
-                "fps",
-                "speakers",
-                "n_objects",
-            ],
-            verification_mode="no_checks",
         )
+        metadata_path = os.path.join(metadata_dir, "data", "metadata.jsonl")
+        with open(metadata_path) as f:
+            rows = [json.loads(line) for line in f if line.strip()]
+
+        allowed_speakers = None
         if speakers is not None:
             if not isinstance(speakers[0], list):
                 speakers = [speakers]
-            self.ds = self.ds.filter(lambda row: row["speakers"] in speakers)
-        if n_objects is not None:
-            self.ds = self.ds.filter(lambda row: row["n_objects"] in n_objects)
+            allowed_speakers = {speaker_code(s) for s in speakers}
+
+        self.rows = [
+            row
+            for row in rows
+            if (allowed_speakers is None or row["speakers"] in allowed_speakers)
+            and (n_objects is None or row["n_objects"] in n_objects)
+        ]
+        if not self.rows:
+            raise ValueError(
+                f"No samples found for speakers={allowed_speakers} and n_objects={n_objects}"
+            )
         print(
-            f"Loaded dataset with {len(self.ds)} samples after filtering for speakers={speakers}, n_objects={n_objects}"
+            f"Loaded dataset with {len(self.rows)} samples after filtering for speakers={allowed_speakers}, n_objects={n_objects}"
         )
 
-        # load samples into RAM for fast access during training
-        sample_patterns = [sample_npz_path(idx) for idx in self.ds["sample_idx"]]
+        sample_patterns = sorted(
+            {
+                row["mask_file_name"]
+                for row in self.rows
+            }
+            | {
+                fft_path(row["sample_id"])
+                for row in self.rows
+            }
+        )
         self.snapshot_dir = snapshot_download(
             repo_id, repo_type="dataset", allow_patterns=sample_patterns, token=token
         )
 
-        def load_npz(sample_idx):
-            d = np.load(os.path.join(self.snapshot_dir, sample_npz_path(sample_idx)))
-            return torch.from_numpy(d["shifts"].copy()), torch.from_numpy(
-                d["mask"].copy()
+        def load_sample(row):
+            fft_payload = np.load(os.path.join(self.snapshot_dir, fft_path(row["sample_id"])))
+            mask = np.asarray(
+                Image.open(os.path.join(self.snapshot_dir, row["mask_file_name"])).convert("L"),
+                dtype=np.float32,
+            ) / 255.0
+            return (
+                torch.from_numpy(fft_payload["fft"].copy()),
+                torch.from_numpy(mask.copy()),
+                torch.from_numpy(fft_payload["freqs"].copy()),
             )
 
-        _shift, _mask = load_npz(self.ds["sample_idx"][0])
+        _fft, _mask, self.freqs = load_sample(self.rows[0])
         print(
-            f"Sample shape: shifts={_shift.shape} ({_shift.dtype}), mask={_mask.shape} ({_mask.dtype})"
+            f"Sample shape: fft={_fft.shape} ({_fft.dtype}), mask={_mask.shape} ({_mask.dtype})"
         )
-        shifts_bytes = len(self.ds) * _shift.numel() * _shift.element_size()
-        masks_bytes = len(self.ds) * _mask.numel() * _mask.element_size()
+        fft_bytes = len(self.rows) * _fft.numel() * _fft.element_size()
+        masks_bytes = len(self.rows) * _mask.numel() * _mask.element_size()
         print(
-            f"Dataset RAM estimate: shifts={shifts_bytes / 1e9:.2f} GB, masks={masks_bytes / 1e9:.2f} GB, total={(shifts_bytes + masks_bytes) / 1e9:.2f} GB"
+            f"Dataset RAM estimate: fft={fft_bytes / 1e9:.2f} GB, masks={masks_bytes / 1e9:.2f} GB, total={(fft_bytes + masks_bytes) / 1e9:.2f} GB"
         )
-        self.shifts, self.masks = (
-            torch.empty(len(self.ds), *_shift.shape),
-            torch.empty(len(self.ds), *_mask.shape),
+        self.fft, self.masks = (
+            torch.empty(len(self.rows), *_fft.shape, dtype=_fft.dtype),
+            torch.empty(len(self.rows), *_mask.shape, dtype=_mask.dtype),
         )
-        for i, idx in enumerate(self.ds["sample_idx"]):
-            self.shifts[i], self.masks[i] = load_npz(idx)
+        for i, row in enumerate(self.rows):
+            self.fft[i], self.masks[i], freqs = load_sample(row)
+            assert torch.equal(freqs, self.freqs), "all samples must share the same FFT frequencies"
         import psutil
 
         ram = psutil.virtual_memory()
@@ -259,28 +247,24 @@ class VibrationDataset(Dataset):
             f"RAM after loading dataset: used={ram.used / 1e9:.1f} GB, available={ram.available / 1e9:.1f} GB, total={ram.total / 1e9:.1f} GB"
         )
 
-        self.patch_size, self.disc_mask_h, self.disc_mask_w = (
-            patch_size,
-            disc_mask_h,
-            disc_mask_w,
-        )
+        self.disc_mask_h, self.disc_mask_w = disc_mask_h, disc_mask_w
         self.floor_cols, self.floor_rows = floor_cols, floor_rows
         self.discretize_fn = (
             F.adaptive_max_pool2d if HARD_MASK else F.adaptive_avg_pool2d
         )
 
     def __repr__(self):
-        return f"VibrationDataset(split={self.ds.split}, n={len(self.ds)})"
+        return f"VibrationDataset(n={len(self.rows)})"
 
     def __len__(self):
-        return len(self.ds)
+        return len(self.rows)
 
     def __getitem__(self, idx):
-        row = self.ds[idx]
-        shifts, mask = (
-            self.shifts[idx],
+        row = self.rows[idx]
+        fft, mask = (
+            self.fft[idx],
             self.masks[idx],
-        )  # (n_lasers, n_timesteps, 2), (H, W)
+        )  # (n_lasers, n_freqs, 2), (H, W)
         if DISCRETIZED_MASK:
             mask = self.discretize_fn(
                 mask[None, None], (self.disc_mask_h, self.disc_mask_w)
@@ -296,12 +280,12 @@ class VibrationDataset(Dataset):
         )
 
         return {
-            "shifts": shifts,
+            "fft": fft,
+            "freqs": self.freqs,
             "mask": mask.float(),
             "floor_x": floor_x,
             "floor_y": floor_y,
-            "fps": row["fps"],
-            "sample_idx": row["sample_idx"],
+            "sample_idx": row["sample_id"],
             "x_position": row["x_position"],
             "y_position": row["y_position"],
             "object": row["object"],
@@ -326,11 +310,11 @@ def make_collate(
 
     def collate(batch):
 
-        fps = [b["fps"] for b in batch]
+        freqs = batch[0]["freqs"]
         floor_x = torch.tensor([b["floor_x"] for b in batch], dtype=torch.long)
         floor_y = torch.tensor([b["floor_y"] for b in batch], dtype=torch.long)
-        shifts, mask = (
-            torch.stack([b["shifts"] for b in batch]),
+        fft, mask = (
+            torch.stack([b["fft"] for b in batch]),
             torch.stack([b["mask"] for b in batch]).float(),
         )
         meta = {
@@ -342,37 +326,30 @@ def make_collate(
         }
 
         if augment:
-            assert len(set(fps)) == 1, f"all fps in batch must match, got {set(fps)}"
-            G = frequency_augmentation(shifts, fps[0], generator=generator)  # (B, T)
-            shifts_aug = torch.fft.ifft(
-                torch.fft.fft(shifts, dim=2) * G[:, None, :, None], dim=2
-            ).real
-            shifts, mask = (
-                torch.cat([shifts, shifts_aug]),
+            G = frequency_augmentation(fft, freqs, generator=generator)  # (B, F)
+            fft_aug = fft * G[:, None, :, None]
+            fft, mask = (
+                torch.cat([fft, fft_aug]),
                 torch.cat([mask, mask]),
-            )  # (2B, L, T, 2)
-            floor_x, floor_y, fps = (
+            )  # (2B, L, F, 2)
+            floor_x, floor_y = (
                 torch.cat([floor_x, floor_x]),
                 torch.cat([floor_y, floor_y]),
-                fps + fps,
             )
             meta = {
                 k: v + v for k, v in meta.items()
             }  # duplicate metadata for augmented samples
 
-        fft_patches = []
-        for i in range(len(shifts)):
-            shifts_clean = clean_shifts(shifts[i], fps[i])  # (L,T,2) -> (L,T,2)
-            fft, _ = do_fft(shifts_clean, fps[i])  # (L,T,2) -> (L,F,2)
-            if normalize:
-                fft = normalize_fn(fft)  # (L,F,2) -> (L,F,2)
-            fft_patches.append(
-                fft.unfold(1, patch_size, patch_size)
-            )  # (L,F,2) -> (L,P,2,PS)
+        fft_patches = [
+            (normalize_fn(fft_i) if normalize_fn else fft_i).unfold(1, patch_size, patch_size)
+            for fft_i in fft
+        ]  # (L,F,2) -> (L,P,2,PS)
 
         return torch.stack(fft_patches), mask, floor_x, floor_y, meta
 
     return collate
+
+
 def get_dataloaders(
     repo_id: str,
     patch_size: int = 256,
@@ -393,7 +370,6 @@ def get_dataloaders(
 ):
     dataset = VibrationDataset(
         repo_id,
-        patch_size=patch_size,
         disc_mask_h=disc_mask_h,
         disc_mask_w=disc_mask_w,
         floor_cols=floor_cols,
@@ -1000,7 +976,7 @@ def get_parser():
     )
 
     # data
-    parser.add_argument("--data-dir", type=str, default="eturok-weizmann/vibrations")
+    parser.add_argument("--data-dir", type=str, default="eturok-weizmann/laser-vibrations")
     parser.add_argument("--signal-is", type=str, default="magnitude")
     parser.add_argument(
         "--speakers",
