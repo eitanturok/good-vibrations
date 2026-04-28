@@ -1,5 +1,10 @@
-import argparse, os, json, math, warnings
-warnings.filterwarnings("ignore", message=r"The pynvml package is deprecated.*", category=FutureWarning) # suppress it
+# supress warnings
+import warnings, logging
+warnings.filterwarnings("ignore", message=r"The pynvml package is deprecated.*", category=FutureWarning)
+# only log errors from this file to suppress warnings about "Redirects are currently not supported in Windows or MacOs."
+logging.getLogger("torch.distributed.elastic.multiprocessing.redirects").setLevel(logging.ERROR)
+
+import argparse, os, json, math
 import torch
 import modal
 import numpy as np
@@ -307,11 +312,11 @@ def train(**kwargs):
     # make trainer
     config = data_info | args.__dict__ | dict(gpu_name=torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu", num_parameters=sum([p_.numel() for p_ in model.parameters()]))
     logger = WandBLogger("laser-vibrations", group="speed", name=args.run_name, init_kwargs={"settings": wandb.Settings(x_disable_stats=False), "config": config, "save_code": True, "id": args.run_name, "resume": "allow"})
-    profiler = Profiler(trace_handlers=[JSONTraceHandler(folder=f'composer_profiler', overwrite=True)], schedule=cyclic_schedule(wait=0, warmup=1, active=4, repeat=1), torch_prof_folder=f'torch_profiler', torch_prof_overwrite=True, torch_prof_memory_filename=None)
-    callbacks=[profiler, SpeedMonitor(1), OOMObserver(), NaNMonitor(), RuntimeEstimator(time_unit="minutes"), SystemMetricsMonitor(), MaskVisualizer(args.num_masks_logged, args.mask_logging_interval)]
+    profiler = Profiler(trace_handlers=[JSONTraceHandler(folder=f'hf://{args.repo_id}/composer_profiler', overwrite=True)], schedule=cyclic_schedule(wait=0, warmup=1, active=1, repeat=1), torch_prof_folder=f'hf://{args.repo_id}/torch_profiler', torch_prof_overwrite=True, torch_prof_memory_filename=None)
+    callbacks=[SpeedMonitor(1), OOMObserver(), NaNMonitor(), RuntimeEstimator(time_unit="minutes"), SystemMetricsMonitor(), MaskVisualizer(args.num_masks_logged, args.mask_logging_interval)]
     trainer = Trainer(run_name=args.run_name, model=model, optimizers=optimizer, train_dataloader=train_loader, auto_log_hparams=False,
                     eval_dataloader=eval_loader, max_duration=args.max_duration, seed=args.seed, eval_interval=args.eval_interval,
-                    save_metrics=True, log_to_console=True, loggers=logger, callbacks=callbacks)
+                    save_metrics=True, log_to_console=True, loggers=logger, callbacks=callbacks, profiler=profiler)
 
     # train da model!!!
     trainer.fit()
