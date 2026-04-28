@@ -1,5 +1,5 @@
 import argparse, os, json, math, warnings
-
+warnings.filterwarnings("ignore", message=r"The pynvml package is deprecated.*", category=FutureWarning) # suppress it
 import torch
 import modal
 import numpy as np
@@ -14,12 +14,13 @@ from composer.models import ComposerModel
 from torchmetrics.regression import MeanSquaredError
 from composer.core import State, Time, TimeUnit
 from composer import Trainer, Callback, Logger
+from composer.profiler import JSONTraceHandler, cyclic_schedule
+from composer.profiler.profiler import Profiler
 from composer.loggers import WandBLogger
 from composer.callbacks import RuntimeEstimator, SpeedMonitor, OOMObserver, NaNMonitor, SystemMetricsMonitor
 from icecream import install; install()
 import wandb
 
-warnings.filterwarnings("ignore", message="The pynvml package is deprecated", category=FutureWarning) # suppress it
 
 # **** Modal ****
 
@@ -31,11 +32,13 @@ image = (
     .apt_install("git")
     .env({"HF_HUB_CACHE": HF_CACHE_PATH, "HF_XET_HIGH_PERFORMANCE": "1"})
     # .uv_sync()
-    .uv_pip_install(['ipykernel', 'pip', 'datasets', 'ipywidgets', 'Pillow', 'torchcodec', 'torch>2.10', 'scikit-learn', 'icecream', 'wandb', 'modal', 'pynvml',
-                     'psutil', # for wandb to properly log the systems pannels (gpu utilization, gpu memory, etc.)
-                     'mosaicml-streaming', # for streaming dataset
-                     "git+https://github.com/eitanturok/composer.git@hf-object-store", # install my composer fork
-                     ])
+    .uv_pip_install([
+        'ipykernel', 'pip', 'ipywidgets', # for notebooks
+        'datasets', 'Pillow', 'torchcodec', 'torch>2.10', 'scikit-learn', 'icecream', 'wandb', 'modal', 'pynvml',
+        'psutil', # for wandb to properly log the systems pannels (gpu utilization, gpu memory, etc.)
+        'mosaicml-streaming', # for streaming dataset
+        "git+https://github.com/eitanturok/composer.git@48126a5",  # the lastest commit on my `hf-object-store` branch from my composer fork
+        ])
     .add_local_dir("src2", remote_path="/root")
 )
 
@@ -304,7 +307,8 @@ def train(**kwargs):
     # make trainer
     config = data_info | args.__dict__ | dict(gpu_name=torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu", num_parameters=sum([p_.numel() for p_ in model.parameters()]))
     logger = WandBLogger("laser-vibrations", group="speed", name=args.run_name, init_kwargs={"settings": wandb.Settings(x_disable_stats=False), "config": config, "save_code": True, "id": args.run_name, "resume": "allow"})
-    callbacks=[SpeedMonitor(3), OOMObserver(), NaNMonitor(), RuntimeEstimator(time_unit="minutes"), SystemMetricsMonitor(), MaskVisualizer(args.num_masks_logged, args.mask_logging_interval)]
+    profiler = Profiler(trace_handlers=[JSONTraceHandler(folder=f'composer_profiler', overwrite=True)], schedule=cyclic_schedule(wait=0, warmup=1, active=4, repeat=1), torch_prof_folder=f'torch_profiler', torch_prof_overwrite=True, torch_prof_memory_filename=None)
+    callbacks=[profiler, SpeedMonitor(1), OOMObserver(), NaNMonitor(), RuntimeEstimator(time_unit="minutes"), SystemMetricsMonitor(), MaskVisualizer(args.num_masks_logged, args.mask_logging_interval)]
     trainer = Trainer(run_name=args.run_name, model=model, optimizers=optimizer, train_dataloader=train_loader, auto_log_hparams=False,
                     eval_dataloader=eval_loader, max_duration=args.max_duration, seed=args.seed, eval_interval=args.eval_interval,
                     save_metrics=True, log_to_console=True, loggers=logger, callbacks=callbacks)
