@@ -31,9 +31,11 @@ image = (
     .apt_install("git")
     .env({"HF_HUB_CACHE": HF_CACHE_PATH, "HF_XET_HIGH_PERFORMANCE": "1"})
     # .uv_sync()
-    .uv_pip_install(['ipykernel', 'pip', 'datasets', 'ipywidgets', 'Pillow', 'torchcodec', 'torch>2.10', 'scikit-learn', "git+https://github.com/eitanturok/composer.git@hf-object-store", 'icecream', 'wandb', 'modal', 'pynvml',
-                     'psutil'], # for wandb to properly log the systems pannels (gpu utilization, gpu memory, etc.)
-                    )
+    .uv_pip_install(['ipykernel', 'pip', 'datasets', 'ipywidgets', 'Pillow', 'torchcodec', 'torch>2.10', 'scikit-learn', 'icecream', 'wandb', 'modal', 'pynvml',
+                     'psutil', # for wandb to properly log the systems pannels (gpu utilization, gpu memory, etc.)
+                     'mosaicml-streaming', # for streaming dataset
+                     "git+https://github.com/eitanturok/composer.git@hf-object-store", # install my composer fork
+                     ])
     .add_local_dir("src2", remote_path="/root")
 )
 
@@ -80,7 +82,7 @@ class MaskVisualizer(Callback):
 class VibrationDataset(Dataset):
     def __init__(self, repo_id:str, patch_size:int, out_h:int, out_w:int, speakers:list[int,str]|list[int]|list[str]|str|None=None, n_objects:list[int]|int|None=None, n_samples:int=None, num_proc:int=8):
         print(f'Downloading dataset {repo_id}...')
-        self.ds = load_dataset("eturok-weizmann/laser-vibrations", split="train", num_proc=num_proc) # this is `data/metadata.jsonl`
+        self.ds = load_dataset(repo_id, split="train", num_proc=num_proc) # this is `data/metadata.jsonl`
         self.ds = self.ds.remove_columns(['segmented_overhead_file_name', 'speckle_vibrations_file_name', 'speckle_shifts_ifft_audio_file_name', 'audio_file_name', 'mask_file_name'])
         print(f"Loaded dataset with {len(self.ds)} samples\n")
 
@@ -131,8 +133,9 @@ def build_dataset(repo_id, patch_size, out_h, out_w, batch_size, eval_batch_size
     dataset = VibrationDataset(repo_id, patch_size, out_h, out_w, speakers, n_objects, n_samples)
 
     train_indices, eval_indices = train_test_split(np.arange(len(dataset)), test_size=test_size, random_state=seed, shuffle=True)
-    train_loader = DataLoader(Subset(dataset, train_indices), batch_size=batch_size, shuffle=True, num_workers=num_workers, generator=generator, pin_memory=True)
-    eval_loader = DataLoader(Subset(dataset, eval_indices), batch_size=eval_batch_size, shuffle=False, num_workers=num_workers, generator=generator, pin_memory=True)
+    # drop_last=True does not seem to speed things up
+    train_loader = DataLoader(Subset(dataset, train_indices), batch_size=batch_size, shuffle=True, num_workers=num_workers, generator=generator, pin_memory=False, persistent_workers=num_workers>0, prefetch_factor=4 if num_workers>0 else None)
+    eval_loader = DataLoader(Subset(dataset, eval_indices), batch_size=eval_batch_size, shuffle=False, num_workers=num_workers, generator=generator, pin_memory=False, persistent_workers=num_workers>0, prefetch_factor=4 if num_workers>0 else None)
     print(f"Train dataloader: batch_size={batch_size}, batches={len(train_loader)}, n_samples={len(train_indices)}")
     print(f"Eval dataloader: batch_size={eval_batch_size}, batches={len(eval_loader)}, n_samples={len(eval_indices)}")
 
@@ -183,8 +186,8 @@ class LaserEncoder(nn.Module):
         B_L, P, _, _ = x.shape
         x = self.raw_to_tokens(x).float()  # (B_L,P,C,_PS) -> (B_L,P,C,PS) where PS=_PS or 2*_PS
         x = self.embed(x.reshape(B_L, P, -1))  # (B_L,P,C,PS) -> (B_L,P,D)
-        x = apply_rope(x, self.freqs_cis.to(x.device)) # (B_L,P,D) -> (B_L,P,D)
-        x = torch.cat((self.cls_token.expand(B_L, -1, -1).to(x.device), x), dim=1) # (B_L,P,D) -> (B_L,P+1,D)
+        x = apply_rope(x, self.freqs_cis) # (B_L,P,D) -> (B_L,P,D)
+        x = torch.cat((self.cls_token.expand(B_L, -1, -1), x), dim=1) # (B_L,P,D) -> (B_L,P+1,D)
         output = self.layers(x)  # (B_L,P+1,D) -> (B_L,P+1,D)
         return output[:, 0, :]  # (B_L,P+1,D) -> (B_L,D)
 
@@ -217,7 +220,7 @@ class VibrationTransformer(ComposerModel):
         x = self.laser_encoder(x.flatten(0, 1)).reshape(B, L, -1)  # (B,L,P,C,PS) -> (B,L,D)
 
         # BoxEncoder learns patterns between ALL the lasers shining on the box
-        x = apply_rope(x, self.freqs_laser.to(x.device)) # (B,L,D) -> (B,L,D)
+        x = apply_rope(x, self.freqs_laser) # (B,L,D) -> (B,L,D)
         x = torch.cat((self.cls_token.expand(B, -1, -1), x), dim=1)  # (B,L,D) (1,1,D) -> (B,L+1,D)
         output = self.box_encoder(x)  # (B,L+1,D) -> (B,L+1,D)
         cls_embedding = output[:, 0, :]  # (B,L+1,D) -> (B,D)
@@ -278,13 +281,14 @@ def get_parser():
 @app.function(
     gpu="A10",
     timeout=86_400,  # maximum timeout is 24 hours or 86_400 seconds; see https://modal.com/docs/guide/timeouts#timeouts
-    retries=3,
+    retries=1,
 )
 def train(**kwargs):
 
     # parse args
     args = get_parser().parse_args()  # get defaults
     args.__dict__.update(kwargs)  # apply overrides from cli
+    # torch.backends.cudnn.benchmark = torch.backends.cuda.benchmark = True # find faster convolution kernels
 
     # set seeds for reproducibility before initializing model + dataloader
     seed_all(args.seed)
@@ -295,12 +299,12 @@ def train(**kwargs):
     train_loader, eval_loader, data_info = build_dataset(args.repo_id, args.patch_size, args.out_h, args.out_w, args.batch_size, args.eval_batch_size, args.seed,
                                                          generator, args.test_size, args.num_workers, args.speakers, args.n_objects, args.n_samples)
     model = VibrationTransformer(args.d_model, args.pnt_num_heads, args.pnt_num_layers, args.seq_num_heads, args.seq_num_layers, data_info)
-    optimizer = torch.optim.Adam(model.parameters(), args.lr)
+    optimizer = torch.optim.Adam(model.parameters(), args.lr, fused=True)
 
     # make trainer
     config = data_info | args.__dict__ | dict(gpu_name=torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu", num_parameters=sum([p_.numel() for p_ in model.parameters()]))
     logger = WandBLogger("laser-vibrations", group="speed", name=args.run_name, init_kwargs={"settings": wandb.Settings(x_disable_stats=False), "config": config, "save_code": True, "id": args.run_name, "resume": "allow"})
-    callbacks=[SpeedMonitor(1), OOMObserver(), NaNMonitor(), RuntimeEstimator(time_unit="minutes"), SystemMetricsMonitor(), MaskVisualizer(args.num_masks_logged, args.mask_logging_interval)]
+    callbacks=[SpeedMonitor(3), OOMObserver(), NaNMonitor(), RuntimeEstimator(time_unit="minutes"), SystemMetricsMonitor(), MaskVisualizer(args.num_masks_logged, args.mask_logging_interval)]
     trainer = Trainer(run_name=args.run_name, model=model, optimizers=optimizer, train_dataloader=train_loader, auto_log_hparams=False,
                     eval_dataloader=eval_loader, max_duration=args.max_duration, seed=args.seed, eval_interval=args.eval_interval,
                     save_metrics=True, log_to_console=True, loggers=logger, callbacks=callbacks)
