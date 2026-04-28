@@ -56,26 +56,24 @@ class MaskVisualizer(Callback):
         self.interval = Time.from_input(interval, TimeUnit.BATCH)
         self.last_train_time_value_logged = self.last_eval_step_logged = -1
 
-    def _log_image(self, state: State, logger: Logger, data_name: str):
+    def _log_image(self, state:State, logger:Logger, data_name:str):
+        # concatenate true and pred masks side by side for joint visualization
         mask_pred, mask_true = state.outputs['mask_pred'], state.batch['mask_true']
-        # concatenate true and pred masks side by side for visualization
         image = _make_input_images(torch.cat([mask_pred, mask_true], dim=2), self.num_images)
-        logger.log_images(image, name=data_name, step=state.timestamp.epoch.value, channels_last=True, use_table=False)
+        logger.log_images(image, name=data_name, channels_last=True, use_table=False)
 
     def before_loss(self, state: State, logger: Logger):
         current_time_value = state.timestamp.get(self.interval.unit).value
         if current_time_value % self.interval.value == 0 and current_time_value != self.last_train_time_value_logged:
             self.last_train_time_value_logged = current_time_value
-            print('logging train image')
-            self._log_image(state, logger, 'Images/Train')
+            self._log_image(state, logger, 'Images/train')
 
     def eval_after_forward(self, state: State, logger: Logger):
         eval_batch = state.eval_timestamp.get(TimeUnit.BATCH).value
         train_step = state.timestamp.batch.value
         if eval_batch > 0 or train_step == self.last_eval_step_logged: return
         self.last_eval_step_logged = train_step
-        print('logging eval image')
-        self._log_image(state, logger, 'Images/Eval')
+        self._log_image(state, logger, 'Images/eval')
 
 #***** Dataset *****
 
