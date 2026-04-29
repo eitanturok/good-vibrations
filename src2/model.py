@@ -42,8 +42,8 @@ image = (
         'datasets', 'Pillow', 'torchcodec', 'torch>2.10', 'scikit-learn', 'icecream', 'wandb', 'modal', 'pynvml',
         'psutil', # for wandb to properly log the systems pannels (gpu utilization, gpu memory, etc.)
         'mosaicml-streaming', # for streaming dataset
-        "git+https://github.com/eitanturok/composer.git@cfa15752",  # the lastest commit on my `hf-object-store` branch from my composer fork
         ])
+    .uv_pip_install("git+https://github.com/eitanturok/composer.git@18440c7")  # the lastest commit on my `hf-object-store` branch from my composer fork
     .add_local_dir("src2", remote_path="/root")
 )
 
@@ -61,29 +61,26 @@ def _make_input_images(inputs: torch.Tensor, num_images: int):
     return inputs[:num_images].unsqueeze(-1).detach().cpu().numpy()
 
 class MaskVisualizer(Callback):
-    def __init__(self, num_images, interval):
+    def __init__(self, num_images, train_interval):
         self.num_images = num_images
-        self.interval = Time.from_input(interval, TimeUnit.BATCH)
-        self.last_train_time_value_logged = self.last_eval_step_logged = -1
-
-    def _log_image(self, state:State, logger:Logger, data_name:str):
-        # concatenate true and pred masks side by side for joint visualization
+        self.train_interval = Time.from_input(train_interval, TimeUnit.EPOCH)
+        self.last_train_time_value_logged = -1
+        self.last_eval_step_logged = -1
+    def _log_image(self, state: State, logger: Logger, data_name: str):
         mask_pred, mask_true = state.outputs['mask_pred'], state.batch['mask_true']
         image = _make_input_images(torch.cat([mask_pred, mask_true], dim=2), self.num_images)
         logger.log_images(image, name=data_name, channels_last=True, use_table=False)
-
     def before_loss(self, state: State, logger: Logger):
-        current_time_value = state.timestamp.get(self.interval.unit).value
-        if current_time_value % self.interval.value == 0 and current_time_value != self.last_train_time_value_logged:
+        current_time_value = state.timestamp.get(self.train_interval.unit).value
+        if current_time_value % self.train_interval.value == 0 and current_time_value != self.last_train_time_value_logged:
             self.last_train_time_value_logged = current_time_value
             self._log_image(state, logger, 'Images/train')
-
     def eval_after_forward(self, state: State, logger: Logger):
         eval_batch = state.eval_timestamp.get(TimeUnit.BATCH).value
         train_step = state.timestamp.batch.value
-        if eval_batch > 0 or train_step == self.last_eval_step_logged: return
-        self.last_eval_step_logged = train_step
-        self._log_image(state, logger, 'Images/eval')
+        if eval_batch == 0 and train_step != self.last_eval_step_logged:
+            self.last_eval_step_logged = train_step
+            self._log_image(state, logger, 'Images/eval')
 
 #***** Dataset *****
 
@@ -256,7 +253,7 @@ def get_parser():
     parser = argparse.ArgumentParser()
     # system
     parser.add_argument("--seed",                   type=int,   default=42)
-    parser.add_argument("--num-workers",            type=int,   default=8)
+    parser.add_argument("--num-workers",            type=int,   default=4)
     parser.add_argument("--debug",                  type=int,   default=0)
     # data
     parser.add_argument("--n-samples",              type=int,   default=None)
@@ -284,7 +281,7 @@ def get_parser():
     parser.add_argument("--run-name",               type=str,   default=None)
     # logging
     parser.add_argument("--num-masks-logged",       type=str,   default=8)
-    parser.add_argument("--mask-logging-interval",  type=str,   default="5ep")
+    parser.add_argument("--mask-logging-interval",  type=str,   default=None, help="Interval to log masks. If not set, defaults to eval_interval.")
     return parser
 
 @app.function(
@@ -298,6 +295,10 @@ def train(**kwargs):
     args = get_parser().parse_args()  # get defaults
     args.__dict__.update(kwargs)  # apply overrides from cli
     # torch.backends.cudnn.benchmark = torch.backends.cuda.benchmark = True # find faster convolution kernels
+
+    # set device
+    device = 'gpu' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu'
+    print(f'Using {device=}')
 
     # set seeds for reproducibility before initializing model + dataloader
     seed_all(args.seed)
@@ -314,18 +315,18 @@ def train(**kwargs):
     config = data_info | args.__dict__ | dict(gpu_name=torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu", num_parameters=sum([p_.numel() for p_ in model.parameters()]))
     logger = WandBLogger("laser-vibrations", group="speed", name=args.run_name, init_kwargs={"settings": wandb.Settings(x_disable_stats=False), "config": config, "save_code": True, "id": args.run_name, "resume": "allow"})
     profiler = Profiler(
-        trace_handlers=[JSONTraceHandler(folder="composer_profiler",
-                                         merged_trace_filename=f"merged_trace_node{{node_rank}}.json",
-                                         remote_file_name=f"hf://{args.repo_id}/runs/{{run_name}}/composer_profiler/ep{{epoch}}-ba{{batch}}-rank{{rank}}.json",
-                                         merged_trace_remote_file_name=f"hf://{args.repo_id}/runs/{{run_name}}/composer_profiler/merged_trace_node{{node_rank}}.json",
+        trace_handlers=[JSONTraceHandler(folder=f"runs/{{run_name}}/composer_profiler",
+                                         merged_trace_filename=f"runs/{{run_name}}/composer_profiler/merged_trace_node{{node_rank}}.json",
+                                        #  remote_file_name=f"hf://{args.repo_id}/runs/{{run_name}}/composer_profiler/ep{{epoch}}-ba{{batch}}-rank{{rank}}.json",
+                                        #  merged_trace_remote_file_name=f"hf://{args.repo_id}/runs/{{run_name}}/composer_profiler/merged_trace_node{{node_rank}}.json",
                                          overwrite=True)],
         schedule=cyclic_schedule(wait=0, warmup=0, active=1, repeat=1),
-        torch_prof_folder="torch_profiler", torch_prof_overwrite=True, torch_prof_memory_filename=None,
-        torch_prof_remote_file_name=f"hf://{args.repo_id}/runs/{{run_name}}/torch_profiler/rank{{rank}}.{{batch}}.pt.trace.json")
-    callbacks=[SpeedMonitor(1), OOMObserver(), NaNMonitor(), RuntimeEstimator(time_unit="minutes"), SystemMetricsMonitor(), MaskVisualizer(args.num_masks_logged, args.mask_logging_interval)]
+        torch_prof_folder=f"runs/{{run_name}}/torch_profiler", torch_prof_overwrite=True, torch_prof_memory_filename=None,
+        # torch_prof_remote_file_name=f"hf://{args.repo_id}/runs/{{run_name}}/torch_profiler/rank{{rank}}.{{batch}}.pt.trace.json")
+    callbacks=[SpeedMonitor(1), OOMObserver(), NaNMonitor(), RuntimeEstimator(time_unit="minutes"), SystemMetricsMonitor(), MaskVisualizer(args.num_masks_logged, args.mask_logging_interval or args.eval_interval)]
     trainer = Trainer(run_name=args.run_name, model=model, optimizers=optimizer, train_dataloader=train_loader, auto_log_hparams=False,
                     eval_dataloader=eval_loader, max_duration=args.max_duration, seed=args.seed, eval_interval=args.eval_interval,
-                    save_metrics=True, log_to_console=True, progress_bar=False,
+                    device=device, save_metrics=True, log_to_console=True, progress_bar=False,
                     loggers=logger, callbacks=callbacks, profiler=profiler if args.debug > 0 else None)
 
     # train da model!!!
