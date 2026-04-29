@@ -1,7 +1,7 @@
 # supress warnings
 import warnings, logging
 warnings.filterwarnings("ignore", message=r"The pynvml package is deprecated.*", category=FutureWarning)
-# only log errors from this file to suppress warnings about "Redirects are currently not supported in Windows or MacOs."
+# only log errors from this file in order to suppress the warning "Redirects are currently not supported in Windows or MacOs."
 logging.getLogger("torch.distributed.elastic.multiprocessing.redirects").setLevel(logging.ERROR)
 
 import argparse, os, json, math
@@ -42,7 +42,7 @@ image = (
         'datasets', 'Pillow', 'torchcodec', 'torch>2.10', 'scikit-learn', 'icecream', 'wandb', 'modal', 'pynvml',
         'psutil', # for wandb to properly log the systems pannels (gpu utilization, gpu memory, etc.)
         'mosaicml-streaming', # for streaming dataset
-        "git+https://github.com/eitanturok/composer.git@48126a5",  # the lastest commit on my `hf-object-store` branch from my composer fork
+        "git+https://github.com/eitanturok/composer.git@cfa15752",  # the lastest commit on my `hf-object-store` branch from my composer fork
         ])
     .add_local_dir("src2", remote_path="/root")
 )
@@ -312,11 +312,20 @@ def train(**kwargs):
     # make trainer
     config = data_info | args.__dict__ | dict(gpu_name=torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu", num_parameters=sum([p_.numel() for p_ in model.parameters()]))
     logger = WandBLogger("laser-vibrations", group="speed", name=args.run_name, init_kwargs={"settings": wandb.Settings(x_disable_stats=False), "config": config, "save_code": True, "id": args.run_name, "resume": "allow"})
-    profiler = Profiler(trace_handlers=[JSONTraceHandler(folder=f'hf://{args.repo_id}/composer_profiler', overwrite=True)], schedule=cyclic_schedule(wait=0, warmup=1, active=1, repeat=1), torch_prof_folder=f'hf://{args.repo_id}/torch_profiler', torch_prof_overwrite=True, torch_prof_memory_filename=None)
+    profiler = Profiler(
+        trace_handlers=[JSONTraceHandler(folder="composer_profiler",
+                                         merged_trace_filename=f"merged_trace_node{{node_rank}}.json",
+                                         remote_file_name=f"hf://{args.repo_id}/runs/{{run_name}}/composer_profiler/ep{{epoch}}-ba{{batch}}-rank{{rank}}.json",
+                                         merged_trace_remote_file_name=f"hf://{args.repo_id}/runs/{{run_name}}/composer_profiler/merged_trace_node{{node_rank}}.json",
+                                         overwrite=True)],
+                        schedule=cyclic_schedule(wait=0, warmup=0, active=1, repeat=1),
+                        torch_prof_folder="torch_profiler", torch_prof_overwrite=True, torch_prof_memory_filename=None,
+                        torch_prof_remote_file_name=f"hf://{args.repo_id}/runs/{{run_name}}/torch_profiler/rank{{rank}}.{{batch}}.pt.trace.json",
+                        )
     callbacks=[SpeedMonitor(1), OOMObserver(), NaNMonitor(), RuntimeEstimator(time_unit="minutes"), SystemMetricsMonitor(), MaskVisualizer(args.num_masks_logged, args.mask_logging_interval)]
     trainer = Trainer(run_name=args.run_name, model=model, optimizers=optimizer, train_dataloader=train_loader, auto_log_hparams=False,
                     eval_dataloader=eval_loader, max_duration=args.max_duration, seed=args.seed, eval_interval=args.eval_interval,
-                    save_metrics=True, log_to_console=True, loggers=logger, callbacks=callbacks, profiler=profiler)
+                    save_metrics=True, log_to_console=True, progress_bar=False, loggers=logger, callbacks=callbacks, profiler=profiler)
 
     # train da model!!!
     trainer.fit()
