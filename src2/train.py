@@ -13,7 +13,7 @@ from sklearn.model_selection import train_test_split
 from torch.utils.data import Dataset, DataLoader, Subset
 from torch.nn import functional as F
 from datasets import load_dataset
-from huggingface_hub import snapshot_download
+from huggingface_hub import snapshot_download, HfApi
 from composer.utils.reproducibility import seed_all
 from composer.models import ComposerModel
 from torchmetrics.regression import MeanSquaredError
@@ -22,7 +22,7 @@ from composer import Trainer, Callback, Logger
 from composer.profiler import JSONTraceHandler, cyclic_schedule
 from composer.profiler.profiler import Profiler
 from composer.loggers import WandBLogger
-from composer.callbacks import RuntimeEstimator, SpeedMonitor, OOMObserver, NaNMonitor, SystemMetricsMonitor
+from composer.callbacks import RuntimeEstimator, SpeedMonitor, OOMObserver, NaNMonitor, SystemMetricsMonitor, ExportForInferenceCallback, CheckpointSaver
 from icecream import install; install()
 import wandb
 
@@ -175,8 +175,6 @@ class MLPDecoder(nn.Module):
         self.net = nn.Sequential(nn.Linear(d_model, 256), nn.ReLU(), nn.Linear(256, out_h * out_w))
     def forward(self, cls): return self.net(cls).view(-1, self.out_h, self.out_w)
 
-raw_to_tokens = {"magnitude": lambda t: t.abs(), "complex": lambda t: torch.cat([t.real, t.imag], dim=-1), "mag_phase": lambda t: torch.cat([t.abs(), t.angle()], dim=-1)}
-
 class LaserEncoder(nn.Module):
     def __init__(self, patch_size, d_model, num_heads, num_layers, signal_length, signal):
         super().__init__()
@@ -184,15 +182,21 @@ class LaserEncoder(nn.Module):
         self.layers = nn.TransformerEncoder(nn.TransformerEncoderLayer(d_model=d_model, nhead=num_heads, batch_first=True), num_layers=num_layers)
         self.cls_token = nn.Parameter(torch.zeros(1, 1, d_model))
         self.register_buffer("freqs_cis", precompute_freqs_cis(d_model, signal_length // patch_size))
-        self.raw_to_tokens = raw_to_tokens[signal]
+        self.signal = signal
+
+    def _raw_to_tokens(self, x: torch.Tensor) -> torch.Tensor:
+        if self.signal == "magnitude": return x.abs()
+        if self.signal == "complex": return torch.cat([x.real, x.imag], dim=-1)
+        if self.signal == "mag_phase": return torch.cat([x.abs(), x.angle()], dim=-1)
+        raise ValueError(f"Unknown signal mode: {self.signal}")
 
     def forward(self, x):
         # x.shape = (B_L,P,C,_PS) = (batch_size * n_lasers, n_patches, n_coords, patch_size)
         B_L, P, _, _ = x.shape
-        x = self.raw_to_tokens(x).float()  # (B_L,P,C,_PS) -> (B_L,P,C,PS) where PS=_PS or 2*_PS
-        x = self.embed(x.reshape(B_L, P, -1))  # (B_L,P,C,PS) -> (B_L,P,D)
-        x = apply_rope(x, self.freqs_cis) # (B_L,P,D) -> (B_L,P,D)
-        x = torch.cat((self.cls_token.expand(B_L, -1, -1), x), dim=1) # (B_L,P,D) -> (B_L,P+1,D)
+        x = self._raw_to_tokens(x).float()      # (B_L,P,C,_PS) -> (B_L,P,C,PS) where PS=_PS or 2*_PS
+        x = self.embed(x.reshape(B_L, P, -1))   # (B_L,P,C,PS) -> (B_L,P,D)
+        x = apply_rope(x, self.freqs_cis)       # (B_L,P,D) -> (B_L,P,D)
+        x = torch.cat((self.cls_token.expand(B_L, -1, -1), x), dim=1)   # (B_L,P,D) -> (B_L,P+1,D)
         output = self.layers(x)  # (B_L,P+1,D) -> (B_L,P+1,D)
         return output[:, 0, :]  # (B_L,P+1,D) -> (B_L,D)
 
@@ -273,14 +277,14 @@ def get_parser():
     # train
     parser.add_argument("--batch-size",             type=int,   default=128)
     parser.add_argument("--lr",                     type=float, default=1e-4)
-    parser.add_argument("--max-duration",           type=str,   default="20ep")
+    parser.add_argument("--max-duration",           type=str,   default="100ep")
     # eval
     parser.add_argument("--eval-batch-size",        type=int,   default=128)
-    parser.add_argument("--eval-interval",          type=str,   default="5ep")
+    parser.add_argument("--eval-interval",          type=str,   default="25ep")
     # run
     parser.add_argument("--run-name",               type=str,   default=None)
     # logging
-    parser.add_argument("--num-masks-logged",       type=str,   default=8)
+    parser.add_argument("--num-masks-logged",       type=str,   default=16)
     parser.add_argument("--mask-logging-interval",  type=str,   default=None, help="Interval to log masks. If not set, defaults to eval_interval.")
     return parser
 
@@ -315,24 +319,33 @@ def train(**kwargs):
     config = data_info | args.__dict__ | dict(gpu_name=torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu", num_parameters=sum([p_.numel() for p_ in model.parameters()]))
     logger = WandBLogger("laser-vibrations", group="speed", name=args.run_name, init_kwargs={"settings": wandb.Settings(x_disable_stats=False), "config": config, "save_code": True, "id": args.run_name, "resume": "allow"})
     profiler = Profiler(
-        trace_handlers=[JSONTraceHandler(folder=f"runs/{{run_name}}/composer_profiler",
-                                         merged_trace_filename=f"runs/{{run_name}}/composer_profiler/merged_trace_node{{node_rank}}.json",
+        trace_handlers=[JSONTraceHandler(folder=f"runs/{{run_name}}/runs/{{run_name}}/composer_profiler",
+                                         merged_trace_filename=f"merged_trace_node{{node_rank}}.json",
                                         #  remote_file_name=f"hf://{args.repo_id}/runs/{{run_name}}/composer_profiler/ep{{epoch}}-ba{{batch}}-rank{{rank}}.json",
                                         #  merged_trace_remote_file_name=f"hf://{args.repo_id}/runs/{{run_name}}/composer_profiler/merged_trace_node{{node_rank}}.json",
                                          overwrite=True)],
         schedule=cyclic_schedule(wait=0, warmup=0, active=1, repeat=1),
-        torch_prof_folder=f"runs/{{run_name}}/torch_profiler", torch_prof_overwrite=True, torch_prof_memory_filename=None,
-        # torch_prof_remote_file_name=f"hf://{args.repo_id}/runs/{{run_name}}/torch_profiler/rank{{rank}}.{{batch}}.pt.trace.json")
-    callbacks=[SpeedMonitor(1), OOMObserver(), NaNMonitor(), RuntimeEstimator(time_unit="minutes"), SystemMetricsMonitor(), MaskVisualizer(args.num_masks_logged, args.mask_logging_interval or args.eval_interval)]
+        torch_prof_folder=f"runs/{{run_name}}/runs/{{run_name}}/torch_profiler", torch_prof_overwrite=True, torch_prof_memory_filename=None,
+        # torch_prof_remote_file_name=f"hf://{args.repo_id}/runs/{{run_name}}/torch_profiler/rank{{rank}}.{{batch}}.pt.trace.json",
+        )
+    callbacks=[SpeedMonitor(1), OOMObserver(), NaNMonitor(), RuntimeEstimator(time_unit="minutes"), SystemMetricsMonitor(),
+               MaskVisualizer(args.num_masks_logged, args.mask_logging_interval or args.eval_interval),
+            #    ExportForInferenceCallback(save_format='torchscript',save_path='runs/{{run_name}}/model.pth'),
+               CheckpointSaver(folder=f"runs/{{run_name}}/runs/{{run_name}}/checkpoints", weights_only=True, overwrite=True, save_interval=args.max_duration)
+               ]
     trainer = Trainer(run_name=args.run_name, model=model, optimizers=optimizer, train_dataloader=train_loader, auto_log_hparams=False,
                     eval_dataloader=eval_loader, max_duration=args.max_duration, seed=args.seed, eval_interval=args.eval_interval,
                     device=device, save_metrics=True, log_to_console=True, progress_bar=False,
                     loggers=logger, callbacks=callbacks, profiler=profiler if args.debug > 0 else None)
-
+    print(f'{trainer.state.run_name=}')
     # train da model!!!
     trainer.fit()
     trainer.close()
 
+    # upload results
+    api = HfApi()
+    api.create_repo(args.repo_id, repo_type="dataset", exist_ok=True)
+    api.upload_large_folder(folder_path=f'runs/{trainer.state.run_name}', repo_id=args.repo_id, repo_type="dataset", num_workers=8)
 
 @app.local_entrypoint()
 def main(*args):
