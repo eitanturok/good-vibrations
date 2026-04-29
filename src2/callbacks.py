@@ -12,7 +12,7 @@ class MaskVisualizer(Callback):
         self.num_images = num_images
         self.train_interval = Time.from_input(train_interval, TimeUnit.EPOCH)
         self.last_train_time_value_logged = -1
-        self.last_eval_step_logged = -1
+        self.last_eval_step_logged = {}
     def _log_image(self, state: State, logger: Logger, data_name: str, pad_width: int=2):
         mask_pred, mask_true = state.outputs['mask_pred'], state.batch['mask_true']
         # add white padding between pred and true masks for easier visualization
@@ -27,6 +27,7 @@ class MaskVisualizer(Callback):
     def eval_after_forward(self, state: State, logger: Logger):
         eval_batch = state.eval_timestamp.get(TimeUnit.BATCH).value
         train_step = state.timestamp.batch.value
-        if eval_batch == 0 and train_step != self.last_eval_step_logged:
-            self.last_eval_step_logged = train_step
-            self._log_image(state, logger, 'Images/eval')
+        evaluator_label = state.dataloader_label or 'eval'
+        if eval_batch == 0 and train_step != self.last_eval_step_logged.get(evaluator_label):
+            self.last_eval_step_logged[evaluator_label] = train_step
+            self._log_image(state, logger, f'Images/{evaluator_label}')

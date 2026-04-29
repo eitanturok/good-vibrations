@@ -7,6 +7,7 @@ from torch.utils.data import Dataset, DataLoader, Subset
 from datasets import load_dataset
 from torch.nn import functional as F
 from huggingface_hub import snapshot_download
+from composer.core import Evaluator
 
 class VibrationDataset(Dataset):
     def __init__(self, repo_id:str, patch_size:int, out_h:int, out_w:int, speakers:list[int,str]|list[int]|list[str]|str|None=None, n_objects:list[int]|int|None=None, n_samples:int=None, num_proc:int=8, dry_run:bool=False):
@@ -65,13 +66,37 @@ class VibrationDataset(Dataset):
 def build_dataset(repo_id, patch_size, out_h, out_w, batch_size, eval_batch_size, seed, generator, test_size, num_workers, speakers, n_objects, n_samples, num_proc, dry_run:bool=False):
     dataset = VibrationDataset(repo_id, patch_size, out_h, out_w, speakers, n_objects, n_samples, num_proc, dry_run)
 
-    train_indices, eval_indices = train_test_split(np.arange(len(dataset)), test_size=test_size, random_state=seed, shuffle=True)
-    # drop_last=True does not seem to speed things up
+    # split the dataset into train and multiple eval sets (unseen positions, multi-object, and the rest)
+    held_out_positions = set([(3, 4), (7, 8), (1, 9), (2, 2), (6, 6)])
+    unseen_pos_indices = set([i for i, d in enumerate(dataset.ds) if (d['x_position'], d['y_position']) in held_out_positions])
+    multi_object_indices = set([i for i, d in enumerate(dataset.ds) if d['n_objects'] > 1])
+    available_indices = set(range(len(dataset))) - unseen_pos_indices - multi_object_indices
+    train_indices, eval_indices = train_test_split(list(available_indices), test_size=test_size, random_state=seed, shuffle=True)
+    print(f'{len(dataset)} total samples\t{len(train_indices)} train samples\t{len(eval_indices)} eval samples\t{len(unseen_pos_indices)} unseen position eval samples\t{len(multi_object_indices)} multi-object eval samples\n')
+    print(f'{held_out_positions=}')
+
+    # train
     train_loader = DataLoader(Subset(dataset, train_indices), batch_size=batch_size, shuffle=True, num_workers=num_workers, generator=generator, pin_memory=False, persistent_workers=num_workers>0, prefetch_factor=4 if num_workers>0 else None)
-    eval_loader = DataLoader(Subset(dataset, eval_indices), batch_size=eval_batch_size, shuffle=False, num_workers=num_workers, generator=generator, pin_memory=False, persistent_workers=num_workers>0, prefetch_factor=4 if num_workers>0 else None)
     print(f"Train dataloader: batch_size={batch_size}, batches={len(train_loader)}, n_samples={len(train_indices)}")
-    print(f"Eval dataloader: batch_size={eval_batch_size}, batches={len(eval_loader)}, n_samples={len(eval_indices)}")
+
+    # eval (general)
+    eval_loader_base = DataLoader(Subset(dataset, eval_indices), batch_size=eval_batch_size, shuffle=False, num_workers=num_workers, generator=generator, pin_memory=False, persistent_workers=num_workers>0, prefetch_factor=4 if num_workers>0 else None)
+    eval_loader_base = Evaluator(label='eval/base', dataloader=eval_loader_base)
+    print(f"Eval dataloader: batch_size={eval_batch_size}, batches={len(eval_loader_base.dataloader.dataloader)}, n_samples={len(eval_indices)}")
+
+    # eval (unseen position)
+    eval_loader_unseen_pos = DataLoader(Subset(dataset, list(unseen_pos_indices)), batch_size=eval_batch_size, shuffle=False, num_workers=num_workers, generator=generator, pin_memory=False, persistent_workers=num_workers>0, prefetch_factor=4 if num_workers>0 else None)
+    eval_loader_unseen_pos = Evaluator(label='eval/unseen_pos', dataloader=eval_loader_unseen_pos)
+    print(f"Eval dataloader (unseen positions): batch_size={eval_batch_size}, batches={len(eval_loader_unseen_pos.dataloader.dataloader)}, n_samples={len(unseen_pos_indices)}")
+
+    # eval (multi-object)
+    eval_loader_multi_object = DataLoader(Subset(dataset, list(multi_object_indices)), batch_size=eval_batch_size, shuffle=False, num_workers=num_workers, generator=generator, pin_memory=False, persistent_workers=num_workers>0, prefetch_factor=4 if num_workers>0 else None)
+    eval_loader_multi_object = Evaluator(label='eval/multi_object', dataloader=eval_loader_multi_object)
+    print(f"Eval dataloader (multi-object): batch_size={eval_batch_size}, batches={len(eval_loader_multi_object.dataloader.dataloader)}, n_samples={len(multi_object_indices)}")
+
     data_info = dict(out_h=dataset.masks.shape[1], out_w=dataset.masks.shape[2], n_freqs=dataset.fft.shape[2] * dataset.fft.shape[4],
                     n_laser_rows=int(math.sqrt(dataset.fft.shape[1])), n_laser_cols=int(math.sqrt(dataset.fft.shape[1])), patch_size=patch_size)
     print(f'{data_info=}')
+
+    eval_loader = [eval_loader_base, eval_loader_unseen_pos, eval_loader_multi_object]
     return train_loader, eval_loader, data_info

@@ -91,7 +91,7 @@ def get_parser():
 @app.function(
     gpu="A10",
     timeout=86_400,  # maximum timeout is 24 hours or 86_400 seconds; see https://modal.com/docs/guide/timeouts#timeouts
-    retries=1,
+    retries=0,
 )
 def train(**kwargs):
 
@@ -141,13 +141,13 @@ def train(**kwargs):
     # train da model!!!
     trainer.fit()
 
+    # close up shop!!
+    trainer.close()
+
     # upload results
     api = HfApi()
     api.create_repo(args.remote_checkpoint_folder, repo_type="dataset", exist_ok=True)
     api.upload_large_folder(folder_path=f'runs/{trainer.state.run_name}', repo_id=args.remote_checkpoint_folder, repo_type="dataset", num_workers=8)
-
-    # close up shop!!
-    trainer.close()
 
 @app.local_entrypoint()
 def main(*args):
