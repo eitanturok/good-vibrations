@@ -6,10 +6,7 @@ data/processed/
 visualizations/
 media/
 artifacts/
-logs/
-test-data/
-composer_profiler/
-torch_profiler/
+runs/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
