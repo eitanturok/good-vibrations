@@ -37,7 +37,7 @@ image = (
         'psutil', # for wandb to properly log the systems pannels (gpu utilization, gpu memory, etc.)
         'mosaicml-streaming', # for streaming dataset
         ])
-    .uv_pip_install("git+https://github.com/eitanturok/composer.git@18440c7")  # the lastest commit on my `hf-object-store` branch from my composer fork
+    .uv_pip_install("git+https://github.com/eitanturok/composer.git@4519dd2")  # the lastest commit on my `hf-object-store` branch from my composer fork
     .add_local_dir("src2", remote_path="/root")
 )
 
@@ -63,6 +63,8 @@ def get_parser():
     parser.add_argument("--patch-size",                 type=int,   default=256)
     parser.add_argument("--speakers",                   type=int,   default=None)
     parser.add_argument("--n-objects",                  type=int,   default=None)
+    parser.add_argument("--num-proc",                   type=int,   default=8, help="Number of processes used to download the dataset.")
+    parser.add_argument("--dry-run",                    action="store_true", default=False)
     # model
     parser.add_argument("--d-model",                    type=int,   default=128)
     parser.add_argument("--pnt-num-heads",              type=int,   default=2)
@@ -82,7 +84,7 @@ def get_parser():
     parser.add_argument("--num-masks-logged",           type=str,   default=16)
     parser.add_argument("--mask-logging-interval",      type=str,   default=None, help="Interval to log masks. If not set, defaults to eval_interval.")
     # checkpointing
-    parser.add_argument("--save-interval",              type=str,   default="500ep")
+    parser.add_argument("--checkpoint-interval",              type=str,   default="500ep")
     parser.add_argument("--remote-checkpoint-folder",   type=str, default="eturok-weizmann/laser-vibrations-checkpoints")
     return parser
 
@@ -109,7 +111,7 @@ def train(**kwargs):
 
     # make dataset, model, optimizer
     train_loader, eval_loader, data_info = build_dataset(args.repo_id, args.patch_size, args.out_h, args.out_w, args.batch_size, args.eval_batch_size, args.seed,
-                                                         generator, args.test_size, args.num_workers, args.speakers, args.n_objects, args.n_samples)
+                                                         generator, args.test_size, args.num_workers, args.speakers, args.n_objects, args.n_samples, args.num_proc, args.dry_run)
     model = VibrationTransformer(args.d_model, args.pnt_num_heads, args.pnt_num_layers, args.seq_num_heads, args.seq_num_layers, data_info)
     optimizer = torch.optim.Adam(model.parameters(), args.lr, fused=True)
 
@@ -129,7 +131,7 @@ def train(**kwargs):
     callbacks=[SpeedMonitor(1), OOMObserver(), NaNMonitor(), RuntimeEstimator(time_unit="minutes"), SystemMetricsMonitor(),
                MaskVisualizer(args.num_masks_logged, args.mask_logging_interval or args.eval_interval),
             #    ExportForInferenceCallback(save_format='torchscript',save_path='runs/{{run_name}}/model.pth'),
-               CheckpointSaver(folder=f"runs/{{run_name}}/runs/{{run_name}}/checkpoints", weights_only=True, overwrite=True, save_interval=args.save_interval)
+               CheckpointSaver(folder=f"runs/{{run_name}}/runs/{{run_name}}/checkpoints", weights_only=True, overwrite=True, save_interval=args.checkpoint_interval)
                ]
     trainer = Trainer(run_name=args.run_name, model=model, optimizers=optimizer, train_dataloader=train_loader, auto_log_hparams=False,
                     eval_dataloader=eval_loader, max_duration=args.max_duration, seed=args.seed, eval_interval=args.eval_interval,

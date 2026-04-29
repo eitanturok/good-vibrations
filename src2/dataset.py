@@ -62,8 +62,8 @@ class VibrationDataset(Dataset):
     def __len__(self): return len(self.ds)
     def __getitem__(self, idx): return dict(mask_true=self.masks[idx], fft=self.fft[idx])
 
-def build_dataset(repo_id, patch_size, out_h, out_w, batch_size, eval_batch_size, seed, generator, test_size, num_workers, speakers, n_objects, n_samples, dry_run:bool=False):
-    dataset = VibrationDataset(repo_id, patch_size, out_h, out_w, speakers, n_objects, n_samples, dry_run)
+def build_dataset(repo_id, patch_size, out_h, out_w, batch_size, eval_batch_size, seed, generator, test_size, num_workers, speakers, n_objects, n_samples, num_proc, dry_run:bool=False):
+    dataset = VibrationDataset(repo_id, patch_size, out_h, out_w, speakers, n_objects, n_samples, num_proc, dry_run)
 
     train_indices, eval_indices = train_test_split(np.arange(len(dataset)), test_size=test_size, random_state=seed, shuffle=True)
     # drop_last=True does not seem to speed things up
