@@ -257,6 +257,7 @@ def get_parser():
     # system
     parser.add_argument("--seed",                   type=int,   default=42)
     parser.add_argument("--num-workers",            type=int,   default=8)
+    parser.add_argument("--debug",                  type=int,   default=0)
     # data
     parser.add_argument("--n-samples",              type=int,   default=None)
     parser.add_argument("--repo-id",                type=str,   default="eturok-weizmann/laser-vibrations")
@@ -318,14 +319,14 @@ def train(**kwargs):
                                          remote_file_name=f"hf://{args.repo_id}/runs/{{run_name}}/composer_profiler/ep{{epoch}}-ba{{batch}}-rank{{rank}}.json",
                                          merged_trace_remote_file_name=f"hf://{args.repo_id}/runs/{{run_name}}/composer_profiler/merged_trace_node{{node_rank}}.json",
                                          overwrite=True)],
-                        schedule=cyclic_schedule(wait=0, warmup=0, active=1, repeat=1),
-                        torch_prof_folder="torch_profiler", torch_prof_overwrite=True, torch_prof_memory_filename=None,
-                        torch_prof_remote_file_name=f"hf://{args.repo_id}/runs/{{run_name}}/torch_profiler/rank{{rank}}.{{batch}}.pt.trace.json",
-                        )
+        schedule=cyclic_schedule(wait=0, warmup=0, active=1, repeat=1),
+        torch_prof_folder="torch_profiler", torch_prof_overwrite=True, torch_prof_memory_filename=None,
+        torch_prof_remote_file_name=f"hf://{args.repo_id}/runs/{{run_name}}/torch_profiler/rank{{rank}}.{{batch}}.pt.trace.json")
     callbacks=[SpeedMonitor(1), OOMObserver(), NaNMonitor(), RuntimeEstimator(time_unit="minutes"), SystemMetricsMonitor(), MaskVisualizer(args.num_masks_logged, args.mask_logging_interval)]
     trainer = Trainer(run_name=args.run_name, model=model, optimizers=optimizer, train_dataloader=train_loader, auto_log_hparams=False,
                     eval_dataloader=eval_loader, max_duration=args.max_duration, seed=args.seed, eval_interval=args.eval_interval,
-                    save_metrics=True, log_to_console=True, progress_bar=False, loggers=logger, callbacks=callbacks, profiler=profiler)
+                    save_metrics=True, log_to_console=True, progress_bar=False,
+                    loggers=logger, callbacks=callbacks, profiler=profiler if args.debug > 0 else None)
 
     # train da model!!!
     trainer.fit()
