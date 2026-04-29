@@ -13,9 +13,10 @@ class MaskVisualizer(Callback):
         self.train_interval = Time.from_input(train_interval, TimeUnit.EPOCH)
         self.last_train_time_value_logged = -1
         self.last_eval_step_logged = -1
-    def _log_image(self, state: State, logger: Logger, data_name: str):
+    def _log_image(self, state: State, logger: Logger, data_name: str, pad_width: int=2):
         mask_pred, mask_true = state.outputs['mask_pred'], state.batch['mask_true']
-        padding = torch.ones(mask_pred.shape[0], mask_pred.shape[1], 5, device=mask_pred.device)  # add white padding between pred and true masks
+        # add white padding between pred and true masks for easier visualization
+        padding = torch.ones(mask_pred.shape[0], mask_pred.shape[1], pad_width, device=mask_pred.device)
         image = _make_input_images(torch.cat([mask_pred, padding, mask_true], dim=2), self.num_images)
         logger.log_images(image, name=data_name, channels_last=True, use_table=False)
     def before_loss(self, state: State, logger: Logger):
