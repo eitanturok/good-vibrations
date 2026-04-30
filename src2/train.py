@@ -19,7 +19,7 @@ import wandb
 
 from model import VibrationTransformer
 from dataset import build_dataset
-from callbacks import MaskVisualizer
+from callbacks import MaskVisualizer, OutputSaver
 
 # **** Modal ****
 
@@ -84,8 +84,9 @@ def get_parser():
     parser.add_argument("--num-masks-logged",           type=str,   default=16)
     parser.add_argument("--mask-logging-interval",      type=str,   default=None, help="Interval to log masks. If not set, defaults to eval_interval.")
     # checkpointing
-    parser.add_argument("--checkpoint-interval",              type=str,   default="500ep")
+    parser.add_argument("--checkpoint-interval",        type=str,   default="500ep")
     parser.add_argument("--remote-checkpoint-folder",   type=str, default="eturok-weizmann/laser-vibrations-checkpoints")
+    parser.add_argument("--save-output-interval",       type=str,   default="100ep")
     return parser
 
 @app.function(
@@ -131,7 +132,8 @@ def train(**kwargs):
     callbacks=[SpeedMonitor(1), OOMObserver(), NaNMonitor(), RuntimeEstimator(time_unit="minutes"), SystemMetricsMonitor(),
                MaskVisualizer(args.num_masks_logged, args.mask_logging_interval or args.eval_interval),
             #    ExportForInferenceCallback(save_format='torchscript',save_path='runs/{{run_name}}/model.pth'),
-               CheckpointSaver(folder=f"runs/{{run_name}}/runs/{{run_name}}/checkpoints", weights_only=True, overwrite=True, save_interval=args.checkpoint_interval)
+               CheckpointSaver(folder=f"runs/{{run_name}}/runs/{{run_name}}/checkpoints", weights_only=True, overwrite=True, save_interval=args.checkpoint_interval),
+               OutputSaver(folder=f"runs/{{run_name}}/runs/{{run_name}}/forward_outputs", overwrite=True, shard_size=64, save_interval=args.save_output_interval)
                ]
     trainer = Trainer(run_name=args.run_name, model=model, optimizers=optimizer, train_dataloader=train_loader, auto_log_hparams=False,
                     eval_dataloader=eval_loader, max_duration=args.max_duration, seed=args.seed, eval_interval=args.eval_interval,
