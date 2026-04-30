@@ -7,7 +7,7 @@ logging.getLogger("torch.distributed.elastic.multiprocessing.redirects").setLeve
 import os
 
 import modal
-import torch
+import torch 
 import wandb
 from composer.utils.reproducibility import seed_all
 from composer.callbacks import RuntimeEstimator, SpeedMonitor, OOMObserver, NaNMonitor, SystemMetricsMonitor, CheckpointSaver

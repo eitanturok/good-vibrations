@@ -1,10 +1,11 @@
 # supress warnings
+import os
 import warnings, logging
 warnings.filterwarnings("ignore", message=r"The pynvml package is deprecated.*", category=FutureWarning)
 # only log errors from this file in order to suppress the warning "Redirects are currently not supported in Windows or MacOs."
 logging.getLogger("torch.distributed.elastic.multiprocessing.redirects").setLevel(logging.ERROR)
 
-import argparse
+import argparse, shutil
 import torch
 import modal
 from huggingface_hub import HfApi
@@ -19,7 +20,7 @@ import wandb
 
 from model import VibrationTransformer
 from dataset import build_dataset
-from callbacks import MaskVisualizer, OutputSaver
+from callbacks import MaskVisualizer, OutputSaver, DataDistribution
 
 # **** Modal ****
 
@@ -112,7 +113,7 @@ def train(**kwargs):
 
     # make dataset, model, optimizer
     train_loader, eval_loader, data_info = build_dataset(args.repo_id, args.patch_size, args.out_h, args.out_w, args.batch_size, args.eval_batch_size, args.seed,
-                                                         generator, args.test_size, args.num_workers, args.speakers, args.n_objects, args.n_samples, args.num_proc, args.dry_run)
+                                                         generator, args.test_size, args.num_workers, args.speakers, args.n_objects, args.n_samples, args.num_proc, 'box_distribution', args.dry_run)
     model = VibrationTransformer(args.d_model, args.pnt_num_heads, args.pnt_num_layers, args.seq_num_heads, args.seq_num_layers, data_info)
     optimizer = torch.optim.Adam(model.parameters(), args.lr, fused=True)
 
@@ -133,7 +134,8 @@ def train(**kwargs):
                MaskVisualizer(args.num_masks_logged, args.mask_logging_interval or args.eval_interval),
             #    ExportForInferenceCallback(save_format='torchscript',save_path='runs/{{run_name}}/model.pth'),
                CheckpointSaver(folder=f"runs/{{run_name}}/runs/{{run_name}}/checkpoints", weights_only=True, overwrite=True, save_interval=args.checkpoint_interval),
-               OutputSaver(folder=f"runs/{{run_name}}/runs/{{run_name}}/forward_outputs", save_interval=args.save_output_interval)
+               OutputSaver(folder=f"runs/{{run_name}}/runs/{{run_name}}/forward_outputs", save_interval=args.save_output_interval),
+               DataDistribution(folder=f'runs/{{run_name}}/runs/{{run_name}}/box_distributions')
                ]
     trainer = Trainer(run_name=args.run_name, model=model, optimizers=optimizer, train_dataloader=train_loader, auto_log_hparams=False,
                     eval_dataloader=eval_loader, max_duration=args.max_duration, seed=args.seed, eval_interval=args.eval_interval,

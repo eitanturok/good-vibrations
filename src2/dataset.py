@@ -2,6 +2,7 @@ import os, json, math
 
 import torch
 import numpy as np
+from sklearn.preprocessing import LabelEncoder
 from sklearn.model_selection import train_test_split
 from torch.utils.data import Dataset, DataLoader, Subset
 from datasets import load_dataset
@@ -15,6 +16,11 @@ class VibrationDataset(Dataset):
         self.ds = load_dataset(repo_id, split="train", num_proc=num_proc) # this is `data/metadata.jsonl`
         self.ds = self.ds.remove_columns(['segmented_overhead_file_name', 'speckle_vibrations_file_name', 'speckle_shifts_ifft_audio_file_name', 'audio_file_name', 'mask_file_name'])
         print(f"Loaded dataset with {len(self.ds)} samples\n")
+
+        # record all the x, y positions in the box
+        self.x_pos_encoder, self.y_pos_encoder = LabelEncoder().fit(self.ds['x_position']), LabelEncoder().fit(self.ds['y_position'])
+        self.x_positions, self.y_positions = self.x_pos_encoder.classes_, self.y_pos_encoder.classes_
+        print(f"x positions: {self.x_positions}\ny positions: {self.y_positions}\n")
 
         # Filter the dataset
         print('Filtering dataset...')
@@ -65,10 +71,10 @@ class VibrationDataset(Dataset):
         info = dict(sample_id=self.ds[idx]['sample_id'], x_position=self.ds[idx]['x_position'], y_position=self.ds[idx]['y_position'], n_objects=self.ds[idx]['n_objects'], speakers=self.ds[idx]['speakers'])
         return dict(mask_true=self.masks[idx], fft=self.fft[idx], info=info)
 
-def build_dataset(repo_id, patch_size, out_h, out_w, batch_size, eval_batch_size, seed, generator, test_size, num_workers, speakers, n_objects, n_samples, num_proc, dry_run:bool=False):
+def build_dataset(repo_id, patch_size, out_h, out_w, batch_size, eval_batch_size, seed, generator, test_size, num_workers, speakers, n_objects, n_samples, num_proc, save_folder, dry_run:bool=False):
     dataset = VibrationDataset(repo_id, patch_size, out_h, out_w, speakers, n_objects, n_samples, num_proc, dry_run)
 
-    # split the dataset into train and multiple eval sets (unseen positions, multi-object, and the rest)
+    # define indices for the train and eval sets (base, unseen positions, multi-object)
     held_out_positions = set([(3, 4), (7, 8), (1, 9), (2, 2), (6, 6)])
     unseen_pos_indices = set([i for i, d in enumerate(dataset.ds) if (d['x_position'], d['y_position']) in held_out_positions])
     multi_object_indices = set([i for i, d in enumerate(dataset.ds) if d['n_objects'] > 1])
@@ -76,6 +82,12 @@ def build_dataset(repo_id, patch_size, out_h, out_w, batch_size, eval_batch_size
     train_indices, eval_indices = train_test_split(list(available_indices), test_size=test_size, random_state=seed, shuffle=True)
     print(f'{len(dataset)} total samples\t{len(train_indices)} train samples\t{len(eval_indices)} eval samples\t{len(unseen_pos_indices)} unseen position eval samples\t{len(multi_object_indices)} multi-object eval samples\n')
     print(f'{held_out_positions=}')
+
+    # save data info (needed for model architecture)
+    data_info = dict(out_h=dataset.masks.shape[1], out_w=dataset.masks.shape[2], n_freqs=dataset.fft.shape[2] * dataset.fft.shape[4],
+                    n_laser_rows=int(math.sqrt(dataset.fft.shape[1])), n_laser_cols=int(math.sqrt(dataset.fft.shape[1])), patch_size=patch_size,
+                    x_pos=list(set(dataset.x_positions)), y_pos=list(set(dataset.y_positions)))
+    print(f'{data_info=}')
 
     # since dataset.__getitem__ returns info, which is a dict not a tensor,
     # we need to tell the trainer how many samples are in each batch
@@ -103,10 +115,6 @@ def build_dataset(repo_id, patch_size, out_h, out_w, batch_size, eval_batch_size
     eval_loader_multi_object = DataSpec(dataloader=eval_loader_multi_object, get_num_samples_in_batch=get_num_samples_in_batch)
     eval_loader_multi_object = Evaluator(label='eval/multi_object', dataloader=eval_loader_multi_object)
     print(f"Eval dataloader (multi-object): batch_size={eval_batch_size}, batches={len(eval_loader_multi_object.dataloader.dataloader)}, n_samples={len(multi_object_indices)}")
-
-    data_info = dict(out_h=dataset.masks.shape[1], out_w=dataset.masks.shape[2], n_freqs=dataset.fft.shape[2] * dataset.fft.shape[4],
-                    n_laser_rows=int(math.sqrt(dataset.fft.shape[1])), n_laser_cols=int(math.sqrt(dataset.fft.shape[1])), patch_size=patch_size)
-    print(f'{data_info=}')
 
     eval_loader = [eval_loader_base, eval_loader_unseen_pos, eval_loader_multi_object]
     return train_loader, eval_loader, data_info
