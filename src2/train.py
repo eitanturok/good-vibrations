@@ -73,11 +73,11 @@ def get_parser():
     parser.add_argument("--pnt-num-layers",             type=int,   default=2)
     parser.add_argument("--seq-num-layers",             type=int,   default=2)
     # train
-    parser.add_argument("--batch-size",                 type=int,   default=128)
+    parser.add_argument("--batch-size",                 type=int,   default=64)
     parser.add_argument("--lr",                         type=float, default=1e-4)
     parser.add_argument("--max-duration",               type=str,   default="100ep")
     # eval
-    parser.add_argument("--eval-batch-size",            type=int,   default=128)
+    parser.add_argument("--eval-batch-size",            type=int,   default=64)
     parser.add_argument("--eval-interval",              type=str,   default="25ep")
     # run
     parser.add_argument("--run-name",                   type=str,   default=None)

@@ -80,8 +80,9 @@ def build_dataset(repo_id, patch_size, out_h, out_w, batch_size, eval_batch_size
     multi_object_indices = set([i for i, d in enumerate(dataset.ds) if d['n_objects'] > 1])
     available_indices = set(range(len(dataset))) - unseen_pos_indices - multi_object_indices
     train_indices, eval_indices = train_test_split(list(available_indices), test_size=test_size, random_state=seed, shuffle=True)
-    print(f'{len(dataset)} total samples\t{len(train_indices)} train samples\t{len(eval_indices)} eval samples\t{len(unseen_pos_indices)} unseen position eval samples\t{len(multi_object_indices)} multi-object eval samples\n')
     print(f'{held_out_positions=}')
+    print(f'{len(dataset)} total samples\t{len(train_indices)} train samples\t{len(eval_indices)} eval samples\t{len(unseen_pos_indices)} unseen position eval samples\t{len(multi_object_indices)} multi-object eval samples\n')
+    print(f'{train_indices=}\n{eval_indices=}\n{unseen_pos_indices=}\n{multi_object_indices=}\n')
 
     # save data info (needed for model architecture)
     data_info = dict(out_h=dataset.masks.shape[1], out_w=dataset.masks.shape[2], n_freqs=dataset.fft.shape[2] * dataset.fft.shape[4],

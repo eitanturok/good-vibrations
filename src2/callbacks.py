@@ -83,11 +83,11 @@ def compute_distributions(dataset, indices):
 
     return position_distribution, mask_distribution
 
-def plot_position_distribution(position_distribution, folder: str, split_name: str, vmax: int, n_samples: int):
+def plot_position_distribution(position_distribution, folder: str, split_name: str, vmax: int, n_samples: int, total_samples: int):
     plt.figure()
     plt.imshow(position_distribution, origin="lower", cmap="viridis", aspect="auto", vmin=0, vmax=vmax)
     plt.colorbar(label="count")
-    plt.title(f"Box Position Distribution [{split_name}, n={n_samples}]")
+    plt.title(f"Box Position Distribution [{split_name}, n={n_samples}/{total_samples}]")
     for i, row in enumerate(position_distribution):
         for j, value in enumerate(row):
             if value: plt.text(j, i, int(value), ha="center", va="center", color="white")
@@ -96,11 +96,11 @@ def plot_position_distribution(position_distribution, folder: str, split_name: s
     plt.savefig(path, dpi=200, bbox_inches="tight")
     plt.close()
 
-def plot_mask_distribution(mask_distribution, folder: str, split_name: str, vmax: int, n_samples: int):
+def plot_mask_distribution(mask_distribution, folder: str, split_name: str, vmax: int, n_samples: int, total_samples: int):
     plt.figure()
     plt.imshow(mask_distribution, origin="lower", cmap="viridis", aspect="auto", vmin=0, vmax=vmax)
     plt.colorbar(label="count")
-    plt.title(f"Box Mask Distribution [{split_name}, n={n_samples}]")
+    plt.title(f"Box Mask Distribution [{split_name}, n={n_samples}/{total_samples}]")
 
     path = os.path.join(folder, f"mask_distribution_{split_name}.png")
     plt.savefig(path, dpi=200, bbox_inches="tight")
@@ -129,9 +129,10 @@ class DataDistribution(Callback):
         mask_max = max([dist[1].max() for dist in distributions.values()])
 
         # plot distributions
+        total_samples = sum([len(dataloader.dataset.indices) for dataloader in dataloaders.values()])
         for label, dataloader in dataloaders.items():
             subset = dataloader.dataset
             pos_dist, mask_dist = distributions[label]
             n_samples = len(subset.indices)
-            plot_position_distribution(pos_dist, self.folder, label, position_max, n_samples)
-            plot_mask_distribution(mask_dist, self.folder, label, mask_max, n_samples)
+            plot_position_distribution(pos_dist, self.folder, label, position_max, n_samples, total_samples)
+            plot_mask_distribution(mask_dist, self.folder, label, mask_max, n_samples, total_samples)
