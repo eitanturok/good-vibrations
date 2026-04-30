@@ -133,7 +133,7 @@ def train(**kwargs):
                MaskVisualizer(args.num_masks_logged, args.mask_logging_interval or args.eval_interval),
             #    ExportForInferenceCallback(save_format='torchscript',save_path='runs/{{run_name}}/model.pth'),
                CheckpointSaver(folder=f"runs/{{run_name}}/runs/{{run_name}}/checkpoints", weights_only=True, overwrite=True, save_interval=args.checkpoint_interval),
-               OutputSaver(folder=f"runs/{{run_name}}/runs/{{run_name}}/forward_outputs", overwrite=True, shard_size=64, save_interval=args.save_output_interval)
+               OutputSaver(folder=f"runs/{{run_name}}/runs/{{run_name}}/forward_outputs", save_interval=args.save_output_interval)
                ]
     trainer = Trainer(run_name=args.run_name, model=model, optimizers=optimizer, train_dataloader=train_loader, auto_log_hparams=False,
                     eval_dataloader=eval_loader, max_duration=args.max_duration, seed=args.seed, eval_interval=args.eval_interval,

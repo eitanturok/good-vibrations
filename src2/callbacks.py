@@ -56,102 +56,125 @@ def get_forward_outputs(path: str, split=None, label=None, epoch=None, batch=Non
     if forward_idx is not None: rows = [row for row in rows if row['forward_idx'] == forward_idx]
     return rows
 
-def _shape(x):
-    if isinstance(x, torch.Tensor): return tuple(x.shape)
-    if isinstance(x, dict): return {k: _shape(v) for k, v in x.items()}
-    if isinstance(x, tuple): return tuple(_shape(v) for v in x)
-    if isinstance(x, list): return [_shape(v) for v in x]
-    return None
+# def _shape(x):
+#     if isinstance(x, torch.Tensor): return tuple(x.shape)
+#     if isinstance(x, dict): return {k: _shape(v) for k, v in x.items()}
+#     if isinstance(x, tuple): return tuple(_shape(v) for v in x)
+#     if isinstance(x, list): return [_shape(v) for v in x]
+#     return None
+
+# class OutputSaver(Callback):
+#     def __init__(self, folder='runs/{run_name}/forward_outputs', filename='ep{epoch:04d}-ba{batch:06d}/{split}.{label}.shard{shard_idx:05d}-rank{rank}.pt', shard_size=32, save_interval='1ep', save_train=True, save_eval=True, save_predict=False, overwrite=False):
+#         self.folder = folder
+#         self.filename = filename
+#         self.shard_size = shard_size
+#         self.save_interval = Time.from_input(save_interval, TimeUnit.EPOCH)
+#         self.splits = {Event.AFTER_FORWARD: save_train, Event.EVAL_AFTER_FORWARD: save_eval, Event.PREDICT_AFTER_FORWARD: save_predict}
+#         self.overwrite = overwrite
+#         self.path = None
+#         self.buffers = defaultdict(list)
+#         self.forward_idxs = defaultdict(int)
+#         self.shard_idxs = defaultdict(int)
+#         self.last_saved = defaultdict(lambda: -1)
+#         self.enabled = defaultdict(bool)
+
+#     def init(self, state: State, logger: Logger):
+#         del logger
+#         self.path = format_name_with_dist(self.folder, state.run_name)
+#         os.makedirs(self.path, exist_ok=True)
+#         if not self.overwrite:
+#             ensure_folder_is_empty(self.path)
+
+#     def run_event(self, event: Event, state: State, logger: Logger):
+#         if event == Event.INIT: return self.init(state, logger)
+#         if event == Event.BATCH_START: return self._start(state, 'train', 'train')
+#         if event == Event.EVAL_START: return self._start(state, 'eval', state.dataloader_label or 'eval')
+#         if event == Event.PREDICT_START: return self._start(state, 'predict', 'predict')
+#         split = {Event.AFTER_FORWARD: 'train', Event.EVAL_AFTER_FORWARD: 'eval', Event.PREDICT_AFTER_FORWARD: 'predict'}.get(event)
+#         label = state.dataloader_label or split
+#         if split is not None and self.splits[event] and self.enabled[label]:
+#             self._record(state, split, label)
+#         elif event == Event.EVAL_END:
+#             self._flush(f"eval:{state.dataloader_label or 'eval'}")
+#         elif event == Event.PREDICT_END:
+#             self._flush('predict:predict')
+#         elif event == Event.FIT_END:
+#             self._flush('train:train')
+#         elif event == Event.EVAL_STANDALONE_END:
+#             for key in list(self.buffers):
+#                 self._flush(key)
+
+#     def state_dict(self):
+#         return {'forward_idxs': dict(self.forward_idxs), 'shard_idxs': dict(self.shard_idxs)}
+
+#     def load_state_dict(self, state):
+#         self.forward_idxs.update(state.get('forward_idxs', {}))
+#         self.shard_idxs.update(state.get('shard_idxs', {}))
+
+#     def _start(self, state: State, split: str, label: str):
+#         t = state.timestamp.get(self.save_interval.unit).value
+#         if self.save_interval.unit == TimeUnit.EPOCH and split == 'train': t += 1
+#         self.enabled[label] = t % self.save_interval.value == 0 and t != self.last_saved[label]
+#         if self.enabled[label]:
+#             self._flush(f'{split}:{label}')
+#             self.last_saved[label] = t
+
+#     def _record(self, state: State, split: str, label: str):
+#         key = f'{split}:{label}'
+#         self.forward_idxs[key] += 1
+#         self.buffers[key].append({
+#             'split': split,
+#             'label': label,
+#             'forward_idx': self.forward_idxs[key],
+#             'rank': dist.get_global_rank(),
+#             'timestamp': state.timestamp.state_dict(),
+#             'eval_timestamp': state.eval_timestamp.state_dict(),
+#             'output_shape': _shape(state.outputs),
+#             'outputs': self._to_cpu(state.outputs),
+#         })
+#         if len(self.buffers[key]) >= self.shard_size:
+#             self._flush(key)
+
+#     def _flush(self, key):
+#         assert self.path is not None, 'OutputSaver.init() must run before saving outputs'
+#         if not self.buffers[key]:
+#             return
+#         split, label = key.split(':', 1)
+#         record = self.buffers[key][-1]
+#         timestamp = record['timestamp']
+#         label = re.sub(r'[^a-zA-Z0-9_.-]+', '_', label)
+#         path = os.path.join(self.path, self.filename.format(split=split, label=label, shard_idx=self.shard_idxs[key], rank=dist.get_global_rank(), epoch=timestamp['epoch'], batch=timestamp['batch']))
+#         os.makedirs(os.path.dirname(path), exist_ok=True)
+#         torch.save(self.buffers[key], path)
+#         self.shard_idxs[key] += 1
+#         self.buffers[key].clear()
+
+#     def _to_cpu(self, x):
+#         if isinstance(x, torch.Tensor): return x.detach().to('cpu', copy=True)
+#         if isinstance(x, dict): return {k: self._to_cpu(v) for k, v in x.items()}
+#         if isinstance(x, tuple): return tuple(self._to_cpu(v) for v in x)
+#         if isinstance(x, list): return [self._to_cpu(v) for v in x]
+#         return x
+
+
+def _to_cpu(x:torch.Tensor): return x.detach().to('cpu', copy=True)
 
 class OutputSaver(Callback):
-    def __init__(self, folder='runs/{run_name}/forward_outputs', filename='ep{epoch:04d}-ba{batch:06d}/{split}.{label}.shard{shard_idx:05d}-rank{rank}.pt', shard_size=32, save_interval='1ep', save_train=True, save_eval=True, save_predict=False, overwrite=False):
-        self.folder = folder
-        self.filename = filename
-        self.shard_size = shard_size
-        self.save_interval = Time.from_input(save_interval, TimeUnit.EPOCH)
-        self.splits = {Event.AFTER_FORWARD: save_train, Event.EVAL_AFTER_FORWARD: save_eval, Event.PREDICT_AFTER_FORWARD: save_predict}
-        self.overwrite = overwrite
-        self.path = None
-        self.buffers = defaultdict(list)
-        self.forward_idxs = defaultdict(int)
-        self.shard_idxs = defaultdict(int)
-        self.last_saved = defaultdict(lambda: -1)
-        self.enabled = defaultdict(bool)
-
+    def __init__(self, save_interval, folder, filename='ep{epoch:04d}-ba{batch:06d}.pt'):
+        self.save_interval, self.folder, self.filename = Time.from_input(save_interval, TimeUnit.EPOCH), folder, filename
     def init(self, state: State, logger: Logger):
         del logger
-        self.path = format_name_with_dist(self.folder, state.run_name)
-        os.makedirs(self.path, exist_ok=True)
-        if not self.overwrite:
-            ensure_folder_is_empty(self.path)
+        self.folder = format_name_with_dist(self.folder, state.run_name)
+        os.makedirs(self.folder, exist_ok=True)
 
-    def run_event(self, event: Event, state: State, logger: Logger):
-        if event == Event.INIT: return self.init(state, logger)
-        if event == Event.BATCH_START: return self._start(state, 'train', 'train')
-        if event == Event.EVAL_START: return self._start(state, 'eval', state.dataloader_label or 'eval')
-        if event == Event.PREDICT_START: return self._start(state, 'predict', 'predict')
-        split = {Event.AFTER_FORWARD: 'train', Event.EVAL_AFTER_FORWARD: 'eval', Event.PREDICT_AFTER_FORWARD: 'predict'}.get(event)
-        label = state.dataloader_label or split
-        if split is not None and self.splits[event] and self.enabled[label]:
-            self._record(state, split, label)
-        elif event == Event.EVAL_END:
-            self._flush(f"eval:{state.dataloader_label or 'eval'}")
-        elif event == Event.PREDICT_END:
-            self._flush('predict:predict')
-        elif event == Event.FIT_END:
-            self._flush('train:train')
-        elif event == Event.EVAL_STANDALONE_END:
-            for key in list(self.buffers):
-                self._flush(key)
+    def save_outputs(self, state: State, logger: Logger, data_name: str):
+        del logger
+        if state.timestamp.epoch.value % self.save_interval == 0:
+            data_name = re.sub(r'[^a-zA-Z0-9_.-]+', '_', data_name)
+            path = os.path.join(self.folder, data_name, self.filename.format(epoch=state.timestamp.epoch.value, batch=state.timestamp.batch.value))
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            outputs = {'fft': _to_cpu(state.batch['fft']), 'outputs': _to_cpu(state.outputs), 'mask_true': _to_cpu(state.batch['mask_true']), 'info': state.batch['info']}
+            torch.save(outputs, path)
 
-    def state_dict(self):
-        return {'forward_idxs': dict(self.forward_idxs), 'shard_idxs': dict(self.shard_idxs)}
-
-    def load_state_dict(self, state):
-        self.forward_idxs.update(state.get('forward_idxs', {}))
-        self.shard_idxs.update(state.get('shard_idxs', {}))
-
-    def _start(self, state: State, split: str, label: str):
-        t = state.timestamp.get(self.save_interval.unit).value
-        if self.save_interval.unit == TimeUnit.EPOCH and split == 'train': t += 1
-        self.enabled[label] = t % self.save_interval.value == 0 and t != self.last_saved[label]
-        if self.enabled[label]:
-            self._flush(f'{split}:{label}')
-            self.last_saved[label] = t
-
-    def _record(self, state: State, split: str, label: str):
-        key = f'{split}:{label}'
-        self.forward_idxs[key] += 1
-        self.buffers[key].append({
-            'split': split,
-            'label': label,
-            'forward_idx': self.forward_idxs[key],
-            'rank': dist.get_global_rank(),
-            'timestamp': state.timestamp.state_dict(),
-            'eval_timestamp': state.eval_timestamp.state_dict(),
-            'output_shape': _shape(state.outputs),
-            'outputs': self._to_cpu(state.outputs),
-        })
-        if len(self.buffers[key]) >= self.shard_size:
-            self._flush(key)
-
-    def _flush(self, key):
-        assert self.path is not None, 'OutputSaver.init() must run before saving outputs'
-        if not self.buffers[key]:
-            return
-        split, label = key.split(':', 1)
-        record = self.buffers[key][-1]
-        timestamp = record['timestamp']
-        label = re.sub(r'[^a-zA-Z0-9_.-]+', '_', label)
-        path = os.path.join(self.path, self.filename.format(split=split, label=label, shard_idx=self.shard_idxs[key], rank=dist.get_global_rank(), epoch=timestamp['epoch'], batch=timestamp['batch']))
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        torch.save(self.buffers[key], path)
-        self.shard_idxs[key] += 1
-        self.buffers[key].clear()
-
-    def _to_cpu(self, x):
-        if isinstance(x, torch.Tensor): return x.detach().to('cpu', copy=True)
-        if isinstance(x, dict): return {k: self._to_cpu(v) for k, v in x.items()}
-        if isinstance(x, tuple): return tuple(self._to_cpu(v) for v in x)
-        if isinstance(x, list): return [self._to_cpu(v) for v in x]
-        return x
+    def after_forward(self, state, logger): self.save_outputs(state, logger, 'train')
+    def eval_after_forward(self, state, logger): self.save_outputs(state, logger, f'eval.{state.dataloader_label or "eval"}')
