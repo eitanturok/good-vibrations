@@ -68,7 +68,7 @@ class VibrationDataset(Dataset):
 
     def __len__(self): return len(self.ds)
     def __getitem__(self, idx):
-        info = dict(sample_id=self.ds[idx]['sample_id'], x_position=self.ds[idx]['x_position'], y_position=self.ds[idx]['y_position'], n_objects=self.ds[idx]['n_objects'], speakers=self.ds[idx]['speakers'])
+        info = dict(sample_id=self.ds[idx]['sample_id'], x_position=self.ds[idx]['x_position'] or -1, y_position=self.ds[idx]['y_position'] or -1, n_objects=self.ds[idx]['n_objects'], speakers=self.ds[idx]['speakers'])
         return dict(mask_true=self.masks[idx], fft=self.fft[idx], info=info)
 
 def build_dataset(repo_id, patch_size, out_h, out_w, batch_size, eval_batch_size, seed, generator, test_size, num_workers, speakers, n_objects, n_samples, num_proc, save_folder, dry_run:bool=False):
