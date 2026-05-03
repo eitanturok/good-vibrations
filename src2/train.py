@@ -1,11 +1,10 @@
 # supress warnings
-import os
 import warnings, logging
 warnings.filterwarnings("ignore", message=r"The pynvml package is deprecated.*", category=FutureWarning)
 # only log errors from this file in order to suppress the warning "Redirects are currently not supported in Windows or MacOs."
 logging.getLogger("torch.distributed.elastic.multiprocessing.redirects").setLevel(logging.ERROR)
 
-import argparse, shutil
+import argparse
 import torch
 import modal
 from huggingface_hub import HfApi
@@ -18,9 +17,9 @@ from composer.callbacks import RuntimeEstimator, SpeedMonitor, OOMObserver, NaNM
 from icecream import install; install()
 import wandb
 
-from model import VibrationTransformer
-from dataset import build_dataset
-from callbacks import MaskVisualizer, OutputSaver, DataDistribution
+from src2.model import VibrationTransformer
+from src2.dataset import build_dataset
+from src2.callbacks import MaskVisualizer, OutputSaver, DataDistribution
 
 # **** Modal ****
 
@@ -37,9 +36,9 @@ image = (
         'datasets', 'Pillow', 'torchcodec', 'torch>2.10', 'scikit-learn', 'icecream', 'wandb', 'modal', 'pynvml',
         'psutil', # for wandb to properly log the systems pannels (gpu utilization, gpu memory, etc.)
         'mosaicml-streaming', # for streaming dataset
+        "git+https://github.com/eitanturok/composer.git@4519dd2", # latest commit on my `hf-object-store` branch of composer
         ])
-    .uv_pip_install("git+https://github.com/eitanturok/composer.git@4519dd2")  # the lastest commit on my `hf-object-store` branch from my composer fork
-    .add_local_dir("src2", remote_path="/root")
+    .add_local_dir("src2", remote_path="/root/src2")
 )
 
 app = modal.App(

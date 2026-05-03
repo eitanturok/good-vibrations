@@ -7,7 +7,7 @@ logging.getLogger("torch.distributed.elastic.multiprocessing.redirects").setLeve
 import os
 
 import modal
-import torch 
+import torch
 import wandb
 from composer.utils.reproducibility import seed_all
 from composer.callbacks import RuntimeEstimator, SpeedMonitor, OOMObserver, NaNMonitor, SystemMetricsMonitor, CheckpointSaver
@@ -15,10 +15,10 @@ from huggingface_hub import HfApi
 from composer import Trainer
 from composer.loggers import WandBLogger
 
-from train import get_parser
-from callbacks import MaskVisualizer, OutputSaver
-from dataset import build_dataset
-from model import VibrationTransformer
+from src2.train import get_parser
+from src2.callbacks import MaskVisualizer, OutputSaver
+from src2.dataset import build_dataset
+from src2.model import VibrationTransformer
 
 # **** Modal ****
 
@@ -35,9 +35,9 @@ image = (
         'datasets', 'Pillow', 'torchcodec', 'torch>2.10', 'scikit-learn', 'icecream', 'wandb', 'modal', 'pynvml',
         'psutil', # for wandb to properly log the systems pannels (gpu utilization, gpu memory, etc.)
         'mosaicml-streaming', # for streaming dataset
+        "git+https://github.com/eitanturok/composer.git@4519dd2", # latest commit on my `hf-object-store` branch of composer
         ])
-    .uv_pip_install("git+https://github.com/eitanturok/composer.git@4519dd2")  # the lastest commit on my `hf-object-store` branch from my composer fork
-    .add_local_dir("src2", remote_path="/root")
+    .add_local_dir("src2", remote_path="/root/src2")
 )
 
 app = modal.App(
