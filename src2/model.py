@@ -60,8 +60,8 @@ class VibrationTransformer(ComposerModel):
         super().__init__()
 
         # encoder
-        self.laser_encoder = LaserEncoder(data_info['patch_size'], d_model, pnt_num_heads, pnt_num_layers, data_info["n_freqs"], signal)
-        self.box_encoder = nn.TransformerEncoder(nn.TransformerEncoderLayer( d_model=d_model, nhead=seq_num_heads, batch_first=True), num_layers=seq_num_layers)
+        self.laser_encoder = LaserEncoder(data_info['patch_size'], d_model, pnt_num_heads, pnt_num_layers, data_info['n_freqs'], signal)
+        self.box_encoder = nn.TransformerEncoder(nn.TransformerEncoderLayer(d_model=d_model, nhead=seq_num_heads, batch_first=True), num_layers=seq_num_layers)
         self.cls_token = nn.Parameter(torch.zeros(1, 1, d_model))
         nn.init.trunc_normal_(self.cls_token, std=0.02)  # Initialize to small random values
         self.register_buffer("freqs_laser", precompute_freqs_cis_2d(d_model, data_info['n_laser_rows'], data_info['n_laser_cols'])) # for laser grid
