@@ -60,8 +60,7 @@ class VibrationDataset(Dataset):
         print(f"masks.shape={self.masks.shape}\tmasks.dtype={self.masks.dtype}\n")
 
         # normalize and patchify FFTs
-        print('Normalizing and patchifying FFTs...')
-        # self.fft = self.fft.abs() # take magnitude of FFTs
+        print('Patchifying FFTs...')
         # drops entries that do not fully fit into patch_size
         self.fft = self.fft.unfold(2, patch_size, patch_size) # (B,L,F,2) -> (B,L,P,2,PS)
         print(f'fft.shape={self.fft.shape}\t{self.fft.dtype=}\n')
