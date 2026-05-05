@@ -118,7 +118,7 @@ def train(**kwargs):
 
     # make trainer
     config = data_info | args.__dict__ | dict(gpu_name=torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu", num_parameters=sum([p_.numel() for p_ in model.parameters()]))
-    logger = WandBLogger("laser-vibrations", group="speed", name=args.run_name, init_kwargs={"settings": wandb.Settings(x_disable_stats=False), "config": config, "save_code": True, "id": args.run_name, "resume": "allow"})
+    logger = WandBLogger("better-tsa", group="speed", name=args.run_name, init_kwargs={"settings": wandb.Settings(x_disable_stats=False), "config": config, "save_code": True, "id": args.run_name, "resume": "allow"})
     profiler = Profiler(
         trace_handlers=[JSONTraceHandler(folder=f"runs/{{run_name}}/runs/{{run_name}}/composer_profiler",
                                          merged_trace_filename=f"merged_trace_node{{node_rank}}.json",
