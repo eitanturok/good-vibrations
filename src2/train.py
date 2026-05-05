@@ -12,7 +12,7 @@ from composer.utils.reproducibility import seed_all
 from composer import Trainer
 from composer.profiler import JSONTraceHandler, cyclic_schedule
 from composer.profiler.profiler import Profiler
-from composer.loggers import WandBLogger
+from composer.loggers import WandBLogger, InMemoryLogger, FileLogger
 from composer.callbacks import RuntimeEstimator, SpeedMonitor, OOMObserver, NaNMonitor, SystemMetricsMonitor, CheckpointSaver
 from icecream import install; install()
 import wandb
@@ -116,41 +116,47 @@ def train(**kwargs):
     model = VibrationTransformer(args.d_model, args.pnt_num_heads, args.pnt_num_layers, args.seq_num_heads, args.seq_num_layers, data_info)
     optimizer = torch.optim.Adam(model.parameters(), args.lr, fused=True)
 
-    # make trainer
+    # make loggers
     config = data_info | args.__dict__ | dict(gpu_name=torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu", num_parameters=sum([p_.numel() for p_ in model.parameters()]))
-    logger = WandBLogger("better-tsa", group="speed", name=args.run_name, init_kwargs={"settings": wandb.Settings(x_disable_stats=False), "config": config, "save_code": True, "id": args.run_name, "resume": "allow"})
+    wandb_logger = WandBLogger("better-tsa", group="speed", name=args.run_name, init_kwargs={"settings": wandb.Settings(x_disable_stats=False), "config": config, "save_code": True, "id": args.run_name, "resume": "allow"})
+    file_logger = FileLogger(f"runs/{{run_name}}/logs-rank{{rank}}.txt")
+    mem_logger = InMemoryLogger()
+    loggers = [mem_logger, wandb_logger, file_logger]
+
+    # make trainer
     profiler = Profiler(
-        trace_handlers=[JSONTraceHandler(folder=f"runs/{{run_name}}/runs/{{run_name}}/composer_profiler",
+        trace_handlers=[JSONTraceHandler(folder=f"runs/{{run_name}}/composer_profiler",
                                          merged_trace_filename=f"merged_trace_node{{node_rank}}.json",
                                         #  remote_file_name=f"hf://{args.remote_checkpoint_folder}/runs/{{run_name}}/composer_profiler/ep{{epoch}}-ba{{batch}}-rank{{rank}}.json",
                                         #  merged_trace_remote_file_name=f"hf://{args.remote_checkpoint_folder}/runs/{{run_name}}/composer_profiler/merged_trace_node{{node_rank}}.json",
                                          overwrite=True)],
         schedule=cyclic_schedule(wait=0, warmup=0, active=1, repeat=1),
-        torch_prof_folder=f"runs/{{run_name}}/runs/{{run_name}}/torch_profiler", torch_prof_overwrite=True, torch_prof_memory_filename=None,
+        torch_prof_folder=f"runs/{{run_name}}/torch_profiler", torch_prof_overwrite=True, torch_prof_memory_filename=None,
         # torch_prof_remote_file_name=f"hf://{args.remote_checkpoint_folder}/runs/{{run_name}}/torch_profiler/rank{{rank}}.{{batch}}.pt.trace.json",
         )
     callbacks=[SpeedMonitor(1), OOMObserver(), NaNMonitor(), RuntimeEstimator(time_unit="minutes"), SystemMetricsMonitor(),
                MaskVisualizer(args.num_masks_logged, args.mask_logging_interval or args.eval_interval),
             #    ExportForInferenceCallback(save_format='torchscript',save_path='runs/{{run_name}}/model.pth'),
-               CheckpointSaver(folder=f"runs/{{run_name}}/runs/{{run_name}}/checkpoints", weights_only=True, overwrite=True, save_interval=args.checkpoint_interval),
-               OutputSaver(folder=f"runs/{{run_name}}/runs/{{run_name}}/forward_outputs", save_interval=args.save_output_interval),
-               DataDistribution(folder=f'runs/{{run_name}}/runs/{{run_name}}/box_distributions')
+               CheckpointSaver(folder=f"runs/{{run_name}}/checkpoints", weights_only=True, overwrite=True, save_interval=args.checkpoint_interval),
+               OutputSaver(folder=f"runs/{{run_name}}/forward_outputs", save_interval=args.save_output_interval),
+               DataDistribution(folder=f'runs/{{run_name}}/box_distributions')
                ]
     trainer = Trainer(run_name=args.run_name, model=model, optimizers=optimizer, train_dataloader=train_loader, auto_log_hparams=False,
                     eval_dataloader=eval_loader, max_duration=args.max_duration, seed=args.seed, eval_interval=args.eval_interval,
                     device=device, save_metrics=True, log_to_console=True, progress_bar=False,
-                    loggers=logger, callbacks=callbacks, profiler=profiler if args.debug > 0 else None)
+                    loggers=loggers, callbacks=callbacks, profiler=profiler if args.debug > 0 else None)
 
     # train da model!!!
     trainer.fit()
+    print(trainer.logger.destinations[0].data)
 
     # close up shop!!
     trainer.close()
 
-    # upload results
-    api = HfApi()
-    api.create_repo(args.remote_checkpoint_folder, repo_type="dataset", exist_ok=True)
-    api.upload_large_folder(folder_path=f'runs/{trainer.state.run_name}', repo_id=args.remote_checkpoint_folder, repo_type="dataset", num_workers=8)
+    # # upload results
+    # api = HfApi()
+    # api.create_repo(args.remote_checkpoint_folder, repo_type="dataset", exist_ok=True)
+    # api.upload_large_folder(folder_path=f'runs/{trainer.state.run_name}', repo_id=args.remote_checkpoint_folder, repo_type="dataset", num_workers=8)
 
 @app.local_entrypoint()
 def main(*args):
