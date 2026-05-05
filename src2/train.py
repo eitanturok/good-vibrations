@@ -112,7 +112,7 @@ def train(**kwargs):
 
     # make dataset, model, optimizer
     train_loader, eval_loader, data_info = build_dataset(args.repo_id, args.patch_size, args.out_h, args.out_w, args.batch_size, args.eval_batch_size, args.seed,
-                                                         generator, args.test_size, args.num_workers, args.speakers, args.n_objects, args.n_samples, args.num_proc, 'box_distribution', args.dry_run)
+                                                         generator, args.test_size, args.num_workers, args.speakers, args.n_objects, args.n_samples, args.num_proc, args.dry_run)
     model = VibrationTransformer(args.d_model, args.pnt_num_heads, args.pnt_num_layers, args.seq_num_heads, args.seq_num_layers, data_info)
     optimizer = torch.optim.Adam(model.parameters(), args.lr, fused=True)
 
@@ -126,7 +126,7 @@ def train(**kwargs):
     # make trainer
     profiler = Profiler(
         trace_handlers=[JSONTraceHandler(folder=f"runs/{{run_name}}/composer_profiler",
-                                         merged_trace_filename=f"merged_trace_node{{node_rank}}.json",
+                                         merged_trace_filename=f"runs/{{run_name}}/merged_trace_node{{node_rank}}.json",
                                         #  remote_file_name=f"hf://{args.remote_checkpoint_folder}/runs/{{run_name}}/composer_profiler/ep{{epoch}}-ba{{batch}}-rank{{rank}}.json",
                                         #  merged_trace_remote_file_name=f"hf://{args.remote_checkpoint_folder}/runs/{{run_name}}/composer_profiler/merged_trace_node{{node_rank}}.json",
                                          overwrite=True)],
@@ -148,7 +148,7 @@ def train(**kwargs):
 
     # train da model!!!
     trainer.fit()
-    print(trainer.logger.destinations[0].data)
+    # print(trainer.logger.destinations[0].data)
 
     # close up shop!!
     trainer.close()
