@@ -95,24 +95,24 @@ def build_dataset(repo_id, patch_size, out_h, out_w, batch_size, eval_batch_size
     def get_num_samples_in_batch(batch: dict) -> int: return batch['mask_true'].shape[0]
 
     # train
-    train_loader = DataLoader(Subset(dataset, train_indices), batch_size=batch_size, shuffle=True, num_workers=num_workers, generator=generator, pin_memory=False, persistent_workers=num_workers>0, prefetch_factor=4 if num_workers>0 else None)
+    train_loader = DataLoader(Subset(dataset, train_indices), batch_size=batch_size, shuffle=True, num_workers=num_workers, generator=generator, pin_memory=True, persistent_workers=num_workers>0, prefetch_factor=4 if num_workers>0 else None)
     train_loader = DataSpec(dataloader=train_loader, get_num_samples_in_batch=get_num_samples_in_batch)
     print(f"Train dataloader: batch_size={batch_size}, batches={len(train_loader.dataloader)}, n_samples={len(train_indices)}")
 
     # eval (general)
-    eval_loader_base = DataLoader(Subset(dataset, eval_indices), batch_size=eval_batch_size, shuffle=False, num_workers=num_workers, generator=generator, pin_memory=False, persistent_workers=num_workers>0, prefetch_factor=4 if num_workers>0 else None)
+    eval_loader_base = DataLoader(Subset(dataset, eval_indices), batch_size=eval_batch_size, shuffle=False, num_workers=num_workers, generator=generator, pin_memory=True, persistent_workers=num_workers>0, prefetch_factor=4 if num_workers>0 else None)
     eval_loader_base = DataSpec(dataloader=eval_loader_base, get_num_samples_in_batch=get_num_samples_in_batch)
     eval_loader_base = Evaluator(label='eval/base', dataloader=eval_loader_base)
     print(f"Eval dataloader: batch_size={eval_batch_size}, batches={len(eval_loader_base.dataloader.dataloader)}, n_samples={len(eval_indices)}")
 
     # eval (unseen position)
-    eval_loader_unseen_pos = DataLoader(Subset(dataset, list(unseen_pos_indices)), batch_size=eval_batch_size, shuffle=False, num_workers=num_workers, generator=generator, pin_memory=False, persistent_workers=num_workers>0, prefetch_factor=4 if num_workers>0 else None)
+    eval_loader_unseen_pos = DataLoader(Subset(dataset, list(unseen_pos_indices)), batch_size=eval_batch_size, shuffle=False, num_workers=num_workers, generator=generator, pin_memory=True, persistent_workers=num_workers>0, prefetch_factor=4 if num_workers>0 else None)
     eval_loader_unseen_pos = DataSpec(dataloader=eval_loader_unseen_pos, get_num_samples_in_batch=get_num_samples_in_batch)
     eval_loader_unseen_pos = Evaluator(label='eval/unseen_pos', dataloader=eval_loader_unseen_pos)
     print(f"Eval dataloader (unseen positions): batch_size={eval_batch_size}, batches={len(eval_loader_unseen_pos.dataloader.dataloader)}, n_samples={len(unseen_pos_indices)}")
 
     # eval (multi-object)
-    eval_loader_multi_object = DataLoader(Subset(dataset, list(multi_object_indices)), batch_size=eval_batch_size, shuffle=False, num_workers=num_workers, generator=generator, pin_memory=False, persistent_workers=num_workers>0, prefetch_factor=4 if num_workers>0 else None)
+    eval_loader_multi_object = DataLoader(Subset(dataset, list(multi_object_indices)), batch_size=eval_batch_size, shuffle=False, num_workers=num_workers, generator=generator, pin_memory=True, persistent_workers=num_workers>0, prefetch_factor=4 if num_workers>0 else None)
     eval_loader_multi_object = DataSpec(dataloader=eval_loader_multi_object, get_num_samples_in_batch=get_num_samples_in_batch)
     eval_loader_multi_object = Evaluator(label='eval/multi_object', dataloader=eval_loader_multi_object)
     print(f"Eval dataloader (multi-object): batch_size={eval_batch_size}, batches={len(eval_loader_multi_object.dataloader.dataloader)}, n_samples={len(multi_object_indices)}")
