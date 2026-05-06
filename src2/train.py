@@ -12,7 +12,7 @@ from composer.utils.reproducibility import seed_all
 from composer import Trainer
 from composer.profiler import JSONTraceHandler, cyclic_schedule
 from composer.profiler.profiler import Profiler
-from composer.loggers import WandBLogger, InMemoryLogger, FileLogger
+from composer.loggers import WandBLogger, FileLogger
 from composer.callbacks import RuntimeEstimator, SpeedMonitor, OOMObserver, NaNMonitor, SystemMetricsMonitor, CheckpointSaver
 from icecream import install; install()
 import wandb
