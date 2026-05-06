@@ -120,8 +120,7 @@ def train(**kwargs):
     config = data_info | args.__dict__ | dict(gpu_name=torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu", num_parameters=sum([p_.numel() for p_ in model.parameters()]))
     wandb_logger = WandBLogger("better-tsa", group="speed", name=args.run_name, init_kwargs={"settings": wandb.Settings(x_disable_stats=False), "config": config, "save_code": True, "id": args.run_name, "resume": "allow"})
     file_logger = FileLogger(f"runs/{{run_name}}/logs-rank{{rank}}.txt")
-    mem_logger = InMemoryLogger()
-    loggers = [mem_logger, wandb_logger, file_logger]
+    loggers = [wandb_logger, file_logger]
 
     # make trainer
     profiler = Profiler(
@@ -137,13 +136,14 @@ def train(**kwargs):
     callbacks=[SpeedMonitor(1), OOMObserver(), NaNMonitor(), RuntimeEstimator(time_unit="minutes"), SystemMetricsMonitor(),
                MaskVisualizer(args.num_masks_logged, args.mask_logging_interval or args.eval_interval),
             #    ExportForInferenceCallback(save_format='torchscript',save_path='runs/{{run_name}}/model.pth'),
-               CheckpointSaver(folder=f"runs/{{run_name}}/checkpoints", weights_only=True, overwrite=True, save_interval=args.checkpoint_interval),
+            #    CheckpointSaver(folder=f"runs/{{run_name}}/checkpoints", weights_only=False, overwrite=True, save_interval=args.checkpoint_interval),
                OutputSaver(folder=f"runs/{{run_name}}/forward_outputs", save_interval=args.save_output_interval),
                DataDistribution(folder=f'runs/{{run_name}}/box_distributions')
                ]
     trainer = Trainer(run_name=args.run_name, model=model, optimizers=optimizer, train_dataloader=train_loader, auto_log_hparams=False,
                     eval_dataloader=eval_loader, max_duration=args.max_duration, seed=args.seed, eval_interval=args.eval_interval,
                     device=device, save_metrics=True, log_to_console=True, progress_bar=False,
+                    autoresume=True, save_folder=f"runs/{{run_name}}/checkpoints", save_interval=args.checkpoint_interval,
                     loggers=loggers, callbacks=callbacks, profiler=profiler if args.debug > 0 else None)
 
     # train da model!!!
