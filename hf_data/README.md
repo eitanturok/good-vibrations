@@ -61,7 +61,7 @@ These are the columns shown in the HuggingFace dataset viewer, sourced from `dat
 | Column | Type | Description |
 |--------|------|-------------|
 | `sample_id` | int | Unique sequential identifier for this sample |
-| `segmented_overhead_file_name` | image | Overhead photo with segmentation mask overlay and speaker-angle annotations |
+| `segmented_overhead_file_name` | image | Final per-sample overhead photo shown in the viewer; stored as `data/<sample_id>/overhead.png` and includes the speaker overlay |
 | `speckle_vibrations_file_name` | video | Slow-motion preview of the laser speckle pattern while the box vibrates |
 | `speckle_shifts_ifft_audio_file_name` | audio | Vibration signal of a single laser point reconstructed as audio (inverse FFT) |
 | `audio_file_name` | audio | Shared excitation chirp played through the loudspeakers during recording |
@@ -91,6 +91,7 @@ experiment-16/
 │   ├── metadata.jsonl                   # One JSON row per sample (viewer-facing)
 │   ├── 0000001/                         # Per-sample directory (zero-padded 7-digit ID)
 │   │   ├── manifest.json                # Full provenance + config for this sample
+│   │   ├── overhead.png                 # Final overhead image with padding + speaker overlay for this sample
 │   │   ├── speckle_vibration_raw.npy    # Raw laser camera frames  [100 lasers × T frames × 2 (XY)]
 │   │   ├── speckle_shifts.npz           # Sub-pixel XY shifts per laser per frame
 │   │   ├── speckle_shifts_clean.npz     # Bandpass-filtered + Hann-windowed shifts
@@ -103,7 +104,7 @@ experiment-16/
     └── <image_dir>/                     # Named: <object>-<x>x-<y>y-<n>obj-<material>-<date>
         ├── raw_overhead.png             # Full overhead photo before cropping
         ├── cropped_overhead.png         # Overhead cropped to the box region
-        ├── segmented_overhead.png       # Overhead with mask overlay + speaker annotations
+        ├── segmented_overhead.png       # Shared overhead with mask overlay + COM marker only (no speaker overlay)
         ├── mask.png                     # Binary segmentation mask (white = object)
         └── mask.npz                     # Binary mask as compressed numpy array
 ```
@@ -114,7 +115,8 @@ experiment-16/
 
 Every sample directory contains a `manifest.json` that records full provenance, hardware config,
 processing parameters, and artifact paths. The `manifest` column in `metadata.jsonl` is this
-same document serialised as a JSON string.
+same document serialised as a JSON string. Shared image assets live under `image/<image_dir>/`,
+while the sample-specific speaker-rendered overhead lives under `data/<sample_id>/overhead.png`.
 
 ## Top-Level Keys
 
@@ -133,7 +135,7 @@ The most important, top-level entries of `manifest.json`.
 | `experiment_config` | object | Merged hardware and recording configuration |
 | `experiment_output` | object | Derived statistics computed during processing |
 | `processing_config` | object | Processing pipeline parameters |
-| `artifacts` | object | Relative repo paths to all files produced for this sample |
+| `artifacts` | object | Relative repo paths to all files produced for this sample, including both shared and sample-specific overhead images |
 
 ## `sample`
 

@@ -905,7 +905,7 @@ def apply_speaker_overlay(img_path: Path, speakers: str) -> None:
     inner_width, inner_height = inner.size
 
     target_icon_height = int(inner_height * 0.40)
-    speaker_icon = Image.open(SPEAKER_DIR / "speaker.png").convert("RGBA")
+    speaker_icon = Image.open(SPEAKER_DIR / "1000.png").convert("RGBA")
     orig_w, orig_h = speaker_icon.size
     target_icon_width = int(orig_w * target_icon_height / orig_h)
 
@@ -921,7 +921,7 @@ def apply_speaker_overlay(img_path: Path, speakers: str) -> None:
         composite = canvas.convert("RGBA")
         for bit, key, idx in zip(speakers, SPEAKER_FILES, range(4)):
             if bit == "1":
-                icon_orig = Image.open(SPEAKER_DIR / "speaker.png").convert("RGBA")
+                icon_orig = Image.open(SPEAKER_DIR / f"{key}.png").convert("RGBA")
                 icon_scaled = icon_orig.resize((target_icon_width, target_icon_height), Image.LANCZOS)
                 if key == "1000":
                     px, py = 0, padded_height // 2 - icon_scaled.height // 2

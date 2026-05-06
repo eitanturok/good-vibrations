@@ -301,7 +301,7 @@ def apply_speaker_overlay(img: PILImage.Image, speakers: str) -> PILImage.Image:
     inner = img.convert("RGB")
     inner_width, inner_height = inner.size
 
-    speaker_icon = PILImage.open(SPEAKER_DIR / "speaker.png").convert("RGBA")
+    speaker_icon = PILImage.open(SPEAKER_DIR / "1000.png").convert("RGBA")
     target_icon_height = int(inner_height * 0.40)
     orig_w, orig_h = speaker_icon.size
     target_icon_width = int(orig_w * target_icon_height / orig_h)
@@ -319,7 +319,8 @@ def apply_speaker_overlay(img: PILImage.Image, speakers: str) -> PILImage.Image:
         for bit, key in zip(speakers, SPEAKER_FILES):
             if bit != "1":
                 continue
-            icon = PILImage.open(SPEAKER_DIR / "speaker.png").convert("RGBA")
+            icon_path = SPEAKER_DIR / f"{key}.png"
+            icon = PILImage.open(icon_path).convert("RGBA")
             icon = icon.resize((target_icon_width, target_icon_height), PILImage.LANCZOS)
             if key == "1000":
                 px, py = 0, padded_height // 2 - icon.height // 2

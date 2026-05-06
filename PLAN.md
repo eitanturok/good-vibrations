@@ -196,6 +196,7 @@ data/
       mask.png
       mask.npz
   0000001/
+    overhead.png
     speckle_vibration_raw.npy
     speckle_vibrations.mp4
     speckle_shifts.npz
@@ -213,6 +214,13 @@ Naming rules:
 - `object`, `n-objects`, and `box-material` should be lowercased/normalized before path generation
 - `x-position` and `y-position` should be zero-padded to width 3
 - `timestamp` should be ordered `YYYY-MM-DD-HH-MM-SS` so lexical sort matches time order
+
+Image artifact rules:
+- `image/<image_dir>/segmented_overhead.png` is shared across samples that reuse the same cropped overhead and mask
+- shared `segmented_overhead.png` contains only the mask overlay and center-of-mass crosshair, with no speaker icon
+- `data/<sample_id>/overhead.png` is the final sample-specific overhead image and is created by adding the padded speaker overlay to the shared `segmented_overhead.png`
+- `metadata.jsonl` continues to use the `segmented_overhead_file_name` column for viewer compatibility, but that column now points to `data/<sample_id>/overhead.png`
+- `manifest.json` should include both `artifacts.segmented_overhead` and `artifacts.overhead`
 
 Coordinate rules:
 - `x_position` and `y_position` are user-provided integer placement coordinates recorded at acquisition time from the physical grid drawn in the box
