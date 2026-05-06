@@ -11,6 +11,8 @@ from PIL import Image, ImageDraw
 DEFAULT_REPO_ID = "eturok-weizmann/laser-vibrations"
 SPEAKER_FILES = ("1000", "0100", "0010", "0001")
 PADDED_BG = (232, 232, 232)
+SPEAKER_SCALE_MULTIPLIER = 1
+REFERENCE_SPEAKER_ICON = "speaker.png"
 
 
 def resolve_repo_root() -> Path:
@@ -106,19 +108,19 @@ def build_sample_overhead(segmented_overhead: Image.Image, speakers: str) -> Ima
     inner = segmented_overhead.convert("RGB")
     inner_width, inner_height = inner.size
 
-    reference_icon_path = SPEAKER_DIR / "1000.png"
-    if not reference_icon_path.exists():
-        reference_icon_path = SPEAKER_DIR / "speaker.png"
+    reference_icon_path = SPEAKER_DIR / REFERENCE_SPEAKER_ICON
     with Image.open(reference_icon_path) as reference_icon_rgba:
         reference_icon = reference_icon_rgba.convert("RGBA")
-        target_icon_height = int(inner_height * 0.40)
+        base_icon_height = int(inner_height * 0.40)
         orig_w, orig_h = reference_icon.size
-        target_icon_width = int(orig_w * target_icon_height / orig_h)
+        base_icon_width = int(orig_w * base_icon_height / orig_h)
+        target_icon_height = int(base_icon_height * SPEAKER_SCALE_MULTIPLIER)
+        target_icon_width = int(base_icon_width * SPEAKER_SCALE_MULTIPLIER)
 
-    padded_width = inner_width + target_icon_width
-    padded_height = inner_height + target_icon_height
+    padded_width = inner_width + base_icon_width
+    padded_height = inner_height + base_icon_height
     canvas = Image.new("RGB", (padded_width, padded_height), PADDED_BG)
-    canvas.paste(inner, (target_icon_width // 2, target_icon_height // 2))
+    canvas.paste(inner, (base_icon_width // 2, base_icon_height // 2))
 
     if "1" not in speakers:
         return canvas
@@ -127,9 +129,7 @@ def build_sample_overhead(segmented_overhead: Image.Image, speakers: str) -> Ima
     for bit, key in zip(speakers, SPEAKER_FILES):
         if bit != "1":
             continue
-        icon_path = SPEAKER_DIR / f"{key}.png"
-        if not icon_path.exists():
-            icon_path = SPEAKER_DIR / "speaker.png"
+        icon_path = SPEAKER_DIR / REFERENCE_SPEAKER_ICON
         with Image.open(icon_path) as icon_rgba:
             icon = icon_rgba.convert("RGBA")
             icon = icon.resize((target_icon_width, target_icon_height), Image.LANCZOS)

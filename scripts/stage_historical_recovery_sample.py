@@ -302,7 +302,7 @@ def apply_speaker_overlay(img: PILImage.Image, speakers: str) -> PILImage.Image:
     inner_width, inner_height = inner.size
 
     speaker_icon = PILImage.open(SPEAKER_DIR / "1000.png").convert("RGBA")
-    target_icon_height = int(inner_height * 0.40)
+    target_icon_height = int(inner_height * 0.10)
     orig_w, orig_h = speaker_icon.size
     target_icon_width = int(orig_w * target_icon_height / orig_h)
 
