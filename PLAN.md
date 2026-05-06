@@ -219,7 +219,7 @@ Image artifact rules:
 - `image/<image_dir>/segmented_overhead.png` is shared across samples that reuse the same cropped overhead and mask
 - shared `segmented_overhead.png` contains only the mask overlay and center-of-mass crosshair, with no speaker icon
 - `data/<sample_id>/overhead.png` is the final sample-specific overhead image and is created by adding the padded speaker overlay to the shared `segmented_overhead.png`
-- `metadata.jsonl` continues to use the `segmented_overhead_file_name` column for viewer compatibility, but that column now points to `data/<sample_id>/overhead.png`
+- `metadata.jsonl` uses `overhead_file_name` as the viewer-facing image column and points it to `data/<sample_id>/overhead.png`
 - `manifest.json` should include both `artifacts.segmented_overhead` and `artifacts.overhead`
 
 Coordinate rules:
@@ -235,7 +235,7 @@ Coordinate rules:
 ```json
 {
   "sample_id": 1,
-  "segmented_overhead_file_name": "https://huggingface.co/datasets/.../resolve/main/data/image/cube-003-007-1-cardboard-2026-04-21-10-05-33/segmented_overhead.png",
+  "overhead_file_name": "https://huggingface.co/datasets/.../resolve/main/data/0000001/overhead.png",
   "speckle_vibrations_file_name": "https://huggingface.co/datasets/.../resolve/main/data/0000001/speckle_vibrations.mp4",
   "speckle_shifts_ifft_audio_file_name": "https://huggingface.co/datasets/.../resolve/main/data/0000001/speckle_shifts_ifft_audio.wav",
   "audio_file_name": "https://huggingface.co/datasets/.../resolve/main/data/audio/chirp_50_1000_3.0sec.wav",
@@ -356,7 +356,7 @@ Meaning:
 
 Role:
 - viewer/display artifact only
-- shown alongside `segmented_overhead_file_name`
+- shown alongside `overhead_file_name`
 
 ### `mask.npz`
 
@@ -648,7 +648,7 @@ We use JSONL instead of Parquet for the reasons outlined in the "Dataset upload 
 
 Final columns (in order, with `_file_name` suffix for media columns):
 1. `sample_id`
-2. `segmented_overhead_file_name` - HF URL to segmented overhead image
+2. `overhead_file_name` - HF URL to the final per-sample overhead image
 3. `speckle_vibrations_file_name` - HF URL to speckle vibration video
 4. `speckle_shifts_ifft_audio_file_name` - HF URL to audio derived from recovered shifts
 5. `audio_file_name` - HF URL to the shared chirp audio
@@ -688,7 +688,7 @@ Reasoning:
 
 For HF viewer compatibility, the media fields should be full HF URLs:
 - `audio_file_name = https://huggingface.co/datasets/<HF_REPO>/resolve/main/data/audio/chirp_50_1000_3.0sec.wav`
-- `segmented_overhead_file_name = https://huggingface.co/datasets/<HF_REPO>/resolve/main/data/image/<IMAGE_DIR>/segmented_overhead.png`
+- `overhead_file_name = https://huggingface.co/datasets/<HF_REPO>/resolve/main/data/<SAMPLE_ID>/overhead.png`
 - `mask_file_name = https://huggingface.co/datasets/<HF_REPO>/resolve/main/data/image/<IMAGE_DIR>/mask.png`
 - `speckle_vibrations_file_name = https://huggingface.co/datasets/<HF_REPO>/resolve/main/data/<SAMPLE_ID>/speckle_vibrations.mp4`
 - `speckle_shifts_ifft_audio_file_name = https://huggingface.co/datasets/<HF_REPO>/resolve/main/data/<SAMPLE_ID>/speckle_shifts_ifft_audio.wav`
@@ -1155,7 +1155,7 @@ dataset_info:
   features:
     - name: sample_id
       dtype: int64
-    - name: segmented_overhead_file_name
+    - name: overhead_file_name
       dtype: image
     - name: speckle_vibrations_file_name
       dtype: video
@@ -1200,7 +1200,7 @@ Rules:
 ```json
 {
   "sample_id": 1,
-  "segmented_overhead_file_name": "https://huggingface.co/datasets/<HF_REPO>/resolve/main/data/image/<IMAGE_DIR>/segmented_overhead.png",
+  "overhead_file_name": "https://huggingface.co/datasets/<HF_REPO>/resolve/main/data/0000001/overhead.png",
   "speckle_vibrations_file_name": "https://huggingface.co/datasets/<HF_REPO>/resolve/main/data/0000001/speckle_vibrations.mp4",
   "speckle_shifts_ifft_audio_file_name": "https://huggingface.co/datasets/<HF_REPO>/resolve/main/data/0000001/speckle_shifts_ifft_audio.wav",
   "audio_file_name": "https://huggingface.co/datasets/<HF_REPO>/resolve/main/data/audio/chirp_50_1000_3.0sec.wav",

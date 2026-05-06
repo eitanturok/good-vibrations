@@ -7,7 +7,7 @@ dataset_info:
   features:
     - name: sample_id
       dtype: int64
-    - name: segmented_overhead_file_name
+    - name: overhead_file_name
       dtype: image
     - name: speckle_vibrations_file_name
       dtype: video
@@ -61,7 +61,7 @@ These are the columns shown in the HuggingFace dataset viewer, sourced from `dat
 | Column | Type | Description |
 |--------|------|-------------|
 | `sample_id` | int | Unique sequential identifier for this sample |
-| `segmented_overhead_file_name` | image | Final per-sample overhead photo shown in the viewer; stored as `data/<sample_id>/overhead.png` and includes the speaker overlay |
+| `overhead_file_name` | image | Final per-sample overhead photo shown in the viewer; stored as `data/<sample_id>/overhead.png` and includes the speaker overlay |
 | `speckle_vibrations_file_name` | video | Slow-motion preview of the laser speckle pattern while the box vibrates |
 | `speckle_shifts_ifft_audio_file_name` | audio | Vibration signal of a single laser point reconstructed as audio (inverse FFT) |
 | `audio_file_name` | audio | Shared excitation chirp played through the loudspeakers during recording |
@@ -307,7 +307,8 @@ The final artifacts we end up with in our dataset.
 |-----|------|-------------|
 | `raw_overhead` | string | `data/image/<dir>/raw_overhead.png` — full overhead photo before cropping |
 | `cropped_overhead` | string | `data/image/<dir>/cropped_overhead.png` — overhead cropped to box region |
-| `segmented_overhead` | string | `data/image/<dir>/segmented_overhead.png` — overhead with mask + speaker overlay |
+| `segmented_overhead` | string | `data/image/<dir>/segmented_overhead.png` — shared overhead with mask + COM marker only |
+| `overhead` | string | `data/<id>/overhead.png` — final per-sample overhead with padding + speaker overlay |
 | `mask_png` | string | `data/image/<dir>/mask.png` — binary segmentation mask (PNG) |
 | `mask_npz` | string | `data/image/<dir>/mask.npz` — binary mask as compressed numpy array |
 | `audio` | string | `data/audio/chirp_50_1000_3.0sec.wav` — shared excitation chirp (all samples) |
