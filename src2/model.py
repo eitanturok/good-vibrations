@@ -4,6 +4,8 @@ import torch.nn.functional as F
 from composer import ComposerModel
 from torchmetrics import MeanSquaredError
 
+from src2.dataset import DATA_INFO
+
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0) -> torch.Tensor:
     freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)] / dim))
     freqs = torch.arange(end).unsqueeze(dim=1) * freqs.unsqueeze(dim=0)
@@ -56,7 +58,7 @@ class LaserEncoder(nn.Module):
 def create_metrics(): return {"mse": MeanSquaredError()}
 
 class VibrationTransformer(ComposerModel):
-    def __init__(self, d_model, pnt_num_heads, pnt_num_layers, seq_num_heads, seq_num_layers, data_info, signal='magnitude'):
+    def __init__(self, d_model:int=128, pnt_num_heads:int=2, pnt_num_layers:int=2, seq_num_heads:int=2, seq_num_layers:int=2, data_info=DATA_INFO, signal='magnitude'):
         super().__init__()
 
         # encoder

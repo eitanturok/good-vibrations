@@ -10,6 +10,9 @@ from torch.nn import functional as F
 from huggingface_hub import snapshot_download
 from composer.core import Evaluator, DataSpec
 
+DATA_INFO = {'out_h': 40, 'out_w': 20, 'n_freqs': 3328, 'n_laser_rows': 10, 'n_laser_cols': 10, 'patch_size': 256,
+             'x_pos': [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, None], 'y_pos': [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, None]}
+
 class VibrationDataset(Dataset):
     def __init__(self, repo_id:str, patch_size:int, out_h:int, out_w:int, speakers:list[int,str]|list[int]|list[str]|str|None=None, n_objects:list[int]|int|None=None, n_samples:int=None, num_proc:int=8, dry_run:bool=False):
         print(f'Downloading dataset {repo_id}...')
@@ -70,7 +73,10 @@ class VibrationDataset(Dataset):
         info = dict(sample_id=self.ds[idx]['sample_id'], x_position=self.ds[idx]['x_position'] or -1, y_position=self.ds[idx]['y_position'] or -1, n_objects=self.ds[idx]['n_objects'], speakers=self.ds[idx]['speakers'])
         return dict(mask_true=self.masks[idx], fft=self.fft[idx], info=info)
 
-def build_dataset(repo_id, patch_size, out_h, out_w, batch_size, eval_batch_size, seed, generator, test_size, num_workers, speakers, n_objects, n_samples, num_proc, save_folder, dry_run:bool=False):
+def build_dataset(repo_id:str='eturok-weizmann/laser-vibrations', patch_size:int=256, out_h:int=40, out_w:int=20, batch_size:int=64, eval_batch_size:int=64,
+                  seed:int=42, generator=None, test_size:float=0.2, num_workers:int=8, speakers:list[int,str]|list[int]|list[str]|str|None=None,
+                  n_objects:int|None=None, n_samples:int|None=None, num_proc:int=8, dry_run:bool=False):
+    if generator is None: generator = torch.Generator().manual_seed(seed)
     dataset = VibrationDataset(repo_id, patch_size, out_h, out_w, speakers, n_objects, n_samples, num_proc, dry_run)
 
     # define indices for the train and eval sets (base, unseen positions, multi-object)
@@ -94,24 +100,24 @@ def build_dataset(repo_id, patch_size, out_h, out_w, batch_size, eval_batch_size
     def get_num_samples_in_batch(batch: dict) -> int: return batch['mask_true'].shape[0]
 
     # train
-    train_loader = DataLoader(Subset(dataset, train_indices), batch_size=batch_size, shuffle=True, num_workers=num_workers, generator=generator, pin_memory=False, persistent_workers=num_workers>0, prefetch_factor=4 if num_workers>0 else None)
+    train_loader = DataLoader(Subset(dataset, train_indices), batch_size=batch_size, shuffle=True, num_workers=num_workers, generator=generator, pin_memory=True, persistent_workers=num_workers>0, prefetch_factor=4 if num_workers>0 else None)
     train_loader = DataSpec(dataloader=train_loader, get_num_samples_in_batch=get_num_samples_in_batch)
     print(f"Train dataloader: batch_size={batch_size}, batches={len(train_loader.dataloader)}, n_samples={len(train_indices)}")
 
     # eval (general)
-    eval_loader_base = DataLoader(Subset(dataset, eval_indices), batch_size=eval_batch_size, shuffle=False, num_workers=num_workers, generator=generator, pin_memory=False, persistent_workers=num_workers>0, prefetch_factor=4 if num_workers>0 else None)
+    eval_loader_base = DataLoader(Subset(dataset, eval_indices), batch_size=eval_batch_size, shuffle=False, num_workers=num_workers, generator=generator, pin_memory=True, persistent_workers=num_workers>0, prefetch_factor=4 if num_workers>0 else None)
     eval_loader_base = DataSpec(dataloader=eval_loader_base, get_num_samples_in_batch=get_num_samples_in_batch)
     eval_loader_base = Evaluator(label='eval/base', dataloader=eval_loader_base)
     print(f"Eval dataloader: batch_size={eval_batch_size}, batches={len(eval_loader_base.dataloader.dataloader)}, n_samples={len(eval_indices)}")
 
     # eval (unseen position)
-    eval_loader_unseen_pos = DataLoader(Subset(dataset, list(unseen_pos_indices)), batch_size=eval_batch_size, shuffle=False, num_workers=num_workers, generator=generator, pin_memory=False, persistent_workers=num_workers>0, prefetch_factor=4 if num_workers>0 else None)
+    eval_loader_unseen_pos = DataLoader(Subset(dataset, list(unseen_pos_indices)), batch_size=eval_batch_size, shuffle=False, num_workers=num_workers, generator=generator, pin_memory=True, persistent_workers=num_workers>0, prefetch_factor=4 if num_workers>0 else None)
     eval_loader_unseen_pos = DataSpec(dataloader=eval_loader_unseen_pos, get_num_samples_in_batch=get_num_samples_in_batch)
     eval_loader_unseen_pos = Evaluator(label='eval/unseen_pos', dataloader=eval_loader_unseen_pos)
     print(f"Eval dataloader (unseen positions): batch_size={eval_batch_size}, batches={len(eval_loader_unseen_pos.dataloader.dataloader)}, n_samples={len(unseen_pos_indices)}")
 
     # eval (multi-object)
-    eval_loader_multi_object = DataLoader(Subset(dataset, list(multi_object_indices)), batch_size=eval_batch_size, shuffle=False, num_workers=num_workers, generator=generator, pin_memory=False, persistent_workers=num_workers>0, prefetch_factor=4 if num_workers>0 else None)
+    eval_loader_multi_object = DataLoader(Subset(dataset, list(multi_object_indices)), batch_size=eval_batch_size, shuffle=False, num_workers=num_workers, generator=generator, pin_memory=True, persistent_workers=num_workers>0, prefetch_factor=4 if num_workers>0 else None)
     eval_loader_multi_object = DataSpec(dataloader=eval_loader_multi_object, get_num_samples_in_batch=get_num_samples_in_batch)
     eval_loader_multi_object = Evaluator(label='eval/multi_object', dataloader=eval_loader_multi_object)
     print(f"Eval dataloader (multi-object): batch_size={eval_batch_size}, batches={len(eval_loader_multi_object.dataloader.dataloader)}, n_samples={len(multi_object_indices)}")

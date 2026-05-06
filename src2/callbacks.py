@@ -7,6 +7,7 @@ from composer.core import State, Time, TimeUnit
 from composer import Callback, Logger
 from torch.utils.data import Subset
 from composer.utils import format_name_with_dist
+from composer.loggers import WandBLogger
 
 # ***** MaskVizualizer *****
 
@@ -47,23 +48,29 @@ def _to_cpu(x:torch.Tensor): return x.detach().to('cpu', copy=True)
 class OutputSaver(Callback):
     def __init__(self, save_interval, folder, filename='ep{epoch:04d}-ba{batch:06d}.pt'):
         self.save_interval, self.folder, self.filename = Time.from_input(save_interval, TimeUnit.EPOCH), folder, filename
+
     def init(self, state: State, logger: Logger):
         del logger
         self.folder = format_name_with_dist(self.folder, state.run_name)
         os.makedirs(self.folder, exist_ok=True)
 
     def save_outputs(self, state: State, logger: Logger, data_name: str):
-        del logger
         current_time_value = state.timestamp.get(self.save_interval.unit).value
         if current_time_value % self.save_interval.value == 0:
-            data_name = re.sub(r'[^a-zA-Z0-9_.-]+', '_', data_name)
+            outputs = {'fft': _to_cpu(state.batch['fft']), 'mask_pred': _to_cpu(state.outputs['mask_pred']), 'mask_true': _to_cpu(state.batch['mask_true']), 'info': state.batch['info']}
+
+            # save to loggers
+            for destination in logger.destinations:
+                if isinstance(destination, WandBLogger): continue # wandb JSON serialization fails on complex tensor fft
+                destination.log_metrics({f'{data_name}/{k}': v for k, v in outputs.items()})
+
+            # save locally
             path = os.path.join(self.folder, data_name, self.filename.format(epoch=state.timestamp.epoch.value, batch=state.timestamp.batch.value))
             os.makedirs(os.path.dirname(path), exist_ok=True)
-            outputs = {'fft': _to_cpu(state.batch['fft']), 'mask_pred': _to_cpu(state.outputs['mask_pred']), 'mask_true': _to_cpu(state.batch['mask_true']), 'info': state.batch['info']}
             torch.save(outputs, path)
 
-    def after_forward(self, state, logger): self.save_outputs(state, logger, 'train')
-    def eval_after_forward(self, state, logger): self.save_outputs(state, logger, f'eval.{state.dataloader_label or "eval"}')
+    def after_forward(self, state, logger): self.save_outputs(state, logger, state.dataloader_label)
+    def eval_after_forward(self, state, logger): self.save_outputs(state, logger, f'{state.dataloader_label or "eval"}')
 
 
 # ***** DataDistribution *****
