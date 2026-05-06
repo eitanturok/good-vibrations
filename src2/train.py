@@ -77,11 +77,11 @@ def get_parser():
     parser.add_argument("--max-duration",               type=str,   default="100ep")
     # eval
     parser.add_argument("--eval-batch-size",            type=int,   default=64)
-    parser.add_argument("--eval-interval",              type=str,   default="25ep")
+    parser.add_argument("--eval-interval",              type=str,   default="50ep")
     # run
     parser.add_argument("--run-name",                   type=str,   default=None)
     # logging
-    parser.add_argument("--num-masks-logged",           type=str,   default=16)
+    parser.add_argument("--num-masks-logged",           type=str,   default=500)
     parser.add_argument("--mask-logging-interval",      type=str,   default=None, help="Interval to log masks. If not set, defaults to eval_interval.")
     # checkpointing
     parser.add_argument("--checkpoint-interval",        type=str,   default="500ep")
