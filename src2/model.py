@@ -1,3 +1,4 @@
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -5,6 +6,9 @@ from composer import ComposerModel
 from torchmetrics import MeanSquaredError
 
 from src2.dataset import DATA_INFO
+
+def getenv(key: str, default=0): return type(default)(os.getenv(key, default))
+SPEAKER_EMBD = getenv('SPEAKER_EMBD', 0)
 
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0) -> torch.Tensor:
     freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)] / dim))
@@ -69,6 +73,7 @@ class VibrationTransformer(ComposerModel):
         self.register_buffer("freqs_laser", precompute_freqs_cis_2d(d_model, data_info['n_laser_rows'], data_info['n_laser_cols'])) # for laser grid
 
         # decoder
+        self.speaker_embed = nn.Embedding(4, d_model)
         self.decoder = MLPDecoder(d_model, data_info['out_h'], data_info['out_w'])
 
         # metrics
@@ -85,6 +90,7 @@ class VibrationTransformer(ComposerModel):
 
         # BoxEncoder learns patterns between ALL the lasers shining on the box
         x = apply_rope(x, self.freqs_laser) # (B,L,D) -> (B,L,D)
+        if SPEAKER_EMBD: x += self.speaker_embed(batch['info']['speakers_encoded']).unsqueeze(1)
         x = torch.cat((self.cls_token.expand(B, -1, -1), x), dim=1)  # (B,L,D) (1,1,D) -> (B,L+1,D)
         output = self.box_encoder(x)  # (B,L+1,D) -> (B,L+1,D)
         cls_embedding = output[:, 0, :]  # (B,L+1,D) -> (B,D)
