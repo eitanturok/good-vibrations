@@ -3,12 +3,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from composer import ComposerModel
-from torchmetrics import MeanSquaredError
+from torchmetrics import MeanSquaredError, Metric
 
 from src2.dataset import DATA_INFO
-
-def getenv(key: str, default=0): return type(default)(os.getenv(key, default))
-SPEAKER_EMBD = getenv('SPEAKER_EMBD', 0)
 
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0) -> torch.Tensor:
     freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)] / dim))
@@ -38,6 +35,7 @@ class LaserEncoder(nn.Module):
     def __init__(self, patch_size, d_model, num_heads, num_layers, signal_length, signal):
         super().__init__()
         self.embed = nn.Linear(2 * patch_size, d_model)
+        self.speakers_embed = nn.Embedding(4, d_model)
         self.layers = nn.TransformerEncoder(nn.TransformerEncoderLayer(d_model=d_model, nhead=num_heads, batch_first=True), num_layers=num_layers)
         self.cls_token = nn.Parameter(torch.zeros(1, 1, d_model))
         self.register_buffer("freqs_cis", precompute_freqs_cis(d_model, signal_length // patch_size))
@@ -49,17 +47,41 @@ class LaserEncoder(nn.Module):
         if self.signal == "mag_phase": return torch.cat([x.abs(), x.angle()], dim=-1)
         raise ValueError(f"Unknown signal mode: {self.signal}")
 
-    def forward(self, x):
+    def forward(self, x, speaker=None):
         # x.shape = (B_L,P,C,_PS) = (batch_size * n_lasers, n_patches, n_coords, patch_size)
         B_L, P, _, _ = x.shape
         x = self._raw_to_tokens(x).float()      # (B_L,P,C,_PS) -> (B_L,P,C,PS) where PS=_PS or 2*_PS
         x = self.embed(x.reshape(B_L, P, -1))   # (B_L,P,C,PS) -> (B_L,P,D)
         x = apply_rope(x, self.freqs_cis)       # (B_L,P,D) -> (B_L,P,D)
+        if speaker is not None: x += self.speakers_embed(speaker).unsqueeze(1)  # (B_L,P,D), (B_L,1,D) -> (B_L,P,D)
         x = torch.cat((self.cls_token.expand(B_L, -1, -1), x), dim=1)   # (B_L,P,D) -> (B_L,P+1,D)
         output = self.layers(x)  # (B_L,P+1,D) -> (B_L,P+1,D)
         return output[:, 0, :]  # (B_L,P+1,D) -> (B_L,D)
 
-def create_metrics(): return {"mse": MeanSquaredError()}
+class CenterOfMassDistance(Metric):
+    def __init__(self, out_h:int, out_w:int, norm:int=2, epsilon:float=1e-6):
+        super().__init__()
+        self.p, self.epsilon = norm, epsilon
+        self.register_buffer("xs", torch.arange(out_w).float())
+        self.register_buffer("ys", torch.arange(out_h).float())
+        self.add_state("total", default=torch.tensor(0.0), dist_reduce_fx="sum")
+        self.add_state("count", default=torch.tensor(0), dist_reduce_fx="sum")
+
+    def _com(self, mask):
+        total = mask.sum((-2, -1), keepdim=True).clamp(min=self.epsilon)
+        cx = (self.xs * mask.sum(-2)).sum(-1) / total.squeeze()
+        cy = (self.ys * mask.sum(-1)).sum(-1) / total.squeeze()
+        return torch.stack([cx, cy], dim=-1)
+
+    def update(self, mask_pred, mask_true):
+        valid = mask_true.sum((-2, -1)) > 0  # skip empty ground-truth masks
+        if not valid.any(): return
+        com_distances = torch.linalg.norm(self._com(mask_pred[valid]) - self._com(mask_true[valid]), ord=self.p, dim=-1)
+        self.total, self.count = self.total + com_distances.sum(), self.count + valid.sum()
+
+    def compute(self): return self.total / self.count
+
+def create_metrics(data_info): return {"mse": MeanSquaredError(), 'com-distance': CenterOfMassDistance(data_info['out_h'], data_info['out_w'])}
 
 class VibrationTransformer(ComposerModel):
     def __init__(self, d_model:int=128, pnt_num_heads:int=2, pnt_num_layers:int=2, seq_num_heads:int=2, seq_num_layers:int=2, data_info=DATA_INFO, signal='magnitude'):
@@ -73,24 +95,23 @@ class VibrationTransformer(ComposerModel):
         self.register_buffer("freqs_laser", precompute_freqs_cis_2d(d_model, data_info['n_laser_rows'], data_info['n_laser_cols'])) # for laser grid
 
         # decoder
-        self.speaker_embed = nn.Embedding(4, d_model)
         self.decoder = MLPDecoder(d_model, data_info['out_h'], data_info['out_w'])
 
         # metrics
-        self.train_metrics, self.val_metrics = create_metrics(), create_metrics()
+        self.train_metrics, self.val_metrics = create_metrics(data_info), create_metrics(data_info)
 
     def forward(self, batch):
         # B=batch size, L=n_lasers, C=n_coordinates=2, PS=patch_size, D=d_model
-        x = batch['fft']
+        x = batch['fft'] # (B,L,P,2,PS)
         B, L, _, _, _ = x.shape
 
         # LaserEncoder learns patterns between all frequencies from a single laser
         # flatten so LaserEncoder processes all lasers AND all batches in parallel
-        x = self.laser_encoder(x.flatten(0, 1)).reshape(B, L, -1)  # (B,L,P,C,PS) -> (B,L,D)
+        speaker = speaker.repeat_interleave(L) if (speaker := batch.get('speakers_encoded', None)) is not None else None # (BL,D)
+        x = self.laser_encoder(x.flatten(0, 1), speaker).reshape(B, L, -1)  # (B,L,P,C,PS) -> (B,L,D)
 
         # BoxEncoder learns patterns between ALL the lasers shining on the box
         x = apply_rope(x, self.freqs_laser) # (B,L,D) -> (B,L,D)
-        if SPEAKER_EMBD: x += self.speaker_embed(batch['info']['speakers_encoded']).unsqueeze(1)
         x = torch.cat((self.cls_token.expand(B, -1, -1), x), dim=1)  # (B,L,D) (1,1,D) -> (B,L+1,D)
         output = self.box_encoder(x)  # (B,L+1,D) -> (B,L+1,D)
         cls_embedding = output[:, 0, :]  # (B,L+1,D) -> (B,D)
@@ -108,8 +129,7 @@ class VibrationTransformer(ComposerModel):
         return self.train_metrics if is_train else self.val_metrics
 
     def update_metric(self, batch, outputs, metric):
-        if isinstance(metric, MeanSquaredError):
-            metric.update(outputs['mask_pred'], batch['mask_true'])
+        metric.update(outputs['mask_pred'], batch['mask_true'])
 
     def eval_forward(self, batch, outputs=None):
         return outputs if outputs is not None else self.forward(batch)

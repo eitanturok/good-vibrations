@@ -10,6 +10,8 @@ from torch.nn import functional as F
 from huggingface_hub import snapshot_download
 from composer.core import Evaluator, DataSpec
 
+from helpers import SPEAKER_EMBD
+
 DATA_INFO = {'out_h': 40, 'out_w': 20, 'n_freqs': 3328, 'n_laser_rows': 10, 'n_laser_cols': 10, 'patch_size': 256,
              'x_pos': [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, None], 'y_pos': [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, None]}
 
@@ -75,8 +77,8 @@ class VibrationDataset(Dataset):
     def __getitem__(self, idx):
         def pos(idx, axis): return -1 if self.ds[idx][f'{axis}_position'] is None else self.ds[idx][f'{axis}_position']
         info = dict(sample_id=self.ds[idx]['sample_id'], x_position=pos(idx, 'x'), y_position=pos(idx, 'y'),
-                    n_objects=self.ds[idx]['n_objects'], speakers=self.ds[idx]['speakers'], speakers_encoded=self.speakers_encoded[idx])
-        return dict(mask_true=self.masks[idx], fft=self.fft[idx], info=info)
+                    n_objects=self.ds[idx]['n_objects'], speakers=self.ds[idx]['speakers'])
+        return dict(mask_true=self.masks[idx], fft=self.fft[idx], info=info) | dict(speakers_encoded=self.speakers_encoded[idx]) if SPEAKER_EMBD else {}
 
 def build_dataset(repo_id:str='eturok-weizmann/laser-vibrations', patch_size:int=256, out_h:int=40, out_w:int=20, batch_size:int=64, eval_batch_size:int=64,
                   seed:int=42, generator=None, test_size:float=0.2, num_workers:int=8, speakers:list[int,str]|list[int]|list[str]|str|None=None,
