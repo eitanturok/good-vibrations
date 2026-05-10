@@ -124,13 +124,13 @@ def train(**kwargs):
 
     # make trainer
     profiler = Profiler(
-        trace_handlers=[JSONTraceHandler(folder=f"runs/{{run_name}}/composer_profiler",
-                                         merged_trace_filename=f"runs/{{run_name}}/merged_trace_node{{node_rank}}.json",
+        trace_handlers=[JSONTraceHandler(folder=f"runs/{{run_name}}/composer_profiler", merged_trace_filename=f"runs/{{run_name}}/merged_trace_node{{node_rank}}.json",
                                         #  remote_file_name=f"hf://{args.remote_checkpoint_folder}/runs/{{run_name}}/composer_profiler/ep{{epoch}}-ba{{batch}}-rank{{rank}}.json",
                                         #  merged_trace_remote_file_name=f"hf://{args.remote_checkpoint_folder}/runs/{{run_name}}/composer_profiler/merged_trace_node{{node_rank}}.json",
-                                         overwrite=True)],
+                                        overwrite=True)],
         schedule=cyclic_schedule(wait=0, warmup=0, active=1, repeat=1),
-        torch_prof_folder=f"runs/{{run_name}}/torch_profiler", torch_prof_overwrite=True, torch_prof_memory_filename=None,
+        torch_prof_folder=f"runs/{{run_name}}/torch_profiler", torch_prof_remote_file_name=f"runs/{{run_name}}/torch_profiler",
+        torch_prof_overwrite=True, torch_prof_memory_filename=None,
         # torch_prof_remote_file_name=f"hf://{args.remote_checkpoint_folder}/runs/{{run_name}}/torch_profiler/rank{{rank}}.{{batch}}.pt.trace.json",
         )
     callbacks=[SpeedMonitor(1), OOMObserver(), NaNMonitor(), RuntimeEstimator(time_unit="minutes"), SystemMetricsMonitor(),
