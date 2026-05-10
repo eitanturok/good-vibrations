@@ -76,9 +76,8 @@ class VibrationDataset(Dataset):
     def __len__(self): return len(self.ds)
     def __getitem__(self, idx):
         def pos(idx, axis): return -1 if self.ds[idx][f'{axis}_position'] is None else self.ds[idx][f'{axis}_position']
-        info = dict(sample_id=self.ds[idx]['sample_id'], x_position=pos(idx, 'x'), y_position=pos(idx, 'y'),
-                    n_objects=self.ds[idx]['n_objects'], speakers=self.ds[idx]['speakers'])
-        return dict(mask_true=self.masks[idx], fft=self.fft[idx], info=info) | dict(speakers_encoded=self.speakers_encoded[idx]) if SPEAKER_EMBD else {}
+        info = dict(sample_id=self.ds[idx]['sample_id'], x_position=pos(idx, 'x'), y_position=pos(idx, 'y'), n_objects=self.ds[idx]['n_objects'], speakers=self.ds[idx]['speakers'])
+        return dict(mask_true=self.masks[idx], fft=self.fft[idx], info=info) | (dict(speakers_encoded=self.speakers_encoded[idx]) if SPEAKER_EMBD else {})
 
 def build_dataset(repo_id:str='eturok-weizmann/laser-vibrations', patch_size:int=256, out_h:int=40, out_w:int=20, batch_size:int=64, eval_batch_size:int=64,
                   seed:int=42, generator=None, test_size:float=0.2, num_workers:int=8, speakers:list[int,str]|list[int]|list[str]|str|None=None,

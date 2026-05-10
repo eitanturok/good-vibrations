@@ -1,4 +1,3 @@
-import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -32,30 +31,36 @@ class MLPDecoder(nn.Module):
     def forward(self, cls): return self.net(cls).view(-1, self.out_h, self.out_w)
 
 class LaserEncoder(nn.Module):
-    def __init__(self, patch_size, d_model, num_heads, num_layers, signal_length, signal):
+    def __init__(self, patch_size:int, d_model:int, num_heads:int, num_layers:int, signal_length:int, signal_mode:str, normalize_mode:str):
         super().__init__()
         self.embed = nn.Linear(2 * patch_size, d_model)
         self.speakers_embed = nn.Embedding(4, d_model)
         self.layers = nn.TransformerEncoder(nn.TransformerEncoderLayer(d_model=d_model, nhead=num_heads, batch_first=True), num_layers=num_layers)
         self.cls_token = nn.Parameter(torch.zeros(1, 1, d_model))
         self.register_buffer("freqs_cis", precompute_freqs_cis(d_model, signal_length // patch_size))
-        self.signal = signal
+        self.signal_mode, self.normalize_mode = signal_mode, normalize_mode
 
-    def _raw_to_tokens(self, x: torch.Tensor) -> torch.Tensor:
-        if self.signal == "magnitude": return x.abs()
-        if self.signal == "complex": return torch.cat([x.real, x.imag], dim=-1)
-        if self.signal == "mag_phase": return torch.cat([x.abs(), x.angle()], dim=-1)
-        raise ValueError(f"Unknown signal mode: {self.signal}")
+    def raw_to_tokens(self, x:torch.Tensor) -> torch.Tensor:
+        if self.signal_mode == "magnitude": return x.abs()
+        if self.signal_mode == "complex": return torch.cat([x.real, x.imag], dim=-1)
+        if self.signal_mode == "mag_phase": return torch.cat([x.abs(), x.angle()], dim=-1)
+        raise ValueError(f"Unknown signal mode: {self.signal_mode}")
+
+    def normalize(self, x:torch.Tensor) -> torch.Tensor:
+        if self.normalize_mode is None: return x
+        if self.normalize_mode == 'z': return (x - x.mean()) / x.std()
+        raise ValueError(f"Unknown normalize mode: {self.normalize_mode}")
 
     def forward(self, x, speaker=None):
         # x.shape = (B_L,P,C,_PS) = (batch_size * n_lasers, n_patches, n_coords, patch_size)
         B_L, P, _, _ = x.shape
-        x = self._raw_to_tokens(x).float()      # (B_L,P,C,_PS) -> (B_L,P,C,PS) where PS=_PS or 2*_PS
+        x = self.raw_to_tokens(x).float()       # (B_L,P,C,_PS) -> (B_L,P,C,PS) where PS=_PS or 2*_PS
+        x = self.normalize(x)                   # (B_L,P,C,PS) -> (B_L,P,C,PS)
         x = self.embed(x.reshape(B_L, P, -1))   # (B_L,P,C,PS) -> (B_L,P,D)
         x = apply_rope(x, self.freqs_cis)       # (B_L,P,D) -> (B_L,P,D)
         if speaker is not None: x += self.speakers_embed(speaker).unsqueeze(1)  # (B_L,P,D), (B_L,1,D) -> (B_L,P,D)
-        x = torch.cat((self.cls_token.expand(B_L, -1, -1), x), dim=1)   # (B_L,P,D) -> (B_L,P+1,D)
-        output = self.layers(x)  # (B_L,P+1,D) -> (B_L,P+1,D)
+        x = torch.cat((self.cls_token.expand(B_L, -1, -1), x), dim=1)           # (B_L,P,D) -> (B_L,P+1,D)
+        output = self.layers(x) # (B_L,P+1,D) -> (B_L,P+1,D)
         return output[:, 0, :]  # (B_L,P+1,D) -> (B_L,D)
 
 class CenterOfMassDistance(Metric):
@@ -84,11 +89,11 @@ class CenterOfMassDistance(Metric):
 def create_metrics(data_info): return {"mse": MeanSquaredError(), 'com-distance': CenterOfMassDistance(data_info['out_h'], data_info['out_w'])}
 
 class VibrationTransformer(ComposerModel):
-    def __init__(self, d_model:int=128, pnt_num_heads:int=2, pnt_num_layers:int=2, seq_num_heads:int=2, seq_num_layers:int=2, data_info=DATA_INFO, signal='magnitude'):
+    def __init__(self, d_model:int=128, pnt_num_heads:int=2, pnt_num_layers:int=2, seq_num_heads:int=2, seq_num_layers:int=2, data_info=DATA_INFO, signal_mode:str='magnitude', normalize_mode:str='z'):
         super().__init__()
 
         # encoder
-        self.laser_encoder = LaserEncoder(data_info['patch_size'], d_model, pnt_num_heads, pnt_num_layers, data_info['n_freqs'], signal)
+        self.laser_encoder = LaserEncoder(data_info['patch_size'], d_model, pnt_num_heads, pnt_num_layers, data_info['n_freqs'], signal_mode, normalize_mode)
         self.box_encoder = nn.TransformerEncoder(nn.TransformerEncoderLayer(d_model=d_model, nhead=seq_num_heads, batch_first=True), num_layers=seq_num_layers)
         self.cls_token = nn.Parameter(torch.zeros(1, 1, d_model))
         nn.init.trunc_normal_(self.cls_token, std=0.02)  # Initialize to small random values

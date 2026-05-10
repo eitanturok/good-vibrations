@@ -143,7 +143,7 @@ def train(**kwargs):
     trainer = Trainer(run_name=args.run_name, model=model, optimizers=optimizer, train_dataloader=train_loader, auto_log_hparams=False,
                     eval_dataloader=eval_loader, max_duration=args.max_duration, seed=args.seed, eval_interval=args.eval_interval,
                     device=device, save_metrics=True, log_to_console=True, progress_bar=False,
-                    autoresume=True, save_folder=f"runs/{{run_name}}/checkpoints", save_interval=args.checkpoint_interval,
+                    autoresume=True if args.run_name else None, save_folder=f"runs/{{run_name}}/checkpoints", save_interval=args.checkpoint_interval,
                     loggers=loggers, callbacks=callbacks, profiler=profiler if args.debug > 0 else None)
 
     # train da model!!!
