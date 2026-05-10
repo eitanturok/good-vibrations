@@ -125,17 +125,21 @@ def train(**kwargs):
     file_logger = FileLogger(f"runs/{{run_name}}/logs-rank{{rank}}.txt")
     loggers = [wandb_logger, file_logger]
 
+    # make profiler
+    profiler = None
+    if args.debug > 0:
+        profiler = Profiler(
+            trace_handlers=[JSONTraceHandler(folder=f"runs/{{run_name}}/composer_profiler", merged_trace_filename=f"runs/{{run_name}}/merged_trace_node{{node_rank}}.json",
+                                            #  remote_file_name=f"hf://{args.remote_checkpoint_folder}/runs/{{run_name}}/composer_profiler/ep{{epoch}}-ba{{batch}}-rank{{rank}}.json",
+                                            #  merged_trace_remote_file_name=f"hf://{args.remote_checkpoint_folder}/runs/{{run_name}}/composer_profiler/merged_trace_node{{node_rank}}.json",
+                                            overwrite=True)],
+            schedule=cyclic_schedule(wait=0, warmup=0, active=1, repeat=1),
+            torch_prof_folder=f"runs/{{run_name}}/torch_profiler", torch_prof_remote_file_name=f"runs/{{run_name}}/torch_profiler",
+            torch_prof_overwrite=True, torch_prof_memory_filename=None,
+            # torch_prof_remote_file_name=f"hf://{args.remote_checkpoint_folder}/runs/{{run_name}}/torch_profiler/rank{{rank}}.{{batch}}.pt.trace.json",
+            )
+
     # make trainer
-    profiler = Profiler(
-        trace_handlers=[JSONTraceHandler(folder=f"runs/{{run_name}}/composer_profiler", merged_trace_filename=f"runs/{{run_name}}/merged_trace_node{{node_rank}}.json",
-                                        #  remote_file_name=f"hf://{args.remote_checkpoint_folder}/runs/{{run_name}}/composer_profiler/ep{{epoch}}-ba{{batch}}-rank{{rank}}.json",
-                                        #  merged_trace_remote_file_name=f"hf://{args.remote_checkpoint_folder}/runs/{{run_name}}/composer_profiler/merged_trace_node{{node_rank}}.json",
-                                        overwrite=True)],
-        schedule=cyclic_schedule(wait=0, warmup=0, active=1, repeat=1),
-        torch_prof_folder=f"runs/{{run_name}}/torch_profiler", torch_prof_remote_file_name=f"runs/{{run_name}}/torch_profiler",
-        torch_prof_overwrite=True, torch_prof_memory_filename=None,
-        # torch_prof_remote_file_name=f"hf://{args.remote_checkpoint_folder}/runs/{{run_name}}/torch_profiler/rank{{rank}}.{{batch}}.pt.trace.json",
-        )
     callbacks=[SpeedMonitor(1), OOMObserver(), NaNMonitor(), RuntimeEstimator(time_unit="minutes"), SystemMetricsMonitor(),
                MaskVisualizer(args.num_masks_logged, args.mask_logging_interval or args.eval_interval),
             #    ExportForInferenceCallback(save_format='torchscript',save_path='runs/{{run_name}}/model.pth'),
@@ -147,7 +151,7 @@ def train(**kwargs):
                     eval_dataloader=eval_loader, max_duration=args.max_duration, seed=args.seed, eval_interval=args.eval_interval,
                     device=device, save_metrics=True, log_to_console=True, progress_bar=False,
                     autoresume=True if args.run_name else None, save_folder=f"runs/{{run_name}}/checkpoints", save_interval=args.checkpoint_interval,
-                    loggers=loggers, callbacks=callbacks, profiler=profiler if args.debug > 0 else None)
+                    loggers=loggers, callbacks=callbacks, profiler=profiler)
 
     # train da model!!!
     trainer.fit()
