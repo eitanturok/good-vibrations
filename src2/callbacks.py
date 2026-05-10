@@ -2,12 +2,13 @@ import os
 
 import torch
 import numpy as np
-import matplotlib.pyplot as plt
+from PIL import Image, ImageDraw, ImageFont
 from composer.core import State, Time, TimeUnit
 from composer import Callback, Logger
 from torch.utils.data import Subset
 from composer.utils import format_name_with_dist
 from composer.loggers import WandBLogger
+import matplotlib.pyplot as plt
 
 # ***** MaskVizualizer *****
 
@@ -18,19 +19,21 @@ class MaskVisualizer(Callback):
         self.last_train_time_value_logged = -1
         self.last_eval_step_logged = {}
 
-    def _log_image(self, state: State, logger: Logger, data_name: str):
+    def _log_image(self, state: State, logger: Logger, data_name: str, scale: int=8, text_height: int=40, sep: int=4):
         mask_pred, mask_true, info = state.outputs['mask_pred'], state.batch['mask_true'], state.batch['info']
         pred_np, true_np = mask_pred.detach().cpu().numpy(), mask_true.detach().cpu().numpy()
+        font = ImageFont.load_default(size=14)
         def _render(i):
-            fig, axes = plt.subplots(ncols=2, figsize=(4, 2))
-            axes[0].imshow(pred_np[i], cmap='gray'); axes[0].set_title('Predicted', fontsize=8); axes[0].axis('off')
-            axes[1].imshow(true_np[i], cmap='gray'); axes[1].set_title('Ground Truth', fontsize=8); axes[1].axis('off')
-            fig.suptitle(f"id={info['sample_id'][i]}\nspks={info['speakers'][i]} objs={info['n_objects'][i]} pos=({info['x_position'][i]},{info['y_position'][i]})", fontsize=6)
-            plt.tight_layout()
-            fig.canvas.draw()
-            arr = np.frombuffer(fig.canvas.buffer_rgba(), dtype=np.uint8).reshape(fig.canvas.get_width_height()[::-1] + (4,))[..., :3]
-            plt.close(fig)
-            return arr
+            h, w = pred_np[i].shape
+            ph, pw = h * scale, w * scale  # panel size after upscale
+            canvas = Image.new("RGB", (pw * 2 + sep, ph + text_height), (255, 255, 255))
+            for j, (arr, label) in enumerate([(pred_np[i], "Predicted"), (true_np[i], "Ground Truth")]):
+                panel = Image.fromarray((arr * 255).clip(0, 255).astype(np.uint8)).resize((pw, ph), Image.NEAREST)
+                canvas.paste(panel, (j * (pw + sep), text_height))
+                ImageDraw.Draw(canvas).text((j * (pw + sep) + pw // 2, text_height - 14), label, fill=(0, 0, 0), font=font, anchor="mt")
+            text = f"id={info['sample_id'][i]}  spks={info['speakers'][i]}  objs={info['n_objects'][i]}  pos=({info['x_position'][i]},{info['y_position'][i]})"
+            ImageDraw.Draw(canvas).text((pw + sep // 2, 2), text, fill=(80, 80, 80), font=font, anchor="mt")
+            return np.array(canvas)
         imgs = [_render(i) for i in range(len(pred_np))]
         logger.log_images(imgs, name=data_name, channels_last=True, use_table=False)
 

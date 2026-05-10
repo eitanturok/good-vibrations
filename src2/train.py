@@ -61,6 +61,8 @@ def get_parser():
     parser.add_argument("--out-h",                      type=int,   default=40)
     parser.add_argument("--out-w",                      type=int,   default=20)
     parser.add_argument("--patch-size",                 type=int,   default=256)
+    parser.add_argument("--signal-mode",                type=str,   default='magnitude')
+    parser.add_argument("--normalize-mode",              type=str,   default='z')
     parser.add_argument("--speakers",                   type=int,   default=None)
     parser.add_argument("--n-objects",                  type=int,   default=None)
     parser.add_argument("--num-proc",                   type=int,   default=8, help="Number of processes used to download the dataset.")
@@ -112,7 +114,8 @@ def train(**kwargs):
 
     # make dataset, model, optimizer
     train_loader, eval_loader, data_info = build_dataset(args.repo_id, args.patch_size, args.out_h, args.out_w, args.batch_size, args.eval_batch_size, args.seed,
-                                                         generator, args.test_size, args.num_workers, args.speakers, args.n_objects, args.n_samples, args.num_proc, args.dry_run)
+                                                         generator, args.test_size, args.num_workers, args.speakers, args.n_objects, args.n_samples, args.num_proc, args.dry_run,
+                                                         args.normalize_mode, args.signal_mode)
     model = VibrationTransformer(args.d_model, args.pnt_num_heads, args.pnt_num_layers, args.seq_num_heads, args.seq_num_layers, data_info)
     optimizer = torch.optim.Adam(model.parameters(), args.lr, fused=True)
 

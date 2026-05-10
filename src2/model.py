@@ -40,22 +40,9 @@ class LaserEncoder(nn.Module):
         self.register_buffer("freqs_cis", precompute_freqs_cis(d_model, signal_length // patch_size))
         self.signal_mode, self.normalize_mode = signal_mode, normalize_mode
 
-    def raw_to_tokens(self, x:torch.Tensor) -> torch.Tensor:
-        if self.signal_mode == "magnitude": return x.abs()
-        if self.signal_mode == "complex": return torch.cat([x.real, x.imag], dim=-1)
-        if self.signal_mode == "mag_phase": return torch.cat([x.abs(), x.angle()], dim=-1)
-        raise ValueError(f"Unknown signal mode: {self.signal_mode}")
-
-    def normalize(self, x:torch.Tensor) -> torch.Tensor:
-        if self.normalize_mode is None: return x
-        if self.normalize_mode == 'z': return (x - x.mean()) / x.std()
-        raise ValueError(f"Unknown normalize mode: {self.normalize_mode}")
-
     def forward(self, x, speaker=None):
-        # x.shape = (B_L,P,C,_PS) = (batch_size * n_lasers, n_patches, n_coords, patch_size)
+        # x.shape = (B_L,P,C,PS) = (batch_size * n_lasers, n_patches, n_coords, patch_size)
         B_L, P, _, _ = x.shape
-        x = self.raw_to_tokens(x).float()       # (B_L,P,C,_PS) -> (B_L,P,C,PS) where PS=_PS or 2*_PS
-        x = self.normalize(x)                   # (B_L,P,C,PS) -> (B_L,P,C,PS)
         x = self.embed(x.reshape(B_L, P, -1))   # (B_L,P,C,PS) -> (B_L,P,D)
         x = apply_rope(x, self.freqs_cis)       # (B_L,P,D) -> (B_L,P,D)
         if speaker is not None: x += self.speakers_embed(speaker).unsqueeze(1)  # (B_L,P,D), (B_L,1,D) -> (B_L,P,D)

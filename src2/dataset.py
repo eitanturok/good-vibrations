@@ -16,7 +16,9 @@ DATA_INFO = {'out_h': 40, 'out_w': 20, 'n_freqs': 3328, 'n_laser_rows': 10, 'n_l
              'x_pos': [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, None], 'y_pos': [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, None]}
 
 class VibrationDataset(Dataset):
-    def __init__(self, repo_id:str, patch_size:int, out_h:int, out_w:int, speakers:list[int,str]|list[int]|list[str]|str|None=None, n_objects:list[int]|int|None=None, n_samples:int=None, num_proc:int=8, dry_run:bool=False):
+    def __init__(self, repo_id:str, patch_size:int, out_h:int, out_w:int, normalize_mode:str='z', signal_mode:str='magnitude',
+                 speakers:list[int,str]|list[int]|list[str]|str|None=None, n_objects:list[int]|int|None=None, n_samples:int=None,
+                 num_proc:int=8, dry_run:bool=False):
         print(f'Downloading dataset {repo_id}...')
         self.ds = load_dataset(repo_id, split="train", num_proc=num_proc) # this is `data/metadata.jsonl`
         self.ds = self.ds.remove_columns(['overhead_file_name', 'speckle_vibrations_file_name', 'speckle_shifts_ifft_audio_file_name', 'audio_file_name', 'mask_file_name'])
@@ -59,7 +61,7 @@ class VibrationDataset(Dataset):
         # Load the masks and FFTs
         print('Loading masks and FFTs...')
         def load_sample(paths, key): return torch.stack([torch.from_numpy(np.load(os.path.join(snapshot_dir, path))[key]) for path in paths])
-        self.masks, self.fft = load_sample(mask_paths, 'mask'), load_sample(fft_paths, 'fft')
+        self.masks, self.fft = load_sample(mask_paths, 'mask'), load_sample(fft_paths, 'fft') # (B,H,W) (B,L,F_,2)
         print(f"masks.shape={self.masks.shape}\tmasks.dtype={self.masks.dtype}\nfft.shape={self.fft.shape}\tfft.dtype={self.fft.dtype}\n")
 
         # discretize masks and cast to float
@@ -67,11 +69,28 @@ class VibrationDataset(Dataset):
         self.masks = F.adaptive_avg_pool2d(self.masks[:, None].float(), (out_h, out_w)).squeeze()
         print(f"masks.shape={self.masks.shape}\tmasks.dtype={self.masks.dtype}\n")
 
-        # normalize and patchify FFTs
-        print('Patchifying FFTs...')
-        # drops entries that do not fully fit into patch_size
+        # patchify, signal-ify, and normalize FFTs
+        print('Processing FFTs...')
+        # Note: F_ is the actual num freqs and F=F_ or 2*F_ depending on signal_mode
+        self.fft = self.raw_to_tokens(self.fft, signal_mode).float()    # (B,L,F_,2) -> (B,L,F,2)
+        self.fft = self.normalize(self.fft, normalize_mode)             # (B,L,F,2) -> (B,L,F,2)
+        # Note: unfold drops entries that do not fully fit into patch_size
         self.fft = self.fft.unfold(2, patch_size, patch_size) # (B,L,F,2) -> (B,L,P,2,PS)
         print(f'fft.shape={self.fft.shape}\t{self.fft.dtype=}\n')
+
+    def raw_to_tokens(self, x:torch.Tensor, signal_mode:str) -> torch.Tensor:
+        if signal_mode == "magnitude": return x.abs()
+        if signal_mode == "complex": return torch.cat([x.real, x.imag], dim=-1)
+        if signal_mode == "mag_phase": return torch.cat([x.abs(), x.angle()], dim=-1)
+        raise ValueError(f"Unknown signal mode: {signal_mode}")
+
+    def normalize(self, x:torch.Tensor, normalize_mode:str) -> torch.Tensor:
+        if normalize_mode is None: return x
+        if normalize_mode == 'z':
+            mean, std = x.mean(), x.std()
+            print(f'mean={mean.item()}, std={std.item()}')
+            return (x - mean) / std
+        raise ValueError(f"Unknown normalize mode: {normalize_mode}")
 
     def __len__(self): return len(self.ds)
     def __getitem__(self, idx):
@@ -81,9 +100,10 @@ class VibrationDataset(Dataset):
 
 def build_dataset(repo_id:str='eturok-weizmann/laser-vibrations', patch_size:int=256, out_h:int=40, out_w:int=20, batch_size:int=64, eval_batch_size:int=64,
                   seed:int=42, generator=None, test_size:float=0.2, num_workers:int=8, speakers:list[int,str]|list[int]|list[str]|str|None=None,
-                  n_objects:int|None=None, n_samples:int|None=None, num_proc:int=8, dry_run:bool=False):
+                  n_objects:int|None=None, n_samples:int|None=None, num_proc:int=8, dry_run:bool=False,
+                  normalize_mode:str='z', signal_mode:str='magnitude'):
     if generator is None: generator = torch.Generator().manual_seed(seed)
-    dataset = VibrationDataset(repo_id, patch_size, out_h, out_w, speakers, n_objects, n_samples, num_proc, dry_run)
+    dataset = VibrationDataset(repo_id, patch_size, out_h, out_w, normalize_mode, signal_mode, speakers, n_objects, n_samples, num_proc, dry_run)
 
     # define indices for the train and eval sets (base, unseen positions, multi-object)
     held_out_positions = set([(3, 4), (7, 8), (1, 9), (2, 2), (6, 6)])
