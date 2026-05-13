@@ -62,7 +62,7 @@ def get_parser():
     parser.add_argument("--out-w",                      type=int,   default=20)
     parser.add_argument("--patch-size",                 type=int,   default=256)
     parser.add_argument("--signal-mode",                type=str,   default='magnitude')
-    parser.add_argument("--normalize-mode",              type=str,   default='z')
+    parser.add_argument("--normalize-mode",              type=str,   default='z-global')
     parser.add_argument("--speakers",                   type=int,   default=None)
     parser.add_argument("--n-objects",                  type=int,   default=None)
     parser.add_argument("--num-proc",                   type=int,   default=8, help="Number of processes used to download the dataset.")
@@ -144,7 +144,7 @@ def train(**kwargs):
                MaskVisualizer(args.num_masks_logged, args.mask_logging_interval or args.eval_interval),
             #    ExportForInferenceCallback(save_format='torchscript',save_path='runs/{{run_name}}/model.pth'),
             #    CheckpointSaver(folder=f"runs/{{run_name}}/checkpoints", weights_only=False, overwrite=True, save_interval=args.checkpoint_interval),
-               OutputSaver(folder=f"runs/{{run_name}}/forward_outputs", save_interval=args.save_output_interval),
+            #    OutputSaver(folder=f"runs/{{run_name}}/forward_outputs", save_interval=args.save_output_interval),
                DataDistribution(folder=f'runs/{{run_name}}/box_distributions')
                ]
     trainer = Trainer(run_name=args.run_name, model=model, optimizers=optimizer, train_dataloader=train_loader, auto_log_hparams=False,
