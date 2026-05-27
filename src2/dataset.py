@@ -9,13 +9,87 @@ from datasets import load_dataset
 from torch.nn import functional as F
 from huggingface_hub import snapshot_download
 from composer.core import Evaluator, DataSpec
+from streaming import StreamingDataset
 
-from helpers import SPEAKER_EMBD
+from src2.helpers import SPEAKER_EMBD
 
 DATA_INFO = {'out_h': 40, 'out_w': 20, 'n_freqs': 3328, 'n_laser_rows': 10, 'n_laser_cols': 10, 'patch_size': 256,
              'x_pos': [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, None], 'y_pos': [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, None]}
+SPEAKER_TYPE = {'1000': 'white', '0100': 'white', '0010': 'black', '0001': 'black'}
+SPEAKER_TYPE_REVERSE = {'white': ['1000', '0100'], 'black': ['0010', '0001']}
 
-class VibrationDataset(Dataset):
+# BAD_SAMPLES = {
+#     "outlier-fft-magnitude": {
+#         "0001": [525, 529, 337],
+#         "0010": [526, 393, 530, 90, 94, 50, 54, 58, 62, 70, 74, 78, 82, 30, 38, 42],
+#         "0100": [527, 531, 394],
+#         "1000": [480, 528, 395, 532, 396, 52, 56, 60, 64, 68, 72, 76, 80, 84, 28, 32, 36, 40, 44],
+#     },
+# }
+# BAD_SAMPLE_IDS = {id for _bad_samples in BAD_SAMPLES.values() for ids in _bad_samples.values() for id in ids}
+BAD_SAMPLE_IDS = {27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 89, 90, 91, 94, 337, 393, 394, 395, 480, 525, 526, 527, 528, 529, 530, 531, 532}
+
+def process_masks(masks:torch.Tensor, out_h:torch.Tensor, out_w:torch.Tensor, verbose:bool=True):
+    # discretize masks and cast to float
+    if verbose: print('Processing masks...')
+    masks = F.adaptive_avg_pool2d(masks, (out_h, out_w)).squeeze()
+    if verbose: print(f"{masks.shape=}\t{masks.dtype=}\n")
+    return masks
+
+def raw_to_tokens(x:torch.Tensor, signal_mode:str) -> torch.Tensor:
+    if signal_mode == "magnitude": return x.abs()
+    if signal_mode == "complex": return torch.cat([x.real, x.imag], dim=-1)
+    if signal_mode == "mag_phase": return torch.cat([x.abs(), x.angle()], dim=-1)
+    raise ValueError(f"Unknown signal mode: {signal_mode}")
+
+def normalize_fft(x:torch.Tensor, normalize_mode:str, speakers, verbose:bool=True) -> torch.Tensor:
+    if normalize_mode is None: return x
+    if normalize_mode == 'std-sample':
+        std = x.std(dim=(1,2,3), keepdim=True).clamp(min=1e-8)
+        if verbose: print(f'Normalize {normalize_mode}\n{std.shape=}\n{std.squeeze()=}')
+        return x / std
+    if normalize_mode == 'z-sample':
+        mean, std = x.mean(dim=(1,2,3), keepdim=True), x.std(dim=(1,2,3), keepdim=True).clamp(min=1e-8)
+        if verbose: print(f'Normalize {normalize_mode}\n{mean.shape=}\t{std.shape=}\n{mean.squeeze()=}\n{std.squeeze()=}')
+        return (x-mean) / std
+    if normalize_mode == 'z-global-sample':
+        mean, std = x.mean(dim=0), x.std(dim=0).clamp(min=1e-8)
+        if verbose: print(f'Normalize {normalize_mode}\n{mean.shape=}\t{std.shape=}\n{mean=}\n{std=}')
+        return (x - mean) / std
+    if normalize_mode == 'z-global':
+        mean, std = x.mean(), x.std().clamp(min=1e-8)
+        if verbose: print(f'Normalize {normalize_mode}\nmean={mean:.4f}  std={std:.4f}')
+        return (x - mean) / std
+    if normalize_mode == 'z-speaker':
+        if verbose: print(f'Normalize {normalize_mode}')
+        for spk in sorted(set(speakers)):
+            idx = [i for i, s in enumerate(speakers) if s == spk]
+            mean, std = x[idx].mean(), x[idx].std().clamp(min=1e-8)
+            x[idx] = (x[idx] - mean) / std
+            if verbose: print(f'\t{spk=}  n={len(idx)}  mean={mean.mean():.4f}  std={std.mean():.4f}')
+        return x
+    if normalize_mode == 'z-speaker-type':
+        for speaker_type, speakers_in_type in SPEAKER_TYPE_REVERSE.items():
+            idx = [i for i, s in enumerate(speakers) if s in speakers_in_type]
+            mean, std = x[idx].mean(), x[idx].std().clamp(min=1e-8)
+            x[idx] = (x[idx] - mean) / std
+            if verbose: print(f'\t{speaker_type=}\tspeakers={speakers_in_type}\tn={len(idx)}\tmean={mean.mean():.4f}\tstd={std.mean():.4f}')
+        return x
+    raise ValueError(f"Unknown normalize mode: {normalize_mode}")
+
+def process_fft(fft:torch.Tensor, patch_size, signal_mode:str, normalize_mode:str, speakers:list, patchify:bool=True, verbose:bool=True):
+    # signal-ify, normalize, and patchify FFTs
+    if verbose: print('Processing FFTs...')
+    # Note: F_ is the actual num freqs and F=F_ or 2*F_ depending on signal_mode
+    fft = raw_to_tokens(fft, signal_mode).float()    # (B,L,F_,2) -> (B,L,F,2)
+    fft = normalize_fft(fft, normalize_mode, speakers, verbose)         # (B,L,F,2) -> (B,L,F,2)
+
+    # Note: unfold drops entries that do not fully fit into patch_size
+    if patchify: fft = fft.unfold(2, patch_size, patch_size)     # (B,L,F,2) -> (B,L,P,2,PS)
+    if verbose: print(f'{fft.shape=}\t{fft.dtype=}\n')
+    return fft
+
+class VibrationDataset(StreamingDataset):
     def __init__(self, repo_id:str, patch_size:int, out_h:int, out_w:int, normalize_mode:str='z', signal_mode:str='magnitude',
                  speakers:list[int,str]|list[int]|list[str]|str|None=None, n_objects:list[int]|int|None=None, n_samples:int=None,
                  num_proc:int=8, dry_run:bool=False):
@@ -34,6 +108,8 @@ class VibrationDataset(Dataset):
 
         # Filter the dataset
         print('Filtering dataset...')
+        print(f'Remove bad samples\n{BAD_SAMPLE_IDS=}')
+        self.ds = self.ds.filter(lambda row: row["sample_id"] not in BAD_SAMPLE_IDS)
         if speakers is not None:
             self.ds = self.ds.filter(lambda row: row["speakers"] in (str(speakers) if isinstance(speakers, list) else [speakers]), num_proc=num_proc)
             print(f"Filtered dataset to {len(self.ds)} samples with speakers={speakers}")
@@ -58,48 +134,15 @@ class VibrationDataset(Dataset):
         snapshot_dir = snapshot_download(repo_id, repo_type="dataset", allow_patterns=set(mask_paths+fft_paths)) # might be duplicate paths for masks
         print(f"Downloaded snapshot to {snapshot_dir}\n")
 
-        # Load the masks and FFTs
+        # Load the masks and FFTs into RAM
         print('Loading masks and FFTs...')
         def load_sample(paths, key): return torch.stack([torch.from_numpy(np.load(os.path.join(snapshot_dir, path))[key]) for path in paths])
         self.masks, self.fft = load_sample(mask_paths, 'mask'), load_sample(fft_paths, 'fft') # (B,H,W) (B,L,F_,2)
         print(f"masks.shape={self.masks.shape}\tmasks.dtype={self.masks.dtype}\nfft.shape={self.fft.shape}\tfft.dtype={self.fft.dtype}\n")
 
-        # discretize masks and cast to float
-        print('Discretizing masks...')
-        self.masks = F.adaptive_avg_pool2d(self.masks[:, None].float(), (out_h, out_w)).squeeze()
-        print(f"masks.shape={self.masks.shape}\tmasks.dtype={self.masks.dtype}\n")
-
-        # patchify, signal-ify, and normalize FFTs
-        print('Processing FFTs...')
-        # Note: F_ is the actual num freqs and F=F_ or 2*F_ depending on signal_mode
-        self.fft = self.raw_to_tokens(self.fft, signal_mode).float()    # (B,L,F_,2) -> (B,L,F,2)
-        self.fft = self.normalize(self.fft, normalize_mode)             # (B,L,F,2) -> (B,L,F,2)
-        # Note: unfold drops entries that do not fully fit into patch_size
-        self.fft = self.fft.unfold(2, patch_size, patch_size) # (B,L,F,2) -> (B,L,P,2,PS)
-        print(f'fft.shape={self.fft.shape}\t{self.fft.dtype=}\n')
-
-    def raw_to_tokens(self, x:torch.Tensor, signal_mode:str) -> torch.Tensor:
-        if signal_mode == "magnitude": return x.abs()
-        if signal_mode == "complex": return torch.cat([x.real, x.imag], dim=-1)
-        if signal_mode == "mag_phase": return torch.cat([x.abs(), x.angle()], dim=-1)
-        raise ValueError(f"Unknown signal mode: {signal_mode}")
-
-    def normalize(self, x:torch.Tensor, normalize_mode:str) -> torch.Tensor:
-        if normalize_mode is None: return x
-        if normalize_mode == 'z-global':
-            mean, std = x.mean(), x.std().clamp(min=1e-8)
-            print(f'Normalize {normalize_mode}\nmean={mean:.4f}  std={std:.4f}')
-            return (x - mean) / std
-        if normalize_mode == 'z-speaker':
-            print(f'Normalize {normalize_mode}')
-            speakers = self.ds['speakers']
-            for spk in sorted(set(speakers)):
-                idx = [i for i, s in enumerate(speakers) if s == spk]
-                mean, std = x[idx].mean(), x[idx].std().clamp(min=1e-8)
-                x[idx] = (x[idx] - mean) / std
-                print(f'\t{spk=}  n={len(idx)}  mean={mean.mean():.4f}  std={std.mean():.4f}')
-            return x
-        raise ValueError(f"Unknown normalize mode: {normalize_mode}")
+        # process them
+        self.masks = process_masks(self.masks[:, None].float(), out_h, out_w)
+        self.fft = process_fft(self.fft, patch_size, signal_mode, normalize_mode, self.ds['speakers'])
 
     def __len__(self): return len(self.ds)
     def __getitem__(self, idx):
@@ -110,7 +153,7 @@ class VibrationDataset(Dataset):
 def build_dataset(repo_id:str='eturok-weizmann/laser-vibrations', patch_size:int=256, out_h:int=40, out_w:int=20, batch_size:int=64, eval_batch_size:int=64,
                   seed:int=42, generator=None, test_size:float=0.2, num_workers:int=8, speakers:list[int,str]|list[int]|list[str]|str|None=None,
                   n_objects:int|None=None, n_samples:int|None=None, num_proc:int=8, dry_run:bool=False,
-                  normalize_mode:str='z', signal_mode:str='magnitude'):
+                  normalize_mode:str='z-global', signal_mode:str='magnitude'):
     if generator is None: generator = torch.Generator().manual_seed(seed)
     dataset = VibrationDataset(repo_id, patch_size, out_h, out_w, normalize_mode, signal_mode, speakers, n_objects, n_samples, num_proc, dry_run)
 

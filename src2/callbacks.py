@@ -56,8 +56,8 @@ class MaskVisualizer(Callback):
 def _to_cpu(x:torch.Tensor): return x.detach().to('cpu', copy=True)
 
 class OutputSaver(Callback):
-    def __init__(self, save_interval, folder, filename='ep{epoch:04d}-ba{batch:06d}.pt'):
-        self.save_interval, self.folder, self.filename = Time.from_input(save_interval, TimeUnit.EPOCH), folder, filename
+    def __init__(self, save_interval, folder, filename='ep{epoch:04d}-ba{batch:06d}.pt', overwrite:bool=False):
+        self.save_interval, self.folder, self.filename, self.overwrite = Time.from_input(save_interval, TimeUnit.EPOCH), folder, filename, overwrite
 
     def init(self, state: State, logger: Logger):
         del logger
@@ -77,6 +77,10 @@ class OutputSaver(Callback):
             # save locally
             path = os.path.join(self.folder, data_name, self.filename.format(epoch=state.timestamp.epoch.value, batch=state.timestamp.batch.value))
             os.makedirs(os.path.dirname(path), exist_ok=True)
+            if os.path.exists(path):
+                if not self.overwrite:
+                    raise FileExistsError(f'OutputSaver: file already exists: {path}\nSet overwrite=True to overwrite.')
+                os.remove(path)
             torch.save(outputs, path)
 
     def after_forward(self, state, logger): self.save_outputs(state, logger, state.dataloader_label)

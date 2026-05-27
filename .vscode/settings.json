@@ -1,3 +1,9 @@
 {
-    "notebook.lineNumbers": "on"
+    "remote.portsAttributes": {
+        "8891": {
+            "label": "position-explorer",
+            "onAutoForward": "silent"
+        }
+    },
+    "remote.autoForwardPorts": true
 }

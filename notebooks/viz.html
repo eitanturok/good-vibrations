@@ -1,0 +1,1196 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Position Explorer</title>
+<script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+<style>
+  * { box-sizing: border-box; }
+  body { font-family: sans-serif; margin: 0; background: #1a1a2e; color: #eee;
+         display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
+
+  /* ---- fixed bars at top ---- */
+  #controls { padding: 6px 14px; display: flex; gap: 8px; align-items: center; flex-shrink: 0; }
+  #info-bar  { padding: 2px 14px 6px; font-size: 22px; color: #dde; font-weight: bold; flex-shrink: 0; }
+  button { padding: 5px 12px; border: none; border-radius: 4px; cursor: pointer; font-size: 13px; background: #334; color: #dde; }
+  button:hover  { background: #556; }
+  button.active { background: #5588bb; color: #fff; }
+  .ctrl-select { background: #334; color: #dde; border: none; border-radius: 4px; padding: 4px 8px; font-size: 13px; cursor: pointer; }
+  .ctrl-label  { font-size: 12px; color: #aac; }
+  .panel-label { font-size: 11px; color: #88a; text-align: center; margin-bottom: 4px; flex-shrink: 0; }
+
+  /* sample-id combobox */
+  #sample-id-wrap { position: relative; display: flex; align-items: center; gap: 4px; }
+  #sample-id-input {
+    background: #334; color: #dde; border: none; border-radius: 4px;
+    padding: 4px 8px; font-size: 13px; width: 90px; outline: none;
+  }
+  #sample-id-input:focus { box-shadow: 0 0 0 2px #5588bb; }
+  #sample-id-input.invalid { box-shadow: 0 0 0 2px #bb4444; }
+  #sample-id-dropdown {
+    display: none; position: absolute; top: 100%; left: 0; z-index: 999;
+    background: #22223a; border: 1px solid #556; border-radius: 4px;
+    max-height: 220px; overflow-y: auto; min-width: 100px;
+  }
+  #sample-id-dropdown.open { display: block; }
+  #sample-id-dropdown .dd-item {
+    padding: 4px 10px; font-size: 12px; cursor: pointer; color: #dde; white-space: nowrap;
+  }
+  #sample-id-dropdown .dd-item:hover,
+  #sample-id-dropdown .dd-item.active { background: #5588bb; color: #fff; }
+  #sample-id-dropdown .dd-item.bad-sample { color: #e07070; }
+  #sample-id-dropdown .dd-item.bad-sample:hover { background: #7a2222; }
+
+  /*
+   * Layout (all below the fixed bars):
+   *
+   *  ┌─────────────┬────────────────────────────────────────┐
+   *  │             │  audio panel  │  mask panel             │  <- top-row (flex: 0 0 33%)
+   *  │  box-panel  ├───────────────┴─────────────────────────┤
+   *  │  (66% h)    │  FFT spectrum                           │  <- spectrum-row (flex: 1)
+   *  ├─────────────┤                                         │
+   *  │ laser-panel │                                         │
+   *  │  (34% h)    │                                         │
+   *  └─────────────┴────────────────────────────────────────┘
+   *       33%                      67%
+   */
+
+  #main-body { display: flex; flex-direction: row; flex: 1 1 0; min-height: 0; gap: 6px; padding: 0 8px 6px; }
+
+  /* left column: 1/3 width, box plot top 2/3, laser grid bottom 1/3 */
+  #left-col {
+    flex: 0 0 33%; min-width: 0; min-height: 0;
+    display: flex; flex-direction: column; align-items: center; gap: 8px;
+  }
+  #box-panel { display: flex; flex-direction: column; align-items: center; flex: 0 0 60%; min-height: 0; width: 100%; }
+  #grid-canvas { cursor: pointer; display: block; }
+
+  /* bin sample strip — shown above the grid when a bin is selected */
+  #bin-strip { display: flex; flex-wrap: wrap; gap: 3px; justify-content: center;
+               padding: 2px 4px; flex-shrink: 0; min-height: 24px; }
+  #bin-strip button { padding: 2px 7px; font-size: 11px; min-width: 32px; }
+  #bin-strip button.active { background: #5588bb; color: #fff; }
+
+  /* laser panel sits below box in left column */
+  #laser-panel { flex: 1 1 0; min-height: 0; width: 100%;
+                 display: flex; flex-direction: column; align-items: center; padding-bottom: 6px; }
+  #laser-avg-btn { margin-bottom: 4px; padding: 2px 8px; font-size: 11px; }
+  #laser-canvas { cursor: pointer; display: block; }
+
+  /* right column: 2/3 width, audio+mask on top (1/3 h), spectrum below (2/3 h) */
+  #right-col { flex: 1 1 0; min-width: 0; min-height: 0; display: flex; flex-direction: column; gap: 6px; }
+
+  #top-row { display: flex; flex-direction: row; gap: 6px; flex: 0 0 45%; min-height: 0; }
+  #top-row > .panel { min-width: 0; min-height: 0; overflow: hidden;
+                      display: flex; flex-direction: column; align-items: center; }
+
+  /* audio panel: 1/3 of right-col width in top row */
+  #audio-panel { flex: 0 0 33%; justify-content: center; gap: 5px; padding-bottom: 6px; }
+  #audio-btn { padding: 4px 14px; font-size: 13px; min-width: 70px; }
+  #audio-label { font-size: 10px; color: #88a; text-align: center; }
+  #audio-progress-wrap { width: 90%; height: 5px; background: #334; border-radius: 3px; overflow: hidden; }
+  #audio-progress-bar  { height: 100%; width: 0%; background: #5588bb; transition: width 0.1s linear; }
+
+  /* mask panel: 2/3 of right-col width in top row */
+  #mask-panel { flex: 1 1 0; }
+
+  #spectrum-row { flex: 1 1 0; min-height: 0; }
+  #spectrum-div { width: 100%; height: 100%; }
+</style>
+</head>
+<body>
+
+<!-- controls bar -->
+<div id="controls">
+  <button id="btn-play" onclick="togglePlay()">&#9654; Play</button>
+  <label class="ctrl-label">Speed:
+    <input id="speed" type="range" min="100" max="2000" step="100" value="600"
+           oninput="document.getElementById('speed-val').textContent=this.value+'ms'">
+    <span id="speed-val">600ms</span>
+  </label>
+  <label class="ctrl-label" style="margin-left:8px">Order:
+    <select id="order-select" class="ctrl-select" onchange="setOrder(this.value)">
+      <option value="horizontal">&#8658; Horizontal</option>
+      <option value="vertical">&#8659; Vertical</option>
+      <option value="distance">&#9711; Distance</option>
+    </select>
+  </label>
+  <label class="ctrl-label" style="margin-left:8px">Speaker:
+    <select id="spk-select" class="ctrl-select" onchange="switchSpeaker(this.value)"></select>
+  </label>
+  <label class="ctrl-label" style="margin-left:8px">Sample ID:
+    <div id="sample-id-wrap">
+      <input id="sample-id-input" type="text" placeholder="id…" autocomplete="off"
+             oninput="onSampleIdInput(this.value)"
+             onkeydown="onSampleIdKey(event)"
+             onfocus="openSampleDropdown()"
+             onblur="closeSampleDropdown()">
+      <div id="sample-id-dropdown"></div>
+    </div>
+  </label>
+</div>
+<div id="info-bar"></div>
+
+<div id="main-body">
+  <!-- left 1/3: box position (top 2/3) + laser grid (bottom 1/3) -->
+  <div id="left-col">
+    <div id="box-panel">
+      <div class="panel-label">Box Position</div>
+      <div id="bin-strip"></div>
+      <canvas id="grid-canvas"></canvas>
+    </div>
+    <div class="panel" id="laser-panel">
+      <div class="panel-label">Laser Grid</div>
+      <button id="laser-avg-btn" class="active" onclick="selectLaser(null)">avg</button>
+      <canvas id="laser-canvas"></canvas>
+    </div>
+  </div>
+
+  <!-- right 2/3: audio+mask on top (1/3 h), spectrum below (2/3 h) -->
+  <div id="right-col">
+    <div id="top-row">
+      <div class="panel" id="audio-panel">
+        <div class="panel-label" id="audio-title">Recovered Audio</div>
+        <div id="audio-path" style="font-size:9px;color:#667;word-break:break-all;text-align:center;padding:0 4px;"></div>
+        <button id="audio-btn" onclick="toggleAudio()">&#9654; Play</button>
+        <div id="audio-label">—</div>
+        <div id="audio-progress-wrap"><div id="audio-progress-bar"></div></div>
+      </div>
+      <div class="panel" id="mask-panel">
+        <div class="panel-label" id="overhead-title">Overhead + Prediction</div>
+        <div id="overhead-path" style="font-size:9px;color:#667;word-break:break-all;text-align:center;padding:0 4px;"></div>
+        <div id="mask-div" style="width:100%;flex:1;min-height:0"></div>
+      </div>
+    </div>
+    <div id="spectrum-row">
+      <div id="spec-controls" style="display:flex;gap:16px;align-items:center;padding:4px 10px;font-size:11px;color:#aac;flex-wrap:wrap;">
+        <span style="color:#667;white-space:nowrap">Norm:</span>
+        <label style="display:flex;align-items:center;gap:4px;white-space:nowrap"><input type="checkbox" id="sc-raw"           onchange="onSpecControl()"><span style="border-bottom:2px dashed rgba(180,180,180,1);padding-bottom:1px">Unnorm</span></label>
+        <label style="display:flex;align-items:center;gap:4px;white-space:nowrap"><input type="checkbox" id="sc-norm"  checked onchange="onSpecControl()"><span style="border-bottom:2px solid  rgba(180,180,180,1);padding-bottom:1px">Norm</span></label>
+        <span style="color:#445;margin-left:4px">|</span>
+        <span style="color:#667;white-space:nowrap">Signal:</span>
+        <label style="display:flex;align-items:center;gap:4px;white-space:nowrap"><input type="checkbox" id="sc-sample" checked onchange="onSpecControl()"><span style="color:rgba(100,150,255,1)">Sample</span></label>
+        <label style="display:flex;align-items:center;gap:4px;white-space:nowrap"><input type="checkbox" id="sc-empty"          onchange="onSpecControl()"><span style="color:rgba(210,210,210,1)">Empty</span></label>
+        <label style="display:flex;align-items:center;gap:4px;white-space:nowrap"><input type="checkbox" id="sc-diff"           onchange="onSpecControl()"><span style="color:rgba(220,80,80,1)">Diff</span></label>
+      </div>
+      <div id="spectrum-div"></div>
+    </div>
+  </div>
+</div>
+
+<script>
+const ALL_DATA = __PAYLOAD__;
+const SIDECAR_FNAME = "__SIDECAR_FNAME__";
+
+let DATA = null;
+let positions, freqs;
+
+// ---- sidecar lazy load --------------------------------------------------
+let SIDECAR = null;
+let sidecarPromise = null;
+function loadSidecar() {
+  if (SIDECAR !== null) return Promise.resolve(SIDECAR);
+  if (sidecarPromise) return sidecarPromise;
+  sidecarPromise = fetch(SIDECAR_FNAME).then(r => r.json()).then(j => { SIDECAR = j; return j; });
+  return sidecarPromise;
+}
+
+// ---- quantized spectrum decode ------------------------------------------
+const _specCache = {};
+const _laserSpecCache = {};
+function _decodeSpkSidecar(spk, sc) {
+  _laserSpecCache[spk] = {};
+  for (const [k, entry] of Object.entries(sc[spk] || {})) {
+    if (entry && entry.avg !== undefined) {
+      _laserSpecCache[spk][k] = { avg: decodeSpec(entry.avg) };
+    } else {
+      _laserSpecCache[spk][k] = { avg: decodeSpec(entry) };
+    }
+  }
+}
+
+function decodeSpec(q) {
+  const bytes = Uint8Array.from(atob(q.b64), c => c.charCodeAt(0));
+  const scale = (q.mx - q.mn) / 255;
+  const out = new Float32Array(bytes.length);
+  for (let i = 0; i < bytes.length; i++) out[i] = bytes[i] * scale + q.mn;
+  if (q.shape.length === 2) {
+    const [L, F] = q.shape;
+    const rows = [];
+    for (let l = 0; l < L; l++) rows.push(Array.from(out.subarray(l*F, (l+1)*F)));
+    return rows;
+  }
+  return Array.from(out);
+}
+
+// ---- mask decode (lazy, same quantization as spec) ----------------------
+const _maskPredCache = new WeakMap();
+const _maskTrueCache = new WeakMap();
+function getMaskPred(pos) {
+  if (pos.mask_pred === null || pos.mask_pred === undefined) { console.log('[getMaskPred] null/undefined, pos.id=', pos?.id); return null; }
+  if (Array.isArray(pos.mask_pred)) return pos.mask_pred; // already decoded (avg)
+  if (_maskPredCache.has(pos)) return _maskPredCache.get(pos);
+  const decoded = decodeSpec(pos.mask_pred);
+  console.log('[getMaskPred] decoded pos.id=', pos?.id, 'shape=', pos.mask_pred?.shape, 'rows=', decoded?.length, 'cols=', decoded?.[0]?.length);
+  _maskPredCache.set(pos, decoded);
+  return decoded;
+}
+function getMaskTrue(pos) {
+  if (Array.isArray(pos.mask_true)) return pos.mask_true; // already decoded (avg)
+  if (_maskTrueCache.has(pos)) return _maskTrueCache.get(pos);
+  const decoded = decodeSpec(pos.mask_true);
+  _maskTrueCache.set(pos, decoded);
+  return decoded;
+}
+
+// spec control state
+// Returns array of {scale, view} combos that are currently checked
+function _checkedCombos() {
+  const scales  = ['raw','norm'].filter(s => document.getElementById(`sc-${s}`)?.checked);
+  const views   = ['sample','empty','diff'].filter(v => document.getElementById(`sc-${v}`)?.checked);
+  const combos  = [];
+  for (const scale of scales) for (const view of views) combos.push({scale, view});
+  return combos;
+}
+function onSpecControl() { specInitialised = false; _specZoom = null; if (currentPos) showPosition(currentPos); }
+
+// map (scale, view) -> pos key for the quantized spec
+const _SPEC_KEY = {
+  raw:  { sample: 'spec',           empty: 'spec',           diff: 'spec_diff'      },
+  norm: { sample: 'spec_norm',      empty: 'spec_norm',      diff: 'spec_diff_norm' },
+};
+// decode cache: cacheKey -> Float32Array
+const _emptySpecCache = {};
+function _getEmptySpec(key) {
+  const cacheKey = `${DATA.speaker}::${key}`;
+  if (_emptySpecCache[cacheKey] !== undefined) return _emptySpecCache[cacheKey];
+  const raw = DATA.empty_spec?.[key];
+  console.log(`[_getEmptySpec] spk=${DATA.speaker} key=${key} DATA.empty_spec keys=${DATA.empty_spec ? Object.keys(DATA.empty_spec) : 'MISSING'} raw=${raw ? 'shape='+JSON.stringify(raw.shape)+' mn='+raw.mn+' mx='+raw.mx : 'NULL'}`);
+  const decoded = raw ? decodeSpec(raw) : null;
+  _emptySpecCache[cacheKey] = decoded;
+  return decoded;
+}
+
+function _decodeForKey(pos, key) {
+  const cacheKey = `${key}::${pos.id ?? '_avg'}`;
+  if (!_specCache[cacheKey]) {
+    const raw = pos[key];
+    if (!raw) {
+      console.log(`[_decodeForKey] pos.id=${pos?.id} key=${key} -> raw is NULL/MISSING. pos keys=${Object.keys(pos).filter(k=>k.startsWith('spec'))}`);
+      return null;
+    }
+    _specCache[cacheKey] = Array.isArray(raw._decoded) ? raw._decoded  // avg sentinel
+                         : raw._decoded               ? raw._decoded
+                         : decodeSpec(raw);
+  }
+  return _specCache[cacheKey];
+}
+
+function getSpec(pos, scale, view) {
+  const key = (_SPEC_KEY[scale] ?? _SPEC_KEY.raw)[view] ?? 'spec';
+  // 'empty' view: decode directly from DATA.empty_spec (not a position in positions[])
+  if (view === 'empty') {
+    const r = _getEmptySpec(key);
+    console.log(`[getSpec] empty key=${key} result=${r ? 'Float32Array len='+r.length+' mn='+Math.min(...r).toFixed(4)+' mx='+Math.max(...r).toFixed(4) : 'NULL'}`);
+    return r;
+  }
+  // avg sentinel path
+  if (pos.spec && pos.spec._decoded && key === 'spec') return pos.spec._decoded;
+  // regular per-position lookup
+  const r = _decodeForKey(pos, key);
+  console.log(`[getSpec] pos.id=${pos?.id} scale=${scale} view=${view} key=${key} raw_present=${!!pos?.[key]} result=${r ? 'len='+r.length+' mn='+Math.min(...r).toFixed(4)+' mx='+Math.max(...r).toFixed(4) : 'NULL'}`);
+  return r;
+}
+
+// ---- load speaker -------------------------------------------------------
+function loadSpeaker(spk) {
+  DATA      = ALL_DATA.data[spk];
+  positions = DATA.positions;
+  freqs     = DATA.freqs;
+  const p0 = DATA.positions[0];
+  console.log(`[loadSpeaker] spk=${spk} n_positions=${DATA.positions.length} freqs.length=${freqs?.length}`);
+  console.log(`[loadSpeaker] pos[0] spec keys:`, Object.keys(p0).filter(k => k.startsWith('spec') || k === 'mask_true' || k === 'mask_pred'));
+  console.log(`[loadSpeaker] pos[0].spec=`, p0?.spec, `pos[0].spec_norm=`, p0?.spec_norm, `pos[0].spec_diff=`, p0?.spec_diff, `pos[0].spec_diff_norm=`, p0?.spec_diff_norm);
+  console.log(`[loadSpeaker] DATA.empty_spec=`, DATA.empty_spec);
+}
+
+// ---- ordering (bins) ----------------------------------------------------
+function buildOrders() { return buildBinOrders(); }
+let orders = null, currentOrder = 'horizontal', orderedBins = null, playTimer = null;
+let currentLaser = null;
+
+// flat navigation: [{bin, sampleIdx},...] where sampleIdx=-1 means avg
+let navSteps = [], currentStepIdx = 0;
+
+function buildNavSteps() {
+  navSteps = [];
+  for (const bin of orderedBins) {
+    navSteps.push({ bin, sampleIdx: -1 });               // avg first
+    bin.samples.forEach((_, i) => navSteps.push({ bin, sampleIdx: i }));
+  }
+}
+
+function currentBin() { return navSteps[currentStepIdx]?.bin ?? orderedBins[0]; }
+
+// Jump to the avg step for a given bin
+function binStepIdx(bin, sampleIdx = -1) {
+  return navSteps.findIndex(s => s.bin === bin && s.sampleIdx === sampleIdx);
+}
+
+// ---- bin grouping -------------------------------------------------------
+let bins = [];   // [{key, bcx, bcy, samples:[pos,...]}, ...]
+
+function buildBins() {
+  const bx = DATA.bin_x, by = DATA.bin_y;
+  const map = new Map();
+  for (const p of positions) {
+    const bkx = Math.round(p.cx / bx) * bx;
+    const bky = Math.round(p.cy / by) * by;
+    const key = `${bkx},${bky}`;
+    if (!map.has(key)) map.set(key, { key, bcx: bkx, bcy: bky, samples: [] });
+    map.get(key).samples.push(p);
+  }
+  bins = Array.from(map.values());
+}
+
+function buildBinOrders() {
+  const mw = DATA.mask_w / 2, mh = DATA.mask_h / 2;
+  return {
+    horizontal: [...bins].sort((a,b) => (a.bcx - b.bcx) || (a.bcy - b.bcy)),
+    vertical:   [...bins].sort((a,b) => (a.bcy - b.bcy) || (a.bcx - b.bcx)),
+    distance:   [...bins].sort((a,b) => ((a.bcx-mw)**2+(a.bcy-mh)**2) - ((b.bcx-mw)**2+(b.bcy-mh)**2)),
+  };
+}
+
+// ---- speaker switch -----------------------------------------------------
+function switchSpeaker(spk) {
+  if (playTimer) { clearInterval(playTimer); playTimer = null; document.getElementById('btn-play').innerHTML = '&#9654; Play'; }
+  loadSpeaker(spk);
+  buildBins();
+  orders = buildOrders();
+  orderedBins = orders[currentOrder];
+  buildNavSteps();
+  currentStepIdx = 0;
+  specInitialised = false;
+  maskInitialised = false;
+  _specZoom = null;
+  if (currentLaser !== null && SIDECAR && !_laserSpecCache[spk])
+    _decodeSpkSidecar(spk, SIDECAR);
+  buildGrid();
+  buildLaserGrid();
+  selectBin(orderedBins[0]);
+}
+
+// ---- box position grid (canvas, mirrors laser grid style) ---------------
+let _activeBin = null;
+let _gridCanvasW = 0, _gridCanvasH = 0;
+
+const GRID_MARGIN = { top: 18, left: 24 }; // px reserved for axis tick labels
+
+function buildGrid() {
+  const boxPanel = document.getElementById('box-panel');
+  const stripH   = document.getElementById('bin-strip').offsetHeight || 0;
+  const availW   = (boxPanel.clientWidth  || document.getElementById('left-col').clientWidth  || 200) - 8;
+  const availH   = (boxPanel.clientHeight || document.getElementById('left-col').clientHeight * 0.66 || 300) - 24 - stripH;
+  // Fill available space with small side padding — cells will be rectangular
+  const gW = Math.max(60, availW - GRID_MARGIN.left - 12);
+  const gH = Math.max(60, availH - GRID_MARGIN.top);
+  _gridCanvasW = gW; _gridCanvasH = gH;
+
+  const dpr    = window.devicePixelRatio || 1;
+  const canvas = document.getElementById('grid-canvas');
+  const cssW   = gW + GRID_MARGIN.left;
+  const cssH   = gH + GRID_MARGIN.top;
+  canvas.width  = cssW * dpr;
+  canvas.height = cssH * dpr;
+  canvas.style.width  = cssW + 'px';
+  canvas.style.height = cssH + 'px';
+  canvas.getContext('2d').scale(dpr, dpr);
+  drawBinGrid();
+}
+
+function drawBinGrid() {
+  const canvas = document.getElementById('grid-canvas');
+  const ctx = canvas.getContext('2d');
+  const gW = _gridCanvasW, gH = _gridCanvasH;
+  const ox = GRID_MARGIN.left, oy = GRID_MARGIN.top; // grid origin in canvas px
+  const mask_w = DATA.mask_w, mask_h = DATA.mask_h;
+  const bx = DATA.bin_x, by = DATA.bin_y;
+  const cols = Math.round(mask_w / bx), rows = Math.round(mask_h / by);
+  const cellW = gW / cols, cellH = gH / rows;
+
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+  // --- empty cells (full grid background) ---
+  ctx.fillStyle = '#1a1a2e';
+  ctx.strokeStyle = '#446';
+  ctx.lineWidth = 0.5;
+  for (let r = 0; r < rows; r++) {
+    for (let c = 0; c < cols; c++) {
+      const px = ox + c * cellW, py = oy + r * cellH;
+      ctx.fillRect(px + 1, py + 1, cellW - 2, cellH - 2);
+      ctx.strokeRect(px + 1, py + 1, cellW - 2, cellH - 2);
+    }
+  }
+
+  // --- axis tick labels ---
+  ctx.fillStyle = '#aac';
+  ctx.textBaseline = 'middle';
+
+  // x ticks (top): bin center x values
+  ctx.textAlign = 'center';
+  ctx.font = '9px sans-serif';
+  for (let c = 0; c < cols; c++) {
+    const label = ((c + 1) * bx).toFixed(2);
+    ctx.fillText(label, ox + c * cellW + cellW / 2, oy / 2);
+  }
+
+  // y ticks (left): bin center y values
+  ctx.textAlign = 'right';
+  for (let r = 0; r < rows; r++) {
+    const label = ((r + 1) * by).toFixed(2);
+    ctx.fillText(label, ox - 3, oy + r * cellH + cellH / 2);
+  }
+
+  // --- cells ---
+  for (const b of bins) {
+    const col = Math.round(b.bcx / bx) - 1;
+    const row = Math.round(b.bcy / by) - 1;
+    const px = ox + col * cellW, py = oy + row * cellH;
+    const isSelected = b === _activeBin;
+    const isBad      = b.samples.some(p => p.is_bad);
+
+    ctx.fillStyle = isSelected ? '#5588bb' : isBad ? '#7a2222' : '#23233a';
+    ctx.fillRect(px + 1, py + 1, cellW - 2, cellH - 2);
+
+    ctx.strokeStyle = isSelected ? '#88bbff' : '#446';
+    ctx.lineWidth   = isSelected ? 2 : 0.5;
+    ctx.strokeRect(px + 1, py + 1, cellW - 2, cellH - 2);
+
+    // Show first sample id; if multiple, show +N in top-right corner
+    const ids = b.samples.map(p => String(p.id));
+    const fontSize = Math.max(7, Math.min(13, cellH * 0.45));
+    ctx.font         = `${fontSize}px sans-serif`;
+    ctx.fillStyle    = isSelected ? '#fff' : 'rgba(180,190,220,0.7)';
+    ctx.textAlign    = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(ids[0], px + cellW / 2, py + cellH / 2);
+    if (ids.length > 1) {
+      ctx.font      = `bold ${Math.max(6, fontSize - 2)}px sans-serif`;
+      ctx.fillStyle = '#f0c040';
+      ctx.textAlign = 'right';
+      ctx.textBaseline = 'top';
+      ctx.fillText(`+${ids.length - 1}`, px + cellW - 2, py + 2);
+    }
+  }
+}
+
+document.getElementById('grid-canvas').addEventListener('click', function(e) {
+  const rect = this.getBoundingClientRect();
+  const ox = GRID_MARGIN.left, oy = GRID_MARGIN.top;
+  const bx = DATA.bin_x, by = DATA.bin_y;
+  const cols = Math.round(DATA.mask_w / bx), rows = Math.round(DATA.mask_h / by);
+  const cellW = _gridCanvasW / cols, cellH = _gridCanvasH / rows;
+  const col = Math.floor((e.clientX - rect.left - ox) / cellW);
+  const row = Math.floor((e.clientY - rect.top  - oy) / cellH);
+  if (col < 0 || col >= cols || row < 0 || row >= rows) return;
+  const bcx = (col + 1) * bx, bcy = (row + 1) * by;
+  let best = null, bestD = Infinity;
+  for (const b of bins) {
+    const d = Math.abs(b.bcx - bcx) + Math.abs(b.bcy - bcy);
+    if (d < bestD) { bestD = d; best = b; }
+  }
+  if (!best || bestD > bx) return;
+  selectBin(best);
+});
+
+function updateHighlight(bin) {
+  _activeBin = bin;
+  drawBinGrid();
+}
+
+// ---- bin averaging ------------------------------------------------------
+function avgPosition(samples) {
+  // element-wise average of spec, mask_pred, mask_true; mean of scalar fields
+  const n = samples.length;
+  const spec0 = getSpec(samples[0], 'raw', 'sample');
+  const avgSpec = new Array(spec0.length).fill(0);
+  for (const p of samples) { const s = getSpec(p, 'raw', 'sample'); for (let i = 0; i < s.length; i++) avgSpec[i] += s[i] / n; }
+
+  const H = getMaskTrue(samples[0]).length, W = getMaskTrue(samples[0])[0].length;
+  const avgTrue  = Array.from({length:H}, (_,r) => Array.from({length:W}, (_,c) => samples.reduce((a,p) => a + getMaskTrue(p)[r][c], 0) / n));
+
+  const mean = (arr, fn) => { const vs = arr.map(fn).filter(v => v != null); return vs.length ? vs.reduce((a,b)=>a+b,0)/vs.length : null; };
+  const hasPred = samples.some(p => getMaskPred(p) !== null);
+  const avgPredFinal = hasPred
+    ? Array.from({length:H}, (_,r) => Array.from({length:W}, (_,c) => {
+        const preds = samples.map(p => getMaskPred(p)).filter(Boolean);
+        return preds.reduce((a,mp) => a + mp[r][c], 0) / preds.length;
+      }))
+    : null;
+  return {
+    id: `avg(${samples.map(p=>p.id).join(',')})`,
+    is_bad: samples.some(p => p.is_bad),
+    spec: { _decoded: avgSpec },  // sentinel so getSpec returns it directly
+    mask_pred: avgPredFinal, mask_true: avgTrue,
+    true_cx:  mean(samples, p => p.true_cx),  true_cy:  mean(samples, p => p.true_cy),
+    pred_cx:  hasPred ? mean(samples, p => p.pred_cx) : null,
+    pred_cy:  hasPred ? mean(samples, p => p.pred_cy) : null,
+    mse:      hasPred ? mean(samples, p => p.mse)      : null,
+    com_dist: hasPred ? mean(samples, p => p.com_dist) : null,
+    n_objects: samples[0].n_objects,
+    overhead_b64: samples[0].overhead_b64,
+    audio_fname: null,
+    run: samples[0].run ?? null,
+    _isAvg: true,
+  };
+}
+
+// ---- bin strip (sample picker above grid) -------------------------------
+function _activeBinPos(bin) {
+  const step = navSteps[currentStepIdx];
+  const si = (step?.bin === bin) ? step.sampleIdx : -1;
+  if (bin.samples.length === 1) return bin.samples[0];
+  if (si >= 0) return bin.samples[si];
+  return avgPosition(bin.samples);
+}
+
+function buildBinStrip(bin) {
+  const strip = document.getElementById('bin-strip');
+  strip.innerHTML = '';
+  if (bin.samples.length === 1) return;
+  const step = navSteps[currentStepIdx];
+  const activeSi = (step?.bin === bin) ? step.sampleIdx : -1;
+  const makeBtn = (label, sampleIdx) => {
+    const b = document.createElement('button');
+    b.textContent = label;
+    b.className = sampleIdx === activeSi ? 'active' : '';
+    b.onclick = () => {
+      const si = binStepIdx(bin, sampleIdx);
+      if (si >= 0) currentStepIdx = si;
+      buildBinStrip(bin);
+      showPosition(_activeBinPos(bin));
+    };
+    strip.appendChild(b);
+  };
+  makeBtn('avg', -1);
+  bin.samples.forEach((p, i) => {
+    const b = document.createElement('button');
+    b.textContent = String(p.id);
+    b.className = i === activeSi ? 'active' : '';
+    if (p.is_bad) b.style.background = i === activeSi ? '#7a2222' : '#5a1a1a';
+    b.onclick = () => {
+      const si = binStepIdx(bin, i);
+      if (si >= 0) currentStepIdx = si;
+      buildBinStrip(bin);
+      showPosition(_activeBinPos(bin));
+    };
+    strip.appendChild(b);
+  });
+}
+
+function selectBin(bin) {
+  // Jump to first sample (or avg if only avg exists)
+  const firstSample = bin.samples.length >= 1 ? binStepIdx(bin, 0) : binStepIdx(bin, -1);
+  if (firstSample >= 0) currentStepIdx = firstSample;
+  buildBinStrip(bin);
+  updateHighlight(bin);
+  showPosition(_activeBinPos(bin));
+}
+
+// ---- laser grid (canvas) ------------------------------------------------
+const LASER_ROWS = 10, LASER_COLS = 10;
+let laserCanvasSize = 0;
+
+function buildLaserGrid() {
+  const panel = document.getElementById('laser-panel');
+  const btnH = 36 + 18; // avg button + label
+  const panelW = panel.clientWidth  || 180;
+  const panelH = panel.clientHeight || 200;
+  const available = Math.min(panelW - 8, panelH - btnH - 10);
+  const size = Math.max(80, available);
+  laserCanvasSize = size;
+  const dpr    = window.devicePixelRatio || 1;
+  const canvas = document.getElementById('laser-canvas');
+  canvas.width  = size * dpr;
+  canvas.height = size * dpr;
+  canvas.style.width  = size + 'px';
+  canvas.style.height = size + 'px';
+  canvas.getContext('2d').scale(dpr, dpr);
+  drawLaserGrid();
+}
+
+function drawLaserGrid() {
+  const canvas = document.getElementById('laser-canvas');
+  const ctx = canvas.getContext('2d');
+  const size = laserCanvasSize;
+  const cell = size / LASER_COLS;
+  ctx.clearRect(0, 0, size, size);
+  for (let r = 0; r < LASER_ROWS; r++) {
+    for (let c = 0; c < LASER_COLS; c++) {
+      const idx = r * LASER_COLS + c;
+      const x = c * cell, y = r * cell;
+      const isSelected = currentLaser === idx;
+      ctx.fillStyle = isSelected ? '#5588bb' : '#23233a';
+      ctx.fillRect(x+1, y+1, cell-2, cell-2);
+      ctx.strokeStyle = isSelected ? '#88bbff' : '#446';
+      ctx.lineWidth = isSelected ? 2 : 0.5;
+      ctx.strokeRect(x+1, y+1, cell-2, cell-2);
+      ctx.fillStyle = isSelected ? '#fff' : 'rgba(180,190,220,0.7)';
+      ctx.font = `${Math.max(8, cell * 0.32)}px sans-serif`;
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(idx, x + cell/2, y + cell/2);
+    }
+  }
+}
+
+document.getElementById('laser-canvas').addEventListener('click', function(e) {
+  const rect = this.getBoundingClientRect();
+  const cell = laserCanvasSize / LASER_COLS;
+  const c = Math.floor((e.clientX - rect.left) / cell);
+  const r = Math.floor((e.clientY - rect.top)  / cell);
+  if (c < 0 || c >= LASER_COLS || r < 0 || r >= LASER_ROWS) return;
+  selectLaser(r * LASER_COLS + c);
+});
+
+function selectLaser(value) {
+  currentLaser = value;
+  _specZoom = null;
+  document.getElementById('laser-avg-btn').classList.toggle('active', value === null);
+  drawLaserGrid();
+  if (value === null) {
+    specInitialised = false;
+    showPosition(_activeBinPos(currentBin()));
+    return;
+  }
+  const spk = DATA.speaker;
+  if (_laserSpecCache[spk]) {
+    specInitialised = false;
+    showPosition(_activeBinPos(currentBin()));
+  } else {
+    const ctx = document.getElementById('laser-canvas').getContext('2d');
+    ctx.fillStyle = 'rgba(0,0,0,0.5)';
+    ctx.fillRect(0, 0, laserCanvasSize, laserCanvasSize);
+    ctx.fillStyle = '#aac'; ctx.font = '13px sans-serif';
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillText('loading…', laserCanvasSize/2, laserCanvasSize/2);
+    loadSidecar().then(sc => {
+      _decodeSpkSidecar(spk, sc);
+      drawLaserGrid();
+      specInitialised = false;
+      showPosition(_activeBinPos(currentBin()));
+      const others = ALL_DATA.speakers.filter(s => s !== spk);
+      let i = 0;
+      function decodeNext() {
+        if (i >= others.length) return;
+        const s = others[i++];
+        if (!_laserSpecCache[s]) _decodeSpkSidecar(s, sc);
+        requestIdleCallback(decodeNext);
+      }
+      requestIdleCallback(decodeNext);
+    });
+  }
+}
+
+// ---- audio playback -----------------------------------------------------
+const _audioCtx   = new (window.AudioContext || window.webkitAudioContext)();
+const _audioBuf   = {};
+const _audioFetch = {};
+let   _audioSrc   = null;
+let   _audioStartTime = 0, _audioDuration = 0;
+let   _audioRafId = null;
+
+function _stopAudio() {
+  if (_audioSrc) { try { _audioSrc.stop(); } catch(e) {} _audioSrc = null; }
+  if (_audioRafId) { cancelAnimationFrame(_audioRafId); _audioRafId = null; }
+  document.getElementById('audio-progress-bar').style.width = '0%';
+  document.getElementById('audio-btn').innerHTML = '&#9654; Play';
+}
+
+function _playBuffer(buf, label) {
+  _stopAudio();
+  _audioCtx.resume();
+  _audioSrc = _audioCtx.createBufferSource();
+  _audioSrc.buffer = buf;
+  _audioSrc.connect(_audioCtx.destination);
+  _audioStartTime = _audioCtx.currentTime;
+  _audioDuration  = buf.duration;
+  _audioSrc.start(0);
+  _audioSrc.onended = () => { _audioSrc = null; _stopAudio(); };
+  document.getElementById('audio-btn').innerHTML = '&#9646;&#9646; Stop';
+  document.getElementById('audio-label').textContent = label;
+  function tick() {
+    if (!_audioSrc) return;
+    const pct = Math.min(100, (_audioCtx.currentTime - _audioStartTime) / _audioDuration * 100);
+    document.getElementById('audio-progress-bar').style.width = pct + '%';
+    _audioRafId = requestAnimationFrame(tick);
+  }
+  tick();
+}
+
+function loadAndPlayAudio(sampleId, fname) {
+  if (!fname) { _stopAudio(); document.getElementById('audio-label').textContent = 'no audio'; return; }
+  const key = String(sampleId), label = `id=${sampleId}`;
+  if (_audioBuf[key]) { _playBuffer(_audioBuf[key], label); return; }
+  if (_audioFetch[key]) { _audioFetch[key].then(buf => { if (buf) _playBuffer(buf, label); }); return; }
+  document.getElementById('audio-label').textContent = 'loading…';
+  _audioFetch[key] = fetch(fname)
+    .then(r => { if (!r.ok) throw new Error(r.status); return r.arrayBuffer(); })
+    .then(ab => _audioCtx.decodeAudioData(ab))
+    .then(buf => { _audioBuf[key] = buf; _playBuffer(buf, label); return buf; })
+    .catch(e => { console.warn('audio load failed', fname, e);
+                  document.getElementById('audio-label').textContent = 'error'; return null; });
+}
+
+function toggleAudio() {
+  if (_audioSrc) { _stopAudio(); return; }
+  const pos = _activeBinPos(currentBin());
+  if (pos._isAvg) { document.getElementById('audio-label').textContent = 'n/a for avg'; return; }
+  loadAndPlayAudio(pos.id, pos.audio_fname);
+}
+
+// ---- spectrum -----------------------------------------------------------
+const _yMaxCache = {};
+function getYMax() {
+  const combos = _checkedCombos();
+  const cacheKey = `${DATA.speaker}::${currentLaser}::${combos.map(c=>c.scale+c.view).join('+')}`;
+  if (_yMaxCache[cacheKey] !== undefined) return _yMaxCache[cacheKey];
+  let mn = 0, mx = 0;
+  for (const {scale, view} of combos) {
+    for (const p of DATA.positions) {
+      const s = getSpec(p, scale, view);
+      if (!s) continue;
+      for (let i = 0; i < s.length; i++) { if (s[i] > mx) mx = s[i]; if (s[i] < mn) mn = s[i]; }
+    }
+    const em = _getEmptySpec((_SPEC_KEY[scale] ?? _SPEC_KEY.raw)[view] ?? 'spec');
+    if (em) for (let i = 0; i < em.length; i++) { if (em[i] > mx) mx = em[i]; if (em[i] < mn) mn = em[i]; }
+  }
+  const pad = (mx - mn) * 0.05 || 0.01;
+  _yMaxCache[cacheKey] = { mn: mn - pad, mx: mx + pad };
+  return _yMaxCache[cacheKey];
+}
+
+function specTitle(pos) {
+  const laserLabel = currentLaser === null ? `avg ${LASER_ROWS*LASER_COLS} lasers, x+y` : `laser ${currentLaser}, x+y`;
+  const combos = _checkedCombos();
+  const normParts   = [...new Set(combos.map(c => _SCALE_LABEL[c.scale]))].join('+') || '—';
+  const signalParts = [...new Set(combos.map(c => _VIEW_LABEL[c.view]))].join('+')  || '—';
+  const line1 = `FFT Magnitude (${laserLabel})  norm=${normParts}  signal=${signalParts}`;
+  if (!pos) return line1;
+  const id = pos._isAvg ? 'avg' : `id=${pos.id}`;
+  const f1 = v => v != null ? v.toFixed(1) : '—';
+  const runTag = pos.run ? `  run=${pos.run}` : '';
+  const line2 = `${id}  spk=${DATA.speaker}  objs=${pos.n_objects ?? '?'}  com=(${f1(pos.true_cx)}, ${f1(pos.true_cy)})${runTag}`;
+  return `${line1}<br>${line2}`;
+}
+
+let specInitialised = false;
+let _specZoom = null; // {xrange, yrange} set by user zoom; null = use defaults
+let currentPos = null;
+
+// color by view (signal), dash by normalization
+const _VIEW_COLOR = { sample: '100,150,255', empty: '210,210,210', diff: '220,80,80' };
+const _SCALE_DASH  = { raw: 'dash', norm: 'solid' };
+const _VIEW_LABEL  = { sample: 'Sample', empty: 'Empty', diff: 'Diff' };
+const _SCALE_LABEL = { raw: 'unnorm', norm: 'norm' };
+
+function _makeTraces(pos) {
+  const combos = _checkedCombos();
+  return combos.flatMap(({scale, view}) => {
+    const y = getSpec(pos, scale, view);
+    if (!y) return [];
+    const bad = pos?.is_bad;
+    const col = bad ? '220,80,80' : (_VIEW_COLOR[view] ?? _VIEW_COLOR.sample);
+    const label = `${_VIEW_LABEL[view]} ${_SCALE_LABEL[scale]}`;
+    return [{
+      x: freqs, y, mode: 'lines', name: label,
+      line: { color: `rgba(${col},0.9)`, width: 1.5, dash: _SCALE_DASH[scale] },
+      hovertemplate: `freq=%{x:.1f} Hz<br>mag=%{y:.4f}<extra>${label}</extra>`,
+      type: 'scatter',
+    }];
+  });
+}
+
+function buildSpectrum(pos) {
+  const traces = _makeTraces(pos);
+  const xaxis = { title: { text: 'Frequency (Hz)', font: { color: '#aac' } }, color: '#aac', gridcolor: '#334' };
+  const yaxis = { title: { text: 'Magnitude', font: { color: '#aac' } }, color: '#aac', gridcolor: '#334',
+                  range: [getYMax().mn, getYMax().mx], autorange: false };
+  if (_specZoom) { xaxis.range = _specZoom.xrange; yaxis.range = _specZoom.yrange; }
+  Plotly.newPlot('spectrum-div', traces, {
+    paper_bgcolor: '#1a1a2e', plot_bgcolor: '#12122a',
+    margin: { l: 55, r: 20, t: 52, b: 45 },
+    title: { text: specTitle(pos), font: { color: '#dde', size: 14 } },
+    xaxis, yaxis,
+    showlegend: false,
+  }, { displayModeBar: true, modeBarButtonsToRemove: ['toImage'], responsive: true });
+  document.getElementById('spectrum-div').on('plotly_relayout', ev => {
+    if (ev['xaxis.autorange'] || ev['yaxis.autorange']) { _specZoom = null; return; }
+    if (ev['xaxis.range[0]'] !== undefined)
+      _specZoom = { xrange: [ev['xaxis.range[0]'], ev['xaxis.range[1]']],
+                    yrange: [ev['yaxis.range[0]'], ev['yaxis.range[1]']] };
+  });
+}
+
+function updateSpectrum(pos) {
+  const el = document.getElementById('spectrum-div');
+  const traces = _makeTraces(pos);
+  el.layout.title.text = specTitle(pos);
+  if (!_specZoom) { const ym = getYMax(); el.layout.yaxis.range = [ym.mn, ym.mx]; }
+  else { el.layout.xaxis.range = _specZoom.xrange; el.layout.yaxis.range = _specZoom.yrange; }
+  Plotly.react('spectrum-div', traces, el.layout);
+}
+
+// ---- mask panel ---------------------------------------------------------
+let maskInitialised = false;
+
+function buildMaskPlot(pos) {
+  const maskTrue = getMaskTrue(pos);
+  const maskPred = getMaskPred(pos);  // null when no run loaded
+  console.log('[buildMaskPlot] pos.id=', pos?.id, 'maskPred=', maskPred ? `${maskPred.length}x${maskPred[0]?.length}` : 'NULL', 'overhead=', !!pos?.overhead_b64);
+  const H = maskTrue.length, W = maskTrue[0].length;
+  const hxs = [], hys = [];
+  for (let r = 0; r < H; r++)
+    for (let c = 0; c < W; c++) { hxs.push(c+0.5); hys.push(r+0.5); }
+
+  const traces = maskPred
+    ? [
+        // Run mode: blue heatmap for pred, gray GT shown via overhead image
+        { type:'heatmap',
+          x: Array.from({length:W},(_,i)=>i+0.5), y: Array.from({length:H},(_,i)=>i+0.5),
+          z: maskPred,
+          colorscale:[[0,'rgba(68,114,196,0)'],[1,'rgba(68,114,196,1)']],
+          zmin:0, zmax:1, showscale:true,
+          colorbar:{title:{text:'pred',font:{color:'#aac',size:10}},tickfont:{color:'#aac',size:9},thickness:10,len:0.6,x:1.01},
+          hoverinfo:'skip' },
+        { type:'scatter', mode:'markers', x:hxs, y:hys,
+          marker:{size:14,opacity:0,color:'white'}, text:_maskHoverText(pos),
+          hovertemplate:'%{text}<extra></extra>', showlegend:false },
+        { type:'scatter', mode:'markers',
+          x: pos.true_cx != null ? [pos.true_cx+0.5] : [],
+          y: pos.true_cy != null ? [pos.true_cy+0.5] : [],
+          marker:{symbol:'cross',size:9,color:'#00e060',line:{color:'#003010',width:1}},
+          showlegend:false, hovertemplate:'GT COM col=%{x:.1f} row=%{y:.1f}<extra></extra>' },
+        { type:'scatter', mode:'markers',
+          x: pos.pred_cx != null ? [pos.pred_cx+0.5] : [],
+          y: pos.pred_cy != null ? [pos.pred_cy+0.5] : [],
+          marker:{symbol:'cross',size:9,color:'#4488ff',line:{color:'#001040',width:1}},
+          showlegend:false, hovertemplate:'Pred COM col=%{x:.1f} row=%{y:.1f}<extra></extra>' },
+      ]
+    : [
+        // Dataset-only mode: just the overhead image, invisible hover grid, GT COM dot
+        { type:'scatter', mode:'markers', x:hxs, y:hys,
+          marker:{size:14,opacity:0,color:'white'}, text:_maskHoverTextTrueOnly(pos),
+          hovertemplate:'%{text}<extra></extra>', showlegend:false },
+        { type:'scatter', mode:'markers',
+          x: pos.true_cx != null ? [pos.true_cx+0.5] : [],
+          y: pos.true_cy != null ? [pos.true_cy+0.5] : [],
+          marker:{symbol:'cross',size:9,color:'#00e060',line:{color:'#003010',width:1}},
+          showlegend:false, hovertemplate:'GT COM col=%{x:.1f} row=%{y:.1f}<extra></extra>' },
+      ];
+
+  Plotly.newPlot('mask-div', traces, {
+    paper_bgcolor:'#1a1a2e', plot_bgcolor:'transparent',
+    margin:{l:30,r:10,t:28,b:30},
+    title:{text:'',font:{color:'#aac',size:11}},
+    xaxis:{range:[0,W],showgrid:false,zeroline:false,showticklabels:false,title:''},
+    yaxis:{range:[H,0],showgrid:false,zeroline:false,showticklabels:false,title:'',scaleanchor:'x',scaleratio:W/H},
+    images: pos.overhead_b64 ? [{source:pos.overhead_b64,xref:'x',yref:'y',x:0,y:0,sizex:W,sizey:H,sizing:'stretch',opacity:1,layer:'below'}] : [],
+  }, {displayModeBar:false, responsive:true});
+  maskInitialised = true;
+  _maskPlotHasPred = maskPred !== null;
+}
+
+function _maskHoverText(pos) {
+  const pred = getMaskPred(pos), true_ = getMaskTrue(pos);
+  const H = true_.length, W = true_[0].length;
+  const t = [];
+  for (let r = 0; r < H; r++)
+    for (let c = 0; c < W; c++) {
+      const predVal = pred ? pred[r][c].toFixed(3) : '—';
+      t.push(`col=${c} row=${r}<br>pred=${predVal}<br>true=${true_[r][c].toFixed(3)}`);
+    }
+  return t;
+}
+
+function _maskHoverTextTrueOnly(pos) {
+  const true_ = getMaskTrue(pos);
+  const H = true_.length, W = true_[0].length;
+  const t = [];
+  for (let r = 0; r < H; r++)
+    for (let c = 0; c < W; c++)
+      t.push(`col=${c} row=${r}<br>true=${true_[r][c].toFixed(3)}`);
+  return t;
+}
+
+let _maskPlotHasPred = false;  // tracks whether current plot was built with prediction
+
+function updateMaskPlot(pos) {
+  const maskPred = getMaskPred(pos);
+  // Rebuild if pred presence changed (e.g. switching between avg and individual in mixed data)
+  if ((maskPred !== null) !== _maskPlotHasPred) {
+    maskInitialised = false;
+    buildMaskPlot(pos);
+    _maskPlotHasPred = maskPred !== null;
+    return;
+  }
+  const el = document.getElementById('mask-div');
+  if (maskPred) {
+    el.data[0].z = maskPred;
+    el.data[1].text = _maskHoverText(pos);
+    el.data[2].x = pos.true_cx != null ? [pos.true_cx+0.5] : [];
+    el.data[2].y = pos.true_cy != null ? [pos.true_cy+0.5] : [];
+    el.data[3].x = pos.pred_cx != null ? [pos.pred_cx+0.5] : [];
+    el.data[3].y = pos.pred_cy != null ? [pos.pred_cy+0.5] : [];
+  } else {
+    el.data[0].text = _maskHoverTextTrueOnly(pos);
+    el.data[1].x = pos.true_cx != null ? [pos.true_cx+0.5] : [];
+    el.data[1].y = pos.true_cy != null ? [pos.true_cy+0.5] : [];
+  }
+  if (el.layout.images && pos.overhead_b64) el.layout.images[0].source = pos.overhead_b64;
+  Plotly.react('mask-div', el.data, el.layout);
+}
+
+// ---- show a position ----------------------------------------------------
+function showPosition(pos) {
+  currentPos = pos;
+  _stopAudio();
+  if (!specInitialised) { buildSpectrum(pos); specInitialised = true; }
+  else                   { updateSpectrum(pos); }
+  if (!maskInitialised) { buildMaskPlot(pos); }
+  else                   { updateMaskPlot(pos); }
+
+  const f1 = v => v != null ? v.toFixed(1) : '—';
+  const f2 = v => v != null ? v.toFixed(2) : '—';
+  const fe = v => v != null ? v.toExponential(1) : '—';
+  const prefix = pos._isAvg ? 'avg' : `id=${pos.id}`;
+  const runTag = pos.run ? `  run=${pos.run}` : '';
+  const _mp = getMaskPred(pos);
+  console.log('[showPosition] pos.id=', pos?.id, '_isAvg=', pos?._isAvg, 'pos.mask_pred type=', typeof pos?.mask_pred, 'pos.mask_pred=', pos?.mask_pred, 'getMaskPred=', _mp ? `${_mp.length}x${_mp[0]?.length}` : 'NULL');
+  const hasPred = _mp !== null;
+  const predPart = hasPred
+    ? `  pred_com=(${f1(pos.pred_cx)}, ${f1(pos.pred_cy)})  dist_com=${f2(pos.com_dist)}  mse=${fe(pos.mse)}`
+    : `  [no run]`;
+  document.getElementById('info-bar').textContent =
+    `${prefix}  spk=${DATA.speaker}  objs=${pos.n_objects ?? '?'}  com=(${f1(pos.true_cx)}, ${f1(pos.true_cy)})` +
+    predPart + runTag;
+
+  const suffix = `  ${prefix}  spk=${DATA.speaker}  objs=${pos.n_objects ?? '?'}  com=(${f1(pos.true_cx)}, ${f1(pos.true_cy)})`;
+  document.getElementById('audio-title').textContent = `Recovered Audio${suffix}`;
+  document.getElementById('overhead-title').textContent = `Overhead + Prediction${suffix}`;
+  document.getElementById('audio-path').textContent = pos.audio_path ?? '—';
+  document.getElementById('overhead-path').textContent = pos.overhead_path ?? '—';
+}
+
+// ---- play / pause -------------------------------------------------------
+function step() {
+  currentStepIdx = (currentStepIdx + 1) % navSteps.length;
+  const { bin } = navSteps[currentStepIdx];
+  buildBinStrip(bin);
+  updateHighlight(bin);
+  showPosition(_activeBinPos(bin));
+}
+function togglePlay() {
+  const btn = document.getElementById('btn-play');
+  if (playTimer) { clearInterval(playTimer); playTimer=null; btn.innerHTML='&#9654; Play'; }
+  else { playTimer = setInterval(step, parseInt(document.getElementById('speed').value)); btn.innerHTML='&#9646;&#9646; Pause'; }
+}
+
+// ---- order dropdown -----------------------------------------------------
+function setOrder(order) {
+  currentOrder = order;
+  orderedBins = orders[order];
+  buildNavSteps();
+  currentStepIdx = 0;
+  if (playTimer) { clearInterval(playTimer); playTimer=null; document.getElementById('btn-play').innerHTML='&#9654; Play'; }
+}
+
+// ---- keyboard navigation ------------------------------------------------
+// All 4 arrows navigate spatially between bins (nearest bin in that direction).
+// Within-bin sample cycling is done via the bin strip buttons.
+document.addEventListener('keydown', function(e) {
+  const dirMap = { ArrowLeft:[-1,0], ArrowRight:[1,0], ArrowUp:[0,-1], ArrowDown:[0,1] };
+  const dir = dirMap[e.key];
+  if (!dir || !navSteps.length) return;
+  e.preventDefault();
+  const curBin = currentBin();
+  let best = null, bestScore = Infinity;
+  for (const b of bins) {
+    if (b === curBin) continue;
+    const dx = b.bcx - curBin.bcx, dy = b.bcy - curBin.bcy;
+    const dot = dx * dir[0] + dy * dir[1];
+    if (dot <= 0) continue;
+    const perp = Math.abs(dx * dir[1] - dy * dir[0]);
+    const score = dot + 3 * perp;
+    if (score < bestScore) { bestScore = score; best = b; }
+  }
+  if (!best) return;
+  selectBin(best);
+});
+
+// ---- sample-id combobox -------------------------------------------------
+// Build a flat map: sampleId (number) -> { spk, posObj }
+let _allSampleIds = [];   // sorted list of all numeric sample ids
+let _sampleMap = {};      // id -> { spk, pos }
+
+function buildSampleMap() {
+  _sampleMap = {};
+  for (const spk of ALL_DATA.speakers) {
+    for (const pos of ALL_DATA.data[spk].positions) {
+      _sampleMap[pos.id] = { spk, pos };
+    }
+  }
+  _allSampleIds = Object.keys(_sampleMap).map(Number).sort((a, b) => a - b);
+}
+
+let _ddActiveIdx = -1;
+let _ddFiltered  = [];
+
+function _ddItems() { return document.querySelectorAll('#sample-id-dropdown .dd-item'); }
+
+function renderSampleDropdown(filtered) {
+  _ddFiltered  = filtered;
+  _ddActiveIdx = -1;
+  const dd = document.getElementById('sample-id-dropdown');
+  dd.innerHTML = '';
+  const limit = 60;
+  const shown = filtered.slice(0, limit);
+  shown.forEach((id, i) => {
+    const div = document.createElement('div');
+    div.className = 'dd-item' + (_sampleMap[id]?.pos?.is_bad ? ' bad-sample' : '');
+    const spk = _sampleMap[id]?.spk ?? '';
+    div.textContent = `${id}  (spk ${spk})`;
+    div.dataset.id = id;
+    div.addEventListener('mousedown', e => {
+      e.preventDefault(); // prevent blur before click fires
+      jumpToSampleId(id);
+    });
+    dd.appendChild(div);
+  });
+  if (filtered.length > limit) {
+    const more = document.createElement('div');
+    more.className = 'dd-item';
+    more.style.color = '#88a';
+    more.style.fontStyle = 'italic';
+    more.textContent = `… ${filtered.length - limit} more`;
+    dd.appendChild(more);
+  }
+  dd.classList.toggle('open', filtered.length > 0);
+}
+
+function openSampleDropdown() {
+  const val = document.getElementById('sample-id-input').value.trim();
+  const filtered = val === '' ? _allSampleIds : _allSampleIds.filter(id => String(id).startsWith(val));
+  renderSampleDropdown(filtered);
+}
+
+function closeSampleDropdown() {
+  // small delay so mousedown on item fires first
+  setTimeout(() => {
+    document.getElementById('sample-id-dropdown').classList.remove('open');
+  }, 150);
+}
+
+function onSampleIdInput(val) {
+  const input = document.getElementById('sample-id-input');
+  input.classList.remove('invalid');
+  const trimmed = val.trim();
+  if (trimmed === '') { renderSampleDropdown(_allSampleIds); return; }
+  const filtered = _allSampleIds.filter(id => String(id).startsWith(trimmed));
+  renderSampleDropdown(filtered);
+  // exact match → highlight valid
+  if (_sampleMap[Number(trimmed)]) {
+    input.classList.remove('invalid');
+  }
+}
+
+function onSampleIdKey(e) {
+  const items = _ddItems();
+  if (e.key === 'ArrowDown') {
+    e.preventDefault();
+    _ddActiveIdx = Math.min(_ddActiveIdx + 1, _ddFiltered.length - 1);
+    items.forEach((el, i) => el.classList.toggle('active', i === _ddActiveIdx));
+    items[_ddActiveIdx]?.scrollIntoView({ block: 'nearest' });
+  } else if (e.key === 'ArrowUp') {
+    e.preventDefault();
+    _ddActiveIdx = Math.max(_ddActiveIdx - 1, 0);
+    items.forEach((el, i) => el.classList.toggle('active', i === _ddActiveIdx));
+    items[_ddActiveIdx]?.scrollIntoView({ block: 'nearest' });
+  } else if (e.key === 'Enter') {
+    e.preventDefault();
+    const id = _ddActiveIdx >= 0 ? _ddFiltered[_ddActiveIdx]
+                                 : Number(document.getElementById('sample-id-input').value.trim());
+    if (_sampleMap[id]) {
+      jumpToSampleId(id);
+    } else {
+      document.getElementById('sample-id-input').classList.add('invalid');
+    }
+  } else if (e.key === 'Escape') {
+    document.getElementById('sample-id-dropdown').classList.remove('open');
+    document.getElementById('sample-id-input').blur();
+  }
+}
+
+function jumpToSampleId(id) {
+  const entry = _sampleMap[id];
+  if (!entry) {
+    document.getElementById('sample-id-input').classList.add('invalid');
+    return;
+  }
+  // Close dropdown and update input text
+  document.getElementById('sample-id-dropdown').classList.remove('open');
+  document.getElementById('sample-id-input').value = String(id);
+  document.getElementById('sample-id-input').classList.remove('invalid');
+  document.getElementById('sample-id-input').blur();
+
+  const { spk, pos } = entry;
+
+  // Switch speaker if needed
+  const spkSel = document.getElementById('spk-select');
+  if (DATA.speaker !== spk) {
+    spkSel.value = spk;
+    switchSpeaker(spk);   // rebuilds bins, nav steps, etc.
+  }
+
+  // Find the bin that contains this position
+  const targetBin = bins.find(b => b.samples.some(p => p.id === id));
+  if (!targetBin) return;
+
+  // Find which sampleIdx within the bin
+  const si = targetBin.samples.findIndex(p => p.id === id);
+
+  // Navigate to that step
+  const stepI = binStepIdx(targetBin, si);
+  if (stepI >= 0) currentStepIdx = stepI;
+
+  buildBinStrip(targetBin);
+  updateHighlight(targetBin);
+  showPosition(pos);
+}
+
+// ---- init ---------------------------------------------------------------
+const sel = document.getElementById('spk-select');
+ALL_DATA.speakers.forEach(spk => {
+  const opt = document.createElement('option');
+  opt.value = spk; opt.textContent = spk;
+  sel.appendChild(opt);
+});
+
+const firstSpk = ALL_DATA.speakers[0];
+sel.value = firstSpk;
+loadSpeaker(firstSpk);
+buildSampleMap();
+buildBins();
+orders      = buildOrders();
+orderedBins = orders[currentOrder];
+buildNavSteps();
+
+buildGrid();
+setTimeout(() => {
+  buildLaserGrid();
+  selectBin(orderedBins[0]);
+}, 50);
+</script>
+</body>
+</html>
