@@ -34,7 +34,8 @@
       "Bash(gh pr *)",
       "Bash(uv run *)",
       "Bash(pip index *)",
-      "Bash(pip show *)"
+      "Bash(pip show *)",
+      "PowerShell(jupyter kernelspec list 2>&1)"
     ]
   }
 }
