@@ -8,11 +8,19 @@ from PIL import Image, ImageDraw
 
 from utils import save, load, append, symlink, Timing
 
-#***** 1 crop *****
+#***** 1 resize *****
 
-def crop(image: Image.Image, left: float, right: float, up: float, down: float) -> Image.Image:
-    width, height = image.size
-    return image.crop((int(width * left), int(height * up), int(width * right), int(height * down)))
+def resize(image: Image.Image, left: float, right: float, up: float, down: float, max_side:int) -> Image.Image:
+    """Crop so only box in the image. Downscale image so segmentation model inference runs faster."""
+    # crop
+    w, h = image.size
+    image = image.crop((int(w * left), int(h * up), int(w * right), int(h * down)))
+
+    # downscale image so its longest side <= max_side, preserving aspect ratio
+    w, h = image.size
+    if max(w, h) <= max_side: return image
+    scale = max_side / max(w, h)
+    return image.resize((int(w * scale), int(h * scale)), resample=Image.LANCZOS)
 
 
 #***** 2 segment mask on modal *****
@@ -118,7 +126,7 @@ def make_overhead(overhead: Image.Image, segment_mask: Image.Image, com: tuple[f
     if not is_empty_box:
         draw = ImageDraw.Draw(overhead)
         cx, cy = int(com[1]), int(com[0])
-        r = max(10, W // 60)
+        r = max(5, W // 60)
         draw.line([(cx - r, cy), (cx + r, cy)], fill=(144, 238, 144, 255), width=3)
         draw.line([(cx, cy - r), (cx, cy + r)], fill=(144, 238, 144, 255), width=3)
 
@@ -147,9 +155,9 @@ def make_overhead(overhead: Image.Image, segment_mask: Image.Image, com: tuple[f
 #***** 6 put it all together
 
 DEFAULT_PROMPT = "A black metal cube sitting on the floor of an open cardboard box from a bird's eye view."
-SHARED_ARTIFACTS = ["00_raw_overhead.png", "01_cropped_overhead.png", "02_segment_mask.png", "03_downsampled_segment_mask.png", "04_com.jsonl", "y.npy"]
+SHARED_ARTIFACTS = ["00_raw_overhead.png", "01_resized_overhead.png", "02_segment_mask.png", "03_downsampled_segment_mask.png", "04_com.jsonl", "y.npy"]
 
-async def process_outputs(speaker: str, raw_overhead_path: Path, output_dir: Path, sample_dir: Path, left: float = 0.15, right: float = 0.67, up: float = 0.08, down: float = 0.7,
+async def process_outputs(speaker: str, raw_overhead_path: Path, output_dir: Path, sample_dir: Path, left: float = 0.15, right: float = 0.67, up: float = 0.08, down: float = 0.7, max_side:int=256,
                           prompt: str = DEFAULT_PROMPT, out_h: int = 40, out_w: int = 20, verbose: int = 1, overwrite: bool = True, is_empty_box:bool|None=None) -> Image.Image:
     sample_id, output_id = sample_dir.name, output_dir.name
     if verbose >= 1: print(f"[{sample_id}] Process Output {output_id}")
@@ -171,22 +179,20 @@ async def process_outputs(speaker: str, raw_overhead_path: Path, output_dir: Pat
             status_path.write_text("".join(json.dumps(l) + "\n" for l in lines))
 
     # if shared artifacts already exist, skip recomputing them
-    # if all((output_dir / a).exists() for a in SHARED_ARTIFACTS):
-    #     with Timing(f"[{sample_id}] load cached artifacts: ", enabled=verbose >= 1):
-    #         cropped_overhead = load(output_dir / "01_cropped_overhead.png")
-    #         segment_mask = load(output_dir / "02_segment_mask.png")
-    #         com = load(output_dir / "04_com.jsonl")[0]['com']
-    if False:
-        pass
+    if all((output_dir / a).exists() for a in SHARED_ARTIFACTS):
+        with Timing(f"[{sample_id}] load cached artifacts: ", enabled=verbose >= 1):
+            resized_overhead = load(output_dir / "01_resized_overhead.png")
+            segment_mask = load(output_dir / "02_segment_mask.png")
+            com = load(output_dir / "04_com.jsonl")[0]['com']
     else:
-        # crop
-        with Timing(f"[{sample_id}] crop: ", enabled=verbose >= 1):
-            cropped_overhead = crop(load(raw_overhead_path), left, right, up, down)
-            save(cropped_overhead, output_dir / "01_cropped_overhead.png")
+        # resize
+        with Timing(f"[{sample_id}] resize: ", enabled=verbose >= 1):
+            resized_overhead = resize(load(raw_overhead_path), left, right, up, down, max_side)
+            save(resized_overhead, output_dir / "01_resized_overhead.png")
 
         # segment mask on modal with SAM3
         with Timing(f"[{sample_id}] segment: ", enabled=verbose >= 1):
-            segment_mask = await segment(cropped_overhead, prompt, is_empty_box)
+            segment_mask = await segment(resized_overhead, prompt, is_empty_box)
             save(segment_mask, output_dir / "02_segment_mask.png")
 
         # downsample
@@ -207,7 +213,7 @@ async def process_outputs(speaker: str, raw_overhead_path: Path, output_dir: Pat
 
     # make overhead image for the current sample
     with Timing(f"[{sample_id}] make overhead: ", enabled=verbose >= 1):
-        overhead = make_overhead(cropped_overhead, segment_mask, com, is_empty_box, speaker)
+        overhead = make_overhead(resized_overhead, segment_mask, com, is_empty_box, speaker)
         save(overhead, sample_dir / "outputs/05_overhead.png")
         symlink(sample_dir / "outputs/05_overhead.png", sample_dir / "overhead.png")
 
