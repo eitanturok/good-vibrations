@@ -1,4 +1,4 @@
-import json
+import json, shutil
 from pathlib import Path
 from datetime import datetime, timezone
 
@@ -59,17 +59,12 @@ class Segmenter:
 # Declared at module level so app.run() can hydrate it. Do not instantiate inside functions.
 _segmenter = Segmenter()
 
-
-def _to_mask_image(mask: np.ndarray) -> Image.Image:
-    return Image.fromarray(mask.astype(np.uint8) * 255, mode="L")
-
-
-async def segment(image: Image.Image, prompt: str) -> Image.Image:
+async def segment(image: Image.Image, prompt: str, is_empty_box:bool) -> Image.Image:
     """Segment an image. Call with `await` inside `async with app.run.aio():`.
     Returns a grayscale PIL image — white (255) where the object is, black (0) elsewhere."""
     array = np.array(image.convert("RGB"), dtype=np.uint8)
-    mask = await _segmenter.run.remote.aio(array, prompt)
-    return _to_mask_image(mask)
+    mask = np.zeros(array.shape) if is_empty_box else await _segmenter.run.remote.aio(array, prompt)
+    return Image.fromarray(mask.astype(np.uint8) * 255, mode="L")
 
 #***** 3 downsample segment mask *****
 
@@ -155,10 +150,13 @@ def make_overhead(overhead: Image.Image, segment_mask: Image.Image, com: tuple[f
 DEFAULT_PROMPT = "A black metal cube sitting on the floor of an open cardboard box from a bird's eye view."
 SHARED_ARTIFACTS = ["00_raw_overhead.png", "01_cropped_overhead.png", "02_segment_mask.png", "03_downsampled_segment_mask.png", "04_com.jsonl", "y.npy"]
 
-async def process_outputs(speaker: str, raw_overhead_path: Path, output_dir: Path, sample_dir: Path, left: float = 0.15, right: float = 0.67, up: float = 0.08, down: float = 0.7, prompt: str = DEFAULT_PROMPT, out_h: int = 40, out_w: int = 20, verbose: int = 1, overwrite: bool = True) -> Image.Image:
-    import shutil
+async def process_outputs(speaker: str, raw_overhead_path: Path, output_dir: Path, sample_dir: Path, left: float = 0.15, right: float = 0.67, up: float = 0.08, down: float = 0.7,
+                          prompt: str = DEFAULT_PROMPT, out_h: int = 40, out_w: int = 20, verbose: int = 1, overwrite: bool = True, is_empty_box:bool|None=None) -> Image.Image:
     sample_id, output_id = sample_dir.name, output_dir.name
     if verbose >= 1: print(f"[{sample_id}] Process Output {output_id}")
+
+    if is_empty_box is None: is_empty_box = 'empty' in prompt
+    if verbose >= 1: print(f"[{sample_id}] Box is {'not '*int(not is_empty_box)}empty")
 
     # check if we already processed this sample and maybe overwrite it
     status_path = output_dir / "status.jsonl"
@@ -166,7 +164,7 @@ async def process_outputs(speaker: str, raw_overhead_path: Path, output_dir: Pat
     already_processed = (sample_dir.exists() and any(sample_dir.iterdir())) or prior is not None
     if already_processed:
         if not overwrite:
-            raise ValueError(f"sample {sample_id} already processed at {prior.get('time') if prior else '?'} in {prior.get('sample_dir') if prior else sample_dir} — pass overwrite=True to redo")
+            raise ValueError(f"[{sample_id}] sample {sample_id} already processed at {prior.get('time') if prior else '?'} in {prior.get('sample_dir') if prior else sample_dir} — pass overwrite=True to redo")
         if verbose >= 1: print(f"[{sample_id}] overwriting previous run")
         if sample_dir.exists(): shutil.rmtree(sample_dir)
         if prior is not None:
@@ -175,31 +173,31 @@ async def process_outputs(speaker: str, raw_overhead_path: Path, output_dir: Pat
 
     # if shared artifacts already exist, skip recomputing them
     if all((output_dir / a).exists() for a in SHARED_ARTIFACTS):
-        with Timing("load cached artifacts: ", enabled=verbose >= 1):
+        with Timing(f"[{sample_id}] load cached artifacts: ", enabled=verbose >= 1):
             cropped_overhead = load(output_dir / "01_cropped_overhead.png")
             segment_mask = load(output_dir / "02_segment_mask.png")
             com = load(output_dir / "04_com.jsonl")[0]['com']
     else:
         # crop
-        with Timing("crop: ", enabled=verbose >= 1):
+        with Timing(f"[{sample_id}] crop: ", enabled=verbose >= 1):
             cropped_overhead = crop(load(raw_overhead_path), left, right, up, down)
             save(cropped_overhead, output_dir / "01_cropped_overhead.png")
 
         # segment mask on modal with SAM3
-        with Timing("segment: ", enabled=verbose >= 1):
-            segment_mask = await segment(cropped_overhead, prompt)
+        with Timing(f"[{sample_id}] segment: ", enabled=verbose >= 1):
+            segment_mask = await segment(cropped_overhead, prompt, is_empty_box)
             save(segment_mask, output_dir / "02_segment_mask.png")
 
         # downsample
-        with Timing("downsample: ", enabled=verbose >= 1):
+        with Timing(f"[{sample_id}] downsample: ", enabled=verbose >= 1):
             downsampled_segment_mask = downsample(segment_mask, out_h, out_w)
             save(downsampled_segment_mask, output_dir / "03_downsampled_segment_mask.png")
             save(np.array(downsampled_segment_mask, dtype=np.float32) / 255.0, output_dir / "y.npy")
 
         # center of mass
-        with Timing("center of mass: ", enabled=verbose >= 1):
-            com = center_of_mass(segment_mask)
-            downsampled_com = center_of_mass(downsampled_segment_mask)
+        with Timing(f"[{sample_id}] center of mass: ", enabled=verbose >= 1):
+            com = (-1, -1) if is_empty_box else center_of_mass(segment_mask)
+            downsampled_com = (-1, -1) if is_empty_box else center_of_mass(downsampled_segment_mask)
             save({"com": com, "downsampled_com": downsampled_com}, output_dir / "04_com.jsonl")
 
     # symlink the shared artifacts in output_dir to the current sample_dir
@@ -207,7 +205,7 @@ async def process_outputs(speaker: str, raw_overhead_path: Path, output_dir: Pat
     symlink(output_dir / "y.npy", sample_dir / "y.npy")
 
     # make overhead image for the current sample
-    with Timing("make overhead: ", enabled=verbose >= 1):
+    with Timing(f"[{sample_id}] make overhead: ", enabled=verbose >= 1):
         overhead = make_overhead(cropped_overhead, segment_mask, com, speaker)
         save(overhead, sample_dir / "outputs/05_overhead.png")
         symlink(sample_dir / "outputs/05_overhead.png", sample_dir / "overhead.png")
