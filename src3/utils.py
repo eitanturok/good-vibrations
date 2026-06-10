@@ -3,6 +3,7 @@ import contextlib
 import time
 from pathlib import Path
 import json
+import shutil
 
 import numpy as np
 from PIL import Image
@@ -79,5 +80,7 @@ def symlink(src:Path, dst:Path):
     if not dst.exists(): dst.parent.mkdir(parents=True, exist_ok=True)
     if dst.is_symlink() and dst.resolve() == src.resolve(): return
     if dst.is_symlink(): dst.unlink()
-    # must symlink to absolute path, not relative path
-    dst.symlink_to(src.resolve())
+    try:
+        dst.symlink_to(src.resolve())
+    except OSError:
+        shutil.copy2(src, dst)

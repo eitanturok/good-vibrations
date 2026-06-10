@@ -6,7 +6,7 @@ import modal
 import numpy as np
 from PIL import Image, ImageDraw
 
-from utils import save, load, append, symlink, Timing
+from src3.utils import save, load, append, symlink, Timing
 
 #***** 1 resize *****
 
@@ -106,8 +106,9 @@ def center_of_mass(mask: Image.Image) -> tuple[float, float]:
 
 def make_overhead(overhead: Image.Image, segment_mask: Image.Image, com: tuple[float, float], is_empty_box:bool, speaker: str | None = None) -> Image.Image:
     # load lazily to not interefere with modal import
-    SPEAKER_IMG = "/home/ethantu/workspace/good-vibrations/data/speaker.png"
-    SPEAKER_POSITION = {'1000': (0, 0.5), '0100': (1/3, 0), '0010': (2/3,0), '0001': (1,0.5)} # assume bottom left corner is (0, 0)
+    SPEAKER_IMG = Path(__file__).parent.parent / "assets" / "speakers" / "speaker.png"
+    # SPEAKER_POSITION = {'1000': (0, 0.5), '0100': (1/3, 0), '0010': (2/3,0), '0001': (1,0.5)} # assume bottom left corner is (0, 0)
+    SPEAKER_POSITION = {3: (0, 0.5), 4: (1/3, 0), 5: (2/3,0), 6: (1,0.5)} # assume bottom left corner is (0, 0)
 
     overhead = overhead.convert("RGBA")
 
@@ -126,7 +127,7 @@ def make_overhead(overhead: Image.Image, segment_mask: Image.Image, com: tuple[f
     if not is_empty_box:
         draw = ImageDraw.Draw(overhead)
         cx, cy = int(com[1]), int(com[0])
-        r = max(5, W // 60)
+        r = max(3, W // 60)
         draw.line([(cx - r, cy), (cx + r, cy)], fill=(144, 238, 144, 255), width=3)
         draw.line([(cx, cy - r), (cx, cy + r)], fill=(144, 238, 144, 255), width=3)
 
@@ -158,7 +159,7 @@ DEFAULT_PROMPT = "A black metal cube sitting on the floor of an open cardboard b
 SHARED_ARTIFACTS = ["00_raw_overhead.png", "01_resized_overhead.png", "02_segment_mask.png", "03_downsampled_segment_mask.png", "04_com.jsonl", "y.npy"]
 
 async def process_outputs(speaker: str, raw_overhead_path: Path, output_dir: Path, sample_dir: Path, left: float = 0.15, right: float = 0.67, up: float = 0.08, down: float = 0.7, max_side:int=256,
-                          prompt: str = DEFAULT_PROMPT, out_h: int = 40, out_w: int = 20, verbose: int = 1, overwrite: bool = True, is_empty_box:bool|None=None) -> Image.Image:
+                          prompt: str = DEFAULT_PROMPT, out_h: int = 40, out_w: int = 20, verbose: int = 1, overwrite: bool = True, is_empty_box:bool|None=None, force:bool=False) -> Image.Image:
     sample_id, output_id = sample_dir.name, output_dir.name
     if verbose >= 1: print(f"[{sample_id}] Process Output {output_id}")
 
@@ -169,7 +170,7 @@ async def process_outputs(speaker: str, raw_overhead_path: Path, output_dir: Pat
     status_path = output_dir / "status.jsonl"
     prior = next((line for line in load(status_path) if line.get("sample_id") == sample_id), None) if status_path.exists() else None
     already_processed = (sample_dir.exists() and any(sample_dir.iterdir())) or prior is not None
-    if already_processed:
+    if not force and already_processed:
         if not overwrite:
             raise ValueError(f"[{sample_id}] sample {sample_id} already processed at {prior.get('time') if prior else '?'} in {prior.get('sample_dir') if prior else sample_dir} — pass overwrite=True to redo")
         if verbose >= 1: print(f"[{sample_id}] overwriting previous run")
@@ -179,7 +180,7 @@ async def process_outputs(speaker: str, raw_overhead_path: Path, output_dir: Pat
             status_path.write_text("".join(json.dumps(l) + "\n" for l in lines))
 
     # if shared artifacts already exist, skip recomputing them
-    if all((output_dir / a).exists() for a in SHARED_ARTIFACTS):
+    if not force and all((output_dir / a).exists() for a in SHARED_ARTIFACTS):
         with Timing(f"[{sample_id}] load cached artifacts: ", enabled=verbose >= 1):
             resized_overhead = load(output_dir / "01_resized_overhead.png")
             segment_mask = load(output_dir / "02_segment_mask.png")
