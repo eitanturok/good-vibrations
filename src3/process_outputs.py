@@ -63,7 +63,7 @@ async def segment(image: Image.Image, prompt: str, is_empty_box:bool) -> Image.I
     """Segment an image. Call with `await` inside `async with app.run.aio():`.
     Returns a grayscale PIL image — white (255) where the object is, black (0) elsewhere."""
     array = np.array(image.convert("RGB"), dtype=np.uint8)
-    mask = np.zeros(array.shape) if is_empty_box else await _segmenter.run.remote.aio(array, prompt)
+    mask = np.zeros(array.shape[:2]) if is_empty_box else await _segmenter.run.remote.aio(array, prompt)
     return Image.fromarray(mask.astype(np.uint8) * 255, mode="L")
 
 #***** 3 downsample segment mask *****
@@ -96,7 +96,7 @@ def center_of_mass(mask: Image.Image) -> tuple[float, float]:
 
 #***** 5 overhead image *****
 
-def make_overhead(overhead: Image.Image, segment_mask: Image.Image, com: tuple[float, float], speaker: str | None = None) -> Image.Image:
+def make_overhead(overhead: Image.Image, segment_mask: Image.Image, com: tuple[float, float], is_empty_box:bool, speaker: str | None = None) -> Image.Image:
     # load lazily to not interefere with modal import
     SPEAKER_IMG = "/home/ethantu/workspace/good-vibrations/data/speaker.png"
     SPEAKER_POSITION = {'1000': (0, 0.5), '0100': (1/3, 0), '0010': (2/3,0), '0001': (1,0.5)} # assume bottom left corner is (0, 0)
@@ -112,16 +112,15 @@ def make_overhead(overhead: Image.Image, segment_mask: Image.Image, com: tuple[f
     color[..., 3] = (mask_arr * 0.35).astype(np.uint8)  # 35% opacity where mask is white
     overlay = Image.fromarray(color, mode="RGBA").resize(overhead.size, resample=Image.NEAREST)
     overhead = Image.alpha_composite(overhead, overlay)
+    W, H = overhead.size
 
     # crosshair at center of mass (com is in mask coordinates — scale to image size)
-    draw = ImageDraw.Draw(overhead)
-    W, H = overhead.size
-    mW, mH = segment_mask.size
-    cx = int(com[1] / mW * W)  # col → x
-    cy = int(com[0] / mH * H)  # row → y
-    r = max(10, W // 60)
-    draw.line([(cx - r, cy), (cx + r, cy)], fill=(144, 238, 144, 255), width=3)
-    draw.line([(cx, cy - r), (cx, cy + r)], fill=(144, 238, 144, 255), width=3)
+    if not is_empty_box:
+        draw = ImageDraw.Draw(overhead)
+        cx, cy = int(com[1]), int(com[0])
+        r = max(10, W // 60)
+        draw.line([(cx - r, cy), (cx + r, cy)], fill=(144, 238, 144, 255), width=3)
+        draw.line([(cx, cy - r), (cx, cy + r)], fill=(144, 238, 144, 255), width=3)
 
     if speaker is None: return overhead.convert("RGB")
 
@@ -172,11 +171,13 @@ async def process_outputs(speaker: str, raw_overhead_path: Path, output_dir: Pat
             status_path.write_text("".join(json.dumps(l) + "\n" for l in lines))
 
     # if shared artifacts already exist, skip recomputing them
-    if all((output_dir / a).exists() for a in SHARED_ARTIFACTS):
-        with Timing(f"[{sample_id}] load cached artifacts: ", enabled=verbose >= 1):
-            cropped_overhead = load(output_dir / "01_cropped_overhead.png")
-            segment_mask = load(output_dir / "02_segment_mask.png")
-            com = load(output_dir / "04_com.jsonl")[0]['com']
+    # if all((output_dir / a).exists() for a in SHARED_ARTIFACTS):
+    #     with Timing(f"[{sample_id}] load cached artifacts: ", enabled=verbose >= 1):
+    #         cropped_overhead = load(output_dir / "01_cropped_overhead.png")
+    #         segment_mask = load(output_dir / "02_segment_mask.png")
+    #         com = load(output_dir / "04_com.jsonl")[0]['com']
+    if False:
+        pass
     else:
         # crop
         with Timing(f"[{sample_id}] crop: ", enabled=verbose >= 1):
@@ -206,7 +207,7 @@ async def process_outputs(speaker: str, raw_overhead_path: Path, output_dir: Pat
 
     # make overhead image for the current sample
     with Timing(f"[{sample_id}] make overhead: ", enabled=verbose >= 1):
-        overhead = make_overhead(cropped_overhead, segment_mask, com, speaker)
+        overhead = make_overhead(cropped_overhead, segment_mask, com, is_empty_box, speaker)
         save(overhead, sample_dir / "outputs/05_overhead.png")
         symlink(sample_dir / "outputs/05_overhead.png", sample_dir / "overhead.png")
 
