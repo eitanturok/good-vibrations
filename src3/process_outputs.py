@@ -203,14 +203,14 @@ async def process_outputs(speaker: str, raw_overhead_path: Path, output_dir: Pat
             save({"com": com, "downsampled_com": downsampled_com}, output_dir / "04_com.jsonl")
 
     # symlink the shared artifacts in output_dir to the current sample_dir
-    for artifact in SHARED_ARTIFACTS: symlink(output_dir / artifact, sample_dir / f"processed_outputs/{artifact}")
+    for artifact in SHARED_ARTIFACTS: symlink(output_dir / artifact, sample_dir / f"outputs/{artifact}")
     symlink(output_dir / "y.npy", sample_dir / "y.npy")
 
     # make overhead image for the current sample
     with Timing("make overhead: ", enabled=verbose >= 1):
         overhead = make_overhead(cropped_overhead, segment_mask, com, speaker)
-        save(overhead, sample_dir / "processed_outputs/05_overhead.png")
-        symlink(sample_dir / "processed_outputs/05_overhead.png", sample_dir / "overhead.png")
+        save(overhead, sample_dir / "outputs/05_overhead.png")
+        symlink(sample_dir / "outputs/05_overhead.png", sample_dir / "overhead.png")
 
     # update tracking status
     time = datetime.now(timezone.utc).isoformat()

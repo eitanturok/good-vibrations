@@ -64,21 +64,24 @@ def recover_audio(fft: np.ndarray, n_samples:int, fs: float, audio_sr:int=22050,
 #***** 5 process fft (extract signal, normalize signal, tokenize)
 
 def _extract_signal(x: np.ndarray, signal_mode: str) -> np.ndarray:
-    if signal_mode == "magnitude": return np.abs(x)
+    # Cast to complex128 before abs/angle: np.abs on complex64 loses precision for large values
+    # because sqrt(re²+im²) is computed in float32; PyTorch promotes internally so we match it.
+    if signal_mode == "magnitude": return np.abs(x.astype(np.complex128))
     if signal_mode == "complex": return np.concatenate([x.real, x.imag], axis=-1)
-    if signal_mode == "mag_phase": return np.concatenate([np.abs(x), np.angle(x)], axis=-1)
+    if signal_mode == "mag_phase": return np.concatenate([np.abs(x.astype(np.complex128)), np.angle(x.astype(np.complex128))], axis=-1)
     raise ValueError(f"Unknown signal mode: {signal_mode}")
 
 def _normalize_fft(x: np.ndarray, normalize_mode: str, verbose:int=0) -> np.ndarray:
     if normalize_mode is None: return x
-    reduce_axes = (1, 2, 3)  # reduce over L, F, C; keep B
+    # Compute stats in float64 with ddof=1 to match PyTorch's std behavior
+    x64 = x.astype(np.float64)
     if normalize_mode == 'std-sample':
-        std = np.maximum(x.std(axis=reduce_axes, keepdims=True), 1e-8)
+        std = np.maximum(x64.std(axis=(1, 2, 3), ddof=1, keepdims=True), 1e-8).astype(np.float32)
         if verbose: print(f'Normalize {normalize_mode}\n{std.shape=}\n{std.squeeze()=}')
         return x / std
     if normalize_mode == 'z-sample':
-        mean = x.mean(axis=reduce_axes, keepdims=True)
-        std = np.maximum(x.std(axis=reduce_axes, keepdims=True), 1e-8)
+        mean = x64.mean(axis=(1, 2, 3), keepdims=True).astype(np.float32)
+        std = np.maximum(x64.std(axis=(1, 2, 3), ddof=1, keepdims=True), 1e-8).astype(np.float32)
         if verbose: print(f'Normalize {normalize_mode}\n{mean.shape=}\t{std.shape=}\n{mean.squeeze()=}\n{std.squeeze()=}')
         return (x - mean) / std
     raise ValueError(f"Unknown normalize mode: {normalize_mode}")
