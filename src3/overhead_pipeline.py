@@ -112,7 +112,7 @@ def center_of_mass(mask: Image.Image) -> tuple[float, float]:
 
 def make_overhead(overhead: Image.Image, segment_mask: Image.Image, com: tuple[float, float], is_empty_box:bool, speaker: str | None = None) -> Image.Image:
     # load lazily to not interefere with modal import
-    SPEAKER_IMG = Path(__file__).parent.parent / "assets" / "speakers" / "speaker.png"
+    SPEAKER_IMG = Path(__file__).parent.parent / "assets/speaker.png"
     # SPEAKER_POSITION = {'1000': (0, 0.5), '0100': (1/3, 0), '0010': (2/3,0), '0001': (1,0.5)} # assume bottom left corner is (0, 0)
     SPEAKER_POSITION = {3: (0, 0.5), 4: (1/3, 0), 5: (2/3,0), 6: (1,0.5)} # assume bottom left corner is (0, 0)
 
@@ -209,6 +209,7 @@ def process_overhead(raw_overhead: Image.Image, output_dir: Path, left: float = 
         downsampled_com = (-1, -1) if is_empty_box else center_of_mass(downsampled_segment_mask)
         save({"com": com, "downsampled_com": downsampled_com}, output_dir / "04_com.jsonl", do_save)
         append({'com_overhead': datetime.now(timezone.utc).isoformat()}, output_dir / 'times.jsonl', do_save)
+        if verbose >= 2: print(f"{com=}\n{downsampled_com=}")
 
     # update tracking status
     append([{"com": com}, {"downsampled_com": downsampled_com}], output_dir / "metadata.jsonl", do_save)

@@ -47,7 +47,7 @@ def load(path:Path|str, keys:list[str]|str|None=None, enabled:bool=True):
     if isinstance(path, str): path = Path(path)
     if path.suffix == '.wav':
         sample_rate, samples = wav_read(path)
-        return Audio(samples, rate=sample_rate)
+        return samples, sample_rate
     elif path.suffix == '.npy':
         with open(path, 'rb') as f: return np.load(f)
     elif path.suffix == '.npz':
@@ -169,9 +169,12 @@ def preview_box_coverage(box_coverage, sample_dir):
     ax.set(title=f"Box Coverage\n{n_objects} {obj} in {box} box ({shape[1]}×{shape[0]}, {len(box_coverage[key]['sample_ids'])} samples)", xlabel='x (downsampled pixel space)', ylabel='y (downsampled pixel space)')
     plt.show()
 
+def preview_audio(samples, sample_rate): return Audio(samples, rate=sample_rate)
+
 def preview(obj, mode):
     if mode == 'image': return preview_image(obj)
     if mode == 'vibration_image': return preview_vibration_image(obj)
     if mode == 'vibration_video': return preview_vibration_video(obj)
     if mode == 'box_coverage': return preview_box_coverage(*obj)
+    if mode == 'audio': return preview_audio(*obj)
     else: raise ValueError(f'{mode=} not recognized')
