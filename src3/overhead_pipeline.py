@@ -163,7 +163,7 @@ def make_overhead(overhead: Image.Image, segment_mask: Image.Image, com: tuple[f
 
 DEFAULT_PROMPT = "A black metal cube sitting on the floor of an open cardboard box from a bird's eye view."
 SHARED_ARTIFACTS = ["00_raw_overhead.png", "01_resized_overhead.png", "02_segment_mask.png", "03_downsampled_segment_mask.png", "04_com.jsonl", "y.npy"]
-COPIED_ARTIFACTS = ["times.jsonl", "data.jsonl"]
+COPIED_ARTIFACTS = ["times.jsonl", "metadata.jsonl"]
 
 def capture_overhead(overhead_cam, capture_image_fxn, output_dir:Path, verbose:int=1, do_save:bool=1) -> Image.Image:
     output_id = output_dir.name
@@ -211,7 +211,7 @@ def process_overhead(raw_overhead: Image.Image, output_dir: Path, left: float = 
         append({'com': datetime.now(timezone.utc).isoformat()}, output_dir / 'times.jsonl', do_save)
 
     # update tracking status
-    append([{"com": com}, {"downsampled_com": downsampled_com}], output_dir / "data.jsonl", do_save)
+    append([{"com": com}, {"downsampled_com": downsampled_com}], output_dir / "metadata.jsonl", do_save)
 
 def visualize_overhead(speaker, sample_dir:Path, output_dir:Path, is_empty_box:bool, verbose:int=1, do_save:bool=True) -> Image.Image:
     sample_id = sample_dir.name
@@ -225,6 +225,7 @@ def visualize_overhead(speaker, sample_dir:Path, output_dir:Path, is_empty_box:b
     # symlink the shared artifacts and copy the copied artifacts from output_dir to the current sample_dir
     for artifact in SHARED_ARTIFACTS: symlink(output_dir / artifact, sample_dir / f"{'' if artifact == 'y.npy' else 'outputs/'}{artifact}", do_save)
     for artifact in COPIED_ARTIFACTS: copy(output_dir / artifact, sample_dir / artifact, do_save)
+    append([{"sample_id": sample_id}, {"sample_dir": str(sample_dir)}], sample_dir / "metadata.jsonl", do_save)
 
     # make overhead image for the current sample
     with Timing(f"[sample {sample_id}] make overhead: ", enabled=verbose >= 2):
