@@ -1,4 +1,3 @@
-import json, shutil
 from pathlib import Path
 from datetime import datetime, timezone
 
@@ -85,13 +84,10 @@ def segment(image: Image.Image, prompt: str, is_empty_box: bool) -> Image.Image:
 def downsample(mask: Image.Image, out_h: int, out_w: int) -> Image.Image:
     arr = np.array(mask, dtype=np.float32) / 255.0  # (H, W) in {0, 1}
     H, W = arr.shape
-    # Pad with nan so H and W are divisible by out_h and out_w, enabling the reshape below.
-    # nan padding is excluded from nanmean, so border blocks are averaged over real pixels
-    # only — the denominator is never inflated by the padding.
-    ph, pw = (out_h - H % out_h) % out_h, (out_w - W % out_w) % out_w
-    arr = np.pad(arr, ((0, ph), (0, pw)), constant_values=np.nan)
-    H2, W2 = arr.shape
-    downsampled_mask = np.nanmean(arr.reshape(out_h, H2 // out_h, out_w, W2 // out_w), axis=(1, 3))
+    block_h, block_w = H // out_h, W // out_w
+    # Trim to exact multiples so the reshape is valid; loses at most (block_h-1) edge pixels.
+    arr = arr[:block_h * out_h, :block_w * out_w]
+    downsampled_mask = arr.reshape(out_h, block_h, out_w, block_w).mean(axis=(1, 3))
     return Image.fromarray((downsampled_mask * 255).astype(np.uint8), mode="L")
 
 #***** 4 center of mass *****
@@ -110,11 +106,12 @@ def center_of_mass(mask: Image.Image) -> tuple[float, float]:
 
 #***** 5 overhead image *****
 
-def make_overhead(overhead: Image.Image, segment_mask: Image.Image, com: tuple[float, float], is_empty_box:bool, speaker: str | None = None) -> Image.Image:
+def make_overhead(overhead: Image.Image, segment_mask: Image.Image, com: tuple[float, float], is_empty_box:bool, speaker: int | None = None) -> Image.Image:
     # load lazily to not interefere with modal import
     SPEAKER_IMG = Path(__file__).parent.parent / "assets/speaker.png"
     # SPEAKER_POSITION = {'1000': (0, 0.5), '0100': (1/3, 0), '0010': (2/3,0), '0001': (1,0.5)} # assume bottom left corner is (0, 0)
     SPEAKER_POSITION = {3: (0, 0.5), 4: (1/3, 0), 5: (2/3,0), 6: (1,0.5)} # assume bottom left corner is (0, 0)
+    SPEAKER_POSITION = {1: (1, 0), 2: (1, 0.7), 3: (0.8, 1), 4: (0.6, 1), 5: (0.4, 1), 6: (0.2, 1), 7: (0, 0.7), 8: (0,0)}
 
     overhead = overhead.convert("RGBA")
 
@@ -156,6 +153,16 @@ def make_overhead(overhead: Image.Image, segment_mask: Image.Image, com: tuple[f
     spk_cx = pad + int(x_frac * W)
     spk_cy = pad + int((1 - y_frac) * H)  # flip y: image y=0 is top, but our coords have y=0 at bottom
     canvas.paste(spk, (spk_cx - spk_w // 2, spk_cy - spk_h // 2), mask=spk)
+
+    # add speaker id
+    draw = ImageDraw.Draw(canvas)
+    font_size = spk_h // 2
+    try:
+        from PIL import ImageFont
+        font = ImageFont.truetype("arial.ttf", font_size)
+    except:
+        font = ImageFont.load_default()
+    draw.text((spk_cx, spk_cy), str(speaker), fill=(255, 255, 255, 255), font=font, anchor="mm")
 
     return canvas.convert("RGB")
 
@@ -209,7 +216,7 @@ def process_overhead(raw_overhead: Image.Image, output_dir: Path, left: float = 
         downsampled_com = (-1, -1) if is_empty_box else center_of_mass(downsampled_segment_mask)
         save({"com": com, "downsampled_com": downsampled_com}, output_dir / "04_com.jsonl", do_save)
         append({'com_overhead': datetime.now(timezone.utc).isoformat()}, output_dir / 'times.jsonl', do_save)
-        if verbose >= 2: print(f"{com=}\n{downsampled_com=}")
+        if verbose >= 2: print(f"[output {output_id}] {com=}\t{downsampled_com=}")
 
     # update tracking status
     append([{"com": com}, {"downsampled_com": downsampled_com}], output_dir / "metadata.jsonl", do_save)
@@ -233,10 +240,10 @@ def visualize_overhead(speaker, sample_dir:Path, output_dir:Path, is_empty_box:b
         overhead = make_overhead(resized_overhead, segment_mask, com, is_empty_box, speaker)
         save(overhead, sample_dir / "outputs/05_overhead.png")
         symlink(sample_dir / "outputs/05_overhead.png", sample_dir / "overhead.png")
-        time = datetime.now(timezone.utc).isoformat()
-        append({'visualize_overhead': time}, output_dir / 'times.jsonl', do_save)
+        timestamp = datetime.now(timezone.utc).isoformat()
+        append({f'visualize_overhead_{sample_id}': timestamp}, output_dir / 'times.jsonl', do_save)
 
     # update tracking status
-    append({"sample_id": sample_id, "sample_dir": str(sample_dir), "time": time}, output_dir / "samples.jsonl", do_save)
+    append({"sample_id": sample_id, "sample_dir": str(sample_dir), "time": timestamp}, output_dir / "samples.jsonl", do_save)
 
     return overhead

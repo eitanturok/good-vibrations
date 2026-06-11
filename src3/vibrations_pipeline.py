@@ -1,3 +1,4 @@
+import threading, time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -117,18 +118,62 @@ def capture_vibrations(cam, run_opt, speaker, play_audio_fxn, capture_n_frames_f
 
     # record vibrations
     with Timing(f"[sample {sample_id}] record vibrations: ", enabled=verbose >= 2):
-        play_audio_fxn(audio_path, speaker)
+        play_audio_fxn(audio_path, speaker, wait=False)
         n_frames = int(n_capture_seconds * run_opt['cam_params']['camera_FPS'])
         raw_vibrations, times = capture_n_frames_fxn(cam, n_frames, *cam.get_im_size()[::-1])
         if verbose >= 2: print(f'[sample {sample_id}] captured {n_frames} frames')
+        append({"capture_vibrations": datetime.now(timezone.utc).isoformat()}, sample_dir / "times.jsonl", do_save)
 
     # save vibrations
     with Timing(f"[sample {sample_id}] save vibrations: ", enabled=verbose >= 2):
         save(raw_vibrations, sample_dir / 'inputs/00_raw_vibrations.npy', do_save)
+        timestamp = datetime.now(timezone.utc).isoformat()
+        append({"save_vibrations": timestamp}, sample_dir / "times.jsonl", do_save)
 
     # update tracking status
-    time = datetime.now(timezone.utc).isoformat()
-    append({"sample_id": sample_id, "output_id": output_id, "time": time}, audio_path.parent / "samples.jsonl", do_save)
-    append({"capture_vibrations": time}, sample_dir / "times.jsonl", do_save)
+    append({"sample_id": sample_id, "output_id": output_id, "time": timestamp}, audio_path.parent / "samples.jsonl", do_save)
 
     return raw_vibrations
+
+def capture_vibrations_async(cam, run_opt, speaker, play_audio_fxn, capture_n_frames_fxn, audio_path, sample_dir, output_dir, n_capture_seconds=3.1, verbose=1, do_save=True):
+    """Like capture_vibrations but launches the numpy save in a background thread.
+
+    Returns (raw_vibrations, save_thread). Caller must join save_thread before
+    the experiment ends to guarantee the file is fully written.
+    """
+    # symlink the audio to the current sample_dir
+    sample_id, output_id = sample_dir.name, output_dir.name
+    symlink(audio_path, sample_dir / "audio.wav", do_save)
+
+    # with Timing(f"[sample {sample_id}] record vibrations: ", enabled=verbose >= 2):
+    #     play_audio_fxn(audio_path, speaker)
+    #     n_frames = int(n_capture_seconds * run_opt['cam_params']['camera_FPS'])
+    #     raw_vibrations, times = capture_n_frames_fxn(cam, n_frames, *cam.get_im_size()[::-1])
+    #     if verbose >= 2: print(f'[sample {sample_id}] captured {n_frames} frames')
+    #     append({"capture_vibrations": datetime.now(timezone.utc).isoformat()}, sample_dir / "times.jsonl", do_save)
+
+    with Timing(f"[sample {sample_id}] record vibrations: ", enabled=verbose >= 2):
+        t_start = time.perf_counter()
+        play_audio_fxn(audio_path, speaker, wait=False)
+        n_frames = int(n_capture_seconds * run_opt['cam_params']['camera_FPS'])
+        try:
+            raw_vibrations, _ = capture_n_frames_fxn(cam, n_frames, *cam.get_im_size()[::-1])
+            if verbose >= 2: print(f'[sample {sample_id}] captured {n_frames} frames')
+        finally:
+            # always wait for audio to finish — even if capture throws — so the next
+            # sample's play_audio call never overlaps with this one
+            remaining = n_capture_seconds - (time.perf_counter() - t_start)
+            if remaining > 0: time.sleep(remaining)
+
+    # launch numpy save in background; it will finish (~1600 ms) well within the next
+    # recording (~7700 ms), so the main loop never has to wait for it
+    npy_path = sample_dir / 'inputs/00_raw_vibrations.npy'
+    save_thread = threading.Thread(target=save, args=(raw_vibrations, npy_path, do_save), daemon=True)
+    save_thread.start()
+    if verbose >= 1: print(f"[sample {sample_id}] save raw_vibration to {npy_path}")
+
+    timestamp = datetime.now(timezone.utc).isoformat()
+    append({"save_vibrations": timestamp}, sample_dir / "times.jsonl", do_save)
+    append({"sample_id": sample_id, "output_id": output_id, "time": timestamp}, audio_path.parent / "samples.jsonl", do_save)
+
+    return raw_vibrations, save_thread

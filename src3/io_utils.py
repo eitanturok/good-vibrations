@@ -99,13 +99,10 @@ def symlink(src:Path|str, dst:Path|str, enabled:bool=True):
     if isinstance(src, str): src = Path(src)
     if isinstance(dst, str): dst = Path(dst)
     if not src.exists(): raise FileNotFoundError(f"Source file does not exist: {src}")
-    if not dst.exists(): dst.parent.mkdir(parents=True, exist_ok=True)
+    dst.parent.mkdir(parents=True, exist_ok=True)
     if dst.is_symlink() and dst.resolve() == src.resolve(): return
-    if dst.is_symlink(): dst.unlink()
-    try:
-        dst.symlink_to(src.resolve())
-    except OSError:
-        shutil.copy2(src, dst)
+    if dst.exists() or dst.is_symlink(): dst.unlink()
+    dst.symlink_to(src.resolve())
 
 def preview_image(image:np.ndarray):
     plt.figure(figsize=(12, 6))
