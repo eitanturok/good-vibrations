@@ -4,7 +4,7 @@ from pathlib import Path
 import numpy as np
 from scipy.signal import butter, resample, sosfiltfilt
 
-from io_utils import save, load, append, symlink, Timing, copy
+from io_utils import save, append, symlink, Timing
 
 MIN_FREQ, MAX_FREQ = 50, 1000
 
@@ -112,18 +112,23 @@ def process_fft(fft: np.ndarray, signal_mode:str='magnitude', normalize_mode:str
 def capture_vibrations(cam, run_opt, speaker, play_audio_fxn, capture_n_frames_fxn, audio_file:Path, sample_dir:Path, output_dir:Path, n_capture_seconds:float=3.1, verbose:int=1, do_save:bool=True):
     sample_id, output_id = sample_dir.name, output_dir.name
 
-    with Timing(f"[sample {sample_id}] record vibrations in "):
-        play_audio_fxn(audio_file, speaker)
-        n_frames = int(n_capture_seconds * run_opt['cam_params']['camera_FPS'])
-        frame_recording, times = capture_n_frames_fxn(cam, n_frames, *cam.get_im_size()[::-1])
-        if verbose >= 2: print(f'captured {n_frames} frames')
-
     # symlink audio to sample_dir
     symlink(audio_file, sample_dir / "audio.wav", do_save)
+
+    # record vibrations
+    with Timing(f"[sample {sample_id}] record vibrations: ", enabled=verbose >= 2):
+        play_audio_fxn(audio_file, speaker)
+        n_frames = int(n_capture_seconds * run_opt['cam_params']['camera_FPS'])
+        raw_vibrations, times = capture_n_frames_fxn(cam, n_frames, *cam.get_im_size()[::-1])
+        if verbose >= 2: print(f'[sample {sample_id}] captured {n_frames} frames')
+
+    # save vibrations
+    with Timing(f"[sample {sample_id}] save vibrations: ", enabled=verbose >= 2):
+        save(raw_vibrations, sample_dir / 'inputs/00_raw_vibrations.npy', do_save)
 
     # update tracking status
     time = datetime.now(timezone.utc).isoformat()
     append({"sample_id": sample_id, "output_id": output_id, "time": time}, audio_file.parent / "samples.jsonl", do_save)
     append({"capture_vibrations": time}, sample_dir / "times.jsonl", do_save)
 
-    return frame_recording
+    return raw_vibrations

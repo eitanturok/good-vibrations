@@ -170,11 +170,11 @@ def capture_overhead(overhead_cam, capture_image_fxn, output_dir:Path, verbose:i
 
     # capture overhead image
     import cv2
-    with Timing(f"[output {output_id}] capture overhead image: ", enabled=verbose >= 2):
+    with Timing(f"[output {output_id}] capture the overhead image: ", enabled=verbose >= 2):
         image, _ = capture_image_fxn(overhead_cam)
         image = Image.fromarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
         save(image, output_dir / "00_raw_overhead.png", do_save)
-        append({'capture': datetime.now(timezone.utc).isoformat()}, output_dir / 'times.jsonl', do_save)
+        append({'capture_overhead': datetime.now(timezone.utc).isoformat()}, output_dir / 'times.jsonl', do_save)
 
     return image
 
@@ -185,30 +185,30 @@ def process_overhead(raw_overhead: Image.Image, output_dir: Path, left: float = 
     if verbose >= 2: print(f"[output {output_id}] Box is {'not '*int(not is_empty_box)}empty")
 
     # resize image
-    with Timing(f"[output {output_id}] resize: ", enabled=verbose >= 2):
+    with Timing(f"[output {output_id}] resize the overhead image: ", enabled=verbose >= 2):
         resized_overhead = resize(raw_overhead, left, right, up, down, max_side)
         save(resized_overhead, output_dir / "01_resized_overhead.png", do_save)
-        append({'resize': datetime.now(timezone.utc).isoformat()}, output_dir / 'times.jsonl', do_save)
+        append({'resize_overhead': datetime.now(timezone.utc).isoformat()}, output_dir / 'times.jsonl', do_save)
 
     # segment mask on modal with SAM3
-    with Timing(f"[output {output_id}] segment: ", enabled=verbose >= 2):
+    with Timing(f"[output {output_id}] segment the overhead image: ", enabled=verbose >= 2):
         segment_mask = segment(resized_overhead, prompt, is_empty_box) # todo: make sync, not async
         save(segment_mask, output_dir / "02_segment_mask.png", do_save)
-        append({'segment': datetime.now(timezone.utc).isoformat()}, output_dir / 'times.jsonl', do_save)
+        append({'segment_overhead': datetime.now(timezone.utc).isoformat()}, output_dir / 'times.jsonl', do_save)
 
     # downsample
-    with Timing(f"[output {output_id}] downsample: ", enabled=verbose >= 2):
+    with Timing(f"[output {output_id}] downsample the overhead image: ", enabled=verbose >= 2):
         downsampled_segment_mask = downsample(segment_mask, out_h, out_w)
         save(downsampled_segment_mask, output_dir / "03_downsampled_segment_mask.png", do_save)
         save(np.array(downsampled_segment_mask, dtype=np.float32) / 255.0, output_dir / "y.npy", do_save)
-        append({'downsample': datetime.now(timezone.utc).isoformat()}, output_dir / 'times.jsonl', do_save)
+        append({'downsample_overhead': datetime.now(timezone.utc).isoformat()}, output_dir / 'times.jsonl', do_save)
 
     # center of mass
-    with Timing(f"[output {output_id}] center of mass: ", enabled=verbose >= 2):
+    with Timing(f"[output {output_id}] center of mass of the overhead image: ", enabled=verbose >= 2):
         com = (-1, -1) if is_empty_box else center_of_mass(segment_mask)
         downsampled_com = (-1, -1) if is_empty_box else center_of_mass(downsampled_segment_mask)
         save({"com": com, "downsampled_com": downsampled_com}, output_dir / "04_com.jsonl", do_save)
-        append({'com': datetime.now(timezone.utc).isoformat()}, output_dir / 'times.jsonl', do_save)
+        append({'com_overhead': datetime.now(timezone.utc).isoformat()}, output_dir / 'times.jsonl', do_save)
 
     # update tracking status
     append([{"com": com}, {"downsampled_com": downsampled_com}], output_dir / "metadata.jsonl", do_save)
@@ -227,13 +227,13 @@ def visualize_overhead(speaker, sample_dir:Path, output_dir:Path, is_empty_box:b
     for artifact in COPIED_ARTIFACTS: copy(output_dir / artifact, sample_dir / artifact, do_save)
     append([{"sample_id": sample_id}, {"sample_dir": str(sample_dir)}], sample_dir / "metadata.jsonl", do_save)
 
-    # make overhead image for the current sample
-    with Timing(f"[sample {sample_id}] make overhead: ", enabled=verbose >= 2):
+    # make viz of overhead image for the current sample
+    with Timing(f"[sample {sample_id}] make viz of the overhead image: ", enabled=verbose >= 2):
         overhead = make_overhead(resized_overhead, segment_mask, com, is_empty_box, speaker)
         save(overhead, sample_dir / "outputs/05_overhead.png")
         symlink(sample_dir / "outputs/05_overhead.png", sample_dir / "overhead.png")
         time = datetime.now(timezone.utc).isoformat()
-        append({'make_overhead': time}, output_dir / 'times.jsonl', do_save)
+        append({'visualize_overhead': time}, output_dir / 'times.jsonl', do_save)
 
     # update tracking status
     append({"sample_id": sample_id, "sample_dir": str(sample_dir), "time": time}, output_dir / "samples.jsonl", do_save)

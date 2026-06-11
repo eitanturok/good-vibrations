@@ -13,8 +13,10 @@ from scipy.io.wavfile import write as wav_write, read as wav_read
 
 
 class Timing(contextlib.ContextDecorator):
-    def __init__(self, prefix="", on_exit=None, enabled=True): self.prefix, self.on_exit, self.enabled = prefix, on_exit, enabled
-    def __enter__(self): self.st = time.perf_counter_ns()
+    def __init__(self, prefix="", enter="", on_exit=None, enabled=True): self.prefix, self.enter, self.on_exit, self.enabled = prefix, enter, on_exit, enabled
+    def __enter__(self):
+        self.st = time.perf_counter_ns()
+        if self.enabled and self.enter: print(self.enter)
     def __exit__(self, *exc):
         self.et = time.perf_counter_ns() - self.st
         if self.enabled: print(f"{self.prefix}{self.et*1e-6:6.2f} ms" + (self.on_exit(self.et) if self.on_exit else ""))
@@ -154,8 +156,22 @@ def preview_vibration_video(frame_recording):
     video_player       = videoPlayerv2(get_frame_func,N_frames,resize_factor=resize_factor)
     video_player.play_video(move_window=0,show_frame_number=show_frame_number)
 
+def get_box_coverage_key(metadata, mask): return (metadata['box'], metadata['object'], metadata['n_objects'], mask.shape)
+
+def preview_box_coverage(box_coverage, sample_dir):
+    metadata = {'sample_id': ''} if sample_dir is None else {k: v for d in load(sample_dir / "metadata.jsonl") for k, v in d.items()}
+    mask = np.array(load(sample_dir / "outputs/02_segment_mask.png"))
+    key = get_box_coverage_key(metadata, mask)
+    box, obj, n_objects, shape = key
+    fig, ax = plt.subplots()
+    im = ax.imshow(box_coverage[key]['mask'], cmap='Blues')
+    plt.colorbar(im, ax=ax)
+    ax.set(title=f"Box Coverage\n{n_objects} {obj} in {box} box ({shape[1]}×{shape[0]}, {len(box_coverage[key]['sample_ids'])} samples)", xlabel='x (downsampled pixel space)', ylabel='y (downsampled pixel space)')
+    plt.show()
+
 def preview(obj, mode):
     if mode == 'image': return preview_image(obj)
     if mode == 'vibration_image': return preview_vibration_image(obj)
     if mode == 'vibration_video': return preview_vibration_video(obj)
+    if mode == 'box_coverage': return preview_box_coverage(*obj)
     else: raise ValueError(f'{mode=} not recognized')

@@ -10,6 +10,7 @@ runs/
 tmp/
 data/
 data2/
+raw_vibrations.npy
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
