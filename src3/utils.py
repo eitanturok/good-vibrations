@@ -18,7 +18,8 @@ class Timing(contextlib.ContextDecorator):
         self.et = time.perf_counter_ns() - self.st
         if self.enabled: print(f"{self.prefix}{self.et*1e-6:6.2f} ms" + (self.on_exit(self.et) if self.on_exit else ""))
 
-def save(x, path:Path):
+def save(x, path:Path, enabled:bool=True):
+    if not enabled: return
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.suffix == '.wav':
         if not (isinstance(x, tuple) and len(x) == 2): raise ValueError("save to .wav requires a tuple of (samples, sample_rate)")
@@ -54,7 +55,8 @@ def load(path:Path, keys:list[str]|str|None=None):
         with open(path) as f: return [json.loads(line) for line in f]
     else: raise ValueError(f"Unsupported file type: {path.suffix}")
 
-def append(x, path:Path):
+def append(x, path:Path, enabled:bool=True):
+    if not enabled: return
     if path.suffix == '.wav':
         raise NotImplementedError("Appending to .wav files is not supported.")
     elif path.suffix == '.npy':
@@ -75,7 +77,15 @@ def append(x, path:Path):
                 f.write('\n')
     else: raise ValueError(f"Unsupported file type: {path.suffix}")
 
-def symlink(src:Path, dst:Path):
+def copy(src:Path, dst:Path, enabled:bool=True):
+    if not enabled: return
+    if not src.exists(): raise FileNotFoundError(f"Source path does not exist: {src}")
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    if src.is_dir(): shutil.copytree(src, dst, dirs_exist_ok=True)
+    else: shutil.copy2(src, dst)
+
+def symlink(src:Path, dst:Path, enabled:bool=True):
+    if not enabled: return
     if not src.exists(): raise FileNotFoundError(f"Source file does not exist: {src}")
     if not dst.exists(): dst.parent.mkdir(parents=True, exist_ok=True)
     if dst.is_symlink() and dst.resolve() == src.resolve(): return

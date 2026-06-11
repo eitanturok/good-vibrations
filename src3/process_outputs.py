@@ -3,10 +3,11 @@ from pathlib import Path
 from datetime import datetime, timezone
 
 import modal
+import cv2
 import numpy as np
 from PIL import Image, ImageDraw
 
-from src3.utils import save, load, append, symlink, Timing
+from src3.utils import save, load, append, symlink, Timing, copy
 
 #***** 1 resize *****
 
@@ -157,73 +158,192 @@ def make_overhead(overhead: Image.Image, segment_mask: Image.Image, com: tuple[f
 
 DEFAULT_PROMPT = "A black metal cube sitting on the floor of an open cardboard box from a bird's eye view."
 SHARED_ARTIFACTS = ["00_raw_overhead.png", "01_resized_overhead.png", "02_segment_mask.png", "03_downsampled_segment_mask.png", "04_com.jsonl", "y.npy"]
+COPIED_ARTIFACTS = ["times.jsonl", "data.jsonl"]
 
-async def process_outputs(speaker: str, raw_overhead_path: Path, output_dir: Path, sample_dir: Path, left: float = 0.15, right: float = 0.67, up: float = 0.08, down: float = 0.7, max_side:int=256,
-                          prompt: str = DEFAULT_PROMPT, out_h: int = 40, out_w: int = 20, verbose: int = 1, overwrite: bool = True, is_empty_box:bool|None=None, force:bool=False) -> Image.Image:
-    sample_id, output_id = sample_dir.name, output_dir.name
-    if verbose >= 1: print(f"[{sample_id}] Process Output {output_id}")
+def capture_overhead(overhead_cam, capture_image_fxn, output_dir:Path, verbose:int=1, do_save:bool=1) -> Image.Image:
+    output_id = output_dir.name
 
-    if is_empty_box is None: is_empty_box = 'empty' in prompt
-    if verbose >= 1: print(f"[{sample_id}] Box is {'not '*int(not is_empty_box)}empty")
+    # capture overhead image
+    with Timing(f"[{output_id}] capture overhead image: ", enabled=verbose >= 2):
+        image, _ = capture_image_fxn(overhead_cam)
+        image = Image.fromarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
+        save(image, output_dir / "00_raw_overhead.png", do_save)
+        append({'capture': datetime.now(timezone.utc).isoformat()}, output_dir / 'times.jsonl', do_save)
 
-    # check if we already processed this sample and maybe overwrite it
-    status_path = output_dir / "status.jsonl"
-    prior = next((line for line in load(status_path) if line.get("sample_id") == sample_id), None) if status_path.exists() else None
-    already_processed = (sample_dir.exists() and any(sample_dir.iterdir())) or prior is not None
-    if not force and already_processed:
-        if not overwrite:
-            raise ValueError(f"[{sample_id}] sample {sample_id} already processed at {prior.get('time') if prior else '?'} in {prior.get('sample_dir') if prior else sample_dir} — pass overwrite=True to redo")
-        if verbose >= 1: print(f"[{sample_id}] overwriting previous run")
-        if sample_dir.exists(): shutil.rmtree(sample_dir)
-        if prior is not None:
-            lines = [l for l in load(status_path) if l.get("sample_id") != sample_id]
-            status_path.write_text("".join(json.dumps(l) + "\n" for l in lines))
+    return image
 
-    # if shared artifacts already exist, skip recomputing them
-    if not force and all((output_dir / a).exists() for a in SHARED_ARTIFACTS):
-        with Timing(f"[{sample_id}] load cached artifacts: ", enabled=verbose >= 1):
-            resized_overhead = load(output_dir / "01_resized_overhead.png")
-            segment_mask = load(output_dir / "02_segment_mask.png")
-            com = load(output_dir / "04_com.jsonl")[0]['com']
-    else:
-        # resize
-        with Timing(f"[{sample_id}] resize: ", enabled=verbose >= 1):
-            resized_overhead = resize(load(raw_overhead_path), left, right, up, down, max_side)
-            save(resized_overhead, output_dir / "01_resized_overhead.png")
+def process_overhead(raw_overhead: Image.Image, output_dir: Path, left: float = 0.15, right: float = 0.67, up: float = 0.08, down: float = 0.7, max_side:int=256,
+                      prompt: str = DEFAULT_PROMPT, out_h: int = 40, out_w: int = 20, is_empty_box:bool=False, verbose: int = 1, do_save:bool=1):
+    output_id = output_dir.name
 
-        # segment mask on modal with SAM3
-        with Timing(f"[{sample_id}] segment: ", enabled=verbose >= 1):
-            segment_mask = await segment(resized_overhead, prompt, is_empty_box)
-            save(segment_mask, output_dir / "02_segment_mask.png")
+    if verbose >= 2: print(f"[{output_id}] Box is {'not '*int(not is_empty_box)}empty")
 
-        # downsample
-        with Timing(f"[{sample_id}] downsample: ", enabled=verbose >= 1):
-            downsampled_segment_mask = downsample(segment_mask, out_h, out_w)
-            save(downsampled_segment_mask, output_dir / "03_downsampled_segment_mask.png")
-            save(np.array(downsampled_segment_mask, dtype=np.float32) / 255.0, output_dir / "y.npy")
+    # resize image
+    with Timing(f"[{output_id}] resize: ", enabled=verbose >= 2):
+        resized_overhead = resize(raw_overhead, left, right, up, down, max_side)
+        save(resized_overhead, output_dir / "01_resized_overhead.png", do_save)
+        append({'resize': datetime.now(timezone.utc).isoformat()}, output_dir / 'times.jsonl', do_save)
 
-        # center of mass
-        with Timing(f"[{sample_id}] center of mass: ", enabled=verbose >= 1):
-            com = (-1, -1) if is_empty_box else center_of_mass(segment_mask)
-            downsampled_com = (-1, -1) if is_empty_box else center_of_mass(downsampled_segment_mask)
-            save({"com": com, "downsampled_com": downsampled_com}, output_dir / "04_com.jsonl")
+    # segment mask on modal with SAM3
+    with Timing(f"[{output_id}] segment: ", enabled=verbose >= 2):
+        segment_mask = await segment(resized_overhead, prompt, is_empty_box) # todo: make sync, not async
+        save(segment_mask, output_dir / "02_segment_mask.png", do_save)
+        append({'segment': datetime.now(timezone.utc).isoformat()}, output_dir / 'times.jsonl', do_save)
 
-    # symlink the shared artifacts in output_dir to the current sample_dir
-    for artifact in SHARED_ARTIFACTS: symlink(output_dir / artifact, sample_dir / f"outputs/{artifact}")
-    symlink(output_dir / "y.npy", sample_dir / "y.npy")
+    # downsample
+    with Timing(f"[{output_id}] downsample: ", enabled=verbose >= 2):
+        downsampled_segment_mask = downsample(segment_mask, out_h, out_w)
+        save(downsampled_segment_mask, output_dir / "03_downsampled_segment_mask.png", do_save)
+        save(np.array(downsampled_segment_mask, dtype=np.float32) / 255.0, output_dir / "y.npy", do_save)
+        append({'downsample': datetime.now(timezone.utc).isoformat()}, output_dir / 'times.jsonl', do_save)
+
+    # center of mass
+    with Timing(f"[{output_id}] center of mass: ", enabled=verbose >= 2):
+        com = (-1, -1) if is_empty_box else center_of_mass(segment_mask)
+        downsampled_com = (-1, -1) if is_empty_box else center_of_mass(downsampled_segment_mask)
+        save({"com": com, "downsampled_com": downsampled_com}, output_dir / "04_com.jsonl", do_save)
+        append({'com': datetime.now(timezone.utc).isoformat()}, output_dir / 'times.jsonl', do_save)
+
+    # update tracking status
+    append([{"com": com}, {"downsampled_com": downsampled_com}], output_dir / "data.jsonl", do_save)
+
+def visualize_overhead(speaker, sample_dir:Path, output_dir:Path, is_empty_box:bool, verbose:int=1, do_save:bool=True) -> Image.Image:
+    sample_id = sample_dir.name
+    assert all((output_dir / a).exists() for a in SHARED_ARTIFACTS+COPIED_ARTIFACTS), f"[{sample_id}] Missing shared or copied artifact"
+
+    with Timing(f"[{sample_id}] load cached artifacts: ", enabled=verbose >= 2):
+        resized_overhead = load(output_dir / "01_resized_overhead.png")
+        segment_mask = load(output_dir / "02_segment_mask.png")
+        com = load(output_dir / "04_com.jsonl")[0]['com']
+
+    # symlink the shared artifacts and copy the copied artifacts from output_dir to the current sample_dir
+    for artifact in SHARED_ARTIFACTS: symlink(output_dir / artifact, sample_dir / f"{'' if artifact == 'y.npy' else 'outputs/'}{artifact}", do_save)
+    for artifact in COPIED_ARTIFACTS: copy(output_dir / artifact, sample_dir / artifact, do_save)
 
     # make overhead image for the current sample
-    with Timing(f"[{sample_id}] make overhead: ", enabled=verbose >= 1):
+    with Timing(f"[{sample_id}] make overhead: ", enabled=verbose >= 2):
         overhead = make_overhead(resized_overhead, segment_mask, com, is_empty_box, speaker)
         save(overhead, sample_dir / "outputs/05_overhead.png")
         symlink(sample_dir / "outputs/05_overhead.png", sample_dir / "overhead.png")
+        time = datetime.now(timezone.utc).isoformat()
+        append({'make_overhead': time}, output_dir / 'times.jsonl', do_save)
+
+    # update tracking status
+    append({"sample_id": sample_id, "sample_dir": str(sample_dir), "time": time}, output_dir / "samples.jsonl", do_save)
+
+    # show image
+    if verbose >= 1: preview_image(overhead)
+    return overhead
+
+def capture_vibrations(cam, run_opt, speakers, audio_file:Path, sample_dir:Path, output_dir:Path, verbose:int=1, do_save:bool=True):
+    sample_id, output_id = sample_dir.name, output_dir.name
+
+    with Timing(f"[{sample_id}] record vibrations in "):
+        play_audio(str(audio_file), speakers)
+        n_frames = int(N_CAPTURE_SECONDS * run_opt['cam_params']['camera_FPS'])
+        frame_recording, times = capture_N_frames(cam, n_frames, *cam.get_im_size()[::-1])
+        if verbose >= 2: print(f'captured {n_frames} frames')
+        if verbose >= 1: preview_speckle_shift_image(frame_recording)
+        if verbose >= 3: preview_speckle_shift_video(frame_recording)
+
+    # symlink audio to sample_dir
+    symlink(audio_file, sample_dir / "audio.wav", do_save)
 
     # update tracking status
     time = datetime.now(timezone.utc).isoformat()
-    append({"sample_id": sample_id, "sample_dir": str(sample_dir), "time": time}, output_dir / "samples.jsonl")
-    append({"processed_outputs_time": time}, sample_dir / "time.jsonl")
-    append([{"output_id": output_id}, {"output_dir": str(output_dir)}], sample_dir / "data.jsonl")
+    append({"sample_id": sample_id, "output_id": output_id, "time": time}, audio_file.parent / "samples.jsonl", do_save)
+    append({"capture_vibrations": time}, sample_dir / "times.jsonl", do_save)
 
-    return overhead
+    return frame_recording
+
+def run_experiment(object, n_objects, prompt, crop_params, box, description, cam, run_opt, overhead_cam, verbose:int=1, do_save:bool=True):
+
+    output_id = make_id(BASE_OUTPUT_DIR)
+    output_dir = BASE_OUTPUT_DIR / output_id
+    is_empty_box = n_objects == 0
+    metadata = dict(output_id=output_id, output_dir=str(output_dir), audio=str(AUDIO_FILE), is_empty_box=is_empty_box,
+                    object=object, n_objects=n_objects, box=box, prompt=prompt, description=description, **crop_params}
+    append([{k:v} for k, v in metadata.items()], output_dir / 'data.jsonl', do_save)
+
+    # capture and segment overhead image
+    raw_overhead = capture_overhead(overhead_cam, capture_image, output_dir, do_save=do_save)
+    process_overhead(raw_overhead, output_dir, **crop_params, prompt=prompt, is_empty_box=is_empty_box, verbose=verbose, do_save=do_save)
+
+    # speaker for loop
+    speaker = 3
+    sample_id  = make_id(BASE_SAMPLE_DIR)
+    sample_dir = BASE_SAMPLE_DIR / sample_id
+    overhead = visualize_overhead(speaker, sample_dir, output_dir, is_empty_box, verbose, do_save=do_save)
+    raw_vibrations = capture_vibrations(cam, run_opt, speaker, AUDIO_FILE, sample_dir, output_dir, verbose, do_save)
+    process_vibrations(raw_vibrations) # launch pckl
+    return
+
+# async def process_outputs(speaker: str, raw_overhead_path: Path, output_dir: Path, sample_dir: Path, left: float = 0.15, right: float = 0.67, up: float = 0.08, down: float = 0.7, max_side:int=256,
+#                           prompt: str = DEFAULT_PROMPT, out_h: int = 40, out_w: int = 20, verbose: int = 1, overwrite: bool = True, is_empty_box:bool|None=None, force:bool=False) -> Image.Image:
+#     sample_id, output_id = sample_dir.name, output_dir.name
+#     if verbose >= 1: print(f"[{sample_id}] Process Output {output_id}")
+
+#     if is_empty_box is None: is_empty_box = 'empty' in prompt
+#     if verbose >= 1: print(f"[{sample_id}] Box is {'not '*int(not is_empty_box)}empty")
+
+#     # check if we already processed this sample and maybe overwrite it
+#     status_path = output_dir / "status.jsonl"
+#     prior = next((line for line in load(status_path) if line.get("sample_id") == sample_id), None) if status_path.exists() else None
+#     already_processed = (sample_dir.exists() and any(sample_dir.iterdir())) or prior is not None
+#     if not force and already_processed:
+#         if not overwrite:
+#             raise ValueError(f"[{sample_id}] sample {sample_id} already processed at {prior.get('time') if prior else '?'} in {prior.get('sample_dir') if prior else sample_dir} — pass overwrite=True to redo")
+#         if verbose >= 1: print(f"[{sample_id}] overwriting previous run")
+#         if sample_dir.exists(): shutil.rmtree(sample_dir)
+#         if prior is not None:
+#             lines = [l for l in load(status_path) if l.get("sample_id") != sample_id]
+#             status_path.write_text("".join(json.dumps(l) + "\n" for l in lines))
+
+#     # if shared artifacts already exist, skip recomputing them
+#     if not force and all((output_dir / a).exists() for a in SHARED_ARTIFACTS):
+#         with Timing(f"[{sample_id}] load cached artifacts: ", enabled=verbose >= 1):
+#             resized_overhead = load(output_dir / "01_resized_overhead.png")
+#             segment_mask = load(output_dir / "02_segment_mask.png")
+#             com = load(output_dir / "04_com.jsonl")[0]['com']
+#     else:
+#         # resize
+#         with Timing(f"[{sample_id}] resize: ", enabled=verbose >= 1):
+#             resized_overhead = resize(load(raw_overhead_path), left, right, up, down, max_side)
+#             save(resized_overhead, output_dir / "01_resized_overhead.png")
+
+#         # segment mask on modal with SAM3
+#         with Timing(f"[{sample_id}] segment: ", enabled=verbose >= 1):
+#             segment_mask = await segment(resized_overhead, prompt, is_empty_box)
+#             save(segment_mask, output_dir / "02_segment_mask.png")
+
+#         # downsample
+#         with Timing(f"[{sample_id}] downsample: ", enabled=verbose >= 1):
+#             downsampled_segment_mask = downsample(segment_mask, out_h, out_w)
+#             save(downsampled_segment_mask, output_dir / "03_downsampled_segment_mask.png")
+#             save(np.array(downsampled_segment_mask, dtype=np.float32) / 255.0, output_dir / "y.npy")
+
+#         # center of mass
+#         with Timing(f"[{sample_id}] center of mass: ", enabled=verbose >= 1):
+#             com = (-1, -1) if is_empty_box else center_of_mass(segment_mask)
+#             downsampled_com = (-1, -1) if is_empty_box else center_of_mass(downsampled_segment_mask)
+#             save({"com": com, "downsampled_com": downsampled_com}, output_dir / "04_com.jsonl")
+
+#     # symlink the shared artifacts in output_dir to the current sample_dir
+#     for artifact in SHARED_ARTIFACTS: symlink(output_dir / artifact, sample_dir / f"outputs/{artifact}")
+#     symlink(output_dir / "y.npy", sample_dir / "y.npy")
+
+#     # make overhead image for the current sample
+#     with Timing(f"[{sample_id}] make overhead: ", enabled=verbose >= 1):
+#         overhead = make_overhead(resized_overhead, segment_mask, com, is_empty_box, speaker)
+#         save(overhead, sample_dir / "outputs/05_overhead.png")
+#         symlink(sample_dir / "outputs/05_overhead.png", sample_dir / "overhead.png")
+
+#     # update tracking status
+#     time = datetime.now(timezone.utc).isoformat()
+#     append({"sample_id": sample_id, "sample_dir": str(sample_dir), "time": time}, output_dir / "samples.jsonl")
+#     append({"processed_outputs_time": time}, sample_dir / "times.jsonl")
+#     append([{"output_id": output_id}, {"output_dir": str(output_dir)}], sample_dir / "data.jsonl")
+
+#     return overhead
 
 
