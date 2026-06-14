@@ -188,7 +188,6 @@ def capture_overhead(overhead_cam, capture_image_fxn, output_dir:Path, verbose:i
 def process_overhead(raw_overhead: Image.Image, output_dir: Path, left: float = 0.15, right: float = 0.67, up: float = 0.08, down: float = 0.7, max_side:int=256,
                       prompt: str = DEFAULT_PROMPT, out_h: int = 40, out_w: int = 20, is_empty_box:bool=False, verbose: int = 1, do_save:bool=True):
     output_id = output_dir.name
-
     if verbose >= 2: print(f"[output {output_id}] Box is {'not '*int(not is_empty_box)}empty")
 
     # resize image
@@ -216,34 +215,31 @@ def process_overhead(raw_overhead: Image.Image, output_dir: Path, left: float = 
         downsampled_com = (-1, -1) if is_empty_box else center_of_mass(downsampled_segment_mask)
         save({"com": com, "downsampled_com": downsampled_com}, output_dir / "04_com.jsonl", do_save)
         append({'com_overhead': datetime.now(timezone.utc).isoformat()}, output_dir / 'times.jsonl', do_save)
+        append([{"com": com}, {"downsampled_com": downsampled_com}], output_dir / "metadata.jsonl", do_save)
         if verbose >= 2: print(f"[output {output_id}] {com=}\t{downsampled_com=}")
-
-    # update tracking status
-    append([{"com": com}, {"downsampled_com": downsampled_com}], output_dir / "metadata.jsonl", do_save)
 
 def visualize_overhead(speaker, sample_dir:Path, output_dir:Path, is_empty_box:bool, verbose:int=1, do_save:bool=True) -> Image.Image:
     sample_id = sample_dir.name
-    assert all((output_dir / a).exists() for a in SHARED_ARTIFACTS+COPIED_ARTIFACTS), f"[sample {sample_id}] Missing shared or copied artifact"
-
-    with Timing(f"[sample {sample_id}] load cached artifacts: ", enabled=verbose >= 2):
-        resized_overhead = load(output_dir / "01_resized_overhead.png")
-        segment_mask = load(output_dir / "02_segment_mask.png")
-        com = load(output_dir / "04_com.jsonl")[0]['com']
 
     # symlink the shared artifacts and copy the copied artifacts from output_dir to the current sample_dir
-    for artifact in SHARED_ARTIFACTS: symlink(output_dir / artifact, sample_dir / f"{'' if artifact == 'y.npy' else 'outputs/'}{artifact}", do_save)
-    for artifact in COPIED_ARTIFACTS: copy(output_dir / artifact, sample_dir / artifact, do_save)
-    append([{"sample_id": sample_id}, {"sample_dir": str(sample_dir)}], sample_dir / "metadata.jsonl", do_save)
+    with Timing(f"[sample {sample_id}] symlink artifacts: ", enabled=verbose >= 2):
+        assert all((output_dir / a).exists() for a in SHARED_ARTIFACTS+COPIED_ARTIFACTS), f"[sample {sample_id}] Missing shared or copied artifact"
+        for artifact in SHARED_ARTIFACTS: symlink(output_dir / artifact, sample_dir / f"{'' if artifact == 'y.npy' else 'outputs/'}{artifact}", do_save)
+        for artifact in COPIED_ARTIFACTS: copy(output_dir / artifact, sample_dir / artifact, do_save)
+        append([{"sample_id": sample_id}, {"sample_dir": str(sample_dir)}], sample_dir / "metadata.jsonl", do_save)
 
     # make viz of overhead image for the current sample
     with Timing(f"[sample {sample_id}] make viz of the overhead image: ", enabled=verbose >= 2):
+        resized_overhead = load(sample_dir / "01_resized_overhead.png")
+        segment_mask = load(sample_dir / "02_segment_mask.png")
+        com = load(sample_dir / "04_com.jsonl")[0]['com']
+
         overhead = make_overhead(resized_overhead, segment_mask, com, is_empty_box, speaker)
         save(overhead, sample_dir / "outputs/05_overhead.png")
         symlink(sample_dir / "outputs/05_overhead.png", sample_dir / "overhead.png")
+
         timestamp = datetime.now(timezone.utc).isoformat()
         append({f'visualize_overhead_{sample_id}': timestamp}, output_dir / 'times.jsonl', do_save)
-
-    # update tracking status
-    append({"sample_id": sample_id, "sample_dir": str(sample_dir), "time": timestamp}, output_dir / "samples.jsonl", do_save)
+        append({"sample_id": sample_id, "sample_dir": str(sample_dir), "time": timestamp}, output_dir / "samples.jsonl", do_save)
 
     return overhead

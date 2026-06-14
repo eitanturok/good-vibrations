@@ -165,8 +165,7 @@ def capture_vibrations_async(cam, run_opt, speaker, play_audio_fxn, capture_n_fr
             remaining = n_capture_seconds - (time.perf_counter() - t_start)
             if remaining > 0: time.sleep(remaining)
 
-    # launch numpy save in background; it will finish (~1600 ms) well within the next
-    # recording (~7700 ms), so the main loop never has to wait for it
+    # launch numpy save in background so the main loop never has to wait for it
     npy_path = sample_dir / 'inputs/00_raw_vibrations.npy'
     save_thread = threading.Thread(target=save, args=(raw_vibrations, npy_path, do_save), daemon=True)
     save_thread.start()
