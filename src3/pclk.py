@@ -171,7 +171,7 @@ def compute_shifts_for_all_rois_batched(videos, batch_size):
         # warp image2 using warp_roll per ROI — identical to pclk_old.py
         aligned = cp.empty_like(image2)                               # (L, n_pairs, H, W)
         for l in range(L):
-            aligned[l] = warp_roll(clip[l], -shifts_PC[l])[1:]
+            aligned[l] = warp_roll(clip[l], -cp.round(shifts_PC[l]).astype(cp.int32))[1:]
         del clip
 
         # Lucas-Kanade with 3 iterations and re-warp
