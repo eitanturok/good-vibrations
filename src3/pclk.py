@@ -167,21 +167,12 @@ def compute_shifts_for_all_rois_batched(videos, batch_size):
 
         # Lucas-Kanade refinement — per-ROI, vectorised across L and n_pairs
         image1, image2 = clip[:, :-1], clip[:, 1:]
-        del clip
 
-        # warp image2 by integer PC shift via cp.roll — matches pclk_old.py warp_roll exactly
-        shifts_PC_int = cp.round(shifts_PC).astype(cp.int32)         # (L, n_pairs, 2)
-        shifts_PC_int_np = cp.asnumpy(shifts_PC_int)                 # pull to CPU for indexing
+        # warp image2 using warp_roll per ROI — identical to pclk_old.py
         aligned = cp.empty_like(image2)                               # (L, n_pairs, H, W)
-        for j in range(n_pairs):
-            # group frames by their (dx, dy) shift to batch cp.roll calls
-            dx_arr = shifts_PC_int_np[:, j, 0]   # (L,) ints on CPU
-            dy_arr = shifts_PC_int_np[:, j, 1]
-            # find unique (dx,dy) pairs and roll each group together
-            unique_shifts = set(zip(dx_arr.tolist(), dy_arr.tolist()))
-            for (dx, dy) in unique_shifts:
-                mask = cp.asarray((dx_arr == dx) & (dy_arr == dy))   # (L,) bool
-                aligned[mask, j] = cp.roll(image2[mask, j], shift=(dy, dx), axis=(-2, -1))
+        for l in range(L):
+            aligned[l] = warp_roll(clip[l], -shifts_PC[l])[1:]
+        del clip
 
         # Lucas-Kanade with 3 iterations and re-warp
         shifts_LK = cp.zeros((L, n_pairs, 2), dtype=cp.float32)
