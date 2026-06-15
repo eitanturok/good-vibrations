@@ -218,7 +218,7 @@ def process_overhead(raw_overhead: Image.Image, output_dir: Path, left: float = 
         append([{"com": com}, {"downsampled_com": downsampled_com}], output_dir / "metadata.jsonl", do_save)
         if verbose >= 2: print(f"[output {output_id}] {com=}\t{downsampled_com=}")
 
-def visualize_overhead(speaker, sample_dir:Path, output_dir:Path, is_empty_box:bool, verbose:int=1, do_save:bool=True) -> Image.Image:
+def output2sample(sample_dir:Path, output_dir:Path, verbose:int=1, do_save:bool=True):
     sample_id = sample_dir.name
 
     # symlink the shared+copy artifacts from output_dir to the current sample_dir
@@ -226,7 +226,10 @@ def visualize_overhead(speaker, sample_dir:Path, output_dir:Path, is_empty_box:b
         assert all((output_dir / a).exists() for a in SHARED_ARTIFACTS+COPIED_ARTIFACTS), f"[sample {sample_id}] Missing shared or copied artifact"
         for artifact in SHARED_ARTIFACTS: symlink(output_dir / artifact, sample_dir / f"{'' if artifact == 'y.npy' else 'outputs/'}{artifact}", do_save)
         for artifact in COPIED_ARTIFACTS: copy(output_dir / artifact, sample_dir / artifact, do_save)
-        append([{"sample_id": sample_id}, {"sample_dir": str(sample_dir)}], sample_dir / "metadata.jsonl", do_save)
+        append([{"sample_id": sample_id}, {"sample_dir": sample_dir}], sample_dir / "metadata.jsonl", do_save)
+
+def visualize_overhead(speaker, sample_dir:Path, output_dir:Path, is_empty_box:bool, verbose:int=1, do_save:bool=True) -> Image.Image:
+    sample_id = sample_dir.name
 
     # make viz of overhead image for the current sample
     with Timing(f"[sample {sample_id}] make viz of the overhead image: ", enabled=verbose >= 2):
@@ -240,6 +243,6 @@ def visualize_overhead(speaker, sample_dir:Path, output_dir:Path, is_empty_box:b
 
         timestamp = datetime.now(timezone.utc).isoformat()
         append({f'visualize_overhead_{sample_id}': timestamp}, output_dir / 'times.jsonl', do_save)
-        append({"sample_id": sample_id, "sample_dir": str(sample_dir), "time": timestamp}, output_dir / "samples.jsonl", do_save)
+        append({"sample_id": sample_id, "sample_dir": sample_dir, "time": timestamp}, output_dir / "samples.jsonl", do_save)
 
     return overhead

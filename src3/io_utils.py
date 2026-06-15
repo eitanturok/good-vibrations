@@ -1,5 +1,6 @@
 
 import contextlib
+import os
 import time
 from pathlib import Path
 import json
@@ -11,6 +12,7 @@ from PIL import Image
 from IPython.display import Audio
 from scipy.io.wavfile import write as wav_write, read as wav_read
 
+#***** timing *****
 
 class Timing(contextlib.ContextDecorator):
     def __init__(self, prefix="", enter="", on_exit=None, enabled=True): self.prefix, self.enter, self.on_exit, self.enabled = prefix, enter, on_exit, enabled
@@ -20,6 +22,15 @@ class Timing(contextlib.ContextDecorator):
     def __exit__(self, *exc):
         self.et = time.perf_counter_ns() - self.st
         if self.enabled: print(f"{self.prefix}{self.et*1e-6:6.2f} ms" + (self.on_exit(self.et) if self.on_exit else ""))
+
+#***** file helpers *****
+
+def paths_to_str(x):
+    if isinstance(x, os.PathLike): return str(x)
+    if isinstance(x, dict): return {paths_to_str(k): paths_to_str(v) for k, v in x.items()}
+    if isinstance(x, list): return [paths_to_str(i) for i in x]
+    if isinstance(x, tuple): return tuple(paths_to_str(i) for i in x)
+    return x
 
 def save(x, path:Path, enabled:bool=True):
     if not enabled: return
@@ -38,7 +49,7 @@ def save(x, path:Path, enabled:bool=True):
         if isinstance(x, dict): x = [x]
         with open(path, 'w') as f:
             for i in x:
-                json.dump(i, f)
+                json.dump(paths_to_str(i), f)
                 f.write('\n')
     else: raise ValueError(f"Unsupported data type: {type(x)}")
 
@@ -81,7 +92,7 @@ def append(x, path:Path|str, enabled:bool=True):
         if isinstance(x, dict): x = [x]
         with open(path, 'a') as f:
             for i in x:
-                json.dump(i, f)
+                json.dump(paths_to_str(i), f)
                 f.write('\n')
     else: raise ValueError(f"Unsupported file type: {path.suffix}")
 
@@ -103,6 +114,8 @@ def symlink(src:Path|str, dst:Path|str, enabled:bool=True):
     if dst.is_symlink() and dst.resolve() == src.resolve(): return
     if dst.exists() or dst.is_symlink(): dst.unlink()
     dst.symlink_to(src.resolve())
+
+#***** preview helpers *****
 
 def preview_image(image:np.ndarray):
     plt.figure(figsize=(12, 6))
