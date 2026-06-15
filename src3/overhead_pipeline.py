@@ -221,7 +221,7 @@ def process_overhead(raw_overhead: Image.Image, output_dir: Path, left: float = 
 def visualize_overhead(speaker, sample_dir:Path, output_dir:Path, is_empty_box:bool, verbose:int=1, do_save:bool=True) -> Image.Image:
     sample_id = sample_dir.name
 
-    # symlink the shared artifacts and copy the copied artifacts from output_dir to the current sample_dir
+    # symlink the shared+copy artifacts from output_dir to the current sample_dir
     with Timing(f"[sample {sample_id}] symlink artifacts: ", enabled=verbose >= 2):
         assert all((output_dir / a).exists() for a in SHARED_ARTIFACTS+COPIED_ARTIFACTS), f"[sample {sample_id}] Missing shared or copied artifact"
         for artifact in SHARED_ARTIFACTS: symlink(output_dir / artifact, sample_dir / f"{'' if artifact == 'y.npy' else 'outputs/'}{artifact}", do_save)
@@ -230,9 +230,9 @@ def visualize_overhead(speaker, sample_dir:Path, output_dir:Path, is_empty_box:b
 
     # make viz of overhead image for the current sample
     with Timing(f"[sample {sample_id}] make viz of the overhead image: ", enabled=verbose >= 2):
-        resized_overhead = load(sample_dir / "01_resized_overhead.png")
-        segment_mask = load(sample_dir / "02_segment_mask.png")
-        com = load(sample_dir / "04_com.jsonl")[0]['com']
+        resized_overhead = load(sample_dir / "outputs/01_resized_overhead.png")
+        segment_mask = load(sample_dir / "outputs/02_segment_mask.png")
+        com = load(sample_dir / "outputs/04_com.jsonl")[0]['com']
 
         overhead = make_overhead(resized_overhead, segment_mask, com, is_empty_box, speaker)
         save(overhead, sample_dir / "outputs/05_overhead.png")
