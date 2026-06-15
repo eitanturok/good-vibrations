@@ -1,25 +1,6 @@
-"""
-Modal app for running PCLK+ (phase correlation + Lucas-Kanade) shift recovery.
-
-Usage:
-    modal run src3/pclk_modal.py --input-path experiment-20/data/samples/000000/inputs/00_raw_vibrations.npy --metadata-path experiment-20/data/samples/000000/metadata.jsonl --output-path experiment-20/data/samples/000000/inputs/01_raw_shifts.npy
-"""
-
-import modal
 import numpy as np
-from pathlib import Path
 
-app = modal.App("pclk")
-
-volume = modal.Volume.from_name("pclk-data", create_if_missing=True)
-VOLUME_PATH = Path("/data")
-
-cuda_image = (
-    modal.Image.from_registry("nvidia/cuda:12.2.2-cudnn8-devel-ubuntu22.04", add_python="3.11")
-    .pip_install("cupy-cuda12x", "numpy", "tqdm")
-)
-
-# ── PCLK helpers ──────────────────────────────────────────────────────────────
+#***** PCLK algorithm *****
 # cupy is only available inside Modal, so these are imported lazily inside each fn.
 
 def get_pad_size(w):
@@ -116,12 +97,11 @@ def find_frame_translation_PCLKi_cupy(video, iterations=3):
 
 def compute_shifts_for_roi(video, batch_size):
     import cupy as cp
-    import tqdm
     n_ref_frames            = video.shape[0]
     all_reference_shifts    = cp.empty((n_ref_frames, 2), dtype=cp.float32)
     all_reference_shifts[0] = cp.array([0, 0], dtype=cp.float32)
     N_batches = int(np.ceil((n_ref_frames - 1) / batch_size))
-    for i in tqdm.tqdm(range(N_batches)):
+    for i in range(N_batches):
         start = i * batch_size
         end   = min((i + 1) * batch_size, n_ref_frames - 1)
         batch_shifts = find_frame_translation_PCLKi_cupy(video[start : end + 2])
@@ -129,95 +109,85 @@ def compute_shifts_for_roi(video, batch_size):
     return cp.asnumpy(cp.cumsum(all_reference_shifts, axis=0))
 
 
-@app.function(
-    gpu="L40S",
-    image=cuda_image,
-    timeout=3600,
-    volumes={VOLUME_PATH: volume},
-)
-def run_pclk(
-    input_path: str,
-    rois: list[list[int]],
-    output_path: str,
-    batch_size: int = 16384,
-):
-    """
+def compute_shifts_for_all_rois_batched(videos, batch_size):
+    """Process all ROIs in parallel on the GPU.
+
     Args:
-        input_path:  path inside the volume to 00_raw_vibrations.npy  (T H W uint8)
-        rois:        list of [x, y, w, h] ROI rectangles
-        output_path: path inside the volume to write 01_raw_shifts.npy  (N_rois, T, 2)
-        batch_size:  number of frame pairs per GPU batch
+        videos: (L, T, H, W) numpy array — all ROI crops stacked
+        batch_size: number of frame pairs per GPU batch
+    Returns:
+        (L, T, 2) numpy array of cumulative shifts
     """
-    import tqdm
+    import cupy as cp
+    L, T, H, W = videos.shape
+    videos_cp = cp.asarray(videos, dtype=cp.float32) / 255  # (L, T, H, W)
 
-    print(f"Loading {input_path} ...")
-    frame_recording = np.load(VOLUME_PATH / input_path)  # [T H W]
+    all_shifts = cp.zeros((L, T, 2), dtype=cp.float32)      # shift[0] stays 0
+    N_batches  = int(np.ceil((T - 1) / batch_size))
 
-    all_shifts = []
-    for roi in tqdm.tqdm(rois):
-        x, y, w, h = roi
-        print(f'Processing ROI={roi}, frame_recording={frame_recording.shape}')
-        cropped_video = frame_recording[:, y:y+h, x:x+w]
-        all_shifts.append(compute_shifts_for_roi(cropped_video, batch_size))
+    hannW = cp.outer(cp.hanning(H), cp.hanning(W))          # (H, W)
+    left_pad, right_pad = get_pad_size(W)
+    up_pad,   down_pad  = get_pad_size(H)
 
-    result = np.stack(all_shifts, axis=0)  # (N_rois, T, 2)
+    for i in range(N_batches):
+        start = i * batch_size
+        end   = min((i + 1) * batch_size, T - 1)
+        # clip: (L, end-start+2, H, W)  — consecutive frame pairs across all ROIs
+        clip  = videos_cp[:, start : end + 2]
+        n_pairs = clip.shape[1] - 1
 
-    out = VOLUME_PATH / output_path
-    out.parent.mkdir(parents=True, exist_ok=True)
-    np.save(out, result)
-    volume.commit()
-    print(f"Saved {result.shape} → {output_path}")
+        # flatten ROI and frame-pair dims: (L * n_pairs, H, W)
+        flat = clip.reshape(L * (n_pairs + 1), H, W)
+        flat_pad  = _pad(flat,  up_pad, down_pad, left_pad, right_pad)
+        hannW_pad = _pad(hannW, up_pad, down_pad, left_pad, right_pad)
 
+        # phase correlation on all L*(n_pairs+1) frames at once
+        fft   = cp.fft.fft2(flat_pad * hannW_pad, axes=(-2, -1))
+        fft   = fft.reshape(L, n_pairs + 1, *fft.shape[-2:])
+        R     = fft[:, :-1] * cp.conj(fft[:, 1:])          # (L, n_pairs, pH, pW)
+        R    /= (cp.abs(R) + 1e-8)
+        corr  = cp.fft.ifft2(R, axes=(-2, -1)).real
+        corr  = cp.fft.fftshift(corr, axes=(-2, -1))
+        pH, pW = corr.shape[-2:]
+        corr_flat = corr.reshape(L * n_pairs, -1)
+        max_idx   = cp.argmax(corr_flat, axis=1)
+        peak_row  = max_idx // pW
+        peak_col  = max_idx % pW
+        shifts_PC = -cp.stack([peak_col - pW // 2, peak_row - pH // 2], axis=1)
+        shifts_PC = shifts_PC.reshape(L, n_pairs, 2).astype(cp.float32)
 
-# ── local entrypoint ───────────────────────────────────────────────────────────
+        # Lucas-Kanade refinement — per-ROI, vectorised across L and n_pairs
+        image1, image2 = clip[:, :-1], clip[:, 1:]
+        aligned   = image2.copy()
 
-@app.local_entrypoint()
-def main(
-    input_path: str,
-    metadata_path: str,
-    output_path: str,
-    batch_size: int = 16384,
-):
-    """
-    Args:
-        input_path:    local path to 00_raw_vibrations.npy
-        metadata_path: local path to metadata.jsonl
-        output_path:   local path to write 01_raw_shifts.npy
-    """
-    import sys
-    import json
-    sys.path.insert(0, str(Path(__file__).parent))
-    from io_utils import load, save
+        # warp image2 by cumulative PC shift (integer roll) — vectorised via FFT phase shift
+        cum_shifts = cp.cumsum(shifts_PC, axis=1)           # (L, n_pairs, 2) cumulative integer shifts
+        aligned_flat = image2.reshape(L * n_pairs, H, W)
+        aligned_flat = warp_video_fft(aligned_flat, -cum_shifts.reshape(L * n_pairs, 2))
+        aligned = aligned_flat.reshape(L, n_pairs, H, W)
 
-    input_path   = Path(input_path).resolve()
-    metadata_path = Path(metadata_path).resolve()
-    output_path  = Path(output_path).resolve()
+        shifts_LK = cp.zeros((L, n_pairs, 2), dtype=cp.float32)
+        I_x = 0.5 * (image1[:, :, 1:-1, 2:] - image1[:, :, 1:-1, :-2])  # (L,P,H-2,W-2)
+        I_y = 0.5 * (image1[:, :, 2:, 1:-1] - image1[:, :, :-2, 1:-1])
+        for _ in range(3):
+            I_t      = aligned[:, :, 1:-1, 1:-1] - image1[:, :, 1:-1, 1:-1]
+            sum_Ix2  = cp.sum(I_x * I_x,  axis=(-2, -1))
+            sum_Iy2  = cp.sum(I_y * I_y,  axis=(-2, -1))
+            sum_IxIy = cp.sum(I_x * I_y,  axis=(-2, -1))
+            sum_IxIt = cp.sum(I_x * I_t,  axis=(-2, -1))
+            sum_IyIt = cp.sum(I_y * I_t,  axis=(-2, -1))
+            det      = sum_Ix2 * sum_Iy2 - sum_IxIy ** 2 + 1e-8
+            delta_x  = (-sum_IxIt * sum_Iy2 + sum_IxIy * sum_IyIt) / det
+            delta_y  = (-sum_IyIt * sum_Ix2 + sum_IxIy * sum_IxIt) / det
+            delta    = cp.stack([delta_x, delta_y], axis=-1)         # (L, P, 2)
+            shifts_LK += delta
+            # warp aligned by -delta (subpixel, via FFT phase shift)
+            aligned_flat = aligned.reshape(L * n_pairs, H, W)
+            delta_flat   = delta.reshape(L * n_pairs, 2)
+            aligned_flat = warp_video_fft(aligned_flat, -delta_flat)
+            aligned      = aligned_flat.reshape(L, n_pairs, H, W)
 
-    # upload input to volume
-    volume_input = Path(input_path.name)
-    print(f"Uploading {input_path} to volume ...")
-    with volume.batch_upload() as batch:
-        batch.put_file(input_path, str(volume_input))
+        batch_shifts = shifts_PC + shifts_LK                 # (L, n_pairs, 2)
+        all_shifts[:, start + 1 : end + 2] = batch_shifts
 
-    print(f"Loading {metadata_path} ...")
-    meta = {k: v for d in load(metadata_path) for k, v in d.items()}
-    rois = meta["roi"]  # list of [x, y, w, h]
-
-    volume_output = Path(output_path.name)
-
-    print(f"Submitting to Modal ({len(rois)} ROIs, batch_size={batch_size}) ...")
-    run_pclk.remote(
-        input_path=str(volume_input),
-        rois=rois,
-        output_path=str(volume_output),
-        batch_size=batch_size,
-    )
-
-    print(f"Downloading result ...")
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(output_path, "wb") as f:
-        for chunk in volume.read_file(str(volume_output)):
-            f.write(chunk)
-
-    result = np.load(output_path)
-    print(f"Saved {result.shape} → {output_path}")
+    return cp.asnumpy(cp.cumsum(all_shifts, axis=1))         # (L, T, 2)

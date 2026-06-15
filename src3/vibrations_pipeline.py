@@ -1,11 +1,18 @@
 import threading, time
 from datetime import datetime, timezone
+import sys
 from pathlib import Path
 
+import modal
 import numpy as np
 from scipy.signal import butter, resample, sosfiltfilt
 
-from io_utils import save, append, symlink, Timing
+# when running inside a Modal container, src3 is mounted at /src3 but this file
+# is copied to /root by Modal's function loader — add /src3 so imports resolve
+if Path("/src3").exists() and str(Path("/src3")) not in sys.path:
+    sys.path.insert(0, "/src3")
+
+from io_utils import save, append, symlink, Timing, load
 
 MIN_FREQ, MAX_FREQ = 50, 1000
 
@@ -14,13 +21,27 @@ MIN_FREQ, MAX_FREQ = 50, 1000
 
 #***** 1 speckle shifts from speckle vibrations *****
 
-def speckle_shifts(vibrations):
-    # run pclk
-    pass
+def get_shifts(frame_recording:np.ndarray, rois: list[list[int]], batch_size: int) -> np.ndarray:
+    import os
+    from pclk_modal import compute_shifts_for_roi, compute_shifts_for_all_rois_batched
+    mode = os.environ.get("PCLK_MODE", "sequential")
+    if mode == "batched":
+        # batch_size here is number of frame-pairs per batch across ALL L ROIs simultaneously.
+        # Keep it small: each batch allocates ~(L * batch_size * pH * pW * 16) bytes on the GPU.
+        # With L=100, pH=32, pW=128: batch_size=100 → ~0.6 GB working set (safe on any GPU).
+        batched_batch_size = int(os.environ.get("PCLK_BATCH_SIZE", "100"))
+        crops = np.stack([frame_recording[:, y:y+h, x:x+w] for x, y, w, h in rois])  # (L, T, H, W)
+        return compute_shifts_for_all_rois_batched(crops, batched_batch_size)          # (L, T, 2)
+    else:
+        from tqdm import tqdm
+        all_shifts = []
+        for x, y, w, h in tqdm(rois):
+            all_shifts.append(compute_shifts_for_roi(frame_recording[:, y:y+h, x:x+w], batch_size))
+        return np.stack(all_shifts, axis=0)  # (L, T, 2)
 
 #***** 2 clean speckle shifts *****
 
-def clean_shifts(shifts: np.ndarray, fs: float, lowcut: float = MIN_FREQ, highcut: float = MAX_FREQ, filter_order: int = 5) -> np.ndarray:
+def get_clean_shifts(shifts: np.ndarray, fs: float, lowcut: float = MIN_FREQ, highcut: float = MAX_FREQ, filter_order: int = 5) -> np.ndarray:
     """Set all the frequencies outside of [lowcut, highcut] to 0 but still keep them in the array"""
     B, L, T, C = shifts.shape
 
@@ -38,7 +59,7 @@ def clean_shifts(shifts: np.ndarray, fs: float, lowcut: float = MIN_FREQ, highcu
 
 #***** 3 fft from speckle shifts *****
 
-def fft_shifts(shifts: np.ndarray, fs:float, min_freq:float=MIN_FREQ, max_freq:float=MAX_FREQ) -> tuple[np.ndarray, np.ndarray, int]:
+def get_fft_shifts(shifts: np.ndarray, fs:float, min_freq:float=MIN_FREQ, max_freq:float=MAX_FREQ) -> tuple[np.ndarray, np.ndarray, int]:
     """After taking the fft, drop all the frequencies outside of [lowcut, highcut], i.e. crop out and physically remove them from the array. This changes the shape.
 
     Input:  (L, T, C)
@@ -52,11 +73,11 @@ def fft_shifts(shifts: np.ndarray, fs:float, min_freq:float=MIN_FREQ, max_freq:f
 
 #***** 4 recover audio *****
 
-def recover_audio(fft: np.ndarray, n_samples:int, fs: float, audio_sr:int=22050, laser_idx: int = 50, xy_idx: int = 0, min_freq: float = MIN_FREQ, max_freq: float = MAX_FREQ) -> np.ndarray:
+def get_recovered_audio(fft: np.ndarray, n_samples:int, fs: float, audio_sample_rate:int=22050, min_freq: float = MIN_FREQ, max_freq: float = MAX_FREQ, laser_idx: int = 50, xy_idx: int = 0) -> np.ndarray:
     """Return 16-bit PCM audio reconstructed from a cropped FFT via IFFT.
 
     Reconstructs the full spectrum by zero-filling bins outside [min_freq, max_freq],
-    then resamples from fs to audio_sr.
+    then resamples from fs to audio_sample_rate.
     """
     assert fft.shape[0] == 1, f"Can only recover audio with batch size of 1 but got {fft.shape[0]}"
     full_freqs = np.fft.rfftfreq(n_samples, d=1.0 / fs)
@@ -66,7 +87,7 @@ def recover_audio(fft: np.ndarray, n_samples:int, fs: float, audio_sr:int=22050,
     signal = np.fft.irfft(spectrum, n=n_samples)
 
     MAX_INT16_VAL = 32767 # greatest number representable in INT16
-    audio = resample(signal, int(audio_sr * len(signal) / fs))
+    audio = resample(signal, int(audio_sample_rate * len(signal) / fs))
     audio = audio / (np.max(np.abs(audio)) + 1e-8)
     return (audio * MAX_INT16_VAL).astype(np.int16)
 
@@ -102,7 +123,7 @@ def _tokenize(x: np.ndarray, patch_size:int):
     P = F // patch_size
     return x[:, :, :P * patch_size, :].reshape(B, L, P, patch_size, C)  # (B,L,P,PS,C)
 
-def process_fft(fft: np.ndarray, signal_mode:str='magnitude', normalize_mode:str='std-sample', patch_size:int=256, verbose:int=0) -> np.ndarray:
+def get_processed_fft(fft: np.ndarray, signal_mode:str, normalize_mode:str, patch_size:int, verbose:int=0) -> np.ndarray:
     """Extract the signal from the FFT, normalize the FFT, and tokenize it (turn into patches like in ViTs)"""
     fft = _extract_signal(fft, signal_mode).astype(np.float32)   # (B,L,F_,C) -> (B,L,F,C)
     fft = _normalize_fft(fft, normalize_mode, verbose)           # (B,L,F,C) -> (B,L,F,C)
@@ -176,3 +197,70 @@ def capture_vibrations_async(cam, run_opt, speaker, play_audio_fxn, capture_n_fr
     append({"sample_id": sample_id, "output_id": output_id, "time": timestamp}, audio_path.parent / "samples.jsonl", do_save)
 
     return raw_vibrations, save_thread
+
+def process_vibrations(sample_dir:Path, min_freq:int=MIN_FREQ, max_freq:int=MAX_FREQ, audio_sample_rate:int=22050, signal_mode:str='magnitude', normalize_mode:str='std-sample', patch_size:int=256, pclk_batch_size:int=16384, verbose:int=1, do_save:bool=True):
+    sample_id = sample_dir.name
+    metadata = {k: v for d in load(sample_dir / 'metadata.jsonl') for k, v in d.items()}
+    fps, rois = int(metadata['laser_camera_fps']), metadata['roi']
+
+    # turn vibrations into shifts with pclk algorithm
+    with Timing(f"[sample {sample_id}] pclk: ", enabled=verbose >= 2):
+        raw_vibrations = load(sample_dir / 'inputs/00_raw_vibrations.npy')
+        raw_shifts = get_shifts(raw_vibrations, rois, pclk_batch_size)  # (L, T, 2)
+        save(raw_shifts, sample_dir / 'inputs/01_raw_shifts.npy', do_save)
+        append({"pclk": datetime.now(timezone.utc).isoformat()}, sample_dir / "times.jsonl", do_save)
+
+    # clean the shifts
+    with Timing(f"[sample {sample_id}] clean shifts: ", enabled=verbose >= 2):
+        clean_shifts = get_clean_shifts(raw_shifts[None], fps, min_freq, max_freq)  # (L,T,2) -> (1,L,T,2)
+        save(clean_shifts, sample_dir / 'inputs/02_clean_shifts.npy', do_save)
+        append({"clean_shifts": datetime.now(timezone.utc).isoformat()}, sample_dir / "times.jsonl", do_save)
+
+    # fft the shifts
+    with Timing(f"[sample {sample_id}] fft shifts: ", enabled=verbose >= 2):
+        fft, freqs, n_samples = get_fft_shifts(clean_shifts, fps, min_freq, max_freq)
+        save({'fft': fft, 'freqs': freqs, 'n_samples': n_samples}, sample_dir / 'inputs/03_fft_shifts.npz', do_save)
+        append({"fft_shifts": datetime.now(timezone.utc).isoformat()}, sample_dir / "times.jsonl", do_save)
+
+    # recover audio from fft
+    with Timing(f"[sample {sample_id}] recover audio: ", enabled=verbose >= 2):
+        recovered_audio = get_recovered_audio(fft, n_samples, fps, audio_sample_rate, min_freq, max_freq)
+        save((recovered_audio, audio_sample_rate), sample_dir / 'inputs/04_recovered_audio.wav', do_save)
+        symlink(sample_dir / 'inputs/04_recovered_audio.wav', sample_dir / 'recovered_audio.wav', do_save)
+        append({"recover_audio": datetime.now(timezone.utc).isoformat()}, sample_dir / "times.jsonl", do_save)
+
+    # process fft (extract signal, normalize, and tokenize fft)
+    with Timing(f"[sample {sample_id}] process fft: ", enabled=verbose >= 2):
+        processed_fft = get_processed_fft(fft, signal_mode, normalize_mode, patch_size)
+        save(processed_fft, sample_dir / 'inputs/05_processed_fft.npy', do_save)
+        symlink(sample_dir / 'inputs/05_processed_fft.npy', sample_dir / 'X.npy', do_save)
+        append({"process_fft": datetime.now(timezone.utc).isoformat()}, sample_dir / "times.jsonl", do_save)
+
+    # update tracking
+    append({"process_vibrations": datetime.now(timezone.utc).isoformat()}, sample_dir / "times.jsonl", do_save)
+
+#***** modal *****
+
+app = modal.App("pclk")
+volume = modal.Volume.from_name("samples", create_if_missing=True)
+VOLUME_PATH = Path("/samples")
+
+cuda_image = (
+    modal.Image.from_registry("nvidia/cuda:12.2.2-cudnn8-devel-ubuntu22.04", add_python="3.11")
+    .pip_install("cupy-cuda12x", "numpy", "tqdm", "scipy", "matplotlib", "pillow", "ipython")
+    .add_local_dir(Path(__file__).parent, remote_path="/src3")
+)
+
+@app.function(
+    gpu="A10G",
+    image=cuda_image,
+    timeout=3600,
+    volumes={VOLUME_PATH: volume},
+)
+def process_vibrations_modal(sample_dir_name: str, **kwargs):
+    import sys
+    sys.path.insert(0, "/src3")
+    from vibrations_pipeline import process_vibrations
+    process_vibrations(VOLUME_PATH / sample_dir_name, **kwargs)
+    volume.commit()
+
