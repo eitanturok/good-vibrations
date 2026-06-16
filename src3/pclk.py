@@ -247,25 +247,28 @@ def compute_shifts_for_all_rois_batched_optimized(videos, batch_size):
         clip    = cp.asarray(videos[:, start : end + 2], dtype=cp.float32) / 255
         n_pairs = clip.shape[1] - 1
 
-        # ---- phase correlation ----
-        flat     = clip.reshape(L * (n_pairs + 1), H, W)
-        flat_pad = _pad(flat, up_pad, down_pad, left_pad, right_pad)
-        del flat
-        flat_pad *= hannW_pad   # in-place: no broadcast allocation
-        video_fft = cp.fft.fft2(flat_pad, axes=(-2, -1))
-        del flat_pad
+        # ---- phase correlation — two-pass FFT to halve peak memory ----
+        # FFT "left" frames (frame 0..n_pairs-1 per ROI) and "right" frames separately
+        # so we never hold all (n_pairs+1) FFTs at once
+        left  = clip[:, :-1].reshape(L * n_pairs, H, W)   # (L*n_pairs, H, W)
+        right = clip[:, 1: ].reshape(L * n_pairs, H, W)
+
+        buf       = _pad(left,  up_pad, down_pad, left_pad, right_pad); del left
+        buf      *= hannW_pad
+        fft_left  = cp.fft.fft2(buf, axes=(-2, -1)); del buf
         cp.get_default_memory_pool().free_all_blocks()
 
-        video_fft = video_fft.reshape(L, n_pairs + 1, pH, pW)
-        # multiply in-place then copy to a contiguous array so del video_fft actually frees memory
-        video_fft[:, :-1] *= cp.conj(video_fft[:, 1:])
-        R = video_fft[:, :-1].copy()   # (L, n_pairs, pH, pW) — contiguous, owns its memory
-        del video_fft
+        buf       = _pad(right, up_pad, down_pad, left_pad, right_pad); del right
+        buf      *= hannW_pad
+        fft_right = cp.fft.fft2(buf, axes=(-2, -1)); del buf
         cp.get_default_memory_pool().free_all_blocks()
 
-        R /= (cp.abs(R) + 1e-8)
-        corr = cp.fft.ifft2(R, axes=(-2, -1)).real
-        del R
+        # cross-power spectrum in-place into fft_left, then free fft_right
+        fft_left *= cp.conj(fft_right); del fft_right
+        cp.get_default_memory_pool().free_all_blocks()
+        fft_left /= (cp.abs(fft_left) + 1e-8)
+        corr = cp.fft.ifft2(fft_left, axes=(-2, -1)).real
+        del fft_left
         cp.get_default_memory_pool().free_all_blocks()
 
         corr      = cp.fft.fftshift(corr, axes=(-2, -1))
