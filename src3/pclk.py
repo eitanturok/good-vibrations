@@ -246,8 +246,9 @@ def compute_shifts_for_all_rois_batched_optimized(videos, batch_size):
 
         n_pairs = end - start
         # load left/right frames from CPU separately — never hold full clip on GPU at once
-        image1    = cp.asarray(videos[:, start:end],     dtype=cp.float32) / 255  # (L, n_pairs, H, W)
-        image2    = cp.asarray(videos[:, start+1:end+1], dtype=cp.float32) / 255  # (L, n_pairs, H, W)
+        # pairs are (start, start+1), (start+1, start+2), ..., (end-1, end)
+        image1 = cp.asarray(videos[:, start:end],   dtype=cp.float32) / 255  # (L, n_pairs, H, W)
+        image2 = cp.asarray(videos[:, start+1:end+1], dtype=cp.float32) / 255
 
         buf_pad   = _pad(image1.reshape(L * n_pairs, H, W), up_pad, down_pad, left_pad, right_pad)
         buf_pad  *= hannW_pad
@@ -314,6 +315,6 @@ def compute_shifts_for_all_rois_batched_optimized(videos, batch_size):
             I_x = 0.5 * (image1[:, :, 1:-1, 2:] - image1[:, :, 1:-1, :-2])
             I_y = 0.5 * (image1[:, :, 2:, 1:-1] - image1[:, :, :-2, 1:-1])
 
-        all_shifts[:, start + 1 : end + 2] = cp.asnumpy(shifts_PC + shifts_LK)
+        all_shifts[:, start + 1 : end + 1] = cp.asnumpy(shifts_PC + shifts_LK)
 
     return np.cumsum(all_shifts, axis=1)                     # (L, T, 2)
