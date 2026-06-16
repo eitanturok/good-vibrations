@@ -307,6 +307,8 @@ def compute_shifts_for_all_rois_batched_optimized(videos, batch_size):
             ], axis=-1)                                                 # (L, n_pairs, 2)
             shifts_LK += delta
             aligned_flat = aligned.reshape(L * n_pairs, H, W)
+            del aligned
+            cp.get_default_memory_pool().free_all_blocks()
             aligned_flat = warp_video_fft(aligned_flat, -delta.reshape(L * n_pairs, 2))
             cp.get_default_memory_pool().free_all_blocks()
             aligned = aligned_flat.reshape(L, n_pairs, H, W)
