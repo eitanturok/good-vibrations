@@ -244,18 +244,17 @@ def compute_shifts_for_all_rois_batched_optimized(videos, batch_size):
         start = i * batch_size
         end   = min((i + 1) * batch_size, T - 1)
 
-        n_pairs = (end - start)
-        # load left/right frames from CPU separately — never put full clip on GPU at once
-        buf      = cp.asarray(videos[:, start:end+1], dtype=cp.float32) / 255  # (L, n_pairs, H, W)
-        image1   = buf                                                           # keep for LK
-        buf_pad  = _pad(buf.reshape(L * n_pairs, H, W), up_pad, down_pad, left_pad, right_pad)
-        buf_pad *= hannW_pad
-        fft_left = cp.fft.fft2(buf_pad, axes=(-2, -1)); del buf_pad
+        n_pairs = end - start
+        # load left/right frames from CPU separately — never hold full clip on GPU at once
+        image1    = cp.asarray(videos[:, start:end],     dtype=cp.float32) / 255  # (L, n_pairs, H, W)
+        image2    = cp.asarray(videos[:, start+1:end+1], dtype=cp.float32) / 255  # (L, n_pairs, H, W)
+
+        buf_pad   = _pad(image1.reshape(L * n_pairs, H, W), up_pad, down_pad, left_pad, right_pad)
+        buf_pad  *= hannW_pad
+        fft_left  = cp.fft.fft2(buf_pad, axes=(-2, -1)); del buf_pad
         cp.get_default_memory_pool().free_all_blocks()
 
-        buf2      = cp.asarray(videos[:, start+1:end+2], dtype=cp.float32) / 255  # (L, n_pairs, H, W)
-        image2    = buf2                                                             # keep for LK
-        buf_pad   = _pad(buf2.reshape(L * n_pairs, H, W), up_pad, down_pad, left_pad, right_pad)
+        buf_pad   = _pad(image2.reshape(L * n_pairs, H, W), up_pad, down_pad, left_pad, right_pad)
         buf_pad  *= hannW_pad
         fft_right = cp.fft.fft2(buf_pad, axes=(-2, -1)); del buf_pad
         cp.get_default_memory_pool().free_all_blocks()
@@ -283,7 +282,7 @@ def compute_shifts_for_all_rois_batched_optimized(videos, batch_size):
         cum_shifts   = cp.cumsum(shifts_PC, axis=1)
         aligned_flat = image2.reshape(L * n_pairs, H, W)
         aligned_flat = warp_video_fft(aligned_flat, -cum_shifts.reshape(L * n_pairs, 2))
-        del cum_shifts, image2, buf2
+        del cum_shifts, image2
         cp.get_default_memory_pool().free_all_blocks()
 
         # ---- Lucas-Kanade with axis=(-2,-1) sums over (L, n_pairs, H, W) ----
