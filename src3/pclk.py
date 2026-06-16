@@ -211,3 +211,106 @@ def compute_shifts_for_all_rois_batched(videos, batch_size):
         all_shifts[:, start + 1 : end + 2] = cp.asnumpy(shifts_PC + shifts_LK)
 
     return np.cumsum(all_shifts, axis=1)                     # (L, T, 2)
+
+
+def compute_shifts_for_all_rois_batched_optimized(videos, batch_size):
+    """Same as compute_shifts_for_all_rois_batched with additional optimizations:
+    - hannW_pad precomputed once outside the batch loop
+    - hann window applied in-place with *= to avoid broadcast allocation
+    - PC warp uses warp_video_fft with cumulative float shifts instead of warp_roll loop
+    - LK sums use axis=(-2,-1) on (L, n_pairs, H, W) instead of flattening to L*n_pairs
+
+    Args:
+        videos: (L, T, H, W) numpy array — all ROI crops stacked (stays on CPU)
+        batch_size: number of frame pairs per GPU batch
+    Returns:
+        (L, T, 2) numpy array of cumulative shifts
+    """
+    from tqdm import tqdm
+    import cupy as cp
+    L, T, H, W = videos.shape
+
+    all_shifts = np.zeros((L, T, 2), dtype=np.float32)
+    N_batches  = int(np.ceil((T - 1) / batch_size))
+
+    # precompute hann window and pad sizes once — reused every batch
+    hannW = cp.outer(cp.hanning(H), cp.hanning(W))
+    left_pad, right_pad = get_pad_size(W)
+    up_pad,   down_pad  = get_pad_size(H)
+    hannW_pad = _pad(hannW, up_pad, down_pad, left_pad, right_pad)
+    pH, pW = hannW_pad.shape
+
+    for i in tqdm(range(N_batches)):
+        start = i * batch_size
+        end   = min((i + 1) * batch_size, T - 1)
+
+        clip    = cp.asarray(videos[:, start : end + 2], dtype=cp.float32) / 255
+        n_pairs = clip.shape[1] - 1
+
+        # ---- phase correlation ----
+        flat     = clip.reshape(L * (n_pairs + 1), H, W)
+        flat_pad = _pad(flat, up_pad, down_pad, left_pad, right_pad)
+        del flat
+        flat_pad *= hannW_pad   # in-place: no broadcast allocation
+        video_fft = cp.fft.fft2(flat_pad, axes=(-2, -1))
+        del flat_pad
+        cp.get_default_memory_pool().free_all_blocks()
+
+        video_fft = video_fft.reshape(L, n_pairs + 1, pH, pW)
+        R = video_fft[:, :-1] * cp.conj(video_fft[:, 1:])
+        del video_fft
+        cp.get_default_memory_pool().free_all_blocks()
+
+        R /= (cp.abs(R) + 1e-8)
+        corr = cp.fft.ifft2(R, axes=(-2, -1)).real
+        del R
+        cp.get_default_memory_pool().free_all_blocks()
+
+        corr      = cp.fft.fftshift(corr, axes=(-2, -1))
+        corr_flat = corr.reshape(L * n_pairs, -1)
+        max_idx   = cp.argmax(corr_flat, axis=1)
+        del corr, corr_flat
+        cp.get_default_memory_pool().free_all_blocks()
+
+        peak_row  = max_idx // pW
+        peak_col  = max_idx % pW
+        shifts_PC = -cp.stack([peak_col - pW // 2, peak_row - pH // 2], axis=1)
+        shifts_PC = shifts_PC.reshape(L, n_pairs, 2).astype(cp.float32)
+
+        # ---- PC warp via FFT phase shift with cumulative float shifts ----
+        image1       = clip[:, :-1]                                    # (L, n_pairs, H, W)
+        image2       = clip[:, 1:]
+        cum_shifts   = cp.cumsum(shifts_PC, axis=1)                    # (L, n_pairs, 2)
+        aligned_flat = image2.reshape(L * n_pairs, H, W)
+        aligned_flat = warp_video_fft(aligned_flat, -cum_shifts.reshape(L * n_pairs, 2))
+        del cum_shifts, image2, clip
+        cp.get_default_memory_pool().free_all_blocks()
+
+        # ---- Lucas-Kanade with axis=(-2,-1) sums over (L, n_pairs, H, W) ----
+        shifts_LK = cp.zeros((L, n_pairs, 2), dtype=cp.float32)
+        I_x = 0.5 * (image1[:, :, 1:-1, 2:] - image1[:, :, 1:-1, :-2])
+        I_y = 0.5 * (image1[:, :, 2:, 1:-1] - image1[:, :, :-2, 1:-1])
+        aligned = aligned_flat.reshape(L, n_pairs, H, W)
+        del aligned_flat
+
+        for _ in range(3):
+            I_t      = aligned[:, :, 1:-1, 1:-1] - image1[:, :, 1:-1, 1:-1]
+            sum_Ix2  = cp.sum(I_x * I_x,  axis=(-2, -1))
+            sum_Iy2  = cp.sum(I_y * I_y,  axis=(-2, -1))
+            sum_IxIy = cp.sum(I_x * I_y,  axis=(-2, -1))
+            sum_IxIt = cp.sum(I_x * I_t,  axis=(-2, -1))
+            sum_IyIt = cp.sum(I_y * I_t,  axis=(-2, -1))
+            det      = sum_Ix2 * sum_Iy2 - sum_IxIy ** 2 + 1e-8
+            delta    = cp.stack([
+                (-sum_IxIt * sum_Iy2 + sum_IxIy * sum_IyIt) / det,
+                (-sum_IyIt * sum_Ix2 + sum_IxIy * sum_IxIt) / det,
+            ], axis=-1)                                                 # (L, n_pairs, 2)
+            shifts_LK += delta
+            aligned_flat = aligned.reshape(L * n_pairs, H, W)
+            aligned_flat = warp_video_fft(aligned_flat, -delta.reshape(L * n_pairs, 2))
+            cp.get_default_memory_pool().free_all_blocks()
+            aligned = aligned_flat.reshape(L, n_pairs, H, W)
+
+        all_shifts[:, start + 1 : end + 2] = cp.asnumpy(shifts_PC + shifts_LK)
+
+    return np.cumsum(all_shifts, axis=1)                     # (L, T, 2)

@@ -23,15 +23,14 @@ MIN_FREQ, MAX_FREQ = 50, 1000
 
 def get_shifts(frame_recording:np.ndarray, rois: list[list[int]], batch_size: int) -> np.ndarray:
     import os
-    from pclk_modal import compute_shifts_for_roi, compute_shifts_for_all_rois_batched
+    from pclk import compute_shifts_for_roi, compute_shifts_for_all_rois_batched, compute_shifts_for_all_rois_batched_optimized
     mode = os.environ.get("PCLK_MODE", "sequential")
     if mode == "batched":
-        # batch_size here is number of frame-pairs per batch across ALL L ROIs simultaneously.
-        # Keep it small: each batch allocates ~(L * batch_size * pH * pW * 16) bytes on the GPU.
-        # With L=100, pH=32, pW=128: batch_size=100 → ~0.6 GB working set (safe on any GPU).
-        batched_batch_size = int(os.environ.get("PCLK_BATCH_SIZE", "100"))
         crops = np.stack([frame_recording[:, y:y+h, x:x+w] for x, y, w, h in rois])  # (L, T, H, W)
-        return compute_shifts_for_all_rois_batched(crops, batched_batch_size)          # (L, T, 2)
+        return compute_shifts_for_all_rois_batched(crops, batch_size)                  # (L, T, 2)
+    if mode == "batched_optimized":
+        crops = np.stack([frame_recording[:, y:y+h, x:x+w] for x, y, w, h in rois])  # (L, T, H, W)
+        return compute_shifts_for_all_rois_batched_optimized(crops, batch_size)        # (L, T, 2)
     else:
         from tqdm import tqdm
         all_shifts = []
@@ -198,7 +197,7 @@ def capture_vibrations_async(cam, run_opt, speaker, play_audio_fxn, capture_n_fr
 
     return raw_vibrations, save_thread
 
-def process_vibrations(sample_dir:Path, min_freq:int=MIN_FREQ, max_freq:int=MAX_FREQ, audio_sample_rate:int=22050, signal_mode:str='magnitude', normalize_mode:str='std-sample', patch_size:int=256, pclk_batch_size:int=16384, verbose:int=1, do_save:bool=True):
+def process_vibrations(sample_dir:Path, min_freq:int=MIN_FREQ, max_freq:int=MAX_FREQ, audio_sample_rate:int=22050, signal_mode:str='magnitude', normalize_mode:str='std-sample', patch_size:int=256, pclk_batch_size:int=1024, verbose:int=1, do_save:bool=True):
     sample_id = sample_dir.name
     metadata = {k: v for d in load(sample_dir / 'metadata.jsonl') for k, v in d.items()}
     fps, rois = int(metadata['laser_camera_fps']), metadata['roi']
@@ -258,9 +257,17 @@ cuda_image = (
     volumes={VOLUME_PATH: volume},
 )
 def process_vibrations_modal(sample_dir_name: str, **kwargs):
-    import sys
+    import sys, os
     sys.path.insert(0, "/src3")
     from vibrations_pipeline import process_vibrations
     process_vibrations(VOLUME_PATH / sample_dir_name, **kwargs)
     volume.commit()
+
+@app.local_entrypoint()
+def main(sample_dir_name: str = "000000", pclk_mode: str = "batched", pclk_batch_size: int = 1024, verbose: int = 2):
+    import time
+    fn = process_vibrations_modal.with_options(env={"PCLK_MODE": pclk_mode})
+    t0 = time.perf_counter()
+    fn.remote(sample_dir_name, pclk_batch_size=pclk_batch_size, verbose=verbose)
+    print(f"\n[{pclk_mode} bs={pclk_batch_size}] total: {time.perf_counter() - t0:.1f}s")
 
