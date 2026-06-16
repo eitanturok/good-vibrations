@@ -257,9 +257,9 @@ def compute_shifts_for_all_rois_batched_optimized(videos, batch_size):
         cp.get_default_memory_pool().free_all_blocks()
 
         video_fft = video_fft.reshape(L, n_pairs + 1, pH, pW)
-        # compute R in-place into video_fft[:, :-1] to avoid allocating a second full array
+        # multiply in-place then copy to a contiguous array so del video_fft actually frees memory
         video_fft[:, :-1] *= cp.conj(video_fft[:, 1:])
-        R = video_fft[:, :-1]
+        R = video_fft[:, :-1].copy()   # (L, n_pairs, pH, pW) — contiguous, owns its memory
         del video_fft
         cp.get_default_memory_pool().free_all_blocks()
 
