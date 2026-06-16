@@ -244,23 +244,20 @@ def compute_shifts_for_all_rois_batched_optimized(videos, batch_size):
         start = i * batch_size
         end   = min((i + 1) * batch_size, T - 1)
 
-        clip    = cp.asarray(videos[:, start : end + 2], dtype=cp.float32) / 255
-        n_pairs = clip.shape[1] - 1
-
-        # ---- phase correlation — two-pass FFT to halve peak memory ----
-        # FFT "left" frames (frame 0..n_pairs-1 per ROI) and "right" frames separately
-        # so we never hold all (n_pairs+1) FFTs at once
-        left  = clip[:, :-1].reshape(L * n_pairs, H, W)   # (L*n_pairs, H, W)
-        right = clip[:, 1: ].reshape(L * n_pairs, H, W)
-
-        buf       = _pad(left,  up_pad, down_pad, left_pad, right_pad); del left
-        buf      *= hannW_pad
-        fft_left  = cp.fft.fft2(buf, axes=(-2, -1)); del buf
+        n_pairs = (end - start)
+        # load left/right frames from CPU separately — never put full clip on GPU at once
+        buf      = cp.asarray(videos[:, start:end+1], dtype=cp.float32) / 255  # (L, n_pairs, H, W)
+        image1   = buf                                                           # keep for LK
+        buf_pad  = _pad(buf.reshape(L * n_pairs, H, W), up_pad, down_pad, left_pad, right_pad)
+        buf_pad *= hannW_pad
+        fft_left = cp.fft.fft2(buf_pad, axes=(-2, -1)); del buf_pad
         cp.get_default_memory_pool().free_all_blocks()
 
-        buf       = _pad(right, up_pad, down_pad, left_pad, right_pad); del right
-        buf      *= hannW_pad
-        fft_right = cp.fft.fft2(buf, axes=(-2, -1)); del buf
+        buf2      = cp.asarray(videos[:, start+1:end+2], dtype=cp.float32) / 255  # (L, n_pairs, H, W)
+        image2    = buf2                                                             # keep for LK
+        buf_pad   = _pad(buf2.reshape(L * n_pairs, H, W), up_pad, down_pad, left_pad, right_pad)
+        buf_pad  *= hannW_pad
+        fft_right = cp.fft.fft2(buf_pad, axes=(-2, -1)); del buf_pad
         cp.get_default_memory_pool().free_all_blocks()
 
         # cross-power spectrum in-place into fft_left, then free fft_right
@@ -283,12 +280,10 @@ def compute_shifts_for_all_rois_batched_optimized(videos, batch_size):
         shifts_PC = shifts_PC.reshape(L, n_pairs, 2).astype(cp.float32)
 
         # ---- PC warp via FFT phase shift with cumulative float shifts ----
-        image1       = clip[:, :-1]                                    # (L, n_pairs, H, W)
-        image2       = clip[:, 1:]
-        cum_shifts   = cp.cumsum(shifts_PC, axis=1)                    # (L, n_pairs, 2)
+        cum_shifts   = cp.cumsum(shifts_PC, axis=1)
         aligned_flat = image2.reshape(L * n_pairs, H, W)
         aligned_flat = warp_video_fft(aligned_flat, -cum_shifts.reshape(L * n_pairs, 2))
-        del cum_shifts, image2, clip
+        del cum_shifts, image2, buf2
         cp.get_default_memory_pool().free_all_blocks()
 
         # ---- Lucas-Kanade with axis=(-2,-1) sums over (L, n_pairs, H, W) ----
