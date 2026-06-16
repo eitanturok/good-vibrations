@@ -288,10 +288,10 @@ def compute_shifts_for_all_rois_batched_optimized(videos, batch_size):
 
         # ---- Lucas-Kanade with axis=(-2,-1) sums over (L, n_pairs, H, W) ----
         shifts_LK = cp.zeros((L, n_pairs, 2), dtype=cp.float32)
-        I_x = 0.5 * (image1[:, :, 1:-1, 2:] - image1[:, :, 1:-1, :-2])
-        I_y = 0.5 * (image1[:, :, 2:, 1:-1] - image1[:, :, :-2, 1:-1])
         aligned = aligned_flat.reshape(L, n_pairs, H, W)
         del aligned_flat
+        I_x = 0.5 * (image1[:, :, 1:-1, 2:] - image1[:, :, 1:-1, :-2])
+        I_y = 0.5 * (image1[:, :, 2:, 1:-1] - image1[:, :, :-2, 1:-1])
 
         for _ in range(3):
             I_t      = aligned[:, :, 1:-1, 1:-1] - image1[:, :, 1:-1, 1:-1]
@@ -307,11 +307,13 @@ def compute_shifts_for_all_rois_batched_optimized(videos, batch_size):
             ], axis=-1)                                                 # (L, n_pairs, 2)
             shifts_LK += delta
             aligned_flat = aligned.reshape(L * n_pairs, H, W)
-            del aligned
+            del aligned, I_x, I_y, I_t
             cp.get_default_memory_pool().free_all_blocks()
             aligned_flat = warp_video_fft(aligned_flat, -delta.reshape(L * n_pairs, 2))
             cp.get_default_memory_pool().free_all_blocks()
             aligned = aligned_flat.reshape(L, n_pairs, H, W)
+            I_x = 0.5 * (image1[:, :, 1:-1, 2:] - image1[:, :, 1:-1, :-2])
+            I_y = 0.5 * (image1[:, :, 2:, 1:-1] - image1[:, :, :-2, 1:-1])
 
         all_shifts[:, start + 1 : end + 2] = cp.asnumpy(shifts_PC + shifts_LK)
 
