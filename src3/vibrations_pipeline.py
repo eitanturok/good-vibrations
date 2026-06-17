@@ -253,7 +253,7 @@ cuda_image = (
 @app.function(
     gpu="A10G",
     image=cuda_image,
-    timeout=3600,
+    timeout=60*10, # timeout after 10 minutes
     volumes={VOLUME_PATH: volume},
 )
 def process_vibrations_modal(sample_dir_name: str, **kwargs):
@@ -262,6 +262,57 @@ def process_vibrations_modal(sample_dir_name: str, **kwargs):
     from vibrations_pipeline import process_vibrations
     process_vibrations(VOLUME_PATH / sample_dir_name, **kwargs)
     volume.commit()
+
+@app.function(
+    gpu="A10G",
+    image=cuda_image,
+    timeout=60*10,
+    volumes={VOLUME_PATH: volume},
+)
+def compare_pclk_modal(sample_dir_name: str, n_rois: int = 3, batch_size: int = 1024):
+    import sys
+    sys.path.insert(0, "/src3")
+    import cupy as cp
+    import numpy as np
+    from io_utils import load
+    from pclk import compute_shifts_for_roi, compute_shifts_for_all_rois_batched, compute_shifts_for_all_rois_batched_optimized
+
+    sample_dir = VOLUME_PATH / sample_dir_name
+    metadata = {k: v for d in load(sample_dir / "metadata.jsonl") for k, v in d.items()}
+    rois = metadata["roi"][:n_rois]
+    raw_vibrations = load(sample_dir / "inputs/00_raw_vibrations.npy")
+    crops = np.stack([raw_vibrations[:, y:y+h, x:x+w] for x, y, w, h in rois])
+    print(f"raw_vibrations: {raw_vibrations.shape}  n_rois={n_rois}  batch_size={batch_size}")
+
+    print("\n[SEQ] sequential...")
+    shifts_seq = np.stack([compute_shifts_for_roi(raw_vibrations[:, y:y+h, x:x+w], batch_size) for x, y, w, h in rois])
+    print(f"[SEQ] max={np.abs(shifts_seq).max():.4f}")
+
+    print("\n[BATCHED] batched...")
+    shifts_batched = compute_shifts_for_all_rois_batched(crops, batch_size)
+    print(f"[BATCHED] max={np.abs(shifts_batched).max():.4f}")
+
+    print("\n[OPT] batched_optimized...")
+    shifts_opt = compute_shifts_for_all_rois_batched_optimized(crops, batch_size)
+    print(f"[OPT] max={np.abs(shifts_opt).max():.4f}")
+
+    def _cmp(name_a, a, name_b, b, tol=1e-4):
+        diff = np.abs(a - b)
+        ok = diff.max() < tol
+        print(f"\n  {name_a} vs {name_b}: max={diff.max():.2e}  mean={diff.mean():.2e}  {'PASS' if ok else 'FAIL'} (tol={tol})")
+        for i in range(a.shape[0]):
+            d = np.abs(a[i] - b[i])
+            print(f"    ROI {i}: max={d.max():.2e}  mean={d.mean():.2e}")
+        return ok
+
+    results = {
+        "seq_vs_batched": _cmp("SEQ", shifts_seq, "BATCHED", shifts_batched),
+        "seq_vs_opt":     _cmp("SEQ", shifts_seq, "OPT",     shifts_opt),
+        "batched_vs_opt": _cmp("BATCHED", shifts_batched, "OPT", shifts_opt),
+    }
+    print(f"\n{'ALL PASS' if all(results.values()) else 'SOME FAILED'}: {results}")
+    return results
+
 
 @app.local_entrypoint()
 def main(sample_dir_name: str = "000000", pclk_mode: str = "batched", pclk_batch_size: int = 1024, verbose: int = 2):

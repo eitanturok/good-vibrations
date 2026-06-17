@@ -253,30 +253,28 @@ def compute_shifts_for_all_rois_batched_optimized(videos, batch_size):
         buf_pad   = _pad(image1.reshape(L * n_pairs, H, W), up_pad, down_pad, left_pad, right_pad)
         buf_pad  *= hannW_pad
         fft_left  = cp.fft.fft2(buf_pad, axes=(-2, -1)); del buf_pad
-        cp.get_default_memory_pool().free_all_blocks()
 
         buf_pad   = _pad(image2.reshape(L * n_pairs, H, W), up_pad, down_pad, left_pad, right_pad)
         buf_pad  *= hannW_pad
         fft_right = cp.fft.fft2(buf_pad, axes=(-2, -1)); del buf_pad
-        cp.get_default_memory_pool().free_all_blocks()
 
         # cross-power spectrum in-place into fft_left, then free fft_right
         fft_left *= cp.conj(fft_right); del fft_right
-        cp.get_default_memory_pool().free_all_blocks()
         fft_left /= (cp.abs(fft_left) + 1e-8)
         corr = cp.fft.ifft2(fft_left, axes=(-2, -1)).real
         del fft_left
-        cp.get_default_memory_pool().free_all_blocks()
 
-        corr      = cp.fft.fftshift(corr, axes=(-2, -1))
+        # skip fftshift: find argmax on raw ifft output, then map back with wrap arithmetic
         corr_flat = corr.reshape(L * n_pairs, -1)
         max_idx   = cp.argmax(corr_flat, axis=1)
         del corr, corr_flat
-        cp.get_default_memory_pool().free_all_blocks()
 
         peak_row  = max_idx // pW
         peak_col  = max_idx % pW
-        shifts_PC = -cp.stack([peak_col - pW // 2, peak_row - pH // 2], axis=1)
+        # wrap: shift = (peak + half) % size - half  (equivalent to fftshift + subtract half)
+        shift_x = (peak_col + pW // 2) % pW - pW // 2
+        shift_y = (peak_row + pH // 2) % pH - pH // 2
+        shifts_PC = -cp.stack([shift_x, shift_y], axis=1)
         shifts_PC = shifts_PC.reshape(L, n_pairs, 2).astype(cp.float32)
 
         # ---- PC warp via FFT phase shift with cumulative float shifts ----
@@ -284,36 +282,34 @@ def compute_shifts_for_all_rois_batched_optimized(videos, batch_size):
         aligned_flat = image2.reshape(L * n_pairs, H, W)
         aligned_flat = warp_video_fft(aligned_flat, -cum_shifts.reshape(L * n_pairs, 2))
         del cum_shifts, image2
-        cp.get_default_memory_pool().free_all_blocks()
 
         # ---- Lucas-Kanade with axis=(-2,-1) sums over (L, n_pairs, H, W) ----
         shifts_LK = cp.zeros((L, n_pairs, 2), dtype=cp.float32)
         aligned = aligned_flat.reshape(L, n_pairs, H, W)
         del aligned_flat
-        I_x = 0.5 * (image1[:, :, 1:-1, 2:] - image1[:, :, 1:-1, :-2])
-        I_y = 0.5 * (image1[:, :, 2:, 1:-1] - image1[:, :, :-2, 1:-1])
+        # I_x, I_y, and their dot products depend only on image1 — precompute all once
+        I_x      = 0.5 * (image1[:, :, 1:-1, 2:] - image1[:, :, 1:-1, :-2])
+        I_y      = 0.5 * (image1[:, :, 2:, 1:-1] - image1[:, :, :-2, 1:-1])
+        sum_Ix2  = cp.sum(I_x * I_x,  axis=(-2, -1))   # (L, n_pairs)
+        sum_Iy2  = cp.sum(I_y * I_y,  axis=(-2, -1))
+        sum_IxIy = cp.sum(I_x * I_y,  axis=(-2, -1))
+        det      = sum_Ix2 * sum_Iy2 - sum_IxIy ** 2 + 1e-8
 
         for _ in range(3):
             I_t      = aligned[:, :, 1:-1, 1:-1] - image1[:, :, 1:-1, 1:-1]
-            sum_Ix2  = cp.sum(I_x * I_x,  axis=(-2, -1))
-            sum_Iy2  = cp.sum(I_y * I_y,  axis=(-2, -1))
-            sum_IxIy = cp.sum(I_x * I_y,  axis=(-2, -1))
             sum_IxIt = cp.sum(I_x * I_t,  axis=(-2, -1))
             sum_IyIt = cp.sum(I_y * I_t,  axis=(-2, -1))
-            det      = sum_Ix2 * sum_Iy2 - sum_IxIy ** 2 + 1e-8
+            del I_t
             delta    = cp.stack([
                 (-sum_IxIt * sum_Iy2 + sum_IxIy * sum_IyIt) / det,
                 (-sum_IyIt * sum_Ix2 + sum_IxIy * sum_IxIt) / det,
             ], axis=-1)                                                 # (L, n_pairs, 2)
             shifts_LK += delta
             aligned_flat = aligned.reshape(L * n_pairs, H, W)
-            del aligned, I_x, I_y, I_t
-            cp.get_default_memory_pool().free_all_blocks()
+            del aligned
             aligned_flat = warp_video_fft(aligned_flat, -delta.reshape(L * n_pairs, 2))
-            cp.get_default_memory_pool().free_all_blocks()
             aligned = aligned_flat.reshape(L, n_pairs, H, W)
-            I_x = 0.5 * (image1[:, :, 1:-1, 2:] - image1[:, :, 1:-1, :-2])
-            I_y = 0.5 * (image1[:, :, 2:, 1:-1] - image1[:, :, :-2, 1:-1])
+            del aligned_flat
 
         all_shifts[:, start + 1 : end + 1] = cp.asnumpy(shifts_PC + shifts_LK)
 
