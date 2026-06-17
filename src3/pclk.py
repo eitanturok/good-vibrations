@@ -230,6 +230,9 @@ def compute_shifts_for_all_rois_batched_optimized(videos, batch_size):
     import cupy as cp
     L, T, H, W = videos.shape
 
+    # cap the cuFFT plan cache so it doesn't consume most of VRAM before we even start
+    cp.fft.config.get_plan_cache().set_size(1)
+
     all_shifts = np.zeros((L, T, 2), dtype=np.float32)
     N_batches  = int(np.ceil((T - 1) / batch_size))
 
@@ -245,24 +248,30 @@ def compute_shifts_for_all_rois_batched_optimized(videos, batch_size):
         end   = min((i + 1) * batch_size, T - 1)
 
         n_pairs = end - start
+        mem = cp.get_default_memory_pool()
+        def mprint(tag): print(f"  [mem {tag}] used={mem.used_bytes()/1e9:.2f}GB total={mem.total_bytes()/1e9:.2f}GB")
+
         # load left/right frames from CPU separately — never hold full clip on GPU at once
         # pairs are (start, start+1), (start+1, start+2), ..., (end-1, end)
         image1 = cp.asarray(videos[:, start:end],   dtype=cp.float32) / 255  # (L, n_pairs, H, W)
         image2 = cp.asarray(videos[:, start+1:end+1], dtype=cp.float32) / 255
+        mprint("after image1+image2")
 
-        buf_pad   = _pad(image1.reshape(L * n_pairs, H, W), up_pad, down_pad, left_pad, right_pad)
-        buf_pad  *= hannW_pad
-        fft_left  = cp.fft.fft2(buf_pad, axes=(-2, -1)); del buf_pad
+        buf_pad  = _pad(image1.reshape(L * n_pairs, H, W), up_pad, down_pad, left_pad, right_pad)
+        buf_pad *= hannW_pad
+        fft_left = cp.fft.fft2(buf_pad, axes=(-2, -1)); del buf_pad
+        mprint("after fft_left")
 
-        buf_pad   = _pad(image2.reshape(L * n_pairs, H, W), up_pad, down_pad, left_pad, right_pad)
-        buf_pad  *= hannW_pad
-        fft_right = cp.fft.fft2(buf_pad, axes=(-2, -1)); del buf_pad
-
-        # cross-power spectrum in-place into fft_left, then free fft_right
-        fft_left *= cp.conj(fft_right); del fft_right
+        buf_pad  = _pad(image2.reshape(L * n_pairs, H, W), up_pad, down_pad, left_pad, right_pad)
+        buf_pad *= hannW_pad
+        mprint("after buf_pad right (peak: fft_left + buf_pad)")
+        # compute right FFT inline and multiply into fft_left — fft_right never persists as a named var
+        fft_left *= cp.conj(cp.fft.fft2(buf_pad, axes=(-2, -1))); del buf_pad
+        mprint("after cross-power (fft_right freed)")
         fft_left /= (cp.abs(fft_left) + 1e-8)
         corr = cp.fft.ifft2(fft_left, axes=(-2, -1)).real
         del fft_left
+        mprint("after ifft (fft_left freed)")
 
         # skip fftshift: find argmax on raw ifft output, then map back with wrap arithmetic
         corr_flat = corr.reshape(L * n_pairs, -1)
@@ -282,6 +291,7 @@ def compute_shifts_for_all_rois_batched_optimized(videos, batch_size):
         aligned_flat = image2.reshape(L * n_pairs, H, W)
         aligned_flat = warp_video_fft(aligned_flat, -cum_shifts.reshape(L * n_pairs, 2))
         del cum_shifts, image2
+        mprint("after PC warp (image2 freed)")
 
         # ---- Lucas-Kanade with axis=(-2,-1) sums over (L, n_pairs, H, W) ----
         shifts_LK = cp.zeros((L, n_pairs, 2), dtype=cp.float32)

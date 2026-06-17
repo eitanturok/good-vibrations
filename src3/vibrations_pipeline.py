@@ -21,14 +21,12 @@ MIN_FREQ, MAX_FREQ = 50, 1000
 
 #***** 1 speckle shifts from speckle vibrations *****
 
-def get_shifts(frame_recording:np.ndarray, rois: list[list[int]], batch_size: int) -> np.ndarray:
-    import os
+def get_shifts(frame_recording:np.ndarray, rois: list[list[int]], batch_size: int, pclk_mode: str = "sequential") -> np.ndarray:
     from pclk import compute_shifts_for_roi, compute_shifts_for_all_rois_batched, compute_shifts_for_all_rois_batched_optimized
-    mode = os.environ.get("PCLK_MODE", "sequential")
-    if mode == "batched":
+    if pclk_mode == "batched":
         crops = np.stack([frame_recording[:, y:y+h, x:x+w] for x, y, w, h in rois])  # (L, T, H, W)
         return compute_shifts_for_all_rois_batched(crops, batch_size)                  # (L, T, 2)
-    if mode == "batched_optimized":
+    if pclk_mode == "batched_optimized":
         crops = np.stack([frame_recording[:, y:y+h, x:x+w] for x, y, w, h in rois])  # (L, T, H, W)
         return compute_shifts_for_all_rois_batched_optimized(crops, batch_size)        # (L, T, 2)
     else:
@@ -135,12 +133,13 @@ def capture_vibrations(cam, run_opt, speaker, play_audio_fxn, capture_n_frames_f
 
     # symlink audio to sample_dir
     symlink(audio_path, sample_dir / "audio.wav", do_save)
+    append({'audio_path': sample_dir / "audio.wav"}, sample_dir / "metadata.jsonl", do_save)
 
     # record vibrations
     with Timing(f"[sample {sample_id}] record vibrations: ", enabled=verbose >= 2):
         play_audio_fxn(audio_path, speaker, wait=False)
         n_frames = int(n_capture_seconds * run_opt['cam_params']['camera_FPS'])
-        raw_vibrations, times = capture_n_frames_fxn(cam, n_frames, *cam.get_im_size()[::-1])
+        raw_vibrations, _ = capture_n_frames_fxn(cam, n_frames, *cam.get_im_size()[::-1])
         if verbose >= 2: print(f'[sample {sample_id}] captured {n_frames} frames')
         append({"capture_vibrations": datetime.now(timezone.utc).isoformat()}, sample_dir / "times.jsonl", do_save)
 
@@ -189,7 +188,7 @@ def capture_vibrations_async(cam, run_opt, speaker, play_audio_fxn, capture_n_fr
     npy_path = sample_dir / 'inputs/00_raw_vibrations.npy'
     save_thread = threading.Thread(target=save, args=(raw_vibrations, npy_path, do_save), daemon=True)
     save_thread.start()
-    if verbose >= 1: print(f"[sample {sample_id}] save raw_vibration to {npy_path}")
+    if verbose >= 1: print(f"[sample {sample_id}] save raw vibration to {npy_path}")
 
     timestamp = datetime.now(timezone.utc).isoformat()
     append({"save_vibrations": timestamp}, sample_dir / "times.jsonl", do_save)
@@ -197,7 +196,7 @@ def capture_vibrations_async(cam, run_opt, speaker, play_audio_fxn, capture_n_fr
 
     return raw_vibrations, save_thread
 
-def process_vibrations(sample_dir:Path, min_freq:int=MIN_FREQ, max_freq:int=MAX_FREQ, audio_sample_rate:int=22050, signal_mode:str='magnitude', normalize_mode:str='std-sample', patch_size:int=256, pclk_batch_size:int=1024, verbose:int=1, do_save:bool=True):
+def process_vibrations(sample_dir:Path, min_freq:int=MIN_FREQ, max_freq:int=MAX_FREQ, audio_sample_rate:int=22050, signal_mode:str='magnitude', normalize_mode:str='std-sample', patch_size:int=256, pclk_batch_size:int=1024, pclk_mode:str='sequential', verbose:int=1, do_save:bool=True):
     sample_id = sample_dir.name
     metadata = {k: v for d in load(sample_dir / 'metadata.jsonl') for k, v in d.items()}
     fps, rois = int(metadata['laser_camera_fps']), metadata['roi']
@@ -205,7 +204,7 @@ def process_vibrations(sample_dir:Path, min_freq:int=MIN_FREQ, max_freq:int=MAX_
     # turn vibrations into shifts with pclk algorithm
     with Timing(f"[sample {sample_id}] pclk: ", enabled=verbose >= 2):
         raw_vibrations = load(sample_dir / 'inputs/00_raw_vibrations.npy')
-        raw_shifts = get_shifts(raw_vibrations, rois, pclk_batch_size)  # (L, T, 2)
+        raw_shifts = get_shifts(raw_vibrations, rois, pclk_batch_size, pclk_mode)  # (L, T, 2)
         save(raw_shifts, sample_dir / 'inputs/01_raw_shifts.npy', do_save)
         append({"pclk": datetime.now(timezone.utc).isoformat()}, sample_dir / "times.jsonl", do_save)
 
@@ -259,9 +258,39 @@ cuda_image = (
 def process_vibrations_modal(sample_dir_name: str, **kwargs):
     import sys, os
     sys.path.insert(0, "/src3")
+    volume.reload()
     from vibrations_pipeline import process_vibrations
     process_vibrations(VOLUME_PATH / sample_dir_name, **kwargs)
     volume.commit()
+
+@app.function(
+    gpu="A10G",
+    image=cuda_image,
+    timeout=60*10,
+    volumes={VOLUME_PATH: volume},
+)
+def process_vibrations_modal_localdata(sample_dir_name: str, raw_vibrations: np.ndarray, metadata: dict, **kwargs):
+    """Like process_vibrations_modal but receives raw_vibrations as a function argument
+    (cloudpickled over the wire) instead of reading from the volume.
+    Results are still written back to the volume via volume.commit().
+    """
+    import sys, tempfile
+    sys.path.insert(0, "/src3")
+    from vibrations_pipeline import process_vibrations
+
+    # write the incoming array + metadata to the volume path so process_vibrations can read them normally
+    sample_dir = VOLUME_PATH / sample_dir_name
+    sample_dir.mkdir(parents=True, exist_ok=True)
+    (sample_dir / 'inputs').mkdir(exist_ok=True)
+    np.save(sample_dir / 'inputs' / '00_raw_vibrations.npy', raw_vibrations)
+    import json
+    with open(sample_dir / 'metadata.jsonl', 'w') as f:
+        for k, v in metadata.items():
+            json.dump({k: v}, f); f.write('\n')
+
+    process_vibrations(sample_dir, **kwargs)
+    volume.commit()
+
 
 @app.function(
     gpu="A10G",

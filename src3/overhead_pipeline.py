@@ -218,7 +218,7 @@ def process_overhead(raw_overhead: Image.Image, output_dir: Path, left: float = 
         append([{"com": com}, {"downsampled_com": downsampled_com}], output_dir / "metadata.jsonl", do_save)
         if verbose >= 2: print(f"[output {output_id}] {com=}\t{downsampled_com=}")
 
-def output2sample(sample_dir:Path, output_dir:Path, verbose:int=1, do_save:bool=True):
+def copy_output_to_sample(sample_dir:Path, output_dir:Path, verbose:int=1, do_save:bool=True):
     sample_id = sample_dir.name
 
     # symlink the shared+copy artifacts from output_dir to the current sample_dir
