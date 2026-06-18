@@ -188,7 +188,6 @@ def capture_vibrations_async(cam, run_opt, speaker, play_audio_fxn, capture_n_fr
     npy_path = sample_dir / 'inputs/00_raw_vibrations.npy'
     save_thread = threading.Thread(target=save, args=(raw_vibrations, npy_path, do_save), daemon=True)
     save_thread.start()
-    if verbose >= 1: print(f"[sample {sample_id}] save raw vibration to {npy_path}")
 
     timestamp = datetime.now(timezone.utc).isoformat()
     append({"save_vibrations": timestamp}, sample_dir / "times.jsonl", do_save)
