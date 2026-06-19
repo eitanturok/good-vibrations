@@ -154,15 +154,16 @@ def capture_vibrations(cam, run_opt, speaker, play_audio_fxn, capture_n_frames_f
 
     return raw_vibrations
 
-def capture_vibrations_async(cam, run_opt, speaker, play_audio_fxn, capture_n_frames_fxn, audio_path, sample_dir, output_dir, n_capture_seconds=3.1, verbose=1, do_save=True):
+def capture_vibrations_async(cam, run_opt, speaker, play_audio_fxn, capture_n_frames_fxn, audio_path, sample_dir, n_capture_seconds=3.1, strict:bool=False, verbose=1, do_save=True):
     """Like capture_vibrations but launches the numpy save in a background thread.
 
     Returns (raw_vibrations, save_thread). Caller must join save_thread before
     the experiment ends to guarantee the file is fully written.
     """
     # symlink the audio to the current sample_dir
-    sample_id, output_id = sample_dir.name, output_dir.name
+    sample_id = sample_dir.name
     symlink(audio_path, sample_dir / "audio.wav", do_save)
+    append([{'audio_path': sample_dir / "audio.wav"}, {'speaker': speaker}], sample_dir / "metadata.jsonl", do_save)
 
     # with Timing(f"[sample {sample_id}] record vibrations: ", enabled=verbose >= 2):
     #     play_audio_fxn(audio_path, speaker)
@@ -175,9 +176,10 @@ def capture_vibrations_async(cam, run_opt, speaker, play_audio_fxn, capture_n_fr
         t_start = time.perf_counter()
         play_audio_fxn(audio_path, speaker, wait=False)
         n_frames = int(n_capture_seconds * run_opt['cam_params']['camera_FPS'])
+        if verbose >= 2: print(f'[sample {sample_id}] capturing {n_frames} frames')
         try:
             raw_vibrations, _ = capture_n_frames_fxn(cam, n_frames, *cam.get_im_size()[::-1])
-            if verbose >= 2: print(f'[sample {sample_id}] captured {n_frames} frames')
+            if verbose >= 2: print(f'[sample {sample_id}] {raw_vibrations.shape=}=(frames, height, width)')
         finally:
             # always wait for audio to finish — even if capture throws — so the next
             # sample's play_audio call never overlaps with this one
@@ -188,10 +190,6 @@ def capture_vibrations_async(cam, run_opt, speaker, play_audio_fxn, capture_n_fr
     npy_path = sample_dir / 'inputs/00_raw_vibrations.npy'
     save_thread = threading.Thread(target=save, args=(raw_vibrations, npy_path, do_save), daemon=True)
     save_thread.start()
-
-    timestamp = datetime.now(timezone.utc).isoformat()
-    append({"save_vibrations": timestamp}, sample_dir / "times.jsonl", do_save)
-    append({"sample_id": sample_id, "output_id": output_id, "time": timestamp}, audio_path.parent / "samples.jsonl", do_save)
 
     return raw_vibrations, save_thread
 
@@ -204,18 +202,21 @@ def process_vibrations(sample_dir:Path, min_freq:int=MIN_FREQ, max_freq:int=MAX_
     with Timing(f"[sample {sample_id}] pclk: ", enabled=verbose >= 2):
         raw_vibrations = load(sample_dir / 'inputs/00_raw_vibrations.npy')
         raw_shifts = get_shifts(raw_vibrations, rois, pclk_batch_size, pclk_mode)  # (L, T, 2)
+        if verbose >= 2: print(f'[sample {sample_id}] {raw_shifts.shape=}=(lasers, frames, x/y)')
         save(raw_shifts, sample_dir / 'inputs/01_raw_shifts.npy', do_save)
         append({"pclk": datetime.now(timezone.utc).isoformat()}, sample_dir / "times.jsonl", do_save)
 
     # clean the shifts
     with Timing(f"[sample {sample_id}] clean shifts: ", enabled=verbose >= 2):
-        clean_shifts = get_clean_shifts(raw_shifts[None], fps, min_freq, max_freq)  # (L,T,2) -> (1,L,T,2)
+        clean_shifts = get_clean_shifts(raw_shifts[None], fps, min_freq, max_freq)  # (L,T,2) -> (B,L,T,2)
+        if verbose >= 2: print(f'[sample {sample_id}] {clean_shifts.shape=}=(batch, lasers, frames, x/y)')
         save(clean_shifts, sample_dir / 'inputs/02_clean_shifts.npy', do_save)
         append({"clean_shifts": datetime.now(timezone.utc).isoformat()}, sample_dir / "times.jsonl", do_save)
 
     # fft the shifts
     with Timing(f"[sample {sample_id}] fft shifts: ", enabled=verbose >= 2):
-        fft, freqs, n_samples = get_fft_shifts(clean_shifts, fps, min_freq, max_freq)
+        fft, freqs, n_samples = get_fft_shifts(clean_shifts, fps, min_freq, max_freq) # (B,L,T,2) -> (B,L,F,2), (F,) (,)
+        if verbose >= 2: print(f'[sample {sample_id}] {fft.shape=}=(batch, lasers, freq bins, x/y)\n[sample {sample_id}] {freqs.shape=}=(freq bins)\n[sample {sample_id}] {n_samples=}')
         save({'fft': fft, 'freqs': freqs, 'n_samples': n_samples}, sample_dir / 'inputs/03_fft_shifts.npz', do_save)
         append({"fft_shifts": datetime.now(timezone.utc).isoformat()}, sample_dir / "times.jsonl", do_save)
 
@@ -228,7 +229,8 @@ def process_vibrations(sample_dir:Path, min_freq:int=MIN_FREQ, max_freq:int=MAX_
 
     # process fft (extract signal, normalize, and tokenize fft)
     with Timing(f"[sample {sample_id}] process fft: ", enabled=verbose >= 2):
-        processed_fft = get_processed_fft(fft, signal_mode, normalize_mode, patch_size)
+        processed_fft = get_processed_fft(fft, signal_mode, normalize_mode, patch_size) # (B,L,F,2) -> (B,L,P,PS,2)
+        if verbose >= 2: print(f'[sample {sample_id}] {processed_fft.shape=}=(batch, lasers, num_patches, patch_size, x/y)')
         save(processed_fft, sample_dir / 'inputs/05_processed_fft.npy', do_save)
         symlink(sample_dir / 'inputs/05_processed_fft.npy', sample_dir / 'X.npy', do_save)
         append({"process_fft": datetime.now(timezone.utc).isoformat()}, sample_dir / "times.jsonl", do_save)
@@ -255,7 +257,7 @@ cuda_image = (
     volumes={VOLUME_PATH: volume},
 )
 def process_vibrations_modal(sample_dir_name: str, **kwargs):
-    import sys, os
+    import sys
     sys.path.insert(0, "/src3")
     volume.reload()
     from vibrations_pipeline import process_vibrations
