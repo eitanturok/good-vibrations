@@ -218,16 +218,6 @@ def process_overhead(raw_overhead: Image.Image, output_dir: Path, left: float = 
         append([{"com": com}, {"downsampled_com": downsampled_com}], output_dir / "metadata.jsonl", do_save)
         if verbose >= 2: print(f"[output {output_id}] {com=}\t{downsampled_com=}")
 
-def copy_output_to_sample(sample_dir:Path, output_dir:Path, verbose:int=1, do_save:bool=True):
-    sample_id = sample_dir.name
-
-    # symlink the shared+copy artifacts from output_dir to the current sample_dir
-    with Timing(f"[sample {sample_id}] symlink artifacts: ", enabled=verbose >= 2):
-        assert all((output_dir / a).exists() for a in SHARED_ARTIFACTS+COPIED_ARTIFACTS), f"[sample {sample_id}] Missing shared or copied artifact"
-        for artifact in SHARED_ARTIFACTS: symlink(output_dir / artifact, sample_dir / f"{'' if artifact == 'y.npy' else 'outputs/'}{artifact}", do_save)
-        for artifact in COPIED_ARTIFACTS: copy(output_dir / artifact, sample_dir / artifact, do_save)
-        append([{"sample_id": sample_id}, {"sample_dir": sample_dir}], sample_dir / "metadata.jsonl", do_save)
-
 def visualize_overhead(speaker, sample_dir:Path, output_dir:Path, is_empty_box:bool, verbose:int=1, do_save:bool=True) -> Image.Image:
     sample_id = sample_dir.name
 

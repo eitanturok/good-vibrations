@@ -188,3 +188,22 @@ def preview(obj, mode):
     if mode == 'box_coverage': return preview_box_coverage(*obj)
     if mode == 'audio': return preview_audio(*obj)
     else: raise ValueError(f'{mode=} not recognized')
+
+#***** sample helpers *****
+
+def copy_output_to_sample(sample_dir:Path, output_dir:Path, verbose:int=1, do_save:bool=True):
+    sample_id = sample_dir.name
+
+    # symlink the shared+copy artifacts from output_dir to the current sample_dir
+    with Timing(f"[sample {sample_id}] symlink artifacts: ", enabled=verbose >= 2):
+        assert all((output_dir / a).exists() for a in SHARED_ARTIFACTS+COPIED_ARTIFACTS), f"[sample {sample_id}] Missing shared or copied artifact"
+        for artifact in SHARED_ARTIFACTS: symlink(output_dir / artifact, sample_dir / f"{'' if artifact == 'y.npy' else 'outputs/'}{artifact}", do_save)
+        for artifact in COPIED_ARTIFACTS: copy(output_dir / artifact, sample_dir / artifact, do_save)
+        append([{"sample_id": sample_id}, {"sample_dir": sample_dir}], sample_dir / "metadata.jsonl", do_save)
+
+def copy_audio_to_sample(speaker:list[int], sample_dir:Path, audio_path:Path, do_save:bool=True):
+    sample_id = sample_dir.name
+
+    symlink(audio_path, sample_dir / "audio.wav", do_save)
+    append([{'audio_path': sample_dir / "audio.wav"}, {'speaker': speaker}], sample_dir / "metadata.jsonl", do_save)
+    # append({'sample_id': sample_id}, audio_path / "samples.jsonl", do_save)

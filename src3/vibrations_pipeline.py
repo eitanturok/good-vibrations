@@ -128,31 +128,31 @@ def get_processed_fft(fft: np.ndarray, signal_mode:str, normalize_mode:str, patc
 
 #***** 6 define each stage of the pipeline ******
 
-def capture_vibrations(cam, run_opt, speaker, play_audio_fxn, capture_n_frames_fxn, audio_path:Path, sample_dir:Path, output_dir:Path, n_capture_seconds:float=3.1, verbose:int=1, do_save:bool=True):
-    sample_id, output_id = sample_dir.name, output_dir.name
+# def capture_vibrations(cam, run_opt, speaker, play_audio_fxn, capture_n_frames_fxn, audio_path:Path, sample_dir:Path, output_dir:Path, n_capture_seconds:float=3.1, verbose:int=1, do_save:bool=True):
+#     sample_id, output_id = sample_dir.name, output_dir.name
 
-    # symlink audio to sample_dir
-    symlink(audio_path, sample_dir / "audio.wav", do_save)
-    append({'audio_path': sample_dir / "audio.wav"}, sample_dir / "metadata.jsonl", do_save)
+#     # symlink audio to sample_dir
+#     symlink(audio_path, sample_dir / "audio.wav", do_save)
+#     append({'audio_path': sample_dir / "audio.wav"}, sample_dir / "metadata.jsonl", do_save)
 
-    # record vibrations
-    with Timing(f"[sample {sample_id}] record vibrations: ", enabled=verbose >= 2):
-        play_audio_fxn(audio_path, speaker, wait=False)
-        n_frames = int(n_capture_seconds * run_opt['cam_params']['camera_FPS'])
-        raw_vibrations, _ = capture_n_frames_fxn(cam, n_frames, *cam.get_im_size()[::-1])
-        if verbose >= 2: print(f'[sample {sample_id}] captured {n_frames} frames')
-        append({"capture_vibrations": datetime.now(timezone.utc).isoformat()}, sample_dir / "times.jsonl", do_save)
+#     # record vibrations
+#     with Timing(f"[sample {sample_id}] record vibrations: ", enabled=verbose >= 2):
+#         play_audio_fxn(audio_path, speaker, wait=False)
+#         n_frames = int(n_capture_seconds * run_opt['cam_params']['camera_FPS'])
+#         raw_vibrations, _ = capture_n_frames_fxn(cam, n_frames, *cam.get_im_size()[::-1])
+#         if verbose >= 2: print(f'[sample {sample_id}] captured {n_frames} frames')
+#         append({"capture_vibrations": datetime.now(timezone.utc).isoformat()}, sample_dir / "times.jsonl", do_save)
 
-    # save vibrations
-    with Timing(f"[sample {sample_id}] save vibrations: ", enabled=verbose >= 2):
-        save(raw_vibrations, sample_dir / 'inputs/00_raw_vibrations.npy', do_save)
-        timestamp = datetime.now(timezone.utc).isoformat()
-        append({"save_vibrations": timestamp}, sample_dir / "times.jsonl", do_save)
+#     # save vibrations
+#     with Timing(f"[sample {sample_id}] save vibrations: ", enabled=verbose >= 2):
+#         save(raw_vibrations, sample_dir / 'inputs/00_raw_vibrations.npy', do_save)
+#         timestamp = datetime.now(timezone.utc).isoformat()
+#         append({"save_vibrations": timestamp}, sample_dir / "times.jsonl", do_save)
 
-    # update tracking status
-    append({"sample_id": sample_id, "output_id": output_id, "time": timestamp}, audio_path.parent / "samples.jsonl", do_save)
+#     # update tracking status
+#     append({"sample_id": sample_id, "output_id": output_id, "time": timestamp}, audio_path.parent / "samples.jsonl", do_save)
 
-    return raw_vibrations
+#     return raw_vibrations
 
 def capture_vibrations_async(cam, run_opt, speaker, play_audio_fxn, capture_n_frames_fxn, audio_path, sample_dir, n_capture_seconds=3.1, strict:bool=False, verbose=1, do_save=True):
     """Like capture_vibrations but launches the numpy save in a background thread.
@@ -192,6 +192,25 @@ def capture_vibrations_async(cam, run_opt, speaker, play_audio_fxn, capture_n_fr
     save_thread.start()
 
     return raw_vibrations, save_thread
+
+def capture_vibrations(cam, speaker, play_audio_fxn, capture_n_frames_fxn, audio_path:Path, sample_dir:Path, height:int, width:int, n_capture_seconds=3.1, fps:int=2500, verbose=1, do_save=True):
+    sample_id = sample_dir.name
+    n_frames = int(n_capture_seconds * fps)
+
+    with Timing(f"[sample {sample_id}] record vibrations: ", enabled=verbose >= 2):
+        t_start = time.perf_counter()
+        play_audio_fxn(audio_path, speaker, wait=False)
+        if verbose >= 2: print(f'[sample {sample_id}] capturing {n_frames} frames')
+        try:
+            raw_vibrations, _ = capture_n_frames_fxn(cam, n_frames, height, width) # *cam.get_im_size()[::-1]
+            if verbose >= 2: print(f'[sample {sample_id}] {raw_vibrations.shape=}=(frames, height, width)')
+        finally:
+            # always wait for audio to finish — even if capture throws — so the next
+            # sample's play_audio call never overlaps with this one
+            remaining = n_capture_seconds - (time.perf_counter() - t_start)
+            if remaining > 0: time.sleep(remaining)
+
+    return raw_vibrations
 
 def process_vibrations(sample_dir:Path, min_freq:int=MIN_FREQ, max_freq:int=MAX_FREQ, audio_sample_rate:int=22050, signal_mode:str='magnitude', normalize_mode:str='std-sample', patch_size:int=256, pclk_batch_size:int=1024, pclk_mode:str='sequential', verbose:int=1, do_save:bool=True):
     sample_id = sample_dir.name
