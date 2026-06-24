@@ -170,7 +170,7 @@ def make_overhead(overhead: Image.Image, segment_mask: Image.Image, com: tuple[f
 
 DEFAULT_PROMPT = "A black metal cube sitting on the floor of an open cardboard box from a bird's eye view."
 
-def capture_and_save_overhead(overhead_cam, capture_image_fxn, output_dir:Path, verbose:int=1, do_save:bool=1) -> Image.Image:
+def capture_overhead(overhead_cam, capture_image_fxn, output_dir:Path, verbose:int=1, do_save:bool=1) -> Image.Image:
     output_id = output_dir.name
 
     # capture overhead image
@@ -180,11 +180,14 @@ def capture_and_save_overhead(overhead_cam, capture_image_fxn, output_dir:Path, 
         image = Image.fromarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
         append({'capture_overhead': datetime.now(timezone.utc).isoformat()}, output_dir / 'times.jsonl', do_save)
 
+    return image
+
+def save_overhead(image, output_dir:Path, verbose:int=1, do_save:bool=1) -> Image.Image:
+    output_id = output_dir.name
+
     with Timing(f"[output {output_id}] save the overhead image: ", enabled=verbose >= 2):
         save(image, output_dir / "00_raw_overhead.png", do_save)
         append({'save_overhead': datetime.now(timezone.utc).isoformat()}, output_dir / 'times.jsonl', do_save)
-
-    return image
 
 def process_overhead(raw_overhead: Image.Image, output_dir: Path, left: float = 0.15, right: float = 0.67, up: float = 0.08, down: float = 0.7, max_side:int=256,
                       prompt: str = DEFAULT_PROMPT, out_h: int = 40, out_w: int = 20, is_empty_box:bool=False, verbose: int = 1, do_save:bool=True):
@@ -224,16 +227,18 @@ def process_overhead(raw_overhead: Image.Image, output_dir: Path, left: float = 
 
 def visualize_overhead(speaker, sample_dir:Path, output_dir:Path, is_empty_box:bool, verbose:int=1, do_save:bool=True) -> Image.Image:
     sample_id = sample_dir.name
+    # samples keep artifacts under outputs/; an output_dir holds them at its root (e.g. when vibrate=False)
+    artifact_dir = sample_dir / "outputs" if (sample_dir / "outputs").exists() else sample_dir
 
     # make viz of overhead image for the current sample
     with Timing(f"[sample {sample_id}] make viz of the overhead image: ", enabled=verbose >= 2):
-        resized_overhead = load(sample_dir / "outputs/01_resized_overhead.png")
-        segment_mask = load(sample_dir / "outputs/02_segment_mask.png")
-        com = load(sample_dir / "outputs/04_com.jsonl")[0]['com']
+        resized_overhead = load(artifact_dir / "01_resized_overhead.png")
+        segment_mask = load(artifact_dir / "02_segment_mask.png")
+        com = load(artifact_dir / "04_com.jsonl")[0]['com']
 
         overhead = make_overhead(resized_overhead, segment_mask, com, is_empty_box, speaker)
-        save(overhead, sample_dir / "outputs/05_overhead.png")
-        symlink(sample_dir / "outputs/05_overhead.png", sample_dir / "overhead.png")
+        save(overhead, artifact_dir / "05_overhead.png", do_save)
+        symlink(artifact_dir / "05_overhead.png", sample_dir / "overhead.png", do_save)
 
         timestamp = datetime.now(timezone.utc).isoformat()
         append({f'visualize_overhead/sample_{sample_id}': timestamp}, output_dir / 'times.jsonl', do_save)

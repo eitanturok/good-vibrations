@@ -1,12 +1,15 @@
 
 import contextlib
+import functools
 import os
+import threading
 import time
 from pathlib import Path
 import json
 import shutil
 
 import numpy as np
+import psutil
 import matplotlib.pyplot as plt
 from PIL import Image
 from IPython.display import Audio
@@ -22,6 +25,16 @@ class Timing(contextlib.ContextDecorator):
     def __exit__(self, *exc):
         self.et = time.perf_counter_ns() - self.st
         if self.enabled: print(f"{self.prefix}{self.et*1e-6:6.2f} ms" + (self.on_exit(self.et) if self.on_exit else ""))
+
+#***** resource usage *****
+
+def print_system_usage(path, label="", verbose=1):
+    if verbose < 1: return
+    total, used, _ = shutil.disk_usage(path)
+    ram = psutil.virtual_memory()
+    GB = 2**30
+    prefix = f"{label} " if label else ""
+    print(f"{prefix}disk: {used/GB:.2f}/{total/GB:.2f} GB used | RAM: {ram.used/GB:.2f}/{ram.total/GB:.2f} GB used | threads: {threading.active_count()}/{psutil.Process().num_threads()} active")
 
 #***** file helpers *****
 
@@ -204,9 +217,51 @@ def copy_output_to_sample(sample_dir:Path, output_dir:Path, verbose:int=1, do_sa
         for artifact in COPIED_ARTIFACTS: copy(output_dir / artifact, sample_dir / artifact, do_save)
         append([{"sample_id": sample_id}, {"sample_dir": sample_dir}], sample_dir / "metadata.jsonl", do_save)
 
-def copy_audio_to_sample(speaker:list[int], sample_dir:Path, audio_path:Path, do_save:bool=True):
+def copy_audio_to_sample(speaker:list[int], sample_dir:Path, audio_dir:Path, do_save:bool=True):
     sample_id = sample_dir.name
 
-    symlink(audio_path, sample_dir / "audio.wav", do_save)
-    append([{'audio_path': sample_dir / "audio.wav"}, {'speaker': speaker}], sample_dir / "metadata.jsonl", do_save)
-    append({'sample_id': sample_id}, audio_path.parent / "samples.jsonl", do_save)
+    symlink(audio_dir / 'audio.wav', sample_dir / "audio.wav", do_save)
+    append([{'audio_dir': sample_dir / "audio.wav"}, {'speaker': speaker}], sample_dir / "metadata.jsonl", do_save)
+    append({'sample_id': sample_id}, audio_dir.parent / "samples.jsonl", do_save)
+
+#***** modal helpers *****
+
+SYMLINKS = [("recovered_audio.wav", "inputs/04_recovered_audio.wav"), ("X.npy", "inputs/05_processed_fft.npy")]
+
+def retry(attempts=4, delay=2.0, backoff=2.0, exceptions=(Exception,)):
+    """Retry a function on transient failures (e.g. DNS/connection errors under load)
+    with exponential backoff. Re-raises the last exception if all attempts fail."""
+    def decorator(fn):
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            wait = delay
+            for attempt in range(1, attempts + 1):
+                try:
+                    return fn(*args, **kwargs)
+                except exceptions as e:
+                    if attempt == attempts: raise
+                    print(f"[retry] {fn.__name__} failed (attempt {attempt}/{attempts}): {type(e).__name__}: {e}. retrying in {wait:.1f}s")
+                    time.sleep(wait)
+                    wait *= backoff
+        return wrapper
+    return decorator
+
+@retry()
+def modal_upload(volume, sample_dir):
+    sample_id = sample_dir.name
+    with volume.batch_upload(force=True) as batch:
+            batch.put_file(sample_dir / 'inputs/00_raw_vibrations.npy', f"{sample_id}/inputs/00_raw_vibrations.npy")
+            batch.put_file(sample_dir / 'metadata.jsonl', f"{sample_id}/metadata.jsonl")
+
+@retry()
+def modal_download(volume, remote_path, local_path):
+    local_path = Path(local_path)
+    local_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(local_path, 'wb') as f:
+        for chunk in volume.read_file(str(remote_path)): f.write(chunk)
+
+def fix_symlinks(sample_dir):
+    for dst_rel, src_rel in SYMLINKS:
+        dst, src = sample_dir / dst_rel, sample_dir / src_rel
+        if dst.exists() or dst.is_symlink(): dst.unlink()
+        dst.symlink_to(src.relative_to(dst.parent))
