@@ -189,7 +189,10 @@ def preview(obj, mode):
     if mode == 'audio': return preview_audio(*obj)
     else: raise ValueError(f'{mode=} not recognized')
 
-#***** sample helpers *****
+#***** copy to sample helpers *****
+
+SHARED_ARTIFACTS = ["00_raw_overhead.png", "01_resized_overhead.png", "02_segment_mask.png", "03_downsampled_segment_mask.png", "04_com.jsonl", "y.npy"]
+COPIED_ARTIFACTS = ["times.jsonl", "metadata.jsonl"]
 
 def copy_output_to_sample(sample_dir:Path, output_dir:Path, verbose:int=1, do_save:bool=True):
     sample_id = sample_dir.name
@@ -206,4 +209,4 @@ def copy_audio_to_sample(speaker:list[int], sample_dir:Path, audio_path:Path, do
 
     symlink(audio_path, sample_dir / "audio.wav", do_save)
     append([{'audio_path': sample_dir / "audio.wav"}, {'speaker': speaker}], sample_dir / "metadata.jsonl", do_save)
-    # append({'sample_id': sample_id}, audio_path / "samples.jsonl", do_save)
+    append({'sample_id': sample_id}, audio_path.parent / "samples.jsonl", do_save)
