@@ -90,7 +90,8 @@ def main():
                             continue
 
                         # 3. Submit to queue
-                        print(f"📥 [watcher] [sample {sample_id}] New raw data ready ({npy_path.stat().st_size / 1e9:.2f} GB). Adding to queue...")
+                        rel_path = npy_path.relative_to(watch_path)
+                        print(f"📥 [watcher] [sample {sample_id}] New raw data ready: {rel_path} ({npy_path.stat().st_size / 1e9:.2f} GB). Adding to queue...")
                         active_jobs.add(sample_id)
                         executor.submit(processing_worker, sample_dir, use_modal, args.verbose)
 
