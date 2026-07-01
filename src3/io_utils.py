@@ -247,11 +247,26 @@ def retry(attempts=4, delay=2.0, backoff=2.0, exceptions=(Exception,)):
     return decorator
 
 @retry()
-def modal_upload(volume, sample_dir):
+def modal_upload(volume, sample_dir, verbose:int=1):
     sample_id = sample_dir.name
+    raw_path = sample_dir / 'inputs/00_raw_vibrations.npy'
+    nbytes = raw_path.stat().st_size + (sample_dir / 'metadata.jsonl').stat().st_size
+    t0 = time.perf_counter()
     with volume.batch_upload(force=True) as batch:
-            batch.put_file(sample_dir / 'inputs/00_raw_vibrations.npy', f"{sample_id}/inputs/00_raw_vibrations.npy")
+            batch.put_file(raw_path, f"{sample_id}/inputs/00_raw_vibrations.npy")
             batch.put_file(sample_dir / 'metadata.jsonl', f"{sample_id}/metadata.jsonl")
+    dt = time.perf_counter() - t0
+    if verbose >= 1:
+        MB = nbytes / 2**20
+        print(f"[sample {sample_id}] upload throughput: {MB:.1f} MB in {dt:.2f}s = {MB/dt:.1f} MB/s ({8*MB/dt:.1f} Mbps)")
+
+def measure_upload_capacity():
+    """Actively measure real internet UPLOAD capacity (Mbps) by pushing data to a
+    speedtest server. Takes ~15s. Requires `pip install speedtest-cli`."""
+    import speedtest
+    st = speedtest.Speedtest()
+    st.get_best_server()
+    return st.upload() / 1e6  # bits/sec -> Mbps
 
 @retry()
 def modal_download(volume, remote_path, local_path):

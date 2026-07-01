@@ -293,7 +293,7 @@ def process_vibrations(sample_dir:Path, use_modal:bool=True, do_save:bool=True, 
 
     # upload raw vibrations DISK->modal_volume
     with Timing(f'[sample {sample_id}] upload raw vibrations DISK->modal_volume: ', enabled=verbose >= 1):
-        modal_upload(volume, sample_dir)
+        modal_upload(volume, sample_dir, verbose=verbose)
         upload_timestamp = datetime.now(timezone.utc).isoformat()
 
     # process raw vibrations remotely

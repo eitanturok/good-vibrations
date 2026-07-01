@@ -8,8 +8,10 @@ import sys
 # Ensure local workspace modules can resolve imports seamlessly
 sys.path.insert(0, str(Path(__file__).parent))
 
-from io_utils import Timing
+from io_utils import Timing, measure_upload_capacity
 from vibrations_pipeline import process_vibrations, app
+
+MIN_READY_BYTES = 1 * 2**20            # sanity floor: reject files caught mid-write at a few KB/MB
 
 def is_file_ready(path: Path, sample_id: str, check_interval: float = 1.0) -> bool:
     """Ensures the 3GB file has finished writing completely to disk before processing."""
@@ -19,8 +21,9 @@ def is_file_ready(path: Path, sample_id: str, check_interval: float = 1.0) -> bo
         size_1 = path.stat().st_size
         time.sleep(check_interval)
         size_2 = path.stat().st_size
-        # If size hasn't changed and is larger than 0, writing is finished
-        return size_1 == size_2 and size_1 > 0
+        # Writing is finished only if the size is stable and above a sanity floor.
+        # The stability check alone can false-positive if the disk stalls mid-write.
+        return size_1 == size_2 and size_1 >= MIN_READY_BYTES
     except (OSError, PermissionError):
         # File might be locked by the main process writing it; retry on next tick
         return False
@@ -55,6 +58,10 @@ def main():
     print(f"📂 Watching Directory: {watch_path}")
     print(f"⚙️  Max Workers:       {args.workers}")
     print(f"☁️  Modal Engine:      {'ENABLED' if use_modal else 'DISABLED'}")
+    try:
+        print(f"📡 Upload capacity:   {measure_upload_capacity():.1f} Mbps (measuring...)")
+    except Exception as e:
+        print(f"📡 Upload capacity:   unavailable ({type(e).__name__}: {e}). `pip install speedtest-cli` to enable.")
     print("=" * 80)
 
     if not watch_path.exists():
