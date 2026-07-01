@@ -125,7 +125,7 @@ def train(**kwargs):
 
     # make loggers
     config = data_info | args.__dict__ | dict(gpu_name=torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu", num_parameters=sum([p_.numel() for p_ in model.parameters()]))
-    wandb_logger = WandBLogger("better-tsa", group="speed", name=args.run_name, init_kwargs={"settings": wandb.Settings(x_disable_stats=False), "config": config, "save_code": True, "id": args.run_name, "resume": "allow"})
+    wandb_logger = WandBLogger("better-tsa", group="metal", name=args.run_name, init_kwargs={"settings": wandb.Settings(x_disable_stats=False), "config": config, "save_code": True, "id": args.run_name, "resume": "allow"})
     file_logger = FileLogger(f"runs/{{run_name}}/logs-rank{{rank}}.txt")
     loggers = [wandb_logger, file_logger]
 

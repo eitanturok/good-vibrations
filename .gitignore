@@ -1,6 +1,6 @@
 # Project specific
 data/experiment*
-wandb/*
+*/wandb/*
 checkpoints/
 data/processed/
 visualizations/
