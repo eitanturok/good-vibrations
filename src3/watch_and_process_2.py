@@ -15,6 +15,7 @@ import sys
 import time
 import argparse
 import threading
+import traceback
 from pathlib import Path
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor
@@ -36,16 +37,17 @@ def is_file_ready(path: Path, check_interval: float = 1.0) -> bool:
     except (OSError, PermissionError):
         return False  # locked by the writer; retry next tick
 
-def poll_status(call_id: str) -> str:
+def poll_status(call_id: str) -> tuple[str, tuple[str, str] | None]:
     """get(timeout=0) IS the done-check: returns if finished, raises TimeoutError if
-    still running, raises the remote error if the job crashed."""
+    still running, raises the remote error if the job crashed. On failure the returned
+    error is (message, traceback) so the poller can persist why the job died."""
     try:
         modal.FunctionCall.from_id(call_id).get(timeout=0)
-        return "done"
+        return "done", None
     except modal.exception.TimeoutError:
-        return "running"
-    except Exception:
-        return "failed"
+        return "running", None
+    except Exception as e:
+        return "failed", (f"{type(e).__name__}: {e}", traceback.format_exc())
 
 def main():
     p = argparse.ArgumentParser(description="Two-pool (upload / download) vibration watcher.")
@@ -58,10 +60,11 @@ def main():
 
     watch_path = Path(args.dir).resolve()
     ledger_path = watch_path / "jobs.jsonl"
+    failed_path = watch_path / "failed_samples.jsonl"
     verbose = args.verbose
 
     jobs = {}                    # sample_id -> {"status", "call_id", "sample_dir"}  (single source of truth)
-    lock = threading.Lock()      # guards `jobs` and ledger appends
+    lock = threading.Lock()      # guards `jobs` and the ledger / failed-log appends
 
     def set_status(sid, status, sample_dir, call_id=None):
         row = {"sample_id": sid, "status": status, "call_id": call_id, "sample_dir": str(sample_dir),
@@ -69,6 +72,13 @@ def main():
         with lock:
             jobs[sid] = {"status": status, "call_id": call_id, "sample_dir": str(sample_dir)}
             append(row, ledger_path)  # append-only; last row per sample wins on reload
+
+    def record_failure(sid, sample_dir, phase, error, tb, call_id=None):
+        """Append a failed modal instance to failed_samples.jsonl (sample id, error, traceback, timestamp)."""
+        row = {"sample_id": sid, "phase": phase, "error": error, "traceback": tb, "call_id": call_id,
+               "sample_dir": str(sample_dir), "time": datetime.now(timezone.utc).isoformat()}
+        with lock:
+            append(row, failed_path)
 
     print("=" * 80)
     print(f"👁️  TWO-POOL WATCHER | {watch_path} | up={args.upload_workers} down={args.download_workers}")
@@ -97,6 +107,7 @@ def main():
                 print(f"🚀 [sample {sid}] spawned modal job {fc.object_id}")
             except Exception as e:
                 print(f"❌ [sample {sid}] upload/spawn failed: {e}", file=sys.stderr)
+                record_failure(sid, sample_dir, "upload", f"{type(e).__name__}: {e}", traceback.format_exc())
                 set_status(sid, "failed", sample_dir)  # scan will retry it
 
         def download_worker(sample_dir, call_id):
@@ -110,6 +121,7 @@ def main():
                 print(f"✅ [sample {sid}] complete.")
             except Exception as e:
                 print(f"❌ [sample {sid}] download failed: {e}", file=sys.stderr)
+                record_failure(sid, sample_dir, "download", f"{type(e).__name__}: {e}", traceback.format_exc(), call_id)
                 set_status(sid, "failed", sample_dir, call_id)  # scan will retry it
 
         def poll_loop():
@@ -117,12 +129,14 @@ def main():
                 with lock:
                     running = [(sid, j["call_id"], Path(j["sample_dir"])) for sid, j in jobs.items() if j["status"] == "running"]
                 for sid, call_id, sample_dir in running:
-                    status = poll_status(call_id)
+                    status, err = poll_status(call_id)
                     if status == "done":
                         set_status(sid, "downloading", sample_dir, call_id)  # leaves "running" so we stop polling it
                         download_pool.submit(download_worker, sample_dir, call_id)
                     elif status == "failed":
-                        print(f"❌ [sample {sid}] modal job {call_id} FAILED.", file=sys.stderr)
+                        msg, tb = err
+                        print(f"❌ [sample {sid}] modal job {call_id} FAILED: {msg}", file=sys.stderr)
+                        record_failure(sid, sample_dir, "modal_job", msg, tb, call_id)
                         set_status(sid, "failed", sample_dir, call_id)
                 time.sleep(args.poll_rate)
 
