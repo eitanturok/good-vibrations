@@ -59,16 +59,17 @@ class CenterOfMassDistance(Metric):
         self.add_state("total", default=torch.tensor(0.0), dist_reduce_fx="sum")
         self.add_state("count", default=torch.tensor(0), dist_reduce_fx="sum")
 
-    def _com(self, mask):
+    def _com(self, mask, normalize:bool=False):
         total = mask.sum((-2, -1), keepdim=True).clamp(min=self.epsilon)
         cx = (self.xs * mask.sum(-2)).sum(-1) / total.squeeze()
         cy = (self.ys * mask.sum(-1)).sum(-1) / total.squeeze()
-        return torch.stack([cx / (len(self.xs) - 1), cy / (len(self.ys) - 1)], dim=-1)
+        if normalize: cx, cy = cx / (len(self.xs) - 1), cy / (len(self.ys) - 1)
+        return torch.stack([cx, cy], dim=-1)
 
     def update(self, mask_pred, mask_true):
         valid = mask_true.sum((-2, -1)) > 0  # skip empty ground-truth masks
         if not valid.any(): return
-        com_distances = torch.linalg.norm(self._com(mask_pred[valid]) - self._com(mask_true[valid]), ord=self.p, dim=-1)
+        com_distances = torch.linalg.norm(self._com(mask_pred[valid], normalize=True) - self._com(mask_true[valid], normalize=True), ord=self.p, dim=-1)
         self.total, self.count = self.total + com_distances.sum(), self.count + valid.sum()
 
     def compute(self): return self.total / self.count

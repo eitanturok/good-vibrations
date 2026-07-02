@@ -136,6 +136,7 @@ def draw_speaker(overhead: Image.Image, speaker: int | None = None) -> Image.Ima
     SPEAKER_POSITION = {1: (1, 0), 2: (1, 0.7), 3: (0.8, 1), 4: (0.6, 1), 5: (0.4, 1), 6: (0.2, 1), 7: (0, 0.7), 8: (0,0)}
 
     overhead = overhead.convert("RGBA")
+    W, H = overhead.size
 
     # add gray padding around the image and place a speaker icon
     pad = max(W, H) // 5  # padding size relative to image
