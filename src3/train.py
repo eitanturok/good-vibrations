@@ -65,10 +65,8 @@ def get_parser():
     parser.add_argument("--debug",                      type=int,   default=0)
     # data
     parser.add_argument("--n-samples",                  type=int,   default=None)
-    parser.add_argument("--mds-path",                   type=str,   default=r"D:/eturok/experiment-22/data/mds/f3b3704dcce9874c")
+    parser.add_argument("--mds-path",                   type=str,   default=r"D:/eturok/experiment-22/data/mds/3dd5526e5199d80d")
     parser.add_argument("--test-size",                  type=float, default=0.2)
-    parser.add_argument("--out-h",                      type=int,   default=18)
-    parser.add_argument("--out-w",                      type=int,   default=44)
     parser.add_argument("--patch-size",                 type=int,   default=256)
     parser.add_argument("--signal-mode",                type=str,   default='magnitude')
     parser.add_argument("--normalize-mode",              type=str,   default='z-global')
