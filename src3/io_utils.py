@@ -1,12 +1,7 @@
 
-import contextlib
-import functools
-import os
-import threading
-import time
+import contextlib, functools, os, threading, time, json, shutil
 from pathlib import Path
-import json
-import shutil
+from datetime import datetime, timezone
 
 import numpy as np
 import psutil
@@ -204,25 +199,27 @@ def preview(obj, mode):
 
 #***** copy to sample helpers *****
 
-SHARED_ARTIFACTS = ["00_raw_overhead.png", "01_resized_overhead.png", "02_segment_mask.png", "03_downsampled_segment_mask.png", "04_com.jsonl", "y.npy"]
-COPIED_ARTIFACTS = ["times.jsonl", "metadata.jsonl"]
+SHARED_FILES = ["00_raw_overhead.png", "01_resized_overhead.png", "02_segment_mask.png", "03_downsampled_segment_mask.png", "04_com.jsonl", "05_overhead_mask.png", "y.npy"]
+COPIED_FILES = ["times.jsonl", "metadata.jsonl"]
 
-def copy_output_to_sample(sample_dir:Path, output_dir:Path, verbose:int=1, do_save:bool=True):
+def copy_to_sample(sample_dir:Path, output_dir:Path, audio_dir:Path, speaker:int, do_save:bool=True):
     sample_id = sample_dir.name
 
     # symlink the shared+copy artifacts from output_dir to the current sample_dir
-    with Timing(f"[sample {sample_id}] symlink artifacts: ", enabled=verbose >= 2):
-        assert all((output_dir / a).exists() for a in SHARED_ARTIFACTS+COPIED_ARTIFACTS), f"[sample {sample_id}] Missing shared or copied artifact"
-        for artifact in SHARED_ARTIFACTS: symlink(output_dir / artifact, sample_dir / f"{'' if artifact == 'y.npy' else 'outputs/'}{artifact}", do_save)
-        for artifact in COPIED_ARTIFACTS: copy(output_dir / artifact, sample_dir / artifact, do_save)
-        append([{"sample_id": sample_id}, {"sample_dir": sample_dir}], sample_dir / "metadata.jsonl", do_save)
+    assert all((output_dir / a).exists() for a in SHARED_FILES+COPIED_FILES), f"[sample {sample_id}] Missing shared or copied artifact"
+    for artifact in SHARED_FILES: symlink(output_dir / artifact, sample_dir / f"{'' if artifact == 'y.npy' else 'outputs/'}{artifact}", do_save)
+    for artifact in COPIED_FILES: copy(output_dir / artifact, sample_dir / artifact, do_save)
 
-def copy_audio_to_sample(speaker:list[int], sample_dir:Path, audio_dir:Path, do_save:bool=True):
-    sample_id = sample_dir.name
-
+    # symlink the audio file from audio_dir to the current sample_dir
     symlink(audio_dir / 'audio.wav', sample_dir / "audio.wav", do_save)
     append([{'audio_dir': sample_dir / "audio.wav"}, {'speaker': speaker}], sample_dir / "metadata.jsonl", do_save)
-    append({'sample_id': sample_id}, audio_dir.parent / "samples.jsonl", do_save)
+    append({'sample_id': sample_id, "sample_dir": sample_dir}, audio_dir.parent / "samples.jsonl", do_save)
+
+    # the output_dir record all the samples that have been generated from it
+    append({"sample_id": sample_id, "sample_dir": sample_dir, "time": datetime.now(timezone.utc).isoformat()}, output_dir / "samples.jsonl", do_save)
+
+    # this sample should record it's own sample_id, sample_dir
+    append([{"sample_id": sample_id}, {"sample_dir": sample_dir}], sample_dir / "metadata.jsonl", do_save)
 
 #***** modal helpers *****
 

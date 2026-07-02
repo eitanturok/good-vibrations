@@ -106,13 +106,7 @@ def center_of_mass(mask: Image.Image) -> tuple[float, float]:
 
 #***** 5 overhead image *****
 
-def make_overhead(overhead: Image.Image, segment_mask: Image.Image, com: tuple[float, float], is_empty_box:bool, speaker: int | None = None) -> Image.Image:
-    # load lazily to not interefere with modal import
-    SPEAKER_IMG = Path(__file__).parent.parent / "assets/speaker.png"
-    # SPEAKER_POSITION = {'1000': (0, 0.5), '0100': (1/3, 0), '0010': (2/3,0), '0001': (1,0.5)} # assume bottom left corner is (0, 0)
-    SPEAKER_POSITION = {3: (0, 0.5), 4: (1/3, 0), 5: (2/3,0), 6: (1,0.5)} # assume bottom left corner is (0, 0)
-    SPEAKER_POSITION = {1: (1, 0), 2: (1, 0.7), 3: (0.8, 1), 4: (0.6, 1), 5: (0.4, 1), 6: (0.2, 1), 7: (0, 0.7), 8: (0,0)}
-
+def draw_mask(overhead: Image.Image, segment_mask: Image.Image, com: tuple[float, float], is_empty_box:bool):
     overhead = overhead.convert("RGBA")
 
     # green overlay from the mask
@@ -131,10 +125,17 @@ def make_overhead(overhead: Image.Image, segment_mask: Image.Image, com: tuple[f
         draw = ImageDraw.Draw(overhead)
         cx, cy = int(com[1]), int(com[0])
         r = max(3, W // 60)
-        draw.line([(cx - r, cy), (cx + r, cy)], fill=(144, 238, 144, 255), width=3)
-        draw.line([(cx, cy - r), (cx, cy + r)], fill=(144, 238, 144, 255), width=3)
+        draw.line([(cx - r, cy), (cx + r, cy)], fill=(144, 238, 144, 255), width=2)
+        draw.line([(cx, cy - r), (cx, cy + r)], fill=(144, 238, 144, 255), width=2)
 
-    if speaker is None: return overhead.convert("RGB")
+    return overhead.convert("RGB")
+
+def draw_speaker(overhead: Image.Image, speaker: int | None = None) -> Image.Image:
+    # load lazily to not interefere with modal import
+    SPEAKER_IMG = Path(__file__).parent.parent / "assets/speaker.png"
+    SPEAKER_POSITION = {1: (1, 0), 2: (1, 0.7), 3: (0.8, 1), 4: (0.6, 1), 5: (0.4, 1), 6: (0.2, 1), 7: (0, 0.7), 8: (0,0)}
+
+    overhead = overhead.convert("RGBA")
 
     # add gray padding around the image and place a speaker icon
     pad = max(W, H) // 5  # padding size relative to image
@@ -225,23 +226,26 @@ def process_overhead(raw_overhead: Image.Image, output_dir: Path, left: float = 
     # update tracking status
     append({'process_overhead': datetime.now(timezone.utc).isoformat()}, output_dir / 'times.jsonl', do_save)
 
-def visualize_overhead(speaker, sample_dir:Path, output_dir:Path, is_empty_box:bool, verbose:int=1, do_save:bool=True) -> Image.Image:
+    return resized_overhead, segment_mask, com
+
+def make_position_overhead(output_dir:Path, resized_overhead:Image.Image, segment_mask:Image.Image, com:tuple[float, float], is_empty_box:bool, verbose:int=1, do_save:bool=True):
+    # visualize overhead image with mask and center of mass, but not with speaker
+    output_id = output_dir.name
+    with Timing(f"[output {output_id}] visualize overhead image: ", enabled=verbose >= 2):
+        overhead_with_mask = draw_mask(resized_overhead, segment_mask, com, is_empty_box)
+        save(overhead_with_mask, output_dir / "05_overhead_mask.png", do_save)
+        append({'visualize_overhead/draw_mask': datetime.now(timezone.utc).isoformat()}, output_dir / 'times.jsonl', do_save)
+    return overhead_with_mask
+
+def make_sample_overhead(sample_dir:Path, output_dir:Path, speaker:int, verbose:int=1, do_save:bool=True) -> Image.Image:
+    # visualize overhead image with mask, center of mass, AND speaker
     sample_id = sample_dir.name
-    # samples keep artifacts under outputs/; an output_dir holds them at its root (e.g. when vibrate=False)
-    artifact_dir = sample_dir / "outputs" if (sample_dir / "outputs").exists() else sample_dir
-
-    # make viz of overhead image for the current sample
-    with Timing(f"[sample {sample_id}] make viz of the overhead image: ", enabled=verbose >= 2):
-        resized_overhead = load(artifact_dir / "01_resized_overhead.png")
-        segment_mask = load(artifact_dir / "02_segment_mask.png")
-        com = load(artifact_dir / "04_com.jsonl")[0]['com']
-
-        overhead = make_overhead(resized_overhead, segment_mask, com, is_empty_box, speaker)
-        save(overhead, artifact_dir / "05_overhead.png", do_save)
-        symlink(artifact_dir / "05_overhead.png", sample_dir / "overhead.png", do_save)
-
+    with Timing(f"[sample {sample_id}] visualize overhead image: ", enabled=verbose >= 2):
+        overhead_with_mask = load(sample_dir / 'outputs/05_overhead_mask.png', 'image')
+        overhead = draw_speaker(overhead_with_mask, speaker)
+        save(overhead, sample_dir / 'overhead.png', do_save)
         timestamp = datetime.now(timezone.utc).isoformat()
-        append({f'visualize_overhead/sample_{sample_id}': timestamp}, output_dir / 'times.jsonl', do_save)
-        append({"sample_id": sample_id, "sample_dir": sample_dir, "time": timestamp}, output_dir / "samples.jsonl", do_save)
+        append({f'visualize_overhead/draw_speaker/sample_{sample_id}': timestamp}, output_dir / 'times.jsonl', do_save)
+        append({f'visualize_overhead/draw_speaker': timestamp}, sample_dir / 'times.jsonl', do_save)
 
     return overhead
