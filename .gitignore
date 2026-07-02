@@ -1,6 +1,7 @@
 # Project specific
 data/experiment*
-*/wandb/*
+wandb/*
+src3/wandb/*
 checkpoints/
 data/processed/
 visualizations/
@@ -9,8 +10,6 @@ artifacts/
 runs/
 tmp/
 data/
-data2/
-raw_vibrations.npy
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

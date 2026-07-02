@@ -9,7 +9,10 @@ from pathlib import Path
 
 # src3 is a scripts dir (bare imports). On Modal it is mounted at /root/src3 -> put it on the path
 # so `from model import ...` resolves both locally (run from src3/) and remotely.
-if Path("/root/src3").exists() and "/root/src3" not in sys.path: sys.path.insert(0, "/root/src3")
+try:
+    if Path("/root/src3").exists() and "/root/src3" not in sys.path: sys.path.insert(0, "/root/src3")
+except PermissionError:
+    pass
 
 import torch
 import modal
