@@ -63,8 +63,7 @@ class CenterOfMassDistance(Metric):
         total = mask.sum((-2, -1), keepdim=True).clamp(min=self.epsilon)
         cx = (self.xs * mask.sum(-2)).sum(-1) / total.squeeze()
         cy = (self.ys * mask.sum(-1)).sum(-1) / total.squeeze()
-        # return torch.stack([cx / (len(self.xs) - 1), cy / (len(self.ys) - 1)], dim=-1)
-        return torch.stack([cx, cy], dim=-1)
+        return torch.stack([cx / (len(self.xs) - 1), cy / (len(self.ys) - 1)], dim=-1)
 
     def update(self, mask_pred, mask_true):
         valid = mask_true.sum((-2, -1)) > 0  # skip empty ground-truth masks

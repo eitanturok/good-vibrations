@@ -119,8 +119,9 @@ def train(**kwargs):
     print(f"Set random seed to {args.seed} for reproducibility")
 
     # make dataset, model, optimizer
-    train_loader, eval_loader, data_info = build_dataset(args.mds_path, args.batch_size, args.eval_batch_size, args.test_size, args.seed,
-                                                         args.num_workers, args.speakers, args.n_objects, args.box, args.n_samples)
+    train_loader, eval_loader, data_info = build_dataset(args.mds_path, batch_size=args.batch_size, eval_batch_size=args.eval_batch_size,
+                                                         test_size=args.test_size, seed=args.seed, num_workers=args.num_workers,
+                                                         speakers=args.speakers, n_objects=args.n_objects, box=args.box, n_samples=args.n_samples)
     model = VibrationTransformer(args.d_model, args.pnt_num_heads, args.pnt_num_layers, args.seq_num_heads, args.seq_num_layers, data_info)
     optimizer = torch.optim.Adam(model.parameters(), args.lr, fused=True)
 

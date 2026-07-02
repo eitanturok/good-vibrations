@@ -1,4 +1,4 @@
-import os, json, hashlib
+import os, json, hashlib, shutil
 from pathlib import Path
 
 import numpy as np
@@ -10,9 +10,11 @@ from streaming import StreamingDataset, MDSWriter
 
 from io_utils import load
 
+# ***** 1. turn dataset into MDS format (sharded, streaming) *****
+
 MDS_COLUMNS = {
     "X": "ndarray:float32", "y": "ndarray:float32",
-    "sample_id": "int", "n_objects": "int", "speaker": "int",
+    "sample_id": "int", "output_id": "str", "n_objects": "int", "speaker": "int",
     "box": "str", "is_empty_box": "int", "object": "str",
     "downsampled_com_x": "float64", "downsampled_com_y": "float64",
 }
@@ -35,17 +37,18 @@ def _load_xy(sample_dir: Path) -> tuple[np.ndarray, np.ndarray]:
 
 
 def _hash_key(data_dir: Path, sample_ids: list[int]) -> str:
-    payload = json.dumps([str(data_dir), sorted(sample_ids)], sort_keys=True)
+    payload = json.dumps([str(data_dir), sorted(sample_ids), MDS_COLUMNS], sort_keys=True)
     return hashlib.sha1(payload.encode()).hexdigest()[:16]
 
 
 def prep_dataset(data_dir: str | Path, mds_root: str | Path | None = None,
-                 exist_ok: bool = True, verbose: int = 1) -> Path:
+                 exist_ok: bool = True, force: bool = False, verbose: int = 1) -> Path:
     """Collect all complete (X.npy, y.npy) samples under ``data_dir`` and write one MDS dataset.
 
     The array shapes (x_shape, out_h, out_w) are inferred from the data and asserted to be uniform
     across all samples. Returns the path to the MDS dir (shards + ``dataset.jsonl`` sidecar).
-    On a cache hit (same data_dir + sample set) the existing dir is returned unchanged.
+    On a cache hit (same data_dir + sample set + MDS_COLUMNS schema) the existing dir is returned
+    unchanged, unless ``force`` is set, in which case the cached dir is rebuilt from scratch.
     """
     data_dir = Path(data_dir)
     samples_dir = data_dir / "samples"
@@ -64,10 +67,13 @@ def prep_dataset(data_dir: str | Path, mds_root: str | Path | None = None,
     sample_ids = [int(m["sample_id"]) for _, m in rows]
     if verbose: print(f"Found {len(rows)} complete samples ({len(skipped_ids)} skipped, missing X.npy)\nskipped ids: {skipped_ids}")
 
-    # hash-keyed output dir -> instant return on cache hit
+    # hash-keyed output dir (depends on MDS_COLUMNS too, so schema changes bust the cache) -> instant return on cache hit
     key = _hash_key(data_dir, sample_ids)
     mds_path = mds_root / key
-    if mds_path.exists() and (mds_path / "dataset.jsonl").exists() and exist_ok:
+    if mds_path.exists() and force:
+        if verbose: print(f"--force: deleting cached MDS at {mds_path} and rebuilding")
+        shutil.rmtree(mds_path)
+    elif mds_path.exists() and (mds_path / "dataset.jsonl").exists() and exist_ok:
         if verbose: print(f"Cache hit: reusing existing MDS at {mds_path}\nMDS: {mds_path} ({len(rows)} samples)")
         return mds_path
 
@@ -96,7 +102,7 @@ def prep_dataset(data_dir: str | Path, mds_root: str | Path | None = None,
 
             com = meta.get("downsampled_com", [-1.0, -1.0])
             sample = {
-                "X": X, "y": y, "sample_id": int(meta["sample_id"]),
+                "X": X, "y": y, "sample_id": int(meta["sample_id"]), "output_id": str(meta.get("output_id", "")),
                 "n_objects": int(meta.get("n_objects", -1)),
                 "speaker": int(meta.get("speaker", -1)),
                 "box": str(meta.get("box", "")),
@@ -118,6 +124,7 @@ def prep_dataset(data_dir: str | Path, mds_root: str | Path | None = None,
     if verbose: print(f"Wrote {len(rows)} samples. data_info={data_info}\nMDS: {mds_path} ({len(rows)} samples)")
     return mds_path
 
+#***** 2 create StreamingDataset (like pytorch Dataset but faster) *****
 
 class VibrationDataset(StreamingDataset):
     def __init__(self, local: str | Path, shuffle: bool = False, **kwargs):
@@ -125,9 +132,11 @@ class VibrationDataset(StreamingDataset):
 
     def __getitem__(self, idx):
         s = super().__getitem__(idx)
-        info = dict(sample_id=s["sample_id"], n_objects=s["n_objects"], speaker=s["speaker"], box=s["box"], is_empty_box=s["is_empty_box"], x_com=s["downsampled_com_x"], y_com=s["downsampled_com_y"])
-        return dict(fft=torch.from_numpy(s["X"]), mask_true=torch.from_numpy(s["y"]), info=info)
+        X, y = s.pop("X"), s.pop("y")
+        info = dict(sample_id=s["sample_id"], output_id=s["output_id"], n_objects=s["n_objects"], speaker=s["speaker"], box=s["box"], is_empty_box=s["is_empty_box"], x_com=s["downsampled_com_x"], y_com=s["downsampled_com_y"])
+        return dict(fft=torch.from_numpy(X), mask_true=torch.from_numpy(y), info=info)
 
+#***** 3 build train/eval DataLoaders with filtering + splitting *****
 
 def _matches(row: dict, speakers, n_objects, box) -> bool:
     if speakers is not None and row["speaker"] not in (speakers if isinstance(speakers, list) else [speakers]): return False
@@ -136,17 +145,23 @@ def _matches(row: dict, speakers, n_objects, box) -> bool:
     return True
 
 
-def build_dataset(mds_path: str | Path, batch_size: int = 64, eval_batch_size: int = 64, test_size: float = 0.2,
-                  seed: int = 42, num_workers: int = 8, speakers=None, n_objects=None, box=None,
-                  n_samples: int | None = None, verbose: int = 1):
+def build_dataset(mds_path: str | Path, batch_size: int = 64, eval_batch_size: int = 64, test_size: float = 0.15,
+                  unseen_pos_speaker_frac: float = 0.06, seed: int = 42, num_workers: int = 8,
+                  speakers=None, n_objects=None, box=None, n_samples: int | None = None, verbose: int = 1):
     """Return (train_loader, eval_loaders, data_info) using an already-written MDS.
 
-    Row filters (speakers/n_objects/box/n_samples) are applied via the index sidecar, then the
-    kept samples are split into train/eval.
+    Row filters (speakers/n_objects/box/n_samples) are applied via the index sidecar. The kept
+    samples are then split into train + 3 eval sets, split at the output_id level (an output_id
+    is a unique object layout/position; several samples, one per speaker, share the same output_id):
+
+    - eval/unseen_layout: all samples whose n_objects > 1.
+    - eval/unseen_pos: every sample whose output_id is in held_out_output_ids (the 15%).
+    - eval/unseen_pos_speaker: a `unseen_pos_speaker_frac` slice of the *sample_ids* (not output_ids) belonging to train_output_ids, so it spans many (position, speaker) combinations.
+    - train: the remaining sample_ids from train_output_ids.
     """
     generator = torch.Generator().manual_seed(seed)
     dataset = VibrationDataset(local=mds_path)
-   
+
     # load dataset.jsonl
     lines = (Path(mds_path) / "dataset.jsonl").read_text().strip().splitlines()
     data_info, index = json.loads(lines[0]), [json.loads(line) for line in lines[1:] if line]
@@ -155,9 +170,26 @@ def build_dataset(mds_path: str | Path, batch_size: int = 64, eval_batch_size: i
     keep = [i for i, row in enumerate(index) if _matches(row, speakers, n_objects, box)]
     if n_samples is not None: keep = keep[:n_samples]
 
-    # train/test split
-    train_idx, eval_idx = train_test_split(keep, test_size=test_size, random_state=seed, shuffle=True)
-    if verbose: print(f"{len(keep)} samples -> {len(train_idx)} train, {len(eval_idx)} eval")
+    # 1. carve out unseen_layout: all samples with n_objects > 1
+    unseen_layout_idx = [i for i in keep if index[i]["n_objects"] > 1]
+    remaining_idx = [i for i in keep if index[i]["n_objects"] <= 1]
+
+    # 2. split the remaining output_ids 85/15 -> train_output_ids, unseen_pos_output_ids
+    output_ids = sorted({index[i]["output_id"] for i in remaining_idx}) # sort for deterministic output
+    train_output_ids, unseen_pos_output_ids = train_test_split(output_ids, test_size=test_size, random_state=seed, shuffle=True)
+    train_output_ids, unseen_pos_output_ids = set(train_output_ids), set(unseen_pos_output_ids)
+
+    unseen_pos_idx = [i for i in remaining_idx if index[i]["output_id"] in unseen_pos_output_ids]
+    train_pool_idx = [i for i in remaining_idx if index[i]["output_id"] in train_output_ids]
+
+    # 3. carve unseen_pos_speaker_frac of the sample_ids (not output_ids) out of the train pool,
+    # so this eval spans many (position, speaker) combinations rather than a few whole layouts
+    train_idx, unseen_pos_speaker_idx = train_test_split(train_pool_idx, test_size=unseen_pos_speaker_frac, random_state=seed, shuffle=True)
+
+    if verbose:
+        print(f"{len(index)} total samples, {len(keep)} after filtering -> "
+              f"train={len(train_idx)}, eval/unseen_pos_speaker={len(unseen_pos_speaker_idx)}, "
+              f"eval/unseen_pos={len(unseen_pos_idx)}, eval/unseen_layout={len(unseen_layout_idx)}")
 
     def num_samples(batch): return batch["mask_true"].shape[0]
     def loader(idxs, bs, shuffle):
@@ -165,7 +197,11 @@ def build_dataset(mds_path: str | Path, batch_size: int = 64, eval_batch_size: i
         return DataSpec(dataloader=dl, get_num_samples_in_batch=num_samples)
 
     train_loader = loader(train_idx, batch_size, shuffle=True)
-    eval_loaders = [Evaluator(label="eval/base", dataloader=loader(eval_idx, eval_batch_size, shuffle=False))]
+    eval_loaders = [
+        Evaluator(label="eval/unseen_pos_speaker", dataloader=loader(unseen_pos_speaker_idx, eval_batch_size, shuffle=False)),
+        Evaluator(label="eval/unseen_pos", dataloader=loader(unseen_pos_idx, eval_batch_size, shuffle=False)),
+        Evaluator(label="eval/unseen_layout", dataloader=loader(unseen_layout_idx, eval_batch_size, shuffle=False)),
+    ]
     return train_loader, eval_loaders, data_info
 
 
@@ -174,6 +210,7 @@ if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("--data-dir", default=r"D:/eturok/experiment-22/data")
     p.add_argument("--mds-root", default=None)
+    p.add_argument("--force", action="store_true", default=False, help="delete and rebuild the cached MDS even on a cache hit")
     args = p.parse_args()
-    path = prep_dataset(args.data_dir, args.mds_root, verbose=2)
+    path = prep_dataset(args.data_dir, args.mds_root, force=args.force, verbose=2)
     print(f"MDS written to: {path}")
