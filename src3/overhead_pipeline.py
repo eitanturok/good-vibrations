@@ -82,13 +82,10 @@ def segment(image: Image.Image, prompt: str, is_empty_box: bool) -> Image.Image:
 #***** 3 downsample segment mask *****
 
 def downsample(mask: Image.Image, out_h: int, out_w: int) -> Image.Image:
-    arr = np.array(mask, dtype=np.float32) / 255.0  # (H, W) in {0, 1}
-    H, W = arr.shape
-    block_h, block_w = H // out_h, W // out_w
-    # Trim to exact multiples so the reshape is valid; loses at most (block_h-1) edge pixels.
-    arr = arr[:block_h * out_h, :block_w * out_w]
-    downsampled_mask = arr.reshape(out_h, block_h, out_w, block_w).mean(axis=(1, 3))
-    return Image.fromarray((downsampled_mask * 255).astype(np.uint8), mode="L")
+    # BOX resampling area-averages over the full H x W mask (unlike a floor-division block
+    # reshape, which silently truncates to block_h*out_h x block_w*out_w and drops the
+    # bottom/right edge whenever out_h/out_w don't evenly divide H/W).
+    return mask.resize((out_w, out_h), resample=Image.BOX)
 
 #***** 4 center of mass *****
 
