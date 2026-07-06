@@ -57,6 +57,17 @@ class FreqEncoder(nn.Module):
         output = self.layers(x) # (B_L,P+1,D) -> (B_L,P+1,D)
         return output[:, 0, :]  # (B_L,P+1,D) -> (B_L,D)
 
+def com(mask, xs, ys, epsilon, normalize):
+    total = mask.sum((-2, -1), keepdim=True).clamp(min=epsilon)
+    cx = (xs * mask.sum(-2)).sum(-1) / total.squeeze()
+    cy = (ys * mask.sum(-1)).sum(-1) / total.squeeze()
+    if normalize: cx, cy = cx / (len(xs) - 1), cy / (len(ys) - 1)
+    return torch.stack([cx, cy], dim=-1)
+
+def com_distances(mask_pred, mask_true, xs, ys, epsilon, normalize):
+    com_dist = com(mask_pred, xs, ys, epsilon, normalize) - com(mask_true, xs, ys, epsilon, normalize)
+    return torch.linalg.norm(com_dist, ord=2, dim=-1)
+
 class CenterOfMassDistance(Metric):
     def __init__(self, out_h:int, out_w:int, norm:int=2, epsilon:float=1e-6):
         super().__init__()
@@ -66,25 +77,18 @@ class CenterOfMassDistance(Metric):
         self.add_state("total", default=torch.tensor(0.0), dist_reduce_fx="sum")
         self.add_state("count", default=torch.tensor(0), dist_reduce_fx="sum")
 
-    def _com(self, mask, normalize:bool=False):
-        total = mask.sum((-2, -1), keepdim=True).clamp(min=self.epsilon)
-        cx = (self.xs * mask.sum(-2)).sum(-1) / total.squeeze()
-        cy = (self.ys * mask.sum(-1)).sum(-1) / total.squeeze()
-        if normalize: cx, cy = cx / (len(self.xs) - 1), cy / (len(self.ys) - 1)
-        return torch.stack([cx, cy], dim=-1)
-
     def update(self, mask_pred, mask_true):
         valid = mask_true.sum((-2, -1)) > 0  # skip empty ground-truth masks
         if not valid.any(): return
-        com_distances = torch.linalg.norm(self._com(mask_pred[valid], normalize=True) - self._com(mask_true[valid], normalize=True), ord=self.p, dim=-1)
-        self.total, self.count = self.total + com_distances.sum(), self.count + valid.sum()
+        com_distances_ = com_distances(mask_pred[valid], mask_true[valid], self.xs, self.ys, self.epsilon, normalize=True)
+        self.total, self.count = self.total + com_distances_.sum(), self.count + valid.sum()
 
     def compute(self): return self.total / self.count
 
 def create_metrics(data_info): return {"mse": MeanSquaredError(), 'com-distance': CenterOfMassDistance(data_info['out_h'], data_info['out_w'])}
 
 class VibrationTransformer(ComposerModel):
-    def __init__(self, d_model:int=128, pnt_num_heads:int=2, pnt_num_layers:int=2, seq_num_heads:int=2, seq_num_layers:int=2, data_info=DATA_INFO, signal_mode:str='magnitude', normalize_mode:str='z', freq_dropout:float=0.5, laser_dropout:float=0.5, save_logits=False):
+    def __init__(self, d_model:int=128, pnt_num_heads:int=2, pnt_num_layers:int=2, seq_num_heads:int=2, seq_num_layers:int=2, data_info=DATA_INFO, signal_mode:str='magnitude', normalize_mode:str='z', freq_dropout:float=0.0, laser_dropout:float=0.0, save_logits=False):
         super().__init__()
 
         # encoder

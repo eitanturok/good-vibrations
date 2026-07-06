@@ -83,7 +83,7 @@ def get_parser():
     # train
     parser.add_argument("--batch-size",                 type=int,   default=64)
     parser.add_argument("--lr",                         type=float, default=1e-4)
-    parser.add_argument("--max-duration",               type=str,   default="100ep")
+    parser.add_argument("--max-duration",               type=str,   default="2500ep")
     # eval
     parser.add_argument("--eval-batch-size",            type=int,   default=64)
     parser.add_argument("--eval-interval",              type=str,   default="50ep")

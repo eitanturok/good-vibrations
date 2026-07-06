@@ -8,6 +8,8 @@ from composer import Callback, Logger
 from composer.utils import format_name_with_dist
 from composer.loggers import WandBLogger
 
+from model import com_distances
+
 # ***** MaskVizualizer *****
 
 class MaskVisualizer(Callback):
@@ -21,6 +23,9 @@ class MaskVisualizer(Callback):
         mask_pred, mask_true, info = state.outputs['mask_pred'], state.batch['mask_true'], state.batch['info']
         pred_np, true_np = mask_pred.detach().cpu().numpy(), mask_true.detach().cpu().numpy()
         font = ImageFont.load_default(size=14)
+        h, w = pred_np.shape[-2:]
+        xs, ys = torch.arange(w, device=mask_pred.device).float(), torch.arange(h, device=mask_pred.device).float()
+        com_dists = com_distances(mask_pred, mask_true, xs, ys, epsilon=1e-6, normalize=True)
         def _render(i):
             h, w = pred_np[i].shape
             ph, pw = h * scale, w * scale  # panel size after upscale
@@ -29,7 +34,9 @@ class MaskVisualizer(Callback):
                 panel = Image.fromarray((arr * 255).clip(0, 255).astype(np.uint8)).resize((pw, ph), Image.NEAREST)
                 canvas.paste(panel, (j * (pw + sep), text_height))
                 ImageDraw.Draw(canvas).text((j * (pw + sep) + pw // 2, text_height - 14), label, fill=(0, 0, 0), font=font, anchor="mt")
-            text = f"id={info['sample_id'][i]}  spk={info['speaker'][i]}  objs={info['n_objects'][i]}  com=({info['x_com'][i]:.1f},{info['y_com'][i]:.1f})"
+            mse = float(np.mean((pred_np[i] - true_np[i]) ** 2))
+            text = (f"id={info['sample_id'][i]}  spk={info['speaker'][i]}  objs={info['n_objects'][i]}  "
+                    f"com=({info['x_com'][i]:.1f},{info['y_com'][i]:.1f})  mse={mse:.4f}  com_dist={com_dists[i]:.4f}")
             ImageDraw.Draw(canvas).text((pw + sep // 2, 2), text, fill=(80, 80, 80), font=font, anchor="mt")
             return np.array(canvas)
         imgs = [_render(i) for i in range(len(pred_np))]

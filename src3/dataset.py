@@ -134,7 +134,7 @@ class VibrationDataset(StreamingDataset):
         s = super().__getitem__(idx)
         X, y = s.pop("X"), s.pop("y")
         info = dict(sample_id=s["sample_id"], output_id=s["output_id"], n_objects=s["n_objects"], speaker=s["speaker"], box=s["box"], is_empty_box=s["is_empty_box"], x_com=s["downsampled_com_x"], y_com=s["downsampled_com_y"])
-        return dict(fft=torch.from_numpy(X), mask_true=torch.from_numpy(y), info=info)
+        return dict(fft=torch.from_numpy(X.copy()), mask_true=torch.from_numpy(y.copy()), info=info)
 
 #***** 3 build train/eval DataLoaders with filtering + splitting *****
 
