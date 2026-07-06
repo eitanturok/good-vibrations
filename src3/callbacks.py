@@ -69,8 +69,8 @@ class OutputSaver(Callback):
         self.folder = format_name_with_dist(self.folder, state.run_name)
         os.makedirs(self.folder, exist_ok=True)
 
-    def save_outputs(self, state: State, logger: Logger, data_name: str):
-        current_time_value = state.timestamp.get(self.save_interval.unit).value
+    def save_outputs(self, state: State, logger: Logger, data_name: str, timestamp):
+        current_time_value = timestamp.get(self.save_interval.unit).value
         if current_time_value % self.save_interval.value == 0:
             outputs = {'fft': _to_cpu(state.batch['fft']), 'mask_pred': _to_cpu(state.outputs['mask_pred']), 'mask_true': _to_cpu(state.batch['mask_true']), 'info': state.batch['info']}
 
@@ -80,7 +80,7 @@ class OutputSaver(Callback):
                 destination.log_metrics({f'{data_name}/{k}': v for k, v in outputs.items()})
 
             # save locally
-            path = os.path.join(self.folder, data_name, self.filename.format(epoch=state.timestamp.epoch.value, batch=state.timestamp.batch.value))
+            path = os.path.join(self.folder, data_name, self.filename.format(epoch=timestamp.epoch.value, batch=timestamp.batch.value))
             os.makedirs(os.path.dirname(path), exist_ok=True)
             if os.path.exists(path):
                 if not self.overwrite:
@@ -88,5 +88,5 @@ class OutputSaver(Callback):
                 os.remove(path)
             torch.save(outputs, path)
 
-    def after_forward(self, state, logger): self.save_outputs(state, logger, state.dataloader_label)
-    def eval_after_forward(self, state, logger): self.save_outputs(state, logger, f'{state.dataloader_label or "eval"}')
+    def after_forward(self, state, logger): self.save_outputs(state, logger, state.dataloader_label, state.timestamp)
+    def eval_after_forward(self, state, logger): self.save_outputs(state, logger, f'{state.dataloader_label or "eval"}', state.eval_timestamp)
