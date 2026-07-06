@@ -77,7 +77,7 @@ class CenterOfMassDistance(Metric):
 def create_metrics(data_info): return {"mse": MeanSquaredError(), 'com-distance': CenterOfMassDistance(data_info['out_h'], data_info['out_w'])}
 
 class VibrationTransformer(ComposerModel):
-    def __init__(self, d_model:int=128, pnt_num_heads:int=2, pnt_num_layers:int=2, seq_num_heads:int=2, seq_num_layers:int=2, data_info=DATA_INFO, signal_mode:str='magnitude', normalize_mode:str='z'):
+    def __init__(self, d_model:int=128, pnt_num_heads:int=2, pnt_num_layers:int=2, seq_num_heads:int=2, seq_num_layers:int=2, data_info=DATA_INFO, signal_mode:str='magnitude', normalize_mode:str='z', save_logits=False):
         super().__init__()
 
         # encoder
@@ -92,6 +92,7 @@ class VibrationTransformer(ComposerModel):
 
         # metrics
         self.train_metrics, self.val_metrics = create_metrics(data_info), create_metrics(data_info)
+        self.save_logits = save_logits
 
     def forward(self, batch):
         # B=batch size, L=n_lasers, C=n_coordinates=2, PS=patch_size, D=d_model
@@ -112,7 +113,7 @@ class VibrationTransformer(ComposerModel):
         # Predict segmentation mask
         mask_logits = self.decoder(cls_embedding) # (B,D) -> (B,H,W)
         mask_pred = mask_logits.sigmoid()
-        return dict(mask_pred=mask_pred)
+        return dict(mask_pred=mask_pred, mask_logits=mask_logits if self.save_logits else None)
 
     def loss(self, outputs, batch):
         # mse is averaged over (B,H,W) so the error is independent of the height and width, making it stable across different out_h / out_w
