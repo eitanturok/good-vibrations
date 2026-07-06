@@ -148,7 +148,7 @@ def _matches(row: dict, speakers, n_objects, box) -> bool:
 def build_dataset(mds_path: str | Path, batch_size: int = 64, eval_batch_size: int = 64, test_size: float = 0.15,
                   unseen_pos_speaker_frac: float = 0.06, seed: int = 42, num_workers: int = 8,
                   speakers=None, n_objects=None, box=None, n_samples: int | None = None, verbose: int = 1):
-    """Return (train_loader, eval_loaders, data_info) using an already-written MDS.
+    """Return (train_loader, eval_loaders) using an already-written MDS.
 
     Row filters (speakers/n_objects/box/n_samples) are applied via the index sidecar. The kept
     samples are then split into train + 3 eval sets, split at the output_id level (an output_id
@@ -162,9 +162,9 @@ def build_dataset(mds_path: str | Path, batch_size: int = 64, eval_batch_size: i
     generator = torch.Generator().manual_seed(seed)
     dataset = VibrationDataset(local=mds_path)
 
-    # load dataset.jsonl
+    # load dataset.jsonl (skip line 0: dataset-level info now comes from args, not the sidecar)
     lines = (Path(mds_path) / "dataset.jsonl").read_text().strip().splitlines()
-    data_info, index = json.loads(lines[0]), [json.loads(line) for line in lines[1:] if line]
+    index = [json.loads(line) for line in lines[1:] if line]
 
     # filter the dataset by speakers, n_objects, box, n_samples
     keep = [i for i, row in enumerate(index) if _matches(row, speakers, n_objects, box)]
@@ -202,7 +202,7 @@ def build_dataset(mds_path: str | Path, batch_size: int = 64, eval_batch_size: i
         Evaluator(label="eval/unseen_pos", dataloader=loader(unseen_pos_idx, eval_batch_size, shuffle=False)),
         Evaluator(label="eval/unseen_layout", dataloader=loader(unseen_layout_idx, eval_batch_size, shuffle=False)),
     ]
-    return train_loader, eval_loaders, data_info
+    return train_loader, eval_loaders
 
 
 if __name__ == "__main__":
