@@ -30,7 +30,7 @@ class MLPDecoder(nn.Module):
         self.net = nn.Sequential(nn.Linear(d_model, 256), nn.ReLU(), nn.Linear(256, out_h * out_w))
     def forward(self, cls): return self.net(cls).view(-1, self.out_h, self.out_w)
 
-class LaserEncoder(nn.Module):
+class FreqEncoder(nn.Module):
     def __init__(self, patch_size:int, d_model:int, num_heads:int, num_layers:int, signal_length:int, signal_mode:str, normalize_mode:str):
         super().__init__()
         self.embed = nn.Linear(2 * patch_size, d_model)
@@ -81,8 +81,8 @@ class VibrationTransformer(ComposerModel):
         super().__init__()
 
         # encoder
-        self.laser_encoder = LaserEncoder(data_info['patch_size'], d_model, pnt_num_heads, pnt_num_layers, data_info['n_freqs'], signal_mode, normalize_mode)
-        self.box_encoder = nn.TransformerEncoder(nn.TransformerEncoderLayer(d_model=d_model, nhead=seq_num_heads, batch_first=True), num_layers=seq_num_layers)
+        self.freq_encoder = FreqEncoder(data_info['patch_size'], d_model, pnt_num_heads, pnt_num_layers, data_info['n_freqs'], signal_mode, normalize_mode)
+        self.laser_encoder = nn.TransformerEncoder(nn.TransformerEncoderLayer(d_model=d_model, nhead=seq_num_heads, batch_first=True), num_layers=seq_num_layers)
         self.cls_token = nn.Parameter(torch.zeros(1, 1, d_model))
         nn.init.trunc_normal_(self.cls_token, std=0.02)  # Initialize to small random values
         self.register_buffer("freqs_laser", precompute_freqs_cis_2d(d_model, data_info['n_laser_rows'], data_info['n_laser_cols'])) # for laser grid
@@ -99,15 +99,15 @@ class VibrationTransformer(ComposerModel):
         x = batch['fft'] # (B,L,P,2,PS)
         B, L, _, _, _ = x.shape
 
-        # LaserEncoder learns patterns between all frequencies from a single laser
-        # flatten so LaserEncoder processes all lasers AND all batches in parallel
+        # FreqEncoder learns patterns between all frequencies from a single laser
+        # flatten so FreqEncoder processes all lasers AND all batches in parallel
         speaker = speaker.repeat_interleave(L) if (speaker := batch.get('speakers_encoded', None)) is not None else None # (BL,D)
-        x = self.laser_encoder(x.flatten(0, 1), speaker).reshape(B, L, -1)  # (B,L,P,C,PS) -> (B,L,D)
+        x = self.freq_encoder(x.flatten(0, 1), speaker).reshape(B, L, -1)  # (B,L,P,C,PS) -> (B,L,D)
 
-        # BoxEncoder learns patterns between ALL the lasers shining on the box
+        # LaserEncoder learns patterns between ALL the lasers shining on the box
         x = apply_rope(x, self.freqs_laser) # (B,L,D) -> (B,L,D)
         x = torch.cat((self.cls_token.expand(B, -1, -1), x), dim=1)  # (B,L,D) (1,1,D) -> (B,L+1,D)
-        output = self.box_encoder(x)  # (B,L+1,D) -> (B,L+1,D)
+        output = self.laser_encoder(x)  # (B,L+1,D) -> (B,L+1,D)
         cls_embedding = output[:, 0, :]  # (B,L+1,D) -> (B,D)
 
         # Predict segmentation mask
