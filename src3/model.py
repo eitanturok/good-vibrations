@@ -30,8 +30,13 @@ class MLPDecoder(nn.Module):
         self.net = nn.Sequential(nn.Linear(d_model, 256), nn.ReLU(), nn.Linear(256, out_h * out_w))
     def forward(self, cls): return self.net(cls).view(-1, self.out_h, self.out_w)
 
+def dropout(x, mask_shape, p, training):
+    if not training or p == 0.0: return x
+    keep = torch.rand(mask_shape, dtype=torch.float32, device=x.device) >= p
+    return x * keep.unsqueeze(-1) / (1 - p)
+
 class FreqEncoder(nn.Module):
-    def __init__(self, patch_size:int, d_model:int, num_heads:int, num_layers:int, signal_length:int, signal_mode:str, normalize_mode:str):
+    def __init__(self, patch_size:int, d_model:int, num_heads:int, num_layers:int, signal_length:int, signal_mode:str, normalize_mode:str, freq_dropout:float):
         super().__init__()
         self.embed = nn.Linear(2 * patch_size, d_model)
         self.speakers_embed = nn.Embedding(4, d_model)
@@ -39,11 +44,13 @@ class FreqEncoder(nn.Module):
         self.cls_token = nn.Parameter(torch.zeros(1, 1, d_model))
         self.register_buffer("freqs_cis", precompute_freqs_cis(d_model, signal_length // patch_size))
         self.signal_mode, self.normalize_mode = signal_mode, normalize_mode
+        self.freq_dropout = freq_dropout
 
     def forward(self, x, speaker=None):
         # x.shape = (B_L,P,C,PS) = (batch_size * n_lasers, n_patches, n_coords, patch_size)
         B_L, P, _, _ = x.shape
         x = self.embed(x.reshape(B_L, P, -1))   # (B_L,P,C,PS) -> (B_L,P,D)
+        x = dropout(x, (B_L, P), self.freq_dropout, self.training)  # drop whole patches
         x = apply_rope(x, self.freqs_cis)       # (B_L,P,D) -> (B_L,P,D)
         if speaker is not None: x += self.speakers_embed(speaker).unsqueeze(1)  # (B_L,P,D), (B_L,1,D) -> (B_L,P,D)
         x = torch.cat((self.cls_token.expand(B_L, -1, -1), x), dim=1)           # (B_L,P,D) -> (B_L,P+1,D)
@@ -77,12 +84,14 @@ class CenterOfMassDistance(Metric):
 def create_metrics(data_info): return {"mse": MeanSquaredError(), 'com-distance': CenterOfMassDistance(data_info['out_h'], data_info['out_w'])}
 
 class VibrationTransformer(ComposerModel):
-    def __init__(self, d_model:int=128, pnt_num_heads:int=2, pnt_num_layers:int=2, seq_num_heads:int=2, seq_num_layers:int=2, data_info=DATA_INFO, signal_mode:str='magnitude', normalize_mode:str='z', save_logits=False):
+    def __init__(self, d_model:int=128, pnt_num_heads:int=2, pnt_num_layers:int=2, seq_num_heads:int=2, seq_num_layers:int=2, data_info=DATA_INFO, signal_mode:str='magnitude', normalize_mode:str='z', freq_dropout:float=0.5, laser_dropout:float=0.5, save_logits=False):
         super().__init__()
 
         # encoder
-        self.freq_encoder = FreqEncoder(data_info['patch_size'], d_model, pnt_num_heads, pnt_num_layers, data_info['n_freqs'], signal_mode, normalize_mode)
+        self.freq_encoder = FreqEncoder(data_info['patch_size'], d_model, pnt_num_heads, pnt_num_layers, data_info['n_freqs'], signal_mode, normalize_mode, freq_dropout)
         self.laser_encoder = nn.TransformerEncoder(nn.TransformerEncoderLayer(d_model=d_model, nhead=seq_num_heads, batch_first=True), num_layers=seq_num_layers)
+        self.laser_dropout = laser_dropout
+
         self.cls_token = nn.Parameter(torch.zeros(1, 1, d_model))
         nn.init.trunc_normal_(self.cls_token, std=0.02)  # Initialize to small random values
         self.register_buffer("freqs_laser", precompute_freqs_cis_2d(d_model, data_info['n_laser_rows'], data_info['n_laser_cols'])) # for laser grid
@@ -103,6 +112,7 @@ class VibrationTransformer(ComposerModel):
         # flatten so FreqEncoder processes all lasers AND all batches in parallel
         speaker = speaker.repeat_interleave(L) if (speaker := batch.get('speakers_encoded', None)) is not None else None # (BL,D)
         x = self.freq_encoder(x.flatten(0, 1), speaker).reshape(B, L, -1)  # (B,L,P,C,PS) -> (B,L,D)
+        x = dropout(x, (B, L), self.laser_dropout, self.training)  # drop whole lasers
 
         # LaserEncoder learns patterns between ALL the lasers shining on the box
         x = apply_rope(x, self.freqs_laser) # (B,L,D) -> (B,L,D)
