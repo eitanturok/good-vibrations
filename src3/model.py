@@ -88,7 +88,7 @@ class CenterOfMassDistance(Metric):
 def create_metrics(data_info): return {"mse": MeanSquaredError(), 'com-distance': CenterOfMassDistance(data_info['out_h'], data_info['out_w'])}
 
 class VibrationTransformer(ComposerModel):
-    def __init__(self, d_model:int=128, pnt_num_heads:int=2, pnt_num_layers:int=2, seq_num_heads:int=2, seq_num_layers:int=2, data_info=DATA_INFO, signal_mode:str='magnitude', normalize_mode:str='z', freq_dropout:float=0.5, laser_dropout:float=0.5, save_logits:bool=False):
+    def __init__(self, d_model:int=128, pnt_num_heads:int=2, pnt_num_layers:int=2, seq_num_heads:int=2, seq_num_layers:int=2, data_info=DATA_INFO, signal_mode:str='magnitude', normalize_mode:str='z', freq_dropout:float=0.3, laser_dropout:float=0.3, save_logits:bool=False):
         super().__init__()
 
         # encoder

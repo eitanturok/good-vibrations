@@ -60,8 +60,8 @@ def get_parser():
     parser.add_argument("--seq-num-heads",              type=int,   default=2)
     parser.add_argument("--pnt-num-layers",             type=int,   default=2)
     parser.add_argument("--seq-num-layers",             type=int,   default=2)
-    parser.add_argument("--freq-dropout",               type=float, default=0.5)
-    parser.add_argument("--laser-dropout",              type=float, default=0.5)
+    parser.add_argument("--freq-dropout",               type=float, default=0.3)
+    parser.add_argument("--laser-dropout",              type=float, default=0.3)
     # train
     parser.add_argument("--batch-size",                 type=int,   default=64)
     parser.add_argument("--lr",                         type=float, default=1e-4)
