@@ -55,6 +55,7 @@ def get_parser():
     parser.add_argument("--box",                        type=str,   default=None)
     parser.add_argument("--dry-run",                    action="store_true", default=False)
     # model
+    parser.add_argument("--decoder",                     type=str,   default='mlp')
     parser.add_argument("--d-model",                    type=int,   default=128)
     parser.add_argument("--pnt-num-heads",              type=int,   default=2)
     parser.add_argument("--seq-num-heads",              type=int,   default=2)
@@ -197,7 +198,7 @@ def run(**kwargs):
 
     # make model
     data_info = dict(out_h=args.out_h, out_w=args.out_w, n_laser_rows=args.n_laser_rows, n_laser_cols=args.n_laser_cols, patch_size=args.patch_size, n_freqs=args.n_freqs)
-    model = VibrationTransformer(args.d_model, args.pnt_num_heads, args.pnt_num_layers, args.seq_num_heads, args.seq_num_layers, data_info, freq_dropout=args.freq_dropout, laser_dropout=args.laser_dropout)
+    model = VibrationTransformer(args.d_model, args.pnt_num_heads, args.pnt_num_layers, args.seq_num_heads, args.seq_num_layers, data_info, args.decoder, freq_dropout=args.freq_dropout, laser_dropout=args.laser_dropout)
     run_name = args.run_name
 
     # train

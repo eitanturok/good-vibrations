@@ -6,6 +6,8 @@ from torchmetrics import MeanSquaredError, Metric
 
 from dataset import DATA_INFO
 
+#***** 0 helpers *****
+
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0) -> torch.Tensor:
     freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)] / dim))
     freqs = torch.arange(end).unsqueeze(dim=1) * freqs.unsqueeze(dim=0)
@@ -23,39 +25,7 @@ def apply_rope(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
     x1, x2 = x.chunk(2, dim=-1)
     return torch.cat([x1 * cos - x2 * sin, x2 * cos + x1 * sin], dim=-1)
 
-class MLPDecoder(nn.Module):
-    def __init__(self, d_model, out_h, out_w):
-        super().__init__()
-        self.out_h, self.out_w = out_h, out_w
-        self.net = nn.Sequential(nn.Linear(d_model, 256), nn.ReLU(), nn.Linear(256, out_h * out_w))
-    def forward(self, cls): return self.net(cls).view(-1, self.out_h, self.out_w)
-
-def dropout(x, mask_shape, p, training):
-    if not training or p == 0.0: return x
-    keep = torch.rand(mask_shape, dtype=torch.float32, device=x.device) >= p
-    return x * keep.unsqueeze(-1) / (1 - p)
-
-class FreqEncoder(nn.Module):
-    def __init__(self, patch_size:int, d_model:int, num_heads:int, num_layers:int, signal_length:int, signal_mode:str, normalize_mode:str, freq_dropout:float):
-        super().__init__()
-        self.embed = nn.Linear(2 * patch_size, d_model)
-        self.speakers_embed = nn.Embedding(4, d_model)
-        self.layers = nn.TransformerEncoder(nn.TransformerEncoderLayer(d_model=d_model, nhead=num_heads, batch_first=True), num_layers=num_layers)
-        self.cls_token = nn.Parameter(torch.zeros(1, 1, d_model))
-        self.register_buffer("freqs_cis", precompute_freqs_cis(d_model, signal_length // patch_size))
-        self.signal_mode, self.normalize_mode = signal_mode, normalize_mode
-        self.freq_dropout = freq_dropout
-
-    def forward(self, x, speaker=None):
-        # x.shape = (B_L,P,C,PS) = (batch_size * n_lasers, n_patches, n_coords, patch_size)
-        B_L, P, _, _ = x.shape
-        x = self.embed(x.reshape(B_L, P, -1))   # (B_L,P,C,PS) -> (B_L,P,D)
-        x = dropout(x, (B_L, P), self.freq_dropout, self.training)  # drop whole patches
-        x = apply_rope(x, self.freqs_cis)       # (B_L,P,D) -> (B_L,P,D)
-        if speaker is not None: x += self.speakers_embed(speaker).unsqueeze(1)  # (B_L,P,D), (B_L,1,D) -> (B_L,P,D)
-        x = torch.cat((self.cls_token.expand(B_L, -1, -1), x), dim=1)           # (B_L,P,D) -> (B_L,P+1,D)
-        output = self.layers(x) # (B_L,P+1,D) -> (B_L,P+1,D)
-        return output[:, 0, :]  # (B_L,P+1,D) -> (B_L,D)
+#***** 1 metrics *****
 
 def com(mask, xs, ys, epsilon, normalize):
     total = mask.sum((-2, -1), keepdim=True).clamp(min=epsilon)
@@ -90,8 +60,68 @@ class CenterOfMassDistance(Metric):
 
 def create_metrics(data_info): return {"mse": MeanSquaredError(), 'com-distance': CenterOfMassDistance(data_info['out_h'], data_info['out_w'])}
 
+#***** 2 decoder *****
+
+class MLPDecoder(nn.Module):
+    def __init__(self, d_model, out_h, out_w):
+        super().__init__()
+        self.out_h, self.out_w = out_h, out_w
+        self.net = nn.Sequential(nn.Linear(d_model, 256), nn.ReLU(), nn.Linear(256, out_h * out_w))
+    def forward(self, cls): return self.net(cls).view(-1, self.out_h, self.out_w)
+
+class Decoder1(nn.Module):
+    def __init__(self, d_model, out_h, out_w):
+        super().__init__()
+        self.out_h, self.out_w = out_h, out_w
+        self.net = nn.Sequential(
+            nn.Linear(d_model, 256), nn.ReLU(),
+            nn.Linear(256, 512), nn.ReLU(),
+            nn.Linear(512, 1024), nn.ReLU(),
+            nn.Linear(1024, 2048), nn.ReLU(),
+            nn.Linear(2048, 1024), nn.ReLU(),
+            nn.Linear(1024, 512), nn.ReLU(),
+            nn.Linear(512, 256), nn.ReLU(),
+            nn.Linear(256, out_h * out_w),
+            )
+    def forward(self, cls): return self.net(cls).view(-1, self.out_h, self.out_w)
+
+def build_decoder(decoder, d_model, out_h, out_w):
+    decoders = {'mlp': MLPDecoder, 'decoder1': Decoder1}
+    return decoders[decoder](d_model, out_h, out_w)
+
+#***** 3 encoder *****
+
+def dropout(x, mask_shape, p, training):
+    if not training or p == 0.0: return x
+    keep = torch.rand(mask_shape, dtype=torch.float32, device=x.device) >= p
+    return x * keep.unsqueeze(-1) / (1 - p)
+
+class FreqEncoder(nn.Module):
+    def __init__(self, patch_size:int, d_model:int, num_heads:int, num_layers:int, signal_length:int, signal_mode:str, normalize_mode:str, freq_dropout:float):
+        super().__init__()
+        self.embed = nn.Linear(2 * patch_size, d_model)
+        self.speakers_embed = nn.Embedding(4, d_model)
+        self.layers = nn.TransformerEncoder(nn.TransformerEncoderLayer(d_model=d_model, nhead=num_heads, batch_first=True), num_layers=num_layers)
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, d_model))
+        self.register_buffer("freqs_cis", precompute_freqs_cis(d_model, signal_length // patch_size))
+        self.signal_mode, self.normalize_mode = signal_mode, normalize_mode
+        self.freq_dropout = freq_dropout
+
+    def forward(self, x, speaker=None):
+        # x.shape = (B_L,P,C,PS) = (batch_size * n_lasers, n_patches, n_coords, patch_size)
+        B_L, P, _, _ = x.shape
+        x = self.embed(x.reshape(B_L, P, -1))   # (B_L,P,C,PS) -> (B_L,P,D)
+        x = dropout(x, (B_L, P), self.freq_dropout, self.training)  # drop whole patches
+        x = apply_rope(x, self.freqs_cis)       # (B_L,P,D) -> (B_L,P,D)
+        if speaker is not None: x += self.speakers_embed(speaker).unsqueeze(1)  # (B_L,P,D), (B_L,1,D) -> (B_L,P,D)
+        x = torch.cat((self.cls_token.expand(B_L, -1, -1), x), dim=1)           # (B_L,P,D) -> (B_L,P+1,D)
+        output = self.layers(x) # (B_L,P+1,D) -> (B_L,P+1,D)
+        return output[:, 0, :]  # (B_L,P+1,D) -> (B_L,D)
+
+#***** 4 model *****
+
 class VibrationTransformer(ComposerModel):
-    def __init__(self, d_model:int=128, pnt_num_heads:int=2, pnt_num_layers:int=2, seq_num_heads:int=2, seq_num_layers:int=2, data_info=DATA_INFO, signal_mode:str='magnitude', normalize_mode:str='z', freq_dropout:float=0.3, laser_dropout:float=0.3, save_logits:bool=False):
+    def __init__(self, d_model:int=128, pnt_num_heads:int=2, pnt_num_layers:int=2, seq_num_heads:int=2, seq_num_layers:int=2, data_info=DATA_INFO, decoder:str='mlp', signal_mode:str='magnitude', normalize_mode:str='z', freq_dropout:float=0.3, laser_dropout:float=0.3, save_logits:bool=False):
         super().__init__()
 
         # encoder
@@ -104,7 +134,7 @@ class VibrationTransformer(ComposerModel):
         self.register_buffer("freqs_laser", precompute_freqs_cis_2d(d_model, data_info['n_laser_rows'], data_info['n_laser_cols'])) # for laser grid
 
         # decoder
-        self.decoder = MLPDecoder(d_model, data_info['out_h'], data_info['out_w'])
+        self.decoder = build_decoder(decoder, d_model, data_info['out_h'], data_info['out_w'])
 
         # metrics
         self.train_metrics, self.val_metrics = create_metrics(data_info), create_metrics(data_info)
@@ -133,7 +163,7 @@ class VibrationTransformer(ComposerModel):
         return dict(mask_pred=mask_pred, mask_logits=mask_logits if self.save_logits else None)
 
     def loss(self, outputs, batch):
-        # mse is averaged over (B,H,W) so the error is independent of the height and width, making it stable across different out_h / out_w
+        # mse is averaged over (B,H,W) so the error is independent of the out_h out_w we choose
         return F.mse_loss(outputs['mask_pred'], batch['mask_true'])
 
     def get_metrics(self, is_train=False):
