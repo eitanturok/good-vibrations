@@ -147,7 +147,8 @@ def _matches(row: dict, speakers, n_objects, box) -> bool:
 
 def build_dataset(mds_path: str | Path, batch_size: int = 64, eval_batch_size: int = 64, test_size: float = 0.15,
                   unseen_pos_speaker_frac: float = 0.06, seed: int = 42, num_workers: int = 8,
-                  speakers=None, n_objects=None, box=None, n_samples: int | None = None, verbose: int = 1):
+                  speakers=None, n_objects=None, box=None, n_samples: int | None = None,
+                  verbose: int = 1):
     """Return (train_loader, eval_loaders) using an already-written MDS.
 
     Row filters (speakers/n_objects/box/n_samples) are applied via the index sidecar. The kept

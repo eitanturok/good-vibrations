@@ -69,17 +69,14 @@ def get_parser():
     # eval
     parser.add_argument("--eval-batch-size",            type=int,   default=64)
     parser.add_argument("--eval-interval",              type=str,   default="50ep")
-    parser.add_argument("--checkpoint-path",            type=str,   default=None, help="Checkpoint to load for eval. If not set, defaults to the run's latest checkpoint.")
-    parser.add_argument("--forward-outputs-dir",        type=str,   default=None, help="Where to save eval .pt outputs. If not set, defaults to the run's forward_outputs dir.")
+    parser.add_argument("--outputs-interval",           type=str,   default="100ep")
+    parser.add_argument("--outputs-dir",                type=str,   default=None, help="Where to save eval .pt outputs. If not set, defaults to the run's outputs dir.")
     # run
     parser.add_argument("--run-name",                   type=str,   default=None)
-    # logging
-    parser.add_argument("--num-masks-logged",           type=str,   default=500)
-    parser.add_argument("--mask-logging-interval",      type=str,   default=None, help="Interval to log masks. If not set, defaults to eval_interval.")
     # checkpointing
+    parser.add_argument("--checkpoint-path",            type=str,   default=None, help="Checkpoint to load for eval. If not set, defaults to the run's latest checkpoint.")
     parser.add_argument("--checkpoint-interval",        type=str,   default="500ep")
     parser.add_argument("--remote-checkpoint-folder",   type=str, default="eturok-weizmann/laser-vibrations-checkpoints")
-    parser.add_argument("--save-output-interval",       type=str,   default="100ep")
     return parser
 
 # **** Modal ****
@@ -153,7 +150,7 @@ def run_train(args, device, model, train_loader, eval_loader, data_info):
             )
 
     callbacks=[SpeedMonitor(1), OOMObserver(folder=f"runs/{{run_name}}/torch_traces", remote_file_name=None), NaNMonitor(), RuntimeEstimator(time_unit="minutes"), SystemMetricsMonitor(),
-               MaskVisualizer(args.num_masks_logged, args.mask_logging_interval or args.eval_interval),
+               MaskVisualizer(args.eval_interval),
                ]
     trainer = Trainer(run_name=args.run_name, model=model, optimizers=optimizer, train_dataloader=train_loader, auto_log_hparams=False,
                     eval_dataloader=eval_loader, max_duration=args.max_duration, seed=args.seed, eval_interval=args.eval_interval,
@@ -166,16 +163,16 @@ def run_train(args, device, model, train_loader, eval_loader, data_info):
     trainer.close()
     return model, run_name
 
-def run_eval(model, train_loader, eval_loader, forward_outputs_dir, load_path=None):
-    """Run a full eval pass and save .pt outputs. Returns forward_outputs_dir."""
-    forward_outputs_dir = Path(forward_outputs_dir)
-    forward_outputs_dir.mkdir(parents=True, exist_ok=True)
+def run_eval(model, train_loader, eval_loader, outputs_dir, load_path=None):
+    """Run a full eval pass and save .pt outputs. Returns outputs_dir."""
+    outputs_dir = Path(outputs_dir)
+    outputs_dir.mkdir(parents=True, exist_ok=True)
 
     data_loaders = eval_loader + [Evaluator(label='train', dataloader=train_loader)]
-    trainer = Trainer(model=model, load_path=load_path, callbacks=OutputSaver('1ep', str(forward_outputs_dir), overwrite=True), progress_bar=False, log_to_console=True)
+    trainer = Trainer(model=model, load_path=load_path, callbacks=OutputSaver('1ep', str(outputs_dir), overwrite=True), progress_bar=False, log_to_console=True)
     trainer.eval(data_loaders)
     cleanup(trainer, data_loaders, eval_loader, train_loader)
-    return forward_outputs_dir
+    return outputs_dir
 
 @app.function(
     gpu="A10",
@@ -200,8 +197,7 @@ def run(**kwargs):
 
     # make model
     data_info = dict(out_h=args.out_h, out_w=args.out_w, n_laser_rows=args.n_laser_rows, n_laser_cols=args.n_laser_cols, patch_size=args.patch_size, n_freqs=args.n_freqs)
-    model = VibrationTransformer(args.d_model, args.pnt_num_heads, args.pnt_num_layers, args.seq_num_heads, args.seq_num_layers, data_info,
-                                  freq_dropout=args.freq_dropout, laser_dropout=args.laser_dropout)
+    model = VibrationTransformer(args.d_model, args.pnt_num_heads, args.pnt_num_layers, args.seq_num_heads, args.seq_num_layers, data_info, freq_dropout=args.freq_dropout, laser_dropout=args.laser_dropout)
     run_name = args.run_name
 
     # train
@@ -216,12 +212,12 @@ def run(**kwargs):
     if not args.no_eval:
         model.save_logits = True
         load_path = str(args.checkpoint_path) if args.no_train else None
-        forward_outputs_dir = args.forward_outputs_dir or f"runs/{run_name}/forward_outputs"
+        outputs_dir = args.outputs_dir or f"runs/{run_name}/outputs"
         train_loader, eval_loader = build_dataset(
             args.mds_path, batch_size=args.batch_size, eval_batch_size=args.eval_batch_size,
             test_size=args.test_size, seed=args.seed, num_workers=args.num_workers,
             speakers=args.speakers, n_objects=args.n_objects, box=args.box, n_samples=args.n_samples)
-        run_eval(model, train_loader, eval_loader, forward_outputs_dir, load_path=load_path)
+        run_eval(model, train_loader, eval_loader, outputs_dir, load_path=load_path)
 
 @app.local_entrypoint()
 def main(*args):

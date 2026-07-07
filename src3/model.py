@@ -68,6 +68,9 @@ def com_distances(mask_pred, mask_true, xs, ys, epsilon, normalize):
     com_dist = com(mask_pred, xs, ys, epsilon, normalize) - com(mask_true, xs, ys, epsilon, normalize)
     return torch.linalg.norm(com_dist, ord=2, dim=-1)
 
+def mses(mask_pred, mask_true):
+    return (mask_pred - mask_true).square().mean(dim=(-2, -1))
+
 class CenterOfMassDistance(Metric):
     def __init__(self, out_h:int, out_w:int, norm:int=2, epsilon:float=1e-6):
         super().__init__()

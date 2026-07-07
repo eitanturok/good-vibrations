@@ -8,53 +8,49 @@ from composer import Callback, Logger
 from composer.utils import format_name_with_dist
 from composer.loggers import WandBLogger
 
-from model import com_distances
+from model import com_distances, mses
 
 # ***** MaskVizualizer *****
 
 class MaskVisualizer(Callback):
-    def __init__(self, num_images, train_interval):
-        self.num_images = num_images
-        self.train_interval = Time.from_input(train_interval, TimeUnit.EPOCH)
-        self.last_train_time_value_logged = -1
-        self.last_eval_step_logged = {}
+    def __init__(self, log_interval):
+        self.log_interval = Time.from_input(log_interval, TimeUnit.EPOCH)
 
-    def _log_image(self, state: State, logger: Logger, data_name: str, scale: int=8, text_height: int=40, sep: int=4):
+    def _render(self, pred_np, true_np, info, mse_vals, com_dists, i, scale=8, text_height=40, sep=4, font=ImageFont.load_default(size=14)):
+        h, w = pred_np[i].shape
+        ph, pw = h * scale, w * scale  # panel size after upscale
+        canvas = Image.new("RGB", (pw * 2 + sep, ph + text_height), (255, 255, 255))
+        for j, (arr, label) in enumerate([(pred_np[i], "Predicted"), (true_np[i], "Ground Truth")]):
+            panel = Image.fromarray((arr * 255).clip(0, 255).astype(np.uint8)).resize((pw, ph), Image.NEAREST)
+            canvas.paste(panel, (j * (pw + sep), text_height))
+            ImageDraw.Draw(canvas).text((j * (pw + sep) + pw // 2, text_height - 14), label, fill=(0, 0, 0), font=font, anchor="mt")
+        text = (f"id={info['sample_id'][i]}  spk={info['speaker'][i]}  objs={info['n_objects'][i]}  "
+                f"com=({info['x_com'][i]:.1f},{info['y_com'][i]:.1f})  mse={mse_vals[i]:.4f}  com_dist={com_dists[i]:.4f}")
+        ImageDraw.Draw(canvas).text((pw + sep // 2, 2), text, fill=(80, 80, 80), font=font, anchor="mt")
+        return np.array(canvas)
+
+    def _render_batch(self, state: State) -> list[np.ndarray]:
         mask_pred, mask_true, info = state.outputs['mask_pred'], state.batch['mask_true'], state.batch['info']
-        pred_np, true_np = mask_pred.detach().cpu().numpy(), mask_true.detach().cpu().numpy()
-        font = ImageFont.load_default(size=14)
-        h, w = pred_np.shape[-2:]
+        h, w = mask_pred.shape[-2:]
         xs, ys = torch.arange(w, device=mask_pred.device).float(), torch.arange(h, device=mask_pred.device).float()
-        com_dists = com_distances(mask_pred, mask_true, xs, ys, epsilon=1e-6, normalize=True)
-        def _render(i):
-            h, w = pred_np[i].shape
-            ph, pw = h * scale, w * scale  # panel size after upscale
-            canvas = Image.new("RGB", (pw * 2 + sep, ph + text_height), (255, 255, 255))
-            for j, (arr, label) in enumerate([(pred_np[i], "Predicted"), (true_np[i], "Ground Truth")]):
-                panel = Image.fromarray((arr * 255).clip(0, 255).astype(np.uint8)).resize((pw, ph), Image.NEAREST)
-                canvas.paste(panel, (j * (pw + sep), text_height))
-                ImageDraw.Draw(canvas).text((j * (pw + sep) + pw // 2, text_height - 14), label, fill=(0, 0, 0), font=font, anchor="mt")
-            mse = float(np.mean((pred_np[i] - true_np[i]) ** 2))
-            text = (f"id={info['sample_id'][i]}  spk={info['speaker'][i]}  objs={info['n_objects'][i]}  "
-                    f"com=({info['x_com'][i]:.1f},{info['y_com'][i]:.1f})  mse={mse:.4f}  com_dist={com_dists[i]:.4f}")
-            ImageDraw.Draw(canvas).text((pw + sep // 2, 2), text, fill=(80, 80, 80), font=font, anchor="mt")
-            return np.array(canvas)
-        imgs = [_render(i) for i in range(len(pred_np))]
-        logger.log_images(imgs, name=data_name, channels_last=True, use_table=False)
+        com_dists = com_distances(mask_pred, mask_true, xs, ys, epsilon=1e-6, normalize=True).detach().cpu().numpy()
+        mse_vals = mses(mask_pred, mask_true).detach().cpu().numpy()
+        pred_np, true_np = mask_pred.detach().cpu().numpy(), mask_true.detach().cpu().numpy()
+        return [self._render(pred_np, true_np, info, mse_vals, com_dists, i) for i in range(len(pred_np))]
 
-    def before_loss(self, state: State, logger: Logger):
-        current_time_value = state.timestamp.get(self.train_interval.unit).value
-        if current_time_value % self.train_interval.value == 0 and current_time_value != self.last_train_time_value_logged:
-            self.last_train_time_value_logged = current_time_value
-            self._log_image(state, logger, 'Images/train')
+    def _due(self, state: State) -> bool:
+        current_time_value = state.timestamp.get(self.log_interval.unit).value
+        return current_time_value % self.log_interval.value == 0
+
+    def after_forward(self, state: State, logger: Logger):
+        # NOTE: wandb.Image caps any single log_images call at MAX_ITEMS=108
+        # so if BS>108, we will only log the first 108 images of the batch
+        if self._due(state):
+            logger.log_images(self._render_batch(state), name='SMask/train', channels_last=True, use_table=False)
 
     def eval_after_forward(self, state: State, logger: Logger):
-        eval_batch = state.eval_timestamp.get(TimeUnit.BATCH).value
-        train_step = state.timestamp.batch.value
-        evaluator_label = state.dataloader_label or 'eval'
-        if eval_batch == 0 and train_step != self.last_eval_step_logged.get(evaluator_label):
-            self.last_eval_step_logged[evaluator_label] = train_step
-            self._log_image(state, logger, f'Images/{evaluator_label}')
+        if self._due(state):
+            logger.log_images(self._render_batch(state), name=f'SMask/{state.dataloader_label}', channels_last=True, use_table=False)
 
 # ***** OutputSaver *****
 
