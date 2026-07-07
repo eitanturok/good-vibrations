@@ -12,117 +12,117 @@ from io_utils import load
 
 # ***** 1. turn dataset into MDS format (sharded, streaming) *****
 
-MDS_COLUMNS = {
-    "X": "ndarray:float32", "y": "ndarray:float32",
-    "sample_id": "int", "output_id": "str", "n_objects": "int", "speaker": "int",
-    "box": "str", "is_empty_box": "int", "object": "str",
-    "downsampled_com_x": "float64", "downsampled_com_y": "float64",
-}
-# default used by the model when no dataset is loaded (matches the experiment-22 MDS)
-DATA_INFO = {"out_h": 18, "out_w": 44, "n_samples": 0,
-             "n_laser_rows": 10, "n_laser_cols": 10, "patch_size": 256, "n_freqs": 3328}
+# MDS_COLUMNS = {
+#     "X": "ndarray:float32", "y": "ndarray:float32",
+#     "sample_id": "int", "output_id": "str", "n_objects": "int", "speaker": "int",
+#     "box": "str", "is_empty_box": "int", "object": "str",
+#     "downsampled_com_x": "float64", "downsampled_com_y": "float64",
+# }
+# # default used by the model when no dataset is loaded (matches the experiment-22 MDS)
+# DATA_INFO = {"out_h": 18, "out_w": 44, "n_samples": 0,
+#              "n_laser_rows": 10, "n_laser_cols": 10, "patch_size": 256, "n_freqs": 3328}
 
 
-def flatten_metadata(sample_dir: Path) -> dict:
-    """Merge every {k: v} line of a sample's metadata.jsonl into one dict."""
-    return {k: v for d in load(sample_dir / "metadata.jsonl") for k, v in d.items()}
+# def flatten_metadata(sample_dir: Path) -> dict:
+#     """Merge every {k: v} line of a sample's metadata.jsonl into one dict."""
+#     return {k: v for d in load(sample_dir / "metadata.jsonl") for k, v in d.items()}
 
 
-def _load_xy(sample_dir: Path) -> tuple[np.ndarray, np.ndarray]:
-    """Load a sample's X (squeezed to (L, P, PS, C)) and y (out_h, out_w)."""
-    X = np.load(sample_dir / "X.npy").astype(np.float32)   # (1, L, P, PS, C)
-    y = np.load(sample_dir / "y.npy").astype(np.float32)   # (out_h, out_w)
-    X = np.squeeze(X, axis=0) if X.ndim == 5 and X.shape[0] == 1 else X
-    return X, y
+# def _load_xy(sample_dir: Path) -> tuple[np.ndarray, np.ndarray]:
+#     """Load a sample's X (squeezed to (L, P, PS, C)) and y (out_h, out_w)."""
+#     X = np.load(sample_dir / "X.npy").astype(np.float32)   # (1, L, P, PS, C)
+#     y = np.load(sample_dir / "y.npy").astype(np.float32)   # (out_h, out_w)
+#     X = np.squeeze(X, axis=0) if X.ndim == 5 and X.shape[0] == 1 else X
+#     return X, y
 
 
-def _hash_key(data_dir: Path, sample_ids: list[int]) -> str:
-    payload = json.dumps([str(data_dir), sorted(sample_ids), MDS_COLUMNS], sort_keys=True)
-    return hashlib.sha1(payload.encode()).hexdigest()[:16]
+# def _hash_key(data_dir: Path, sample_ids: list[int]) -> str:
+#     payload = json.dumps([str(data_dir), sorted(sample_ids), MDS_COLUMNS], sort_keys=True)
+#     return hashlib.sha1(payload.encode()).hexdigest()[:16]
 
 
-def prep_dataset(data_dir: str | Path, mds_root: str | Path | None = None,
-                 exist_ok: bool = True, force: bool = False, verbose: int = 1) -> Path:
-    """Collect all complete (X.npy, y.npy) samples under ``data_dir`` and write one MDS dataset.
+# def prep_dataset(data_dir: str | Path, mds_root: str | Path | None = None,
+#                  exist_ok: bool = True, force: bool = False, verbose: int = 1) -> Path:
+#     """Collect all complete (X.npy, y.npy) samples under ``data_dir`` and write one MDS dataset.
 
-    The array shapes (x_shape, out_h, out_w) are inferred from the data and asserted to be uniform
-    across all samples. Returns the path to the MDS dir (shards + ``dataset.jsonl`` sidecar).
-    On a cache hit (same data_dir + sample set + MDS_COLUMNS schema) the existing dir is returned
-    unchanged, unless ``force`` is set, in which case the cached dir is rebuilt from scratch.
-    """
-    data_dir = Path(data_dir)
-    samples_dir = data_dir / "samples"
-    mds_root = Path(mds_root) if mds_root is not None else data_dir / "mds"
+#     The array shapes (x_shape, out_h, out_w) are inferred from the data and asserted to be uniform
+#     across all samples. Returns the path to the MDS dir (shards + ``dataset.jsonl`` sidecar).
+#     On a cache hit (same data_dir + sample set + MDS_COLUMNS schema) the existing dir is returned
+#     unchanged, unless ``force`` is set, in which case the cached dir is rebuilt from scratch.
+#     """
+#     data_dir = Path(data_dir)
+#     samples_dir = data_dir / "samples"
+#     mds_root = Path(mds_root) if mds_root is not None else data_dir / "mds"
 
-    # collect complete samples (both X and y present) + their flattened metadata
-    rows = []
-    skipped_ids = []
-    for sample_dir in sorted(samples_dir.glob("*")):
-        if not (sample_dir / "X.npy").exists() or not (sample_dir / "y.npy").exists() or not (sample_dir / 'metadata.jsonl').exists():
-            skipped_ids.append(sample_dir.name)
-            continue
-        rows.append((sample_dir, flatten_metadata(sample_dir)))
-    if not rows:
-        raise RuntimeError(f"No complete samples (with both X.npy and y.npy) found under {samples_dir}")
-    sample_ids = [int(m["sample_id"]) for _, m in rows]
-    if verbose: print(f"Found {len(rows)} complete samples ({len(skipped_ids)} skipped, missing X.npy)\nskipped ids: {skipped_ids}")
+#     # collect complete samples (both X and y present) + their flattened metadata
+#     rows = []
+#     skipped_ids = []
+#     for sample_dir in sorted(samples_dir.glob("*")):
+#         if not (sample_dir / "X.npy").exists() or not (sample_dir / "y.npy").exists() or not (sample_dir / 'metadata.jsonl').exists():
+#             skipped_ids.append(sample_dir.name)
+#             continue
+#         rows.append((sample_dir, flatten_metadata(sample_dir)))
+#     if not rows:
+#         raise RuntimeError(f"No complete samples (with both X.npy and y.npy) found under {samples_dir}")
+#     sample_ids = [int(m["sample_id"]) for _, m in rows]
+#     if verbose: print(f"Found {len(rows)} complete samples ({len(skipped_ids)} skipped, missing X.npy)\nskipped ids: {skipped_ids}")
 
-    # hash-keyed output dir (depends on MDS_COLUMNS too, so schema changes bust the cache) -> instant return on cache hit
-    key = _hash_key(data_dir, sample_ids)
-    mds_path = mds_root / key
-    if mds_path.exists() and force:
-        if verbose: print(f"--force: deleting cached MDS at {mds_path} and rebuilding")
-        shutil.rmtree(mds_path)
-    elif mds_path.exists() and (mds_path / "dataset.jsonl").exists() and exist_ok:
-        if verbose: print(f"Cache hit: reusing existing MDS at {mds_path}\nMDS: {mds_path} ({len(rows)} samples)")
-        return mds_path
+#     # hash-keyed output dir (depends on MDS_COLUMNS too, so schema changes bust the cache) -> instant return on cache hit
+#     key = _hash_key(data_dir, sample_ids)
+#     mds_path = mds_root / key
+#     if mds_path.exists() and force:
+#         if verbose: print(f"--force: deleting cached MDS at {mds_path} and rebuilding")
+#         shutil.rmtree(mds_path)
+#     elif mds_path.exists() and (mds_path / "dataset.jsonl").exists() and exist_ok:
+#         if verbose: print(f"Cache hit: reusing existing MDS at {mds_path}\nMDS: {mds_path} ({len(rows)} samples)")
+#         return mds_path
 
-    # write shards + a lightweight metadata sidecar (index.jsonl) for loader-side filtering.
-    # Streaming urlparses `out`, so an absolute Windows path (e.g. "D:/...") is misread as a
-    # cloud scheme "d:". Chdir to the parent and pass the relative dir name -> empty url scheme.
-    if verbose: print(f"Writing MDS to {mds_path} ...")
+#     # write shards + a lightweight metadata sidecar (index.jsonl) for loader-side filtering.
+#     # Streaming urlparses `out`, so an absolute Windows path (e.g. "D:/...") is misread as a
+#     # cloud scheme "d:". Chdir to the parent and pass the relative dir name -> empty url scheme.
+#     if verbose: print(f"Writing MDS to {mds_path} ...")
 
-    # parse the model-shape fields once from the first sample: X is (L, P, PS, C)
-    X0, y0 = _load_xy(rows[0][0])
-    L, P, PS, _ = X0.shape
-    shape_info = dict(n_laser_rows=int(L ** 0.5), n_laser_cols=int(L ** 0.5), patch_size=PS, n_freqs=P * PS)
-    x_shape0, out_hw = X0.shape, y0.shape
+#     # parse the model-shape fields once from the first sample: X is (L, P, PS, C)
+#     X0, y0 = _load_xy(rows[0][0])
+#     L, P, PS, _ = X0.shape
+#     shape_info = dict(n_laser_rows=int(L ** 0.5), n_laser_cols=int(L ** 0.5), patch_size=PS, n_freqs=P * PS)
+#     x_shape0, out_hw = X0.shape, y0.shape
 
-    # write to MSD format
-    index_rows = []
-    mds_root.mkdir(parents=True, exist_ok=True)
-    cwd = os.getcwd()
-    os.chdir(mds_root)
-    try:
-      with MDSWriter(out=key, columns=MDS_COLUMNS, exist_ok=True) as writer:
-        for i, (sample_dir, meta) in enumerate(rows):
-            X, y = _load_xy(sample_dir)
-            assert X.shape == x_shape0, f"{sample_dir.name}: X.shape={X.shape} != {x_shape0}"
-            assert y.shape == out_hw, f"{sample_dir.name}: y.shape={y.shape} != {out_hw}"
+#     # write to MSD format
+#     index_rows = []
+#     mds_root.mkdir(parents=True, exist_ok=True)
+#     cwd = os.getcwd()
+#     os.chdir(mds_root)
+#     try:
+#       with MDSWriter(out=key, columns=MDS_COLUMNS, exist_ok=True) as writer:
+#         for i, (sample_dir, meta) in enumerate(rows):
+#             X, y = _load_xy(sample_dir)
+#             assert X.shape == x_shape0, f"{sample_dir.name}: X.shape={X.shape} != {x_shape0}"
+#             assert y.shape == out_hw, f"{sample_dir.name}: y.shape={y.shape} != {out_hw}"
 
-            com = meta.get("downsampled_com", [-1.0, -1.0])
-            sample = {
-                "X": X, "y": y, "sample_id": int(meta["sample_id"]), "output_id": str(meta.get("output_id", "")),
-                "n_objects": int(meta.get("n_objects", -1)),
-                "speaker": int(meta.get("speaker", -1)),
-                "box": str(meta.get("box", "")),
-                "is_empty_box": int(bool(meta.get("is_empty_box", False))),
-                "object": str(meta.get("object", "")),
-                "downsampled_com_x": float(com[0]), "downsampled_com_y": float(com[1]),
-            }
-            writer.write(sample)
-            index_rows.append(meta)  # full per-sample metadata -> sidecar (used for loader-side filtering)
-            if verbose >= 2 and (i + 1) % 50 == 0: print(f"  wrote {i + 1}/{len(rows)}")
-    finally:
-        os.chdir(cwd)
+#             com = meta.get("downsampled_com", [-1.0, -1.0])
+#             sample = {
+#                 "X": X, "y": y, "sample_id": int(meta["sample_id"]), "output_id": str(meta.get("output_id", "")),
+#                 "n_objects": int(meta.get("n_objects", -1)),
+#                 "speaker": int(meta.get("speaker", -1)),
+#                 "box": str(meta.get("box", "")),
+#                 "is_empty_box": int(bool(meta.get("is_empty_box", False))),
+#                 "object": str(meta.get("object", "")),
+#                 "downsampled_com_x": float(com[0]), "downsampled_com_y": float(com[1]),
+#             }
+#             writer.write(sample)
+#             index_rows.append(meta)  # full per-sample metadata -> sidecar (used for loader-side filtering)
+#             if verbose >= 2 and (i + 1) % 50 == 0: print(f"  wrote {i + 1}/{len(rows)}")
+#     finally:
+#         os.chdir(cwd)
 
-    # dataset-level sidecar (named dataset.jsonl to distinguish it from each sample's metadata.jsonl):
-    # line 0 is dataset-level info, then one line of full metadata per sample for loader-side filtering.
-    data_info = dict(out_h=out_hw[0], out_w=out_hw[1], n_samples=len(rows)) | shape_info
-    lines = [json.dumps(data_info)] + [json.dumps(r) for r in index_rows]
-    (mds_path / "dataset.jsonl").write_text("\n".join(lines))
-    if verbose: print(f"Wrote {len(rows)} samples. data_info={data_info}\nMDS: {mds_path} ({len(rows)} samples)")
-    return mds_path
+#     # dataset-level sidecar (named dataset.jsonl to distinguish it from each sample's metadata.jsonl):
+#     # line 0 is dataset-level info, then one line of full metadata per sample for loader-side filtering.
+#     data_info = dict(out_h=out_hw[0], out_w=out_hw[1], n_samples=len(rows)) | shape_info
+#     lines = [json.dumps(data_info)] + [json.dumps(r) for r in index_rows]
+#     (mds_path / "dataset.jsonl").write_text("\n".join(lines))
+#     if verbose: print(f"Wrote {len(rows)} samples. data_info={data_info}\nMDS: {mds_path} ({len(rows)} samples)")
+#     return mds_path
 
 #***** 2 create StreamingDataset (like pytorch Dataset but faster) *****
 

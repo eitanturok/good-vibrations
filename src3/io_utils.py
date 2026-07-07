@@ -199,7 +199,7 @@ def preview(obj, mode):
 
 #***** copy to sample helpers *****
 
-SHARED_FILES = ["00_raw_overhead.png", "01_resized_overhead.png", "02_segment_mask.png", "03_downsampled_segment_mask.png", "04_com.jsonl", "05_overhead_mask.png", "y.npy"]
+SHARED_FILES = ["00_raw.png", "01_cropped.png", "02_smask.png", "03_smask.npy", "04_overhead_with_smask.png"]
 COPIED_FILES = ["times.jsonl", "metadata.jsonl"]
 
 def copy_to_sample(sample_dir:Path, output_dir:Path, audio_dir:Path, speaker:int, do_save:bool=True):
@@ -207,7 +207,7 @@ def copy_to_sample(sample_dir:Path, output_dir:Path, audio_dir:Path, speaker:int
 
     # symlink the shared+copy artifacts from output_dir to the current sample_dir
     assert all((output_dir / a).exists() for a in SHARED_FILES+COPIED_FILES), f"[sample {sample_id}] Missing shared or copied artifact"
-    for artifact in SHARED_FILES: symlink(output_dir / artifact, sample_dir / f"{'' if artifact == 'y.npy' else 'outputs/'}{artifact}", do_save)
+    for artifact in SHARED_FILES: symlink(output_dir / artifact, sample_dir / f"outputs/{artifact}", do_save)
     for artifact in COPIED_FILES: copy(output_dir / artifact, sample_dir / artifact, do_save)
 
     # symlink the audio file from audio_dir to the current sample_dir
@@ -223,7 +223,7 @@ def copy_to_sample(sample_dir:Path, output_dir:Path, audio_dir:Path, speaker:int
 
 #***** modal helpers *****
 
-SYMLINKS = [("recovered_audio.wav", "inputs/04_recovered_audio.wav"), ("X.npy", "inputs/05_processed_fft.npy")]
+SYMLINKS = [("recovered_audio.wav", "inputs/04_recovered_audio.wav")]
 
 def retry(attempts=4, delay=2.0, backoff=2.0, exceptions=(Exception,)):
     """Retry a function on transient failures (e.g. DNS/connection errors under load)

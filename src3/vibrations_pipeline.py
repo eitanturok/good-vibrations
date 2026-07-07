@@ -106,47 +106,9 @@ def get_recovered_audio(fft: np.ndarray, n_samples:int, fs: float, audio_sample_
     audio = audio / (np.max(np.abs(audio)) + 1e-8)
     return (audio * MAX_INT16_VAL).astype(np.int16)
 
-#***** 5 process fft (extract signal, normalize signal, tokenize)
+#***** 5 group steps and add timing, save to files ******
 
-def _extract_signal(x: np.ndarray, signal_mode: str) -> np.ndarray:
-    # Cast to complex128 before abs/angle: np.abs on complex64 loses precision for large values
-    # because sqrt(re²+im²) is computed in float32; PyTorch promotes internally so we match it.
-    if signal_mode == "magnitude": return np.abs(x.astype(np.complex128))
-    if signal_mode == "complex": return np.concatenate([x.real, x.imag], axis=-1)
-    if signal_mode == "mag_phase": return np.concatenate([np.abs(x.astype(np.complex128)), np.angle(x.astype(np.complex128))], axis=-1)
-    raise ValueError(f"Unknown signal mode: {signal_mode}")
-
-def _normalize_fft(x: np.ndarray, normalize_mode: str, verbose:int=0) -> np.ndarray:
-    if normalize_mode is None: return x
-    # Compute stats in float64 with ddof=1 to match PyTorch's std behavior
-    x64 = x.astype(np.float64)
-    if normalize_mode == 'std-sample':
-        std = np.maximum(x64.std(axis=(1, 2, 3), ddof=1, keepdims=True), 1e-8).astype(np.float32)
-        if verbose: print(f'Normalize {normalize_mode}\n{std.shape=}\n{std.squeeze()=}')
-        return x / std
-    if normalize_mode == 'z-sample':
-        mean = x64.mean(axis=(1, 2, 3), keepdims=True).astype(np.float32)
-        std = np.maximum(x64.std(axis=(1, 2, 3), ddof=1, keepdims=True), 1e-8).astype(np.float32)
-        if verbose: print(f'Normalize {normalize_mode}\n{mean.shape=}\t{std.shape=}\n{mean.squeeze()=}\n{std.squeeze()=}')
-        return (x - mean) / std
-    raise ValueError(f"Unknown normalize mode: {normalize_mode}")
-
-def _tokenize(x: np.ndarray, patch_size:int):
-    # Note: unfold drops entries that do not fully fit into patch_size
-    if patch_size <= 0: return x
-    B, L, F, C = x.shape
-    P = F // patch_size
-    return x[:, :, :P * patch_size, :].reshape(B, L, P, patch_size, C)  # (B,L,P,PS,C)
-
-def get_processed_fft(fft: np.ndarray, signal_mode:str, normalize_mode:str, patch_size:int, verbose:int=0) -> np.ndarray:
-    """Extract the signal from the FFT, normalize the FFT, and tokenize it (turn into patches like in ViTs)"""
-    fft = _extract_signal(fft, signal_mode).astype(np.float32)   # (B,L,F_,C) -> (B,L,F,C)
-    fft = _normalize_fft(fft, normalize_mode, verbose)           # (B,L,F,C) -> (B,L,F,C)
-    return _tokenize(fft, patch_size)                            # (B,L,F,C) -> (B,L,P,PS,C)
-
-#***** 6 process vibrations ******
-
-def process_vibrations_local(sample_dir:Path, min_freq:int=MIN_FREQ, max_freq:int=MAX_FREQ, audio_sample_rate:int=22050, signal_mode:str='magnitude', normalize_mode:str='std-sample', patch_size:int=256, pclk_batch_size:int=1024, pclk_mode:str='sequential', verbose:int=1, do_save:bool=True):
+def _process_vibrations_local(sample_dir:Path, min_freq:int=MIN_FREQ, max_freq:int=MAX_FREQ, audio_sample_rate:int=22050, signal_mode:str='magnitude', normalize_mode:str='std-sample', patch_size:int=256, pclk_batch_size:int=1024, pclk_mode:str='sequential', verbose:int=1, do_save:bool=True):
     sample_id = sample_dir.name
     metadata = {k: v for d in load(sample_dir / 'metadata.jsonl') for k, v in d.items()}
     fps, rois = int(metadata['fps']), metadata['roi']
@@ -170,7 +132,7 @@ def process_vibrations_local(sample_dir:Path, min_freq:int=MIN_FREQ, max_freq:in
     with Timing(f"[sample {sample_id}] fft shifts: ", enabled=verbose >= 2):
         fft, freqs, n_samples = get_fft_shifts(clean_shifts, fps, min_freq, max_freq) # (B,L,T,2) -> (B,L,F,2), (F,) (,)
         if verbose >= 2: print(f'[sample {sample_id}] {fft.shape=}=(batch, lasers, freq bins, x/y)\n[sample {sample_id}] {freqs.shape=}=(freq bins)\n[sample {sample_id}] {n_samples=}')
-        save({'fft': fft, 'freqs': freqs, 'n_samples': n_samples}, sample_dir / 'inputs/03_fft_shifts.npz', do_save)
+        save({'fft': fft, 'freqs': freqs, 'n_samples': n_samples}, sample_dir / 'inputs/03_fft.npz', do_save)
         append({"fft_shifts": datetime.now(timezone.utc).isoformat()}, sample_dir / "times.jsonl", do_save)
 
     # recover audio from fft
@@ -180,16 +142,21 @@ def process_vibrations_local(sample_dir:Path, min_freq:int=MIN_FREQ, max_freq:in
         symlink(sample_dir / 'inputs/04_recovered_audio.wav', sample_dir / 'recovered_audio.wav', do_save)
         append({"recover_audio": datetime.now(timezone.utc).isoformat()}, sample_dir / "times.jsonl", do_save)
 
-    # process fft (extract signal, normalize, and tokenize fft)
-    with Timing(f"[sample {sample_id}] process fft: ", enabled=verbose >= 2):
-        processed_fft = get_processed_fft(fft, signal_mode, normalize_mode, patch_size) # (B,L,F,2) -> (B,L,P,PS,2)
-        if verbose >= 2: print(f'[sample {sample_id}] {processed_fft.shape=}=(batch, lasers, num_patches, patch_size, x/y)')
-        save(processed_fft, sample_dir / 'inputs/05_processed_fft.npy', do_save)
-        symlink(sample_dir / 'inputs/05_processed_fft.npy', sample_dir / 'X.npy', do_save)
-        append({"process_fft": datetime.now(timezone.utc).isoformat()}, sample_dir / "times.jsonl", do_save)
-
     # update tracking
     append({"process_vibrations": datetime.now(timezone.utc).isoformat()}, sample_dir / "times.jsonl", do_save)
+
+def save_vibrations(raw_vibrations:np.ndarray, sample_dir:Path, audio_dir:Path, do_save:bool=True, verbose:int=1):
+    sample_id = sample_dir.name
+
+    # save raw vibrations RAM->DISK (~2.7 GB per sample)
+    raw_vibration_path = sample_dir / 'inputs/00_raw_vibrations.npy'
+    with Timing(f'[sample {sample_id}] save raw vibrations RAM->DISK::{raw_vibration_path}: ', enabled=verbose >= 1):
+        save(raw_vibrations, raw_vibration_path, do_save)
+        timestamp = datetime.now(timezone.utc).isoformat()
+        append({"save_vibrations": timestamp}, sample_dir / "times.jsonl", do_save)
+        append({"sample_id": sample_id, "time": timestamp}, audio_dir.parent / "samples.jsonl", do_save)
+
+#****** 6 run on modal *****
 
 app = modal.App("pclk")
 volume = modal.Volume.from_name("samples", create_if_missing=True)
@@ -208,15 +175,15 @@ cuda_image = (
     timeout=60*10, # timeout after 10 minutes
     volumes={VOLUME_PATH: volume},
 )
-def process_vibrations_modal(sample_dir_name: str, **kwargs):
+def _process_vibrations_modal(sample_dir_name: str, **kwargs):
     import sys
     sys.path.insert(0, "/src3")
     volume.reload()
-    from vibrations_pipeline import process_vibrations_local
-    process_vibrations_local(VOLUME_PATH / sample_dir_name, **kwargs)
+    from vibrations_pipeline import _process_vibrations_local
+    _process_vibrations_local(VOLUME_PATH / sample_dir_name, **kwargs)
     volume.commit()
 
-VIBRATION_FILES = ["01_raw_shifts.npy", "02_clean_shifts.npy", "03_fft_shifts.npz", "04_recovered_audio.wav", "05_processed_fft.npy"]
+VIBRATION_FILES = ["01_raw_shifts.npy", "02_clean_shifts.npy", "03_fft.npz", "04_recovered_audio.wav", "05_processed_fft.npy"]
 
 def process_vibrations(sample_dir:Path, use_modal:bool=True, do_save:bool=True, verbose:int=1):
     sample_id = sample_dir.name
@@ -224,7 +191,7 @@ def process_vibrations(sample_dir:Path, use_modal:bool=True, do_save:bool=True, 
     # run locally
     if not use_modal:
         with Timing(f'[sample {sample_id}] process vibrations locally: ', enabled=verbose >= 1):
-            return process_vibrations_local(sample_dir, do_save=do_save, verbose=verbose)
+            return _process_vibrations_local(sample_dir, do_save=do_save, verbose=verbose)
 
     # upload raw vibrations DISK->modal_volume
     with Timing(f'[sample {sample_id}] upload raw vibrations DISK->modal_volume: ', enabled=verbose >= 1):
@@ -233,7 +200,7 @@ def process_vibrations(sample_dir:Path, use_modal:bool=True, do_save:bool=True, 
 
     # process raw vibrations remotely
     with Timing(f'[sample {sample_id}] process vibrations on modal: ', enabled=verbose >= 1):
-        process_vibrations_modal.remote(sample_dir.name, pclk_batch_size=1024, pclk_mode='sequential', verbose=verbose)
+        _process_vibrations_modal.remote(sample_dir.name, pclk_batch_size=1024, pclk_mode='sequential', verbose=verbose)
 
     # download processed vibrations modal_volume->DISK
     with Timing(f'[sample {sample_id}] download processed vibrations modal_volume->DISK::{sample_dir}: ', enabled=verbose >= 1):
@@ -242,21 +209,8 @@ def process_vibrations(sample_dir:Path, use_modal:bool=True, do_save:bool=True, 
         append({"modal_upload": upload_timestamp}, sample_dir / "times.jsonl", do_save)
         append({"modal_download": datetime.now(timezone.utc).isoformat()}, sample_dir / "times.jsonl", do_save)
 
-#***** 7 define the different stages of capturing the vibrations
-
-def save_vibrations(raw_vibrations:np.ndarray, sample_dir:Path, audio_dir:Path, do_save:bool=True, verbose:int=1):
-    sample_id = sample_dir.name
-
-    # save raw vibrations RAM->DISK
-    raw_vibration_path = sample_dir / 'inputs/00_raw_vibrations.npy'
-    with Timing(f'[sample {sample_id}] save raw vibrations RAM->DISK::{raw_vibration_path}: ', enabled=verbose >= 1):
-        save(raw_vibrations, raw_vibration_path, do_save)
-        timestamp = datetime.now(timezone.utc).isoformat()
-        append({"save_vibrations": timestamp}, sample_dir / "times.jsonl", do_save)
-        append({"sample_id": sample_id, "time": timestamp}, audio_dir.parent / "samples.jsonl", do_save)
-
-# run this together async
 def save_and_process_vibrations(raw_vibrations:np.ndarray, sample_dir:Path, audio_dir:Path, min_freq:int, max_freq:int, use_modal:bool=True, do_save:bool=True, verbose:int=1):
     save_vibrations(raw_vibrations, sample_dir, audio_dir, do_save, verbose)
+    # delete vibrations as soon as we finish saving it
     del raw_vibrations
     process_vibrations(sample_dir, use_modal, do_save, verbose)

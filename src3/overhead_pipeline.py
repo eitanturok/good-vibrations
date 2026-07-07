@@ -79,15 +79,7 @@ def segment(image: Image.Image, prompt: str, is_empty_box: bool) -> Image.Image:
     mask = np.zeros(array.shape[:2]) if is_empty_box else _segmenter.run.remote(array, prompt)
     return Image.fromarray(mask.astype(np.uint8) * 255, mode="L")
 
-#***** 3 downsample segment mask *****
-
-def downsample(mask: Image.Image, out_h: int, out_w: int) -> Image.Image:
-    # BOX resampling area-averages over the full H x W mask (unlike a floor-division block
-    # reshape, which silently truncates to block_h*out_h x block_w*out_w and drops the
-    # bottom/right edge whenever out_h/out_w don't evenly divide H/W).
-    return mask.resize((out_w, out_h), resample=Image.BOX)
-
-#***** 4 center of mass *****
+#***** 3 center of mass *****
 
 def center_of_mass(mask: Image.Image) -> tuple[float, float]:
     """Return (row, col) center of mass of a mask with values in [0, 1]."""
@@ -101,7 +93,7 @@ def center_of_mass(mask: Image.Image) -> tuple[float, float]:
     return row.item(), col.item()
 
 
-#***** 5 overhead image *****
+#***** 4 add smask to overhead image *****
 
 def draw_mask(overhead: Image.Image, segment_mask: Image.Image, com: tuple[float, float], is_empty_box:bool):
     overhead = overhead.convert("RGBA")
@@ -126,6 +118,8 @@ def draw_mask(overhead: Image.Image, segment_mask: Image.Image, com: tuple[float
         draw.line([(cx, cy - r), (cx, cy + r)], fill=(144, 238, 144, 255), width=2)
 
     return overhead.convert("RGB")
+
+#***** 5 add speaker to overhead image *****
 
 def draw_speaker(overhead: Image.Image, speaker: int | None = None) -> Image.Image:
     # load lazily to not interefere with modal import
@@ -165,85 +159,70 @@ def draw_speaker(overhead: Image.Image, speaker: int | None = None) -> Image.Ima
 
     return canvas.convert("RGB")
 
-#***** 6 define each stage of the pipeline ******
+#***** 6 group each stage of the pipeline and add timing, saving to files ******
 
 DEFAULT_PROMPT = "A black metal cube sitting on the floor of an open cardboard box from a bird's eye view."
 
 def capture_overhead(overhead_cam, capture_image_fxn, output_dir:Path, verbose:int=1, do_save:bool=1) -> Image.Image:
     output_id = output_dir.name
-
-    # capture overhead image
-    import cv2
     with Timing(f"[output {output_id}] capture the overhead image: ", enabled=verbose >= 2):
         image, _ = capture_image_fxn(overhead_cam)
+        import cv2
         image = Image.fromarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
         append({'capture_overhead': datetime.now(timezone.utc).isoformat()}, output_dir / 'times.jsonl', do_save)
-
     return image
 
-def save_overhead(image, output_dir:Path, verbose:int=1, do_save:bool=1) -> Image.Image:
+def save_overhead(image, output_dir:Path, verbose:int=1, do_save:bool=1):
     output_id = output_dir.name
-
     with Timing(f"[output {output_id}] save the overhead image: ", enabled=verbose >= 2):
-        save(image, output_dir / "00_raw_overhead.png", do_save)
+        save(image, output_dir / "00_raw.png", do_save)
         append({'save_overhead': datetime.now(timezone.utc).isoformat()}, output_dir / 'times.jsonl', do_save)
 
 def process_overhead(raw_overhead: Image.Image, output_dir: Path, left: float = 0.15, right: float = 0.67, up: float = 0.08, down: float = 0.7, max_side:int=256,
-                      prompt: str = DEFAULT_PROMPT, out_h: int = 40, out_w: int = 20, is_empty_box:bool=False, verbose: int = 1, do_save:bool=True):
+                      prompt: str = DEFAULT_PROMPT, is_empty_box:bool=False, verbose: int = 1, do_save:bool=True):
     output_id = output_dir.name
     if verbose >= 2: print(f"[output {output_id}] Box is {'not '*int(not is_empty_box)}empty")
 
     # resize image
     with Timing(f"[output {output_id}] resize the overhead image: ", enabled=verbose >= 2):
         resized_overhead = resize(raw_overhead, left, right, up, down, max_side)
-        save(resized_overhead, output_dir / "01_resized_overhead.png", do_save)
-        append({'process_overhead/resize': datetime.now(timezone.utc).isoformat()}, output_dir / 'times.jsonl', do_save)
+        save(resized_overhead, output_dir / "01_resized.png", do_save)
+        append({'resized_overhead': datetime.now(timezone.utc).isoformat()}, output_dir / 'times.jsonl', do_save)
 
     # segment mask on modal with SAM3
     with Timing(f"[output {output_id}] segment the overhead image: ", enabled=verbose >= 2):
         segment_mask = segment(resized_overhead, prompt, is_empty_box) # todo: make sync, not async
-        save(segment_mask, output_dir / "02_segment_mask.png", do_save)
-        append({'process_overhead/segment': datetime.now(timezone.utc).isoformat()}, output_dir / 'times.jsonl', do_save)
-
-    # downsample
-    with Timing(f"[output {output_id}] downsample the overhead image: ", enabled=verbose >= 2):
-        downsampled_segment_mask = downsample(segment_mask, out_h, out_w)
-        save(downsampled_segment_mask, output_dir / "03_downsampled_segment_mask.png", do_save)
-        save(np.array(downsampled_segment_mask, dtype=np.float32) / 255.0, output_dir / "y.npy", do_save)
-        append({'process_overhead/downsample': datetime.now(timezone.utc).isoformat()}, output_dir / 'times.jsonl', do_save)
+        save(segment_mask, output_dir / "02_smask.png", do_save)
+        save(np.array(segment_mask, dtype=np.float32) / 255.0, output_dir / "03_smask.npy", do_save)
+        append({'segment_mask': datetime.now(timezone.utc).isoformat()}, output_dir / 'times.jsonl', do_save)
 
     # center of mass
     with Timing(f"[output {output_id}] center of mass of the overhead image: ", enabled=verbose >= 2):
         com = (-1, -1) if is_empty_box else center_of_mass(segment_mask)
-        downsampled_com = (-1, -1) if is_empty_box else center_of_mass(downsampled_segment_mask)
-        save({"com": com, "downsampled_com": downsampled_com}, output_dir / "04_com.jsonl", do_save)
-        append({'process_overhead/com': datetime.now(timezone.utc).isoformat()}, output_dir / 'times.jsonl', do_save)
-        append([{"com": com}, {"downsampled_com": downsampled_com}], output_dir / "metadata.jsonl", do_save)
-        if verbose >= 2: print(f"[output {output_id}] {com=}\t{downsampled_com=}")
+        append({'center_of_mass': datetime.now(timezone.utc).isoformat()}, output_dir / 'times.jsonl', do_save)
+        append([{"com": com}], output_dir / "metadata.jsonl", do_save)
+        if verbose >= 2: print(f"[output {output_id}] {com=}")
+
+    # make overhead image with segmentation mask and center of mass, but no speaker
+    with Timing(f"[output {output_id}] visualize overhead image: ", enabled=verbose >= 2):
+        overhead_with_smask = draw_mask(resized_overhead, segment_mask, com, is_empty_box)
+        save(overhead_with_smask, output_dir / "04_overhead_with_smask.png", do_save)
+        append({'viz_overhead_with_smask': datetime.now(timezone.utc).isoformat()}, output_dir / 'times.jsonl', do_save)
 
     # update tracking status
     append({'process_overhead': datetime.now(timezone.utc).isoformat()}, output_dir / 'times.jsonl', do_save)
 
-    return resized_overhead, segment_mask, com
+    return overhead_with_smask
 
-def make_position_overhead(output_dir:Path, resized_overhead:Image.Image, segment_mask:Image.Image, com:tuple[float, float], is_empty_box:bool, verbose:int=1, do_save:bool=True):
-    # visualize overhead image with mask and center of mass, but not with speaker
-    output_id = output_dir.name
-    with Timing(f"[output {output_id}] visualize overhead image: ", enabled=verbose >= 2):
-        overhead_with_mask = draw_mask(resized_overhead, segment_mask, com, is_empty_box)
-        save(overhead_with_mask, output_dir / "05_overhead_mask.png", do_save)
-        append({'visualize_overhead/draw_mask': datetime.now(timezone.utc).isoformat()}, output_dir / 'times.jsonl', do_save)
-    return overhead_with_mask
-
-def make_sample_overhead(sample_dir:Path, output_dir:Path, speaker:int, verbose:int=1, do_save:bool=True) -> Image.Image:
-    # visualize overhead image with mask, center of mass, AND speaker
+def make_overhead(sample_dir:Path, output_dir:Path, speaker:int, verbose:int=1, do_save:bool=True) -> Image.Image:
+    # add speaker to overhead image with smask, center of mass
     sample_id = sample_dir.name
     with Timing(f"[sample {sample_id}] visualize overhead image: ", enabled=verbose >= 2):
-        overhead_with_mask = load(sample_dir / 'outputs/05_overhead_mask.png', 'image')
-        overhead = draw_speaker(overhead_with_mask, speaker)
-        save(overhead, sample_dir / 'overhead.png', do_save)
+        overhead_with_smask = load(sample_dir / 'outputs/04_overhead_with_smask.png', 'image')
+        overhead = draw_speaker(overhead_with_smask, speaker)
+        save(overhead, sample_dir / 'outputs/05_overhead_with_smask_and_speaker.png', do_save)
         timestamp = datetime.now(timezone.utc).isoformat()
-        append({f'visualize_overhead/draw_speaker/sample_{sample_id}': timestamp}, output_dir / 'times.jsonl', do_save)
-        append({f'visualize_overhead/draw_speaker': timestamp}, sample_dir / 'times.jsonl', do_save)
+        append({f'viz_overhead_with_smask_and_speaker/sample_{sample_id}': timestamp}, output_dir / 'times.jsonl', do_save)
+        append({f'viz_overhead_with_smask_and_speaker': timestamp}, sample_dir / 'times.jsonl', do_save)
 
     return overhead
