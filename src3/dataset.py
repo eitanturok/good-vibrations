@@ -12,15 +12,9 @@ from io_utils import load
 
 # ***** 1. turn dataset into MDS format (sharded, streaming) *****
 
-# MDS_COLUMNS = {
-#     "X": "ndarray:float32", "y": "ndarray:float32",
-#     "sample_id": "int", "output_id": "str", "n_objects": "int", "speaker": "int",
-#     "box": "str", "is_empty_box": "int", "object": "str",
-#     "downsampled_com_x": "float64", "downsampled_com_y": "float64",
-# }
-# # default used by the model when no dataset is loaded (matches the experiment-22 MDS)
-# DATA_INFO = {"out_h": 18, "out_w": 44, "n_samples": 0,
-#              "n_laser_rows": 10, "n_laser_cols": 10, "patch_size": 256, "n_freqs": 3328}
+# default used by the model when no dataset is loaded (matches the experiment-22 MDS)
+DATA_INFO = {"out_h": 18, "out_w": 44, "n_samples": 0,
+             "n_laser_rows": 10, "n_laser_cols": 10, "patch_size": 256, "n_freqs": 3328}
 
 
 # def flatten_metadata(sample_dir: Path) -> dict:
