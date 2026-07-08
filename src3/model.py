@@ -124,14 +124,13 @@ def pad_mask(keep, B_or_BL):
     return ~torch.cat([cls_keep, keep], dim=1)
 
 class FreqEncoder(nn.Module):
-    def __init__(self, patch_size:int, d_model:int, num_heads:int, num_layers:int, signal_length:int, signal_mode:str, normalize_mode:str, freq_dropout:float):
+    def __init__(self, patch_size:int, d_model:int, num_heads:int, num_layers:int, signal_length:int, freq_dropout:float):
         super().__init__()
         self.embed = nn.Linear(2 * patch_size, d_model)
         self.speakers_embed = nn.Embedding(4, d_model)
         self.layers = nn.TransformerEncoder(nn.TransformerEncoderLayer(d_model=d_model, nhead=num_heads, batch_first=True), num_layers=num_layers)
         self.cls_token = nn.Parameter(torch.zeros(1, 1, d_model))
         self.register_buffer("freqs_cis", precompute_freqs_cis(d_model, signal_length // patch_size))
-        self.signal_mode, self.normalize_mode = signal_mode, normalize_mode
         self.freq_dropout = freq_dropout
 
     def forward(self, x, speaker=None):
@@ -149,11 +148,11 @@ class FreqEncoder(nn.Module):
 #***** 4 model *****
 
 class VibrationTransformer(ComposerModel):
-    def __init__(self, d_model:int=128, pnt_num_heads:int=2, pnt_num_layers:int=2, seq_num_heads:int=2, seq_num_layers:int=2, data_info=DATA_INFO, decoder:str='mlp', decoder_num_heads:int=2, decoder_num_layers:int=2, signal_mode:str='magnitude', normalize_mode:str='z', freq_dropout:float=0.3, laser_dropout:float=0.3, save_logits:bool=False):
+    def __init__(self, d_model:int=128, pnt_num_heads:int=2, pnt_num_layers:int=2, seq_num_heads:int=2, seq_num_layers:int=2, data_info=DATA_INFO, decoder:str='mlp', decoder_num_heads:int=2, decoder_num_layers:int=2, freq_dropout:float=0.3, laser_dropout:float=0.3, save_logits:bool=False):
         super().__init__()
 
         # encoder
-        self.freq_encoder = FreqEncoder(data_info['patch_size'], d_model, pnt_num_heads, pnt_num_layers, data_info['n_freqs'], signal_mode, normalize_mode, freq_dropout)
+        self.freq_encoder = FreqEncoder(data_info['patch_size'], d_model, pnt_num_heads, pnt_num_layers, data_info['n_freqs'], freq_dropout)
         self.laser_encoder = nn.TransformerEncoder(nn.TransformerEncoderLayer(d_model=d_model, nhead=seq_num_heads, batch_first=True), num_layers=seq_num_layers)
         self.laser_dropout = laser_dropout
 
