@@ -50,7 +50,7 @@ def tokenize(x: np.ndarray, patch_size:int):
 
 #***** 3 post-process a single sample *****
 
-def post_process_sample(sample_dir:Path, is_empty_box:bool, out_h:int, out_w:int, signal_mode:str, normalize_mode:str, patch_size:int, verbose:int, do_save:bool):
+def post_process_sample(sample_dir:Path, is_empty_box:bool, out_h:int, out_w:int, signal_mode:str, normalize_mode:str, patch_size:int, verbose:int, do_save:bool, denotch_fn=None):
     sample_id = sample_dir.name
 
     # post process overhead image (downsample segment mask, compute new center of mass)
@@ -71,7 +71,12 @@ def post_process_sample(sample_dir:Path, is_empty_box:bool, out_h:int, out_w:int
 
     # post process vibrations (extract signal, normalize signal, tokenize)
     with Timing(f"[sample {sample_id}] post-process vibrations: ", enabled=verbose >= 2):
-        fft_raw = load(sample_dir / 'inputs/03_fft.npz')
+        fft_npz = load(sample_dir / 'inputs/03_fft.npz')
+        freqs, fft_raw = fft_npz['freqs'], fft_npz['fft']
+        if denotch_fn is not None:
+            fft_raw = denotch_fn(fft_raw, freqs)
+            save({'fft': fft_raw, 'freqs': freqs, 'n_samples': fft_npz['n_samples']}, sample_dir / 'inputs/03_fft.npz', do_save)
+            append({"fft_denotched": datetime.now(timezone.utc).isoformat()}, sample_dir / "times.jsonl", do_save)
         if verbose >= 2: print(f'[sample {sample_id}] {fft_raw.shape=}=(batch, lasers, _freqs, x/y)')
 
         # extract signal from fft
@@ -159,7 +164,7 @@ IMAGE_FILES = ["00_raw.png", "01_cropped.png", "02_smask.png", "03_smask.npy", "
 VIBRATION_FILES = ["00_raw_vibrations.npy", "01_raw_shifts.npy", "02_clean_shifts.npy", "03_fft.npz", "05_fft_signaled.npy", "06_fft_normalized.npy", "07_fft_tokenized.npy"]
 SAMPLE_FILES = ["X.npy", "y.npy", "metadata.jsonl", "times.jsonl", "audio.mp3", "recovered_audio.mp3", "overhead.png"]
 
-def post_process(base_sample_dir:Path, mds_dir:Path, is_empty_box:bool, out_h:int, out_w:int, signal_mode:str, normalize_mode:str, patch_size:int, force:bool=False, verbose:int=1, do_save:bool=True):
+def post_process(base_sample_dir:Path, mds_dir:Path, is_empty_box:bool, out_h:int, out_w:int, signal_mode:str, normalize_mode:str, patch_size:int, force:bool=False, verbose:int=1, do_save:bool=True, denotch_fn=None):
 
     # collect complete samples (both X and y present) + their flattened metadata
     rows, skipped_ids = {}, []
@@ -189,7 +194,7 @@ def post_process(base_sample_dir:Path, mds_dir:Path, is_empty_box:bool, out_h:in
     # post process each sample
     for sample_dir in sorted(base_sample_dir.glob("sample_*")):
         if not sample_dir.is_dir(): continue
-        post_process_sample(sample_dir, is_empty_box, out_h, out_w, signal_mode, normalize_mode, patch_size, verbose, do_save)
+        post_process_sample(sample_dir, is_empty_box, out_h, out_w, signal_mode, normalize_mode, patch_size, verbose, do_save, denotch_fn)
 
     # convert to MDS
     n_lasers, n_freqs = rows[sample_ids[0]]["n_lasers"], rows[sample_ids[0]]["n_freqs"]

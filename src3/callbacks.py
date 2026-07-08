@@ -57,18 +57,21 @@ class MaskVisualizer(Callback):
 def _to_cpu(x:torch.Tensor): return x.detach().to('cpu', copy=True)
 
 class OutputSaver(Callback):
-    def __init__(self, save_interval, folder, filename='ep{epoch:04d}-ba{batch:06d}.pt', overwrite:bool=False):
-        self.save_interval, self.folder, self.filename, self.overwrite = Time.from_input(save_interval, TimeUnit.EPOCH), folder, filename, overwrite
+    def __init__(self, save_interval, folder, filename='ep{epoch:04d}-ba{batch:06d}.pt', overwrite:bool=False, save_fft:bool=True):
+        self.save_interval, self.folder, self.filename, self.overwrite, self.save_fft = Time.from_input(save_interval, TimeUnit.EPOCH), folder, filename, overwrite, save_fft
 
     def init(self, state: State, logger: Logger):
         del logger
         self.folder = format_name_with_dist(self.folder, state.run_name)
         os.makedirs(self.folder, exist_ok=True)
 
-    def save_outputs(self, state: State, logger: Logger, data_name: str, timestamp):
-        current_time_value = timestamp.get(self.save_interval.unit).value
-        if current_time_value % self.save_interval.value == 0:
-            outputs = {'fft': _to_cpu(state.batch['fft']), 'mask_pred': _to_cpu(state.outputs['mask_pred']), 'mask_true': _to_cpu(state.batch['mask_true']), 'info': state.batch['info']}
+    def save_outputs(self, state: State, logger: Logger, data_name: str, batch: int):
+        # due-check and filename epoch both use the *trainer* timestamp, so eval dumps taken
+        # during training land on the real epoch (ep0050, ep0100, ...) instead of ep0000
+        epoch = state.timestamp.get(self.save_interval.unit).value
+        if epoch % self.save_interval.value == 0:
+            outputs = {'mask_pred': _to_cpu(state.outputs['mask_pred']), 'mask_true': _to_cpu(state.batch['mask_true']), 'info': state.batch['info']}
+            if self.save_fft: outputs['fft'] = _to_cpu(state.batch['fft'])
 
             # save to loggers
             for destination in logger.destinations:
@@ -76,7 +79,7 @@ class OutputSaver(Callback):
                 destination.log_metrics({f'{data_name}/{k}': v for k, v in outputs.items()})
 
             # save locally
-            path = os.path.join(self.folder, data_name, self.filename.format(epoch=timestamp.epoch.value, batch=timestamp.batch.value))
+            path = os.path.join(self.folder, data_name, self.filename.format(epoch=state.timestamp.epoch.value, batch=batch))
             os.makedirs(os.path.dirname(path), exist_ok=True)
             if os.path.exists(path):
                 if not self.overwrite:
@@ -84,5 +87,5 @@ class OutputSaver(Callback):
                 os.remove(path)
             torch.save(outputs, path)
 
-    def after_forward(self, state, logger): self.save_outputs(state, logger, state.dataloader_label, state.timestamp)
-    def eval_after_forward(self, state, logger): self.save_outputs(state, logger, f'{state.dataloader_label or "eval"}', state.eval_timestamp)
+    def after_forward(self, state, logger): self.save_outputs(state, logger, state.dataloader_label, state.timestamp.batch.value)
+    def eval_after_forward(self, state, logger): self.save_outputs(state, logger, f'{state.dataloader_label or "eval"}', state.eval_timestamp.batch.value)

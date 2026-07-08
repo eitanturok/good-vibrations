@@ -1,0 +1,162 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Good Vibrations</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div id="shell">
+  <button id="sidebar-toggle" title="show/hide filters">‹</button>
+  <aside id="controller">
+    <div class="logo">GOOD <span>VIBRATIONS</span> <span id="live-dot" title="live: watching data/ and runs/"></span></div>
+
+    <section class="panel" id="filters-scroll">
+      <div class="panel-head">
+        filters
+        <span class="hint" id="filters-summary" style="margin-left:8px"></span>
+      </div>
+      <div class="panel-body row-body" id="filters-body">
+        <input id="sample-add" placeholder="add by sample_id or output_id: 513, 80-87, p64…" spellcheck="false" style="width:100%">
+
+        <div class="facet-label">runs</div>
+        <div id="run-chips"></div>
+        <select id="run-add" style="width:100%;margin-top:6px"><option value="">+ add run…</option></select>
+        <div class="hint">adding a run loads all its samples into the pool</div>
+
+        <div class="facet-label">audio</div>
+        <div class="chips" data-facet="audio"></div>
+        <div class="facet-label">box</div>
+        <div class="chips" data-facet="box"></div>
+        <div class="facet-label">object</div>
+        <div class="chips" data-facet="object"></div>
+        <div class="facet-label">n objects</div>
+        <div class="chips" data-facet="n_objects"></div>
+        <div class="facet-label">layout</div>
+        <div class="chips" data-facet="layout"></div>
+        <div class="facet-label" id="split-facet-label" hidden>split</div>
+        <div class="chips" data-facet="split" hidden></div>
+        <div class="add-row">
+          <button class="btn" id="add-matching">+ add <span id="match-count">0</span> matching</button>
+        </div>
+
+        <div class="facet-label">speaker &amp; position — click to toggle</div>
+        <div class="spatial-legend">
+          <span>speaker <span class="mini" id="spk-all">all</span><span class="mini" id="spk-none">none</span></span>
+          <span>position <span class="mini" id="pos-all">all</span><span class="mini" id="pos-none">none</span></span>
+        </div>
+        <div id="spatial-wrap">
+          <canvas id="posmap" tabindex="0"></canvas>
+        </div>
+        <div class="chips" id="empty-chips"></div>
+        <div class="hint">hover previews · click/enter toggles · arrows move to spatial neighbors</div>
+
+        <div class="facet-label">color by</div>
+        <select id="color-by" style="width:100%">
+          <option value="speaker">speaker</option>
+          <option value="output_id">position</option>
+          <option value="layout">layout</option>
+          <option value="split">split</option>
+        </select>
+      </div>
+    </section>
+  </aside>
+
+  <main id="display">
+    <div class="row2">
+      <section class="panel">
+        <div class="panel-head">
+          box
+          <span style="flex:1"></span>
+          <label style="cursor:pointer"><input type="checkbox" id="contours-toggle"> contours</label>
+        </div>
+        <div class="panel-body">
+          <div id="box-plot" class="plot" style="bottom:22px"></div>
+          <div id="empty-box-strip" class="hint" style="position:absolute;left:0;right:0;bottom:0;padding:2px 10px"></div>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head">
+          <span id="pool-count">0 samples</span>
+          <span class="mini" id="pool-remove-filtered">remove filtered-out</span>
+          <span class="mini" id="pool-clear">clear</span>
+          <span style="flex:1"></span>
+          <div class="seg" id="view-seg">
+            <button data-view="table" class="active">table</button>
+            <button data-view="panel">panels</button>
+          </div>
+        </div>
+        <div class="panel-body">
+          <div id="table-wrap"></div>
+          <div id="panel-wrap"></div>
+        </div>
+      </section>
+    </div>
+
+    <section class="panel" id="fft-runs-panel">
+      <div class="panel-head">
+        <div class="seg" id="fft-tabs">
+          <button data-tab="fft" class="active">fft</button>
+          <button data-tab="runs">runs</button>
+        </div>
+      </div>
+      <div class="panel-body" style="display:flex">
+        <div id="fft-runs-controls">
+          <div id="fft-controls">
+            <div class="facet-label">lasers <span id="laser-count">100/100</span></div>
+            <div id="laser-grid" title="click to toggle lasers"></div>
+            <div class="ctrl-line"><span class="mini" id="laser-all">all</span><span class="mini" id="laser-none">none</span></div>
+            <div class="facet-label">direction</div>
+            <div class="seg" id="dir-seg">
+              <button data-dir="x">x</button><button data-dir="y">y</button><button data-dir="xy" class="active">x+y</button>
+            </div>
+            <div class="facet-label">scale</div>
+            <div class="seg" id="logy-seg">
+              <button data-log="lin">lin</button><button data-log="log" class="active">log</button>
+            </div>
+            <div class="facet-label">signal</div>
+            <label class="check-line"><input type="checkbox" id="norm-check" checked> normalized</label>
+            <div class="facet-label">options</div>
+            <label class="check-line"><input type="checkbox" id="avg-speaker-check"> avg by speaker</label>
+            <label class="check-line"><input type="checkbox" id="diff-empty-check"> diff vs empty</label>
+            <div class="ctrl-line" id="empty-select-line" hidden>baseline <select id="empty-select"></select></div>
+          </div>
+          <div id="runs-controls" hidden>
+            <div class="facet-label">metric</div>
+            <select id="run-metric" style="width:100%">
+              <option value="com_dist">com dist</option>
+              <option value="mse">mse</option>
+            </select>
+          </div>
+        </div>
+        <div id="fft-runs-plots">
+          <div id="fft-plot" class="plot"></div>
+          <div id="runs-plot-wrap" class="plot" style="display:none">
+            <div id="position-focus-strip" class="hint" style="padding:4px 10px"></div>
+            <div id="runs-plot" class="plot" style="top:20px"></div>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+</div>
+
+<div id="modal"><div class="sheet">
+  <button class="btn close" onclick="document.getElementById('modal').classList.remove('open')">esc</button>
+  <h3 id="modal-title"></h3>
+  <div class="sub" id="modal-sub"></div>
+  <div class="views">
+    <div id="m-side"></div>
+    <div id="m-diff"></div>
+    <div id="m-overlay"></div>
+  </div>
+</div></div>
+
+<div id="lightbox"><img id="lightbox-img" alt=""></div>
+
+<script src="/static/vendor/plotly.min.js"></script>
+<script src="/static/app.js"></script>
+</body>
+</html>

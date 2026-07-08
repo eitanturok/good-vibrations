@@ -171,6 +171,9 @@ def run_train(args, device, model, train_loader, eval_loader, data_info):
 
     callbacks=[SpeedMonitor(1), OOMObserver(folder=f"runs/{{run_name}}/torch_traces", remote_file_name=None), NaNMonitor(), RuntimeEstimator(skip_batches=64, time_unit="minutes"), SystemMetricsMonitor(),
                MaskVisualizer(args.eval_interval),
+               # keep per-epoch prediction history (masks only, no fft) so the viz dashboard can animate training later;
+               # the final full dump still goes to outputs/ via run_eval's OutputSaver
+               OutputSaver(args.outputs_interval, f"runs/{{run_name}}/outputs_history", overwrite=True, save_fft=False),
                ]
     trainer = Trainer(run_name=args.run_name, model=model, optimizers=optimizer, train_dataloader=train_loader, auto_log_hparams=False,
                     eval_dataloader=eval_loader, max_duration=args.max_duration, seed=args.seed, eval_interval=args.eval_interval,
