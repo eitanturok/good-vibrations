@@ -8,10 +8,11 @@
 </head>
 <body>
 <div id="shell">
-  <button id="sidebar-toggle" title="show/hide filters">‹</button>
+  <div class="logo">
+    <button id="sidebar-toggle" title="show/hide filters">‹</button>
+    GOOD <span>VIBRATIONS</span>
+  </div>
   <aside id="controller">
-    <div class="logo">GOOD <span>VIBRATIONS</span> <span id="live-dot" title="live: watching data/ and runs/"></span></div>
-
     <section class="panel" id="filters-scroll">
       <div class="panel-head">
         filters
@@ -82,19 +83,9 @@
           <span id="pool-count">0 samples</span>
           <span class="mini" id="pool-remove-filtered">remove filtered-out</span>
           <span class="mini" id="pool-clear">clear</span>
-          <span style="flex:1"></span>
-          <span id="panel-sort-line" hidden>
-            sort <select id="panel-sort-key"></select>
-            <button class="mini" id="panel-sort-dir" title="reverse sort direction">↑</button>
-          </span>
-          <div class="seg" id="view-seg">
-            <button data-view="table" class="active">table</button>
-            <button data-view="panel">panels</button>
-          </div>
         </div>
         <div class="panel-body">
-          <div id="table-wrap"></div>
-          <div id="panel-wrap"></div>
+          <div id="compact-wrap"></div>
         </div>
       </section>
     </div>
@@ -150,11 +141,12 @@
 <div id="modal"><div class="sheet">
   <button class="btn close" onclick="document.getElementById('modal').classList.remove('open')">esc</button>
   <h3 id="modal-title"></h3>
-  <div class="sub" id="modal-sub"></div>
-  <div class="views">
+  <table class="meta-table" id="modal-meta"></table>
+  <div class="views" id="modal-views">
+    <div id="m-gt-overlay"></div>
+    <div id="m-pred-overlay"></div>
     <div id="m-side"></div>
     <div id="m-diff"></div>
-    <div id="m-overlay"></div>
   </div>
 </div></div>
 

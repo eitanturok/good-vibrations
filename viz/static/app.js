@@ -30,7 +30,7 @@ const S = {
   fftCache: new Map(),             // `${key}|${id}` -> curve
   freqs: null,
   sort: { key: "sample_id", dir: 1 },
-  view: "table", runMetric: "com_dist", contours: false,
+  runMetric: "com_dist", contours: false,
   version: null,
   fftZoom: null,                   // {x:[lo,hi], y:[lo,hi]} preserved across redraws
 };
@@ -48,8 +48,11 @@ function candidatePasses(s, skipFacet = null) {
   for (const [f, set] of Object.entries(S.filters)) {
     if (f === skipFacet || !set) continue;
     if (f === "split") {
-      const rec = S.runData[S.runs[0]] && S.runData[S.runs[0]].samples[s.sample_id];
-      if (rec && !set.has(rec.split)) return false;   // only filters samples that are in a loaded run
+      // splits are assigned per training run, so check every loaded run's record for this sample
+      for (const run of S.runs) {
+        const rec = S.runData[run] && S.runData[run].samples[s.sample_id];
+        if (rec && !set.has(rec.split)) return false;
+      }
       continue;
     }
     if (!set.has(s[f])) return false;
@@ -131,10 +134,18 @@ function removeFilteredOut() {
   for (const [id, s] of S.pool) if (!candidatePasses(s)) S.pool.delete(id);
   renderAll();
 }
-function poolSamples() { return [...S.pool.values()]; }
+// facet chips live-filter the pool view: toggling a chip off immediately hides matching pooled
+// samples everywhere (table/compact/panels/fft/box); toggling it back on brings them right back,
+// since pool membership itself (S.pool) is never touched here -- only what's shown. This applies
+// to every facet, not just split; "remove filtered-out" is the separate, deliberate, non-reversible
+// action for when you actually want to drop samples from the pool for good.
+function poolSamples() { return [...S.pool.values()].filter(s => candidatePasses(s)); }
 
 function renderPoolCount() {
-  $("#pool-count").textContent = `${S.pool.size} sample${S.pool.size === 1 ? "" : "s"}`;
+  const shown = poolSamples().length;
+  $("#pool-count").textContent = shown === S.pool.size
+    ? `${S.pool.size} sample${S.pool.size === 1 ? "" : "s"}`
+    : `${shown} of ${S.pool.size} samples shown`;
 }
 $("#pool-clear").onclick = clearPool;
 $("#pool-remove-filtered").onclick = removeFilteredOut;
@@ -702,39 +713,11 @@ const contourTrace = (mask, color, ghost = false) => ({
 });
 $("#contours-toggle").onchange = e => { S.contours = e.target.checked; updateBox(); };
 
-// ===== table / panels =====
-$("#view-seg").onclick = e => {
-  if (!e.target.dataset.view) return;
-  S.view = e.target.dataset.view;
-  for (const b of $("#view-seg").children) b.classList.toggle("active", b === e.target);
-  $("#table-wrap").style.display = S.view === "table" ? "" : "none";
-  $("#panel-wrap").style.display = S.view === "panel" ? "grid" : "none";
-  renderPanelSortControl();
-  renderSamplesView();
-};
-
-// shared sort-key list for both the table's clickable headers and the panel view's sort dropdown
-const BASE_SORT_COLS = [["sample_id", "id"], ["speaker", "spk"], ["layout", "layout"], ["n_objects", "n"], ["com_row", "gt com"]];
-const RUN_SORT_COLS = [["split", "split"], ["mse", "mse"], ["com_dist", "com dist"]];
-function sortableKeys() {
-  const activeRuns = S.runs.filter(r => S.runData[r]);
-  const keys = BASE_SORT_COLS.map(([k, l]) => [k, l]);
-  for (const r of activeRuns) for (const [k, l] of RUN_SORT_COLS) keys.push([`run:${r}:${k}`, `${r} · ${l}`]);
-  return keys;
-}
-function renderPanelSortControl() {
-  const line = $("#panel-sort-line");
-  line.hidden = S.view !== "panel";
-  if (S.view !== "panel") return;
-  const sel = $("#panel-sort-key");
-  const keys = sortableKeys();
-  const optionsHtml = keys.map(([k, l]) => `<option value="${k}" ${S.sort.key === k ? "selected" : ""}>${l}</option>`).join("");
-  if (sel.innerHTML !== optionsHtml) sel.innerHTML = optionsHtml;
-  sel.value = S.sort.key;
-  $("#panel-sort-dir").textContent = S.sort.dir > 0 ? "↑" : "↓";
-}
-$("#panel-sort-key").onchange = e => { S.sort = { key: e.target.value, dir: S.sort.dir }; renderPanels(); };
-$("#panel-sort-dir").onclick = () => { S.sort = { key: S.sort.key, dir: -S.sort.dir }; renderPanelSortControl(); renderPanels(); };
+// ===== compact table: one view, sortable by clicking column headers =====
+// first column = ground truth/sample thumbnail, sortable by sample_id or position (output_id);
+// each following column = one active run's prediction thumbnail, sortable by that run's mse/com_dist.
+const GT_SORT_COLS = [["sample_id", "id"], ["output_id_num", "position"]];
+const RUN_SORT_COLS = [["mse", "mse"], ["com_dist", "com dist"]];
 
 function sortVal(s, key) {
   if (key.startsWith("run:")) {
@@ -742,6 +725,7 @@ function sortVal(s, key) {
     const rec = S.runData[run] && S.runData[run].samples[s.sample_id];
     return rec ? rec[field] : null;
   }
+  if (key === "output_id_num") return +s.output_id;
   return s[key];
 }
 function sortedPool() {
@@ -755,79 +739,96 @@ function sortedPool() {
     return (va > vb ? 1 : va < vb ? -1 : 0) * dir;
   });
 }
-
-function renderSamplesView() {
-  renderPanelSortControl();
-  S.view === "table" ? renderTable() : renderPanels();
+function setSort(key) {
+  S.sort = { key, dir: S.sort.key === key ? -S.sort.dir : 1 };
+  renderCompact();
 }
 
-function rowHtml(s, isGhost) {
-  const runTds = S.runs.filter(r => S.runData[r]).map(r => {
-    const rec = S.runData[r].samples[s.sample_id];
-    if (!rec) return `<td class="run-start" colspan="5" style="color:${BASE}">not in run</td>`;
-    return `<td class="run-start">${rec.split.replace("unseen_", "u-")}</td><td>${fmt(rec.mse, 5)}</td><td>${fmt(rec.com_dist)}</td>` +
-      (isGhost ? `<td></td><td></td>` :
-        `<td><span class="mask-slot" data-run="${r}" data-id="${s.sample_id}" data-mode="pred"></span></td>` +
-        `<td><span class="mask-slot" data-run="${r}" data-id="${s.sample_id}" data-mode="diff"></span></td>`);
-  }).join("");
+function renderSamplesView() { renderCompact(); }
+
+let currentAudio = null, currentAudioBtn = null;
+function stopCurrentAudio() {
+  if (currentAudio) currentAudio.pause();
+  if (currentAudioBtn) currentAudioBtn.classList.remove("playing");
+  currentAudio = null; currentAudioBtn = null;
+}
+function wirePlayButtons(root) {
+  root.querySelectorAll(".play").forEach(b => b.onclick = e => {
+    e.stopPropagation();
+    const sameButton = currentAudioBtn === b;
+    stopCurrentAudio();
+    if (sameButton) return;   // second click on the playing button: pause and stop, don't restart
+    currentAudio = new Audio(b.dataset.src);   // fresh Audio each time -> always starts at 0
+    currentAudioBtn = b;
+    b.classList.add("playing");
+    currentAudio.addEventListener("ended", stopCurrentAudio);
+    currentAudio.play();
+  });
+}
+function highlightRows() {
+  const ids = new Set(S.ghost ? S.ghost.ids : []);
+  document.querySelectorAll("#compact-wrap tbody tr:not(.ghost-row)").forEach(tr =>
+    tr.classList.toggle("hovered", ids.has(+tr.dataset.id)));
+}
+
+// small white cross at the ground-truth center of mass, drawn directly on an overlay canvas
+function drawComCross(cv, s) {
+  if (!s || s.com_row < 0) return;
+  const g = cv.getContext("2d");
+  const x = (s.com_col + 0.5) / S.man.out_w * cv.width, y = (s.com_row + 0.5) / S.man.out_h * cv.height;
+  const r = Math.max(4, cv.width * 0.02);
+  g.strokeStyle = "#fff"; g.lineWidth = 2;
+  g.beginPath(); g.moveTo(x - r, y); g.lineTo(x + r, y); g.moveTo(x, y - r); g.lineTo(x, y + r); g.stroke();
+}
+
+function rowHtml(s, isGhost, activeRuns) {
+  const gtCell = isGhost ? `<img class="thumb" loading="lazy" src="/media/${s.sample_id}/thumb" alt="" data-id="${s.sample_id}">`
+    : `<span class="overlay-slot" data-id="${s.sample_id}" data-kind="gt"></span>`;
+  const predCells = activeRuns.map(r => isGhost ? "" : `<td class="run-col">
+    <div class="compact-cell" data-run="${r}"><span class="overlay-slot" data-id="${s.sample_id}" data-run="${r}" data-kind="pred"></span></td>`).join("");
   return `<tr data-id="${s.sample_id}" class="${isGhost ? "ghost-row" : ""}">
-    <td>${isGhost ? "" : `<span class="row-x" title="remove">✕</span>`}</td>
-    <td><span class="overlay-slot" data-id="${s.sample_id}"><img class="thumb" loading="lazy" src="/media/${s.sample_id}/thumb" alt="" data-id="${s.sample_id}"></span></td>
-    <td><span class="swatch" style="background:${colorFor(s)}"></span>${s.sample_id}</td>
-    <td>${s.speaker}</td><td>${s.layout}</td><td>${s.n_objects}</td>
-    <td>(${s.com_row.toFixed(1)}, ${s.com_col.toFixed(1)})</td>
-    <td><button class="play" data-src="/media/${s.sample_id}/audio">in ▶</button>
-        <button class="play" data-src="/media/${s.sample_id}/recovered">rec ▶</button></td>
-    ${runTds}</tr>`;
+    <td>${isGhost ? "" : `<span class="row-x" title="remove">✕</span>`}
+      <div class="compact-cell">
+        <div class="compact-cap"><span class="swatch" style="background:${colorFor(s)}"></span><span class="compact-id">#${s.sample_id}</span> · spk${s.speaker} · ${s.layout} · com (${s.com_row.toFixed(1)}, ${s.com_col.toFixed(1)})</div>
+        ${gtCell}
+        <div class="compact-cap"><button class="play" data-src="/media/${s.sample_id}/audio">in ▶</button> <button class="play" data-src="/media/${s.sample_id}/recovered">rec ▶</button></div>
+      </div>
+    </td>
+    ${predCells}</tr>`;
 }
 
-let _tableRenderGen = 0;
-async function renderTable() {
-  // renderTable is async (awaits network calls) and can be re-entered while a previous call is
-  // still in flight (hover -> renderRunsPanel -> ... -> another renderTable, or the 3s live-poll
-  // refresh). If an older call finishes last, it overwrites the table with stale data and rewires
-  // listeners onto nodes that are about to be discarded — that's what broke the audio play button
-  // mid-click. Each call gets a generation id; a call that's no longer the newest bails before
-  // touching the DOM.
-  const gen = ++_tableRenderGen;
-  const wrap = $("#table-wrap");
+let _compactRenderGen = 0;
+async function renderCompact() {
+  // guards a stale render (started before a newer one) from clobbering live DOM/listeners --
+  // same race the old table view hit from hover/live-poll re-entrancy.
+  const gen = ++_compactRenderGen;
+  const wrap = $("#compact-wrap");
   const rows = sortedPool();
   const ghostRows = S.ghost ? S.ghost.ids.map(id => SAMPLE.get(id)).filter(s => s && !S.pool.has(s.sample_id)) : [];
   if (!rows.length && !ghostRows.length) {
-    if (gen !== _tableRenderGen) return;
+    if (gen !== _compactRenderGen) return;
     wrap.innerHTML = `<div class="hint" style="padding:12px">add samples — pick a run above, click a position, or use "add matching" / the search box in dataset filters</div>`;
     return;
   }
-  for (const run of S.runs) if (S.runData[run]) {
-    try { await ensureRunMasks(run, rows.map(s => s.sample_id)); } catch (e) { console.error(e); }
-  }
-  if (gen !== _tableRenderGen) return;   // a newer render started while we were awaiting masks
-  const base = [["", ""], ["", "overhead"], ...BASE_SORT_COLS, ["", "audio"]];
-  const runCols = [...RUN_SORT_COLS, ["pred", "pred"], ["diff", "diff"]];
-  const arrow = k => S.sort.key === k ? (S.sort.dir > 0 ? " ↑" : " ↓") : "";
   const activeRuns = S.runs.filter(r => S.runData[r]);
+  for (const run of activeRuns) await ensureRunMasks(run, rows.map(s => s.sample_id)).catch(console.error);
+  if (gen !== _compactRenderGen) return;
 
-  const thead = `<thead>
-    <tr class="groups"><th colspan="${base.length}"></th>${activeRuns.map(r =>
-      `<th class="run-start" colspan="${runCols.length}" style="color:${runColor(r)}">${r}</th>`).join("")}</tr>
-    <tr class="cols">${base.map(([k, l]) => `<th data-key="${k}">${l}${arrow(k)}</th>`).join("")}
-    ${activeRuns.map(r => runCols.map(([k, l], i) =>
-      `<th ${i === 0 ? 'class="run-start"' : ""} data-key="run:${r}:${k}">${l}${arrow(`run:${r}:${k}`)}</th>`).join("")).join("")}</tr>
-  </thead>`;
+  const arrow = k => S.sort.key === k ? (S.sort.dir > 0 ? " ↑" : " ↓") : "";
+  const thead = `<thead><tr>
+    <th>${GT_SORT_COLS.map(([k, l]) => `<span data-sort-key="${k}" style="cursor:pointer">${l}${arrow(k)}</span>`).join(" · ")} — ground truth</th>
+    ${activeRuns.map(r => `<th class="run-col" style="color:${runColor(r)}">${r}
+      <span style="color:${INK};font-weight:400"> — ${RUN_SORT_COLS.map(([k, l]) => `<span data-sort-key="run:${r}:${k}" style="cursor:pointer">${l}${arrow(`run:${r}:${k}`)}</span>`).join(" · ")}</span>
+    </th>`).join("")}
+  </tr></thead>`;
 
-  const tb = ghostRows.map(s => rowHtml(s, true)).join("") + rows.map(s => rowHtml(s, false)).join("");
-  if (gen !== _tableRenderGen) return;   // superseded while building row html (sync, but cheap insurance)
-  wrap.innerHTML = `<table class="grid">${thead}<tbody>${tb}</tbody></table>`;
+  const tb = ghostRows.map(s => rowHtml(s, true, activeRuns)).join("") + rows.map(s => rowHtml(s, false, activeRuns)).join("");
+  if (gen !== _compactRenderGen) return;
+  wrap.innerHTML = `<table class="compact-table">${thead}<tbody>${tb}</tbody></table>`;
 
-  await fillMaskSlots(wrap);
-  fillOverlaySlots(wrap, activeRuns[0]);   // fire-and-forget: don't block the rest of the row wiring on it
-  if (gen !== _tableRenderGen) return;   // superseded while awaiting mask thumbnails — don't wire stale nodes
-  wrap.querySelectorAll("th[data-key]").forEach(th => th.onclick = () => {
-    const k = th.dataset.key;
-    if (!k) return;
-    S.sort = { key: k, dir: S.sort.key === k ? -S.sort.dir : 1 };
-    renderTable();
-  });
+  fillOverlayStacks(wrap);   // fire-and-forget: don't block the rest of the row wiring on it
+  if (gen !== _compactRenderGen) return;
+  wrap.querySelectorAll("[data-sort-key]").forEach(el => el.onclick = e => { e.stopPropagation(); setSort(el.dataset.sortKey); });
   wrap.querySelectorAll("tbody tr:not(.ghost-row)").forEach(tr => {
     tr.onmouseenter = () => setGhost({ oid: null, ids: [+tr.dataset.id] }, true);
     tr.onmouseleave = () => setGhost(null, true);
@@ -841,108 +842,53 @@ async function renderTable() {
   highlightRows();
 }
 
-async function fillMaskSlots(root) {
-  const slots = [...root.querySelectorAll(".mask-slot")];
-  if (!slots.length) return;
-  await ensureGtMasks([...new Set(slots.map(sl => +sl.dataset.id))]).catch(console.error);
-  for (const sl of slots) {
-    const { run, id, mode } = sl.dataset;
-    const pred = S.runMasks[run] && S.runMasks[run][+id], gt = S.gtMasks[+id];
-    if (!pred) continue;
-    const m = mode === "diff" && gt ? pred.map((row, r) => row.map((v, c) => v - gt[r][c])) : pred;
-    const cv = maskCanvas(m, mode === "diff" ? "diff" : "pred");
-    cv.title = "click for detail view";
-    cv.onclick = () => openDetail(+id, run);
-    sl.replaceWith(cv);
-  }
-}
-
-// replaces the plain overhead thumbnail with a prediction-overlay canvas once a run's mask is
-// available — that's the primary thing being looked at, so it's the default, not opt-in
-async function fillOverlaySlots(root, run) {
+// fills every ".overlay-slot" in root: kind="gt" -> overhead + gt mask + com cross, opens the
+// metadata+mask detail modal in gt mode; kind="pred" (data-run set) -> overhead + that run's
+// predicted mask + pred com cross, opens the detail modal in prediction mode for that run
+async function fillOverlayStacks(root) {
   const slots = [...root.querySelectorAll(".overlay-slot")];
-  if (!slots.length || !run) return;
-  const ids = slots.map(sl => +sl.dataset.id);
-  try { await ensureRunMasks(run, ids); } catch (e) { console.error(e); return; }
+  if (!slots.length) return;
+  const gtIds = [...new Set(slots.filter(sl => sl.dataset.kind === "gt").map(sl => +sl.dataset.id))];
+  if (gtIds.length) await ensureGtMasks(gtIds).catch(console.error);
+  const byRun = new Map();
+  for (const sl of slots) if (sl.dataset.kind === "pred") {
+    if (!byRun.has(sl.dataset.run)) byRun.set(sl.dataset.run, new Set());
+    byRun.get(sl.dataset.run).add(+sl.dataset.id);
+  }
+  for (const [run, ids] of byRun) await ensureRunMasks(run, [...ids]).catch(console.error);
+
   for (const sl of slots) {
     const id = +sl.dataset.id;
-    const pred = S.runMasks[run] && S.runMasks[run][id];
-    if (!pred) continue;
-    const cv = await overlayCanvas(id, pred);
+    const s = SAMPLE.get(id);
+    let cv;
+    if (sl.dataset.kind === "gt") {
+      const gt = S.gtMasks[id];
+      if (!gt) continue;
+      cv = await maskOverlayCanvas(id, gt, [24, 178, 24], "ground truth");
+      cv.onclick = () => openDetail(id, null);
+    } else {
+      const run = sl.dataset.run;
+      const pred = S.runMasks[run] && S.runMasks[run][id];
+      if (!pred) continue;
+      cv = await maskOverlayCanvas(id, pred, [224, 82, 82], run);
+      cv.onclick = () => openDetail(id, run);
+    }
+    drawComCross(cv, s);
     cv.className = "thumb";
-    cv.title = "prediction overlaid on overhead";
-    cv.onclick = () => openLightbox(`/media/${id}/thumb`);
-    if (sl.isConnected) sl.replaceWith(cv);   // table may have re-rendered while this awaited
+    if (sl.isConnected) sl.replaceWith(cv);   // view may have re-rendered while this awaited
   }
 }
 
-let currentAudio = null, currentAudioBtn = null;
-function stopCurrentAudio() {
-  if (currentAudio) currentAudio.pause();
-  if (currentAudioBtn) currentAudioBtn.classList.remove("playing");
-  currentAudio = null; currentAudioBtn = null;
-}
-function wirePlayButtons(root) {
-  root.querySelectorAll(".play").forEach(b => b.onclick = () => {
-    const sameButton = currentAudioBtn === b;
-    stopCurrentAudio();
-    if (sameButton) return;   // second click on the playing button: pause and stop, don't restart
-    currentAudio = new Audio(b.dataset.src);   // fresh Audio each time -> always starts at 0
-    currentAudioBtn = b;
-    b.classList.add("playing");
-    currentAudio.addEventListener("ended", stopCurrentAudio);
-    currentAudio.play();
-  });
-}
-function highlightRows() {
-  const ids = new Set(S.ghost ? S.ghost.ids : []);
-  document.querySelectorAll("#table-wrap tbody tr:not(.ghost-row)").forEach(tr =>
-    tr.classList.toggle("hovered", ids.has(+tr.dataset.id)));
-}
-
-async function renderPanels() {
-  const wrap = $("#panel-wrap");
-  const rows = sortedPool();
-  if (!rows.length) { wrap.innerHTML = `<div class="hint" style="padding:12px">add samples to fill this view</div>`; return; }
-  for (const run of S.runs) if (S.runData[run]) await ensureRunMasks(run, rows.map(s => s.sample_id)).catch(console.error);
-  wrap.innerHTML = "";
-  const primaryRun = S.runs.find(r => S.runData[r]);
-  for (const s of rows) {
-    const card = document.createElement("div");
-    card.className = "card";
-    card.innerHTML = `<span class="row-x" title="remove">✕</span>
-      <div class="meta"><span><span class="swatch" style="background:${colorFor(s)}"></span>${label(s)}</span><span>${s.layout}</span></div>
-      <span class="thumb-slot"><img loading="lazy" src="/media/${s.sample_id}/thumb" alt=""></span>`;
-    card.querySelector(".row-x").onclick = e => { e.stopPropagation(); removeFromPool([s.sample_id]); };
-    const thumbSlot = card.querySelector(".thumb-slot");
-    thumbSlot.querySelector("img").onclick = () => openLightbox(`/media/${s.sample_id}/thumb`);
-    const primaryMask = primaryRun && S.runMasks[primaryRun] && S.runMasks[primaryRun][s.sample_id];
-    if (primaryMask) {
-      overlayCanvas(s.sample_id, primaryMask).then(cv => {
-        cv.title = "prediction overlaid on overhead";
-        cv.style.cssText = "width:100%;border-radius:4px;display:block;cursor:pointer";
-        cv.onclick = () => openLightbox(`/media/${s.sample_id}/thumb`);
-        if (thumbSlot.isConnected) thumbSlot.replaceWith(cv);
-      });
-    }
-    for (const run of S.runs) {
-      const rec = S.runData[run] && S.runData[run].samples[s.sample_id];
-      const m = S.runMasks[run] && S.runMasks[run][s.sample_id];
-      if (!rec) continue;
-      const line = document.createElement("div");
-      line.className = "metrics";
-      line.innerHTML = `<span style="color:${runColor(run)}">▮</span> ${run} · ${rec.split.replace("unseen_", "u-")} · com ${fmt(rec.com_dist)}`;
-      card.appendChild(line);
-      if (m && run !== primaryRun) { const cv = maskCanvas(m, "pred"); cv.onclick = () => openDetail(s.sample_id, run); card.appendChild(cv); }
-    }
-    card.onmouseenter = () => setGhost({ oid: null, ids: [s.sample_id] });
-    card.onmouseleave = () => setGhost(null);
-    wrap.appendChild(card);
+// accepts a plain image URL (bare overhead photo) or a canvas (e.g. an overlay already showing
+// the mask) -- clicking a mask-overlay thumbnail should enlarge with the mask still visible,
+// not silently fall back to the bare photo
+function openLightbox(srcOrCanvas) {
+  const img = $("#lightbox-img");
+  if (srcOrCanvas instanceof HTMLCanvasElement) {
+    img.src = srcOrCanvas.toDataURL();
+  } else {
+    img.src = srcOrCanvas;
   }
-}
-
-function openLightbox(src) {
-  $("#lightbox-img").src = src;
   $("#lightbox").classList.add("open");
 }
 $("#lightbox").onclick = () => $("#lightbox").classList.remove("open");
@@ -1005,77 +951,134 @@ async function renderRunsPanel() {
 }
 
 // ===== detail modal (mask comparison) =====
+// metadata table shared by both the gt-only and prediction detail modes -- id, spk, layout, n,
+// gt com, and the two playable audio clips, exactly as requested (plus the run's own metrics
+// appended as extra rows when a run is open)
+function metaTableRows(s, run, rec) {
+  const rows = [
+    ["id", `#${s.sample_id}`], ["speaker", s.speaker], ["layout", s.layout], ["n objects", s.n_objects],
+    ["gt com", `(${s.com_row.toFixed(1)}, ${s.com_col.toFixed(1)})`],
+    ["audio", `<button class="play" data-src="/media/${s.sample_id}/audio">in ▶</button> <button class="play" data-src="/media/${s.sample_id}/recovered">rec ▶</button>`],
+  ];
+  if (run) rows.push(
+    ["run", run], ["split", rec?.split.replace("unseen_", "u-") ?? "?"],
+    ["mse", fmt(rec?.mse, 6)], ["com_dist", fmt(rec?.com_dist)],
+    ["pred com", `(${fmt(rec?.pred_row, 1)}, ${fmt(rec?.pred_col, 1)})`],
+  );
+  return rows.map(([k, v]) => `<tr><td>${k}</td><td>${v}</td></tr>`).join("");
+}
+
+// fixed pixel size every detail-modal image renders at, regardless of view -- overhead photos
+// are natively 256x104 (checked across the dataset); scaling every image/heatmap to the same
+// width keeps gt/pred/diff/overlay visually comparable and never squished relative to each other
+const DETAIL_IMG_W = 460;
+
 async function openDetail(sampleId, run) {
-  const s = SAMPLE.get(sampleId), rec = S.runData[run]?.samples[sampleId];
+  const s = SAMPLE.get(sampleId);
   await ensureGtMasks([sampleId]);
-  await ensureRunMasks(run, [sampleId]);
-  const gt = S.gtMasks[sampleId], pred = S.runMasks[run][sampleId];
-  if (!gt || !pred) return;
-  $("#modal-title").textContent = `${label(s)} — ${run}`;
-  $("#modal-sub").textContent = `${s.layout} · split ${rec?.split ?? "?"} · mse ${fmt(rec?.mse, 6)} · com_dist ${fmt(rec?.com_dist)} · gt com (${s.com_row.toFixed(1)}, ${s.com_col.toFixed(1)}) · pred com (${fmt(rec?.pred_row, 1)}, ${fmt(rec?.pred_col, 1)})`;
+  const gt = S.gtMasks[sampleId];
+  if (!gt) return;
+  const rec = run ? S.runData[run]?.samples[sampleId] : null;
+  let pred = null;
+  if (run) { await ensureRunMasks(run, [sampleId]); pred = S.runMasks[run][sampleId]; if (!pred) return; }
+
+  $("#modal-title").textContent = run ? `${label(s)} — ${run}` : label(s);
+  $("#modal-meta").innerHTML = metaTableRows(s, run, rec);
   $("#modal").classList.add("open");
 
   const H = gt.length, W = gt[0].length;
+  const detailH = Math.round(DETAIL_IMG_W * H / W);
+  wirePlayButtons($("#modal"));
+
+  const gtOverlay = $("#m-gt-overlay"), predOverlay = $("#m-pred-overlay"), side = $("#m-side"), diff = $("#m-diff");
+  gtOverlay.innerHTML = `<div class="sub" style="text-align:center;margin:4px 0">overhead + ground truth overlay</div>`;
+  maskOverlayCanvas(sampleId, gt, [24, 178, 24], "ground truth").then(cv => {
+    drawComCross(cv, s);
+    cv.style.cssText = `width:${DETAIL_IMG_W}px;border-radius:6px;display:block`;
+    gtOverlay.appendChild(cv);
+  });
+
+  if (!run) { predOverlay.innerHTML = ""; side.innerHTML = ""; diff.innerHTML = ""; return; }
+
+  predOverlay.innerHTML = `<div class="sub" style="text-align:center;margin:4px 0">overhead + prediction overlay</div>`;
+  overlayCanvas(sampleId, pred).then(cv => {
+    drawComCross(cv, s);
+    cv.style.cssText = `width:${DETAIL_IMG_W}px;border-radius:6px;display:block`;
+    predOverlay.appendChild(cv);
+  });
+
   const comMarks = (ax = "") => [
     { type: "scatter", x: [s.com_col], y: [s.com_row], mode: "markers", showlegend: false, hoverinfo: "skip",
       xaxis: "x" + ax, yaxis: "y" + ax, marker: { symbol: "cross-thin", size: 11, line: { width: 2, color: "#fff" } } },
-    ...(rec ? [{ type: "scatter", x: [rec.pred_col], y: [rec.pred_row], mode: "markers", showlegend: false, hoverinfo: "skip",
-      xaxis: "x" + ax, yaxis: "y" + ax, marker: { symbol: "x-thin", size: 11, line: { width: 2, color: "#fff" } } }] : []),
+    { type: "scatter", x: [rec.pred_col], y: [rec.pred_row], mode: "markers", showlegend: false, hoverinfo: "skip",
+      xaxis: "x" + ax, yaxis: "y" + ax, marker: { symbol: "x-thin", size: 11, line: { width: 2, color: "#fff" } } },
   ];
   const axes = over => ({
     xaxis: AXIS({ range: [-0.5, W - 0.5], constrain: "domain", visible: false }),
     yaxis: AXIS({ range: [H - 0.5, -0.5], scaleanchor: over ? "x" : undefined, visible: false }),
     margin: { l: 6, r: 6, t: 22, b: 6 }, showlegend: false,
+    width: over ? DETAIL_IMG_W : DETAIL_IMG_W * 2 + 12, height: detailH + 28,
   });
   const heat = (z, colorscale, name) => ({ type: "heatmap", z, colorscale, showscale: false, name,
     hovertemplate: "(%{y}, %{x}) %{z:.3f}<extra>" + name + "</extra>" });
   const GT_SCALE = [[0, SURFACE], [1, "#18b218"]], PRED_SCALE = [[0, SURFACE], [1, "#e05252"]];
   const DIFF_SCALE = [[0, "#18b218"], [0.5, "#383835"], [1, "#e05252"]];
 
-  Plotly.react("m-side", [
+  side.innerHTML = "";
+  Plotly.newPlot(side, [
     Object.assign(heat(gt, GT_SCALE, "ground truth"), { xaxis: "x", yaxis: "y" }),
     Object.assign(heat(pred, PRED_SCALE, "prediction"), { xaxis: "x2", yaxis: "y2" }),
     ...comMarks(), ...comMarks("2"),
   ], LAYOUT({
-    ...axes(), title: { text: "ground truth (green) · prediction (red)", font: { size: 11 }, x: 0.5 },
+    ...axes(false), title: { text: "ground truth (green) · prediction (red)", font: { size: 11 }, x: 0.5 },
     xaxis: AXIS({ domain: [0, 0.485], range: [-0.5, W - 0.5], visible: false }),
     yaxis: AXIS({ range: [H - 0.5, -0.5], visible: false }),
     xaxis2: AXIS({ domain: [0.515, 1], range: [-0.5, W - 0.5], visible: false }),
     yaxis2: AXIS({ range: [H - 0.5, -0.5], anchor: "x2", visible: false }),
   }), CONFIG);
 
-  const diff = pred.map((row, r) => row.map((v, c) => v - gt[r][c]));
-  Plotly.react("m-diff", [
-    Object.assign(heat(diff, DIFF_SCALE, "pred − gt"), { zmid: 0, zmin: -1, zmax: 1, showscale: true,
+  const diffMask = pred.map((row, r) => row.map((v, c) => v - gt[r][c]));
+  diff.innerHTML = "";
+  Plotly.newPlot(diff, [
+    Object.assign(heat(diffMask, DIFF_SCALE, "pred − gt"), { zmid: 0, zmin: -1, zmax: 1, showscale: true,
       colorbar: { thickness: 8, outlinewidth: 0, tickfont: { color: MUTED } } }),
     ...comMarks(),
   ], LAYOUT({ ...axes(true), title: { text: "diff: red = pred extra · green = gt missed", font: { size: 11 }, x: 0.5 } }), CONFIG);
-
-  const holder = $("#m-overlay");
-  holder.innerHTML = `<div class="sub" style="text-align:center;margin:4px 0">overhead + prediction overlay</div>`;
-  overlayCanvas(sampleId, pred).then(cv => { cv.style.width = "100%"; cv.style.borderRadius = "6px"; holder.appendChild(cv); });
 }
 
 // overhead photo with the predicted mask painted on top in translucent red — this is the
 // default thumbnail in table/panel views once a run is loaded, since seeing the prediction
 // against the real photo is the main thing being looked at, not the bare photo
 function overlayCanvas(sampleId, pred) {
+  return maskOverlayCanvas(sampleId, pred, [224, 82, 82]);
+}
+
+// generic overhead + translucent-mask overlay, with a live hover tooltip reporting the exact
+// mask value under the cursor (native <title>, cheap and works everywhere a canvas can go)
+function maskOverlayCanvas(sampleId, mask, rgb, label = "") {
   return new Promise(resolve => {
     const img = new Image();
     img.src = `/media/${sampleId}/thumb`;
     img.onload = () => {
-      const H = pred.length, W = pred[0].length;
+      const H = mask.length, W = mask[0].length;
       const cv = document.createElement("canvas");
       cv.width = img.naturalWidth; cv.height = img.naturalHeight;
       const g = cv.getContext("2d");
       g.drawImage(img, 0, 0);
       const cw = cv.width / W, ch = cv.height / H;
       for (let r = 0; r < H; r++) for (let c = 0; c < W; c++) {
-        if (pred[r][c] > 0.05) {
-          g.fillStyle = `rgba(224,82,82,${Math.min(pred[r][c] * 0.65, 0.75)})`;
+        const v = mask[r][c];
+        if (v > 0.05) {
+          g.fillStyle = `rgba(${rgb[0]},${rgb[1]},${rgb[2]},${Math.min(v * 0.65, 0.75)})`;
           g.fillRect(c * cw, r * ch, cw + 0.5, ch + 0.5);
         }
       }
+      cv.onmousemove = e => {
+        const rect = cv.getBoundingClientRect();
+        const c = Math.min(W - 1, Math.max(0, Math.floor((e.clientX - rect.left) / rect.width * W)));
+        const r = Math.min(H - 1, Math.max(0, Math.floor((e.clientY - rect.top) / rect.height * H)));
+        cv.title = `${label ? label + " · " : ""}(${r}, ${c}) = ${mask[r][c].toFixed(3)}`;
+      };
       resolve(cv);
     };
   });
@@ -1116,14 +1119,13 @@ $("#fft-tabs").onclick = e => {
 setInterval(async () => {
   try {
     const { version } = await jget("/api/version");
-    $("#live-dot").classList.add("on");
     if (version !== S.version) {
       S.version = version;
       S.fftCache.clear(); S.gtMasks = {}; S.runMasks = {};
       for (const r of S.runs) S.runData[r] = await jget(`/api/run/${r}`).catch(() => S.runData[r]);
       await boot();
     }
-  } catch { $("#live-dot").classList.remove("on"); }
+  } catch { /* transient: retried on the next tick */ }
 }, 3000);
 
 window.addEventListener("resize", debounce(() => { renderPosmap(); }, 150));
