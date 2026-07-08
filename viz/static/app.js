@@ -709,8 +709,32 @@ $("#view-seg").onclick = e => {
   for (const b of $("#view-seg").children) b.classList.toggle("active", b === e.target);
   $("#table-wrap").style.display = S.view === "table" ? "" : "none";
   $("#panel-wrap").style.display = S.view === "panel" ? "grid" : "none";
+  renderPanelSortControl();
   renderSamplesView();
 };
+
+// shared sort-key list for both the table's clickable headers and the panel view's sort dropdown
+const BASE_SORT_COLS = [["sample_id", "id"], ["speaker", "spk"], ["layout", "layout"], ["n_objects", "n"], ["com_row", "gt com"]];
+const RUN_SORT_COLS = [["split", "split"], ["mse", "mse"], ["com_dist", "com dist"]];
+function sortableKeys() {
+  const activeRuns = S.runs.filter(r => S.runData[r]);
+  const keys = BASE_SORT_COLS.map(([k, l]) => [k, l]);
+  for (const r of activeRuns) for (const [k, l] of RUN_SORT_COLS) keys.push([`run:${r}:${k}`, `${r} · ${l}`]);
+  return keys;
+}
+function renderPanelSortControl() {
+  const line = $("#panel-sort-line");
+  line.hidden = S.view !== "panel";
+  if (S.view !== "panel") return;
+  const sel = $("#panel-sort-key");
+  const keys = sortableKeys();
+  const optionsHtml = keys.map(([k, l]) => `<option value="${k}" ${S.sort.key === k ? "selected" : ""}>${l}</option>`).join("");
+  if (sel.innerHTML !== optionsHtml) sel.innerHTML = optionsHtml;
+  sel.value = S.sort.key;
+  $("#panel-sort-dir").textContent = S.sort.dir > 0 ? "↑" : "↓";
+}
+$("#panel-sort-key").onchange = e => { S.sort = { key: e.target.value, dir: S.sort.dir }; renderPanels(); };
+$("#panel-sort-dir").onclick = () => { S.sort = { key: S.sort.key, dir: -S.sort.dir }; renderPanelSortControl(); renderPanels(); };
 
 function sortVal(s, key) {
   if (key.startsWith("run:")) {
@@ -732,7 +756,10 @@ function sortedPool() {
   });
 }
 
-function renderSamplesView() { S.view === "table" ? renderTable() : renderPanels(); }
+function renderSamplesView() {
+  renderPanelSortControl();
+  S.view === "table" ? renderTable() : renderPanels();
+}
 
 function rowHtml(s, isGhost) {
   const runTds = S.runs.filter(r => S.runData[r]).map(r => {
@@ -745,7 +772,7 @@ function rowHtml(s, isGhost) {
   }).join("");
   return `<tr data-id="${s.sample_id}" class="${isGhost ? "ghost-row" : ""}">
     <td>${isGhost ? "" : `<span class="row-x" title="remove">✕</span>`}</td>
-    <td><img class="thumb" loading="lazy" src="/media/${s.sample_id}/thumb" alt="" data-id="${s.sample_id}"></td>
+    <td><span class="overlay-slot" data-id="${s.sample_id}"><img class="thumb" loading="lazy" src="/media/${s.sample_id}/thumb" alt="" data-id="${s.sample_id}"></span></td>
     <td><span class="swatch" style="background:${colorFor(s)}"></span>${s.sample_id}</td>
     <td>${s.speaker}</td><td>${s.layout}</td><td>${s.n_objects}</td>
     <td>(${s.com_row.toFixed(1)}, ${s.com_col.toFixed(1)})</td>
@@ -775,11 +802,8 @@ async function renderTable() {
     try { await ensureRunMasks(run, rows.map(s => s.sample_id)); } catch (e) { console.error(e); }
   }
   if (gen !== _tableRenderGen) return;   // a newer render started while we were awaiting masks
-  const base = [
-    ["", ""], ["", "overhead"], ["sample_id", "id"], ["speaker", "spk"], ["layout", "layout"],
-    ["n_objects", "n"], ["com_row", "gt com"], ["", "audio"],
-  ];
-  const runCols = [["split", "split"], ["mse", "mse"], ["com_dist", "com dist"], ["pred", "pred"], ["diff", "diff"]];
+  const base = [["", ""], ["", "overhead"], ...BASE_SORT_COLS, ["", "audio"]];
+  const runCols = [...RUN_SORT_COLS, ["pred", "pred"], ["diff", "diff"]];
   const arrow = k => S.sort.key === k ? (S.sort.dir > 0 ? " ↑" : " ↓") : "";
   const activeRuns = S.runs.filter(r => S.runData[r]);
 
@@ -796,6 +820,7 @@ async function renderTable() {
   wrap.innerHTML = `<table class="grid">${thead}<tbody>${tb}</tbody></table>`;
 
   await fillMaskSlots(wrap);
+  fillOverlaySlots(wrap, activeRuns[0]);   // fire-and-forget: don't block the rest of the row wiring on it
   if (gen !== _tableRenderGen) return;   // superseded while awaiting mask thumbnails — don't wire stale nodes
   wrap.querySelectorAll("th[data-key]").forEach(th => th.onclick = () => {
     const k = th.dataset.key;
@@ -832,6 +857,25 @@ async function fillMaskSlots(root) {
   }
 }
 
+// replaces the plain overhead thumbnail with a prediction-overlay canvas once a run's mask is
+// available — that's the primary thing being looked at, so it's the default, not opt-in
+async function fillOverlaySlots(root, run) {
+  const slots = [...root.querySelectorAll(".overlay-slot")];
+  if (!slots.length || !run) return;
+  const ids = slots.map(sl => +sl.dataset.id);
+  try { await ensureRunMasks(run, ids); } catch (e) { console.error(e); return; }
+  for (const sl of slots) {
+    const id = +sl.dataset.id;
+    const pred = S.runMasks[run] && S.runMasks[run][id];
+    if (!pred) continue;
+    const cv = await overlayCanvas(id, pred);
+    cv.className = "thumb";
+    cv.title = "prediction overlaid on overhead";
+    cv.onclick = () => openLightbox(`/media/${id}/thumb`);
+    if (sl.isConnected) sl.replaceWith(cv);   // table may have re-rendered while this awaited
+  }
+}
+
 let currentAudio = null, currentAudioBtn = null;
 function stopCurrentAudio() {
   if (currentAudio) currentAudio.pause();
@@ -862,14 +906,25 @@ async function renderPanels() {
   if (!rows.length) { wrap.innerHTML = `<div class="hint" style="padding:12px">add samples to fill this view</div>`; return; }
   for (const run of S.runs) if (S.runData[run]) await ensureRunMasks(run, rows.map(s => s.sample_id)).catch(console.error);
   wrap.innerHTML = "";
+  const primaryRun = S.runs.find(r => S.runData[r]);
   for (const s of rows) {
     const card = document.createElement("div");
     card.className = "card";
     card.innerHTML = `<span class="row-x" title="remove">✕</span>
-      <img loading="lazy" src="/media/${s.sample_id}/thumb" alt="">
-      <div class="meta"><span><span class="swatch" style="background:${colorFor(s)}"></span>${label(s)}</span><span>${s.layout}</span></div>`;
+      <div class="meta"><span><span class="swatch" style="background:${colorFor(s)}"></span>${label(s)}</span><span>${s.layout}</span></div>
+      <span class="thumb-slot"><img loading="lazy" src="/media/${s.sample_id}/thumb" alt=""></span>`;
     card.querySelector(".row-x").onclick = e => { e.stopPropagation(); removeFromPool([s.sample_id]); };
-    card.querySelector("img").onclick = () => openLightbox(`/media/${s.sample_id}/thumb`);
+    const thumbSlot = card.querySelector(".thumb-slot");
+    thumbSlot.querySelector("img").onclick = () => openLightbox(`/media/${s.sample_id}/thumb`);
+    const primaryMask = primaryRun && S.runMasks[primaryRun] && S.runMasks[primaryRun][s.sample_id];
+    if (primaryMask) {
+      overlayCanvas(s.sample_id, primaryMask).then(cv => {
+        cv.title = "prediction overlaid on overhead";
+        cv.style.cssText = "width:100%;border-radius:4px;display:block;cursor:pointer";
+        cv.onclick = () => openLightbox(`/media/${s.sample_id}/thumb`);
+        if (thumbSlot.isConnected) thumbSlot.replaceWith(cv);
+      });
+    }
     for (const run of S.runs) {
       const rec = S.runData[run] && S.runData[run].samples[s.sample_id];
       const m = S.runMasks[run] && S.runMasks[run][s.sample_id];
@@ -878,7 +933,7 @@ async function renderPanels() {
       line.className = "metrics";
       line.innerHTML = `<span style="color:${runColor(run)}">▮</span> ${run} · ${rec.split.replace("unseen_", "u-")} · com ${fmt(rec.com_dist)}`;
       card.appendChild(line);
-      if (m) { const cv = maskCanvas(m, "pred"); cv.onclick = () => openDetail(s.sample_id, run); card.appendChild(cv); }
+      if (m && run !== primaryRun) { const cv = maskCanvas(m, "pred"); cv.onclick = () => openDetail(s.sample_id, run); card.appendChild(cv); }
     }
     card.onmouseenter = () => setGhost({ oid: null, ids: [s.sample_id] });
     card.onmouseleave = () => setGhost(null);
@@ -941,9 +996,10 @@ async function renderRunsPanel() {
   }
   Plotly.react("runs-plot", traces, LAYOUT({
     barmode: "group", bargap: 0.25,
-    xaxis: AXIS({ domain: [0, 0.44], title: { text: `${metricLabel} by split`, font: { size: 11 } } }),
+    margin: { l: 44, r: 10, t: 8, b: 58 },   // extra room: split tick labels ("u-pos_speaker") wrap in a narrow column and clipped the axis title with the default margin
+    xaxis: AXIS({ domain: [0, 0.44], title: { text: `${metricLabel} by split`, font: { size: 11 }, standoff: 14 }, tickangle: -30 }),
     yaxis: AXIS({}),
-    xaxis2: AXIS({ domain: [0.56, 1], title: { text: `eval ${metricLabel} by speaker`, font: { size: 11 } } }),
+    xaxis2: AXIS({ domain: [0.56, 1], title: { text: `eval ${metricLabel} by speaker`, font: { size: 11 }, standoff: 14 } }),
     yaxis2: AXIS({ anchor: "x2" }),
   }), CONFIG);
 }
@@ -997,23 +1053,32 @@ async function openDetail(sampleId, run) {
 
   const holder = $("#m-overlay");
   holder.innerHTML = `<div class="sub" style="text-align:center;margin:4px 0">overhead + prediction overlay</div>`;
-  const img = new Image();
-  img.src = `/media/${sampleId}/thumb`;
-  img.onload = () => {
-    const cv = document.createElement("canvas");
-    cv.width = img.naturalWidth; cv.height = img.naturalHeight;
-    cv.style.width = "100%"; cv.style.borderRadius = "6px";
-    const g = cv.getContext("2d");
-    g.drawImage(img, 0, 0);
-    const cw = cv.width / W, ch = cv.height / H;
-    for (let r = 0; r < H; r++) for (let c = 0; c < W; c++) {
-      if (pred[r][c] > 0.05) {
-        g.fillStyle = `rgba(224,82,82,${Math.min(pred[r][c] * 0.65, 0.75)})`;
-        g.fillRect(c * cw, r * ch, cw + 0.5, ch + 0.5);
+  overlayCanvas(sampleId, pred).then(cv => { cv.style.width = "100%"; cv.style.borderRadius = "6px"; holder.appendChild(cv); });
+}
+
+// overhead photo with the predicted mask painted on top in translucent red — this is the
+// default thumbnail in table/panel views once a run is loaded, since seeing the prediction
+// against the real photo is the main thing being looked at, not the bare photo
+function overlayCanvas(sampleId, pred) {
+  return new Promise(resolve => {
+    const img = new Image();
+    img.src = `/media/${sampleId}/thumb`;
+    img.onload = () => {
+      const H = pred.length, W = pred[0].length;
+      const cv = document.createElement("canvas");
+      cv.width = img.naturalWidth; cv.height = img.naturalHeight;
+      const g = cv.getContext("2d");
+      g.drawImage(img, 0, 0);
+      const cw = cv.width / W, ch = cv.height / H;
+      for (let r = 0; r < H; r++) for (let c = 0; c < W; c++) {
+        if (pred[r][c] > 0.05) {
+          g.fillStyle = `rgba(224,82,82,${Math.min(pred[r][c] * 0.65, 0.75)})`;
+          g.fillRect(c * cw, r * ch, cw + 0.5, ch + 0.5);
+        }
       }
-    }
-    holder.appendChild(cv);
-  };
+      resolve(cv);
+    };
+  });
 }
 document.addEventListener("keydown", e => {
   if (e.key === "Escape") { $("#modal").classList.remove("open"); $("#lightbox").classList.remove("open"); setGhost(null); }
@@ -1039,7 +1104,12 @@ $("#fft-tabs").onclick = e => {
   $("#runs-plot-wrap").style.display = tab === "runs" ? "" : "none";
   $("#fft-controls").hidden = tab !== "fft";
   $("#runs-controls").hidden = tab !== "runs";
-  tab === "fft" ? updateFFT() : renderRunsPanel();
+  // Plotly.react on a just-unhidden container reads its size before the browser has finished
+  // laying it out (display:none -> block happens in the same tick), so it renders at a stale
+  // size and the axis titles land outside the visible box. Force a resize on the next frame,
+  // once layout has actually settled, to pull the plot back to its real container size.
+  if (tab === "fft") { updateFFT(); }
+  else { renderRunsPanel(); requestAnimationFrame(() => Plotly.Plots.resize("runs-plot")); }
 };
 
 // ===== live updates =====

@@ -129,6 +129,9 @@ button.btn {
 button.btn:hover { border-color: var(--muted); color: var(--ink); }
 .mini { cursor: pointer; color: var(--muted); font-size: 11px; }
 .mini:hover { color: var(--ink); }
+button.mini { background: none; border: 0; padding: 0 2px; font: inherit; }
+#panel-sort-line { display: flex; align-items: center; gap: 4px; margin-right: 10px; }
+#panel-sort-key { font-size: 11px; padding: 1px 4px; }
 
 /* run chips */
 .run-chip { border-width: 2px; }
@@ -187,12 +190,12 @@ table.grid tbody tr:hover { background: var(--surface-2); }
 table.grid tbody tr.hovered { background: rgba(57, 135, 229, 0.10); }
 table.grid tbody tr.ghost-row { background: rgba(255, 255, 255, 0.05); font-style: italic; }
 table.grid td { color: var(--ink-2); font-variant-numeric: tabular-nums; }
-table.grid td img.thumb {
+table.grid td img.thumb, table.grid td canvas.thumb {
   display: block; height: 68px; border-radius: 4px; cursor: pointer; object-fit: cover;
 }
-table.grid td img.thumb:hover { outline: 2px solid var(--accent); }
-table.grid td canvas { display: block; height: 40px; image-rendering: pixelated; border-radius: 3px; cursor: pointer; }
-table.grid td canvas:hover { outline: 1px solid var(--ink); }
+table.grid td img.thumb:hover, table.grid td canvas.thumb:hover { outline: 2px solid var(--accent); }
+table.grid td canvas:not(.thumb) { display: block; height: 40px; image-rendering: pixelated; border-radius: 3px; cursor: pointer; }
+table.grid td canvas:not(.thumb):hover { outline: 1px solid var(--ink); }
 .swatch { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 5px; }
 .play {
   background: none; border: 1px solid var(--grid); border-radius: 4px; color: var(--ink-2);

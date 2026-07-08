@@ -9,10 +9,27 @@ def find_notch_mask(freqs: np.ndarray, spike_freqs: list[float], half_width_hz: 
         mask |= np.abs(freqs - f) <= half_width_hz
     return mask
 
-def interpolate_notch(fft: np.ndarray, freqs: np.ndarray, spike_freqs: list[float] = [60.0, 100.0], half_width_hz: float = 3.0) -> np.ndarray:
-    """Linearly interpolate the complex FFT across each notch band, using the bins immediately
-    outside the band as endpoints. Real and imaginary parts are interpolated independently so
-    phase isn't forced to a spurious value. Leaves everything outside the notch bands untouched.
+def _endpoint(real, imag, freqs, center_hz, side, offset_hz, window_hz, F):
+    """Median real/imag over a small window centered offset_hz away from center_hz (side=-1 below, +1 above),
+    used as a robust, leakage-clear interpolation endpoint (as opposed to the single bin adjacent to the notch,
+    which can itself still be depressed/elevated by spectral leakage from the spike)."""
+    target = center_hz + side * offset_hz
+    in_window = np.abs(freqs - target) <= window_hz / 2
+    idx = np.flatnonzero(in_window)
+    if idx.size == 0:  # fall back to the nearest single bin if the window is empty (e.g. near spectrum edge)
+        idx = np.array([np.argmin(np.abs(freqs - target))])
+    idx = idx[(idx >= 0) & (idx < F)]
+    return np.median(real[..., idx, :], axis=-2, keepdims=True), np.median(imag[..., idx, :], axis=-2, keepdims=True)
+
+def interpolate_notch(fft: np.ndarray, freqs: np.ndarray, spike_freqs: list[float] = [60.0, 100.0],
+                       half_width_hz: float = 1.0, endpoint_offset_hz: float = 5.0, endpoint_window_hz: float = 2.0) -> np.ndarray:
+    """Linearly interpolate the complex FFT across each notch band. The band itself (what gets
+    replaced) is +/- half_width_hz around each spike_freq. The interpolation endpoints are NOT the
+    bins immediately adjacent to the band -- those can still be slightly depressed/elevated by
+    spectral leakage from the spike -- but the median magnitude over a small window centered
+    endpoint_offset_hz away on each side, where the floor is clean. Real and imaginary parts are
+    interpolated independently so phase isn't forced to a spurious value. Leaves everything outside
+    the notch bands untouched.
 
     fft: (B,L,F,2) complex. freqs: (F,) in Hz, same ordering as fft's F axis.
     """
@@ -22,20 +39,20 @@ def interpolate_notch(fft: np.ndarray, freqs: np.ndarray, spike_freqs: list[floa
     F = freqs.shape[0]
     real, imag = fft.real.astype(np.float64).copy(), fft.imag.astype(np.float64).copy()
 
-    # find contiguous notch runs so each gets interpolated against its own pair of endpoint bins
+    # find contiguous notch runs so each gets interpolated against its own pair of endpoints
     edges = np.flatnonzero(np.diff(np.concatenate(([0], notch.view(np.int8), [0]))))
     starts, ends = edges[0::2], edges[1::2]  # [start, end) index pairs, in bin space
 
     for start, end in zip(starts, ends):
-        lo, hi = start - 1, end  # bin just before / just after the notch
-        if lo < 0 or hi >= F:  # spike at spectrum edge: fall back to nearest valid neighbor (flat fill)
-            src = hi if lo < 0 else lo
-            real[..., start:end, :] = real[..., src:src + 1, :]
-            imag[..., start:end, :] = imag[..., src:src + 1, :]
-            continue
-        # weight goes 0->1 across the band; broadcasts over all leading (B,L) and trailing (C) dims
-        w = ((freqs[start:end] - freqs[lo]) / (freqs[hi] - freqs[lo])).reshape(-1, 1)
-        real[..., start:end, :] = real[..., lo:lo + 1, :] * (1 - w) + real[..., hi:hi + 1, :] * w
-        imag[..., start:end, :] = imag[..., lo:lo + 1, :] * (1 - w) + imag[..., hi:hi + 1, :] * w
+        center_hz = (freqs[start] + freqs[end - 1]) / 2
+        lo_val, hi_val = (_endpoint(real, imag, freqs, center_hz, -1, endpoint_offset_hz, endpoint_window_hz, F),
+                          _endpoint(real, imag, freqs, center_hz, +1, endpoint_offset_hz, endpoint_window_hz, F))
+        (lo_real, lo_imag), (hi_real, hi_imag) = lo_val, hi_val
+
+        band_freqs = freqs[start:end]
+        f_lo, f_hi = center_hz - endpoint_offset_hz, center_hz + endpoint_offset_hz
+        w = ((band_freqs - f_lo) / (f_hi - f_lo)).clip(0, 1).reshape(-1, 1)
+        real[..., start:end, :] = lo_real * (1 - w) + hi_real * w
+        imag[..., start:end, :] = lo_imag * (1 - w) + hi_imag * w
 
     return (real + 1j * imag).astype(fft.dtype)
