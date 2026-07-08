@@ -187,15 +187,15 @@ def build_dataset(mds_path: str | Path, batch_size: int = 64, eval_batch_size: i
               f"eval/unseen_pos={len(unseen_pos_idx)}, eval/unseen_layout={len(unseen_layout_idx)}")
 
     def num_samples(batch): return batch["mask_true"].shape[0]
-    def loader(idxs, bs, shuffle):
-        dl = DataLoader(Subset(dataset, idxs), batch_size=bs, shuffle=shuffle, num_workers=num_workers, generator=generator, pin_memory=True, persistent_workers=num_workers > 0, prefetch_factor=4 if num_workers > 0 else None)
+    def loader(idxs, bs, shuffle=False, drop_last=False):
+        dl = DataLoader(Subset(dataset, idxs), batch_size=bs, shuffle=shuffle, num_workers=num_workers, generator=generator, pin_memory=True, persistent_workers=num_workers > 0, prefetch_factor=4 if num_workers > 0 else None, drop_last=drop_last)
         return DataSpec(dataloader=dl, get_num_samples_in_batch=num_samples)
 
-    train_loader = loader(train_idx, batch_size, shuffle=True)
+    train_loader = loader(train_idx, batch_size, shuffle=True, drop_last=True)
     eval_loaders = [
-        Evaluator(label="eval/unseen_pos_speaker", dataloader=loader(unseen_pos_speaker_idx, eval_batch_size, shuffle=False)),
-        Evaluator(label="eval/unseen_pos", dataloader=loader(unseen_pos_idx, eval_batch_size, shuffle=False)),
-        Evaluator(label="eval/unseen_layout", dataloader=loader(unseen_layout_idx, eval_batch_size, shuffle=False)),
+        Evaluator(label="eval/unseen_pos_speaker", dataloader=loader(unseen_pos_speaker_idx, eval_batch_size)),
+        Evaluator(label="eval/unseen_pos", dataloader=loader(unseen_pos_idx, eval_batch_size)),
+        Evaluator(label="eval/unseen_layout", dataloader=loader(unseen_layout_idx, eval_batch_size)),
     ]
     return train_loader, eval_loaders
 

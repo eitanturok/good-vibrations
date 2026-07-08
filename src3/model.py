@@ -69,7 +69,7 @@ class MLPDecoder(nn.Module):
         self.net = nn.Sequential(nn.Linear(d_model, 256), nn.ReLU(), nn.Linear(256, out_h * out_w))
     def forward(self, cls): return self.net(cls).view(-1, self.out_h, self.out_w)
 
-class Decoder1(nn.Module):
+class MLPMidDecoder(nn.Module):
     def __init__(self, d_model, out_h, out_w):
         super().__init__()
         self.out_h, self.out_w = out_h, out_w
@@ -85,16 +85,43 @@ class Decoder1(nn.Module):
             )
     def forward(self, cls): return self.net(cls).view(-1, self.out_h, self.out_w)
 
-def build_decoder(decoder, d_model, out_h, out_w):
-    decoders = {'mlp': MLPDecoder, 'decoder1': Decoder1}
-    return decoders[decoder](d_model, out_h, out_w)
+class AttnDecoder(nn.Module):
+    def __init__(self, d_model, out_h, out_w, num_heads:int=2, num_layers:int=2):
+        super().__init__()
+        self.out_h, self.out_w = out_h, out_w
+        self.query_seed = nn.Parameter(torch.zeros(1, 1, d_model))
+        nn.init.trunc_normal_(self.query_seed, std=0.02)
+        self.register_buffer("freqs_query", precompute_freqs_cis_2d(d_model, out_h, out_w))  # 2D RoPE over the output grid
+        layer = nn.TransformerDecoderLayer(d_model=d_model, nhead=num_heads, batch_first=True)
+        self.layers = nn.TransformerDecoder(layer, num_layers=num_layers)
+        self.head = nn.Linear(d_model, 1)
+
+    def forward(self, memory, memory_key_padding_mask=None):
+        # memory: (B,S,D) per-laser token sequence to cross-attend into (S = L+1, includes cls token)
+        B = memory.shape[0]
+        queries = self.query_seed.expand(B, self.out_h * self.out_w, -1)  # (B,out_h*out_w,D)
+        queries = apply_rope(queries, self.freqs_query)                    # give each query its 2D grid position
+        out = self.layers(queries, memory, memory_key_padding_mask=memory_key_padding_mask)  # (B,out_h*out_w,D)
+        return self.head(out).view(B, self.out_h, self.out_w)
+
+def build_decoder(decoder, d_model, out_h, out_w, decoder_num_heads:int=2, decoder_num_layers:int=2):
+    if decoder == 'mlp': return MLPDecoder(d_model, out_h, out_w)
+    if decoder == 'mlp-mid': return MLPMidDecoder(d_model, out_h, out_w)
+    if decoder == 'attn': return AttnDecoder(d_model, out_h, out_w, num_heads=decoder_num_heads, num_layers=decoder_num_layers)
+    raise ValueError(f"Unknown decoder: {decoder}")
 
 #***** 3 encoder *****
 
 def dropout(x, mask_shape, p, training):
-    if not training or p == 0.0: return x
+    if not training or p == 0.0: return x, None
     keep = torch.rand(mask_shape, dtype=torch.float32, device=x.device) >= p
-    return x * keep.unsqueeze(-1) / (1 - p)
+    return x * keep.unsqueeze(-1) / (1 - p), keep
+
+def pad_mask(keep, B_or_BL):
+    """(B,L) keep mask -> (B,L+1) key_padding_mask (True = ignore), with the prepended cls token never masked."""
+    if keep is None: return None
+    cls_keep = torch.ones(B_or_BL, 1, dtype=torch.bool, device=keep.device)
+    return ~torch.cat([cls_keep, keep], dim=1)
 
 class FreqEncoder(nn.Module):
     def __init__(self, patch_size:int, d_model:int, num_heads:int, num_layers:int, signal_length:int, signal_mode:str, normalize_mode:str, freq_dropout:float):
@@ -111,17 +138,18 @@ class FreqEncoder(nn.Module):
         # x.shape = (B_L,P,C,PS) = (batch_size * n_lasers, n_patches, n_coords, patch_size)
         B_L, P, _, _ = x.shape
         x = self.embed(x.reshape(B_L, P, -1))   # (B_L,P,C,PS) -> (B_L,P,D)
-        x = dropout(x, (B_L, P), self.freq_dropout, self.training)  # drop whole patches
+        # drop entire freq patches by setting them to zero, don't actually remove them
+        x, keep = dropout(x, (B_L, P), self.freq_dropout, self.training) # (B_L,P,D) -> (B_L,P,D), (B_L,P)
         x = apply_rope(x, self.freqs_cis)       # (B_L,P,D) -> (B_L,P,D)
         if speaker is not None: x += self.speakers_embed(speaker).unsqueeze(1)  # (B_L,P,D), (B_L,1,D) -> (B_L,P,D)
         x = torch.cat((self.cls_token.expand(B_L, -1, -1), x), dim=1)           # (B_L,P,D) -> (B_L,P+1,D)
-        output = self.layers(x) # (B_L,P+1,D) -> (B_L,P+1,D)
+        output = self.layers(x, src_key_padding_mask=pad_mask(keep, B_L)) # (B_L,P+1,D) -> (B_L,P+1,D)
         return output[:, 0, :]  # (B_L,P+1,D) -> (B_L,D)
 
 #***** 4 model *****
 
 class VibrationTransformer(ComposerModel):
-    def __init__(self, d_model:int=128, pnt_num_heads:int=2, pnt_num_layers:int=2, seq_num_heads:int=2, seq_num_layers:int=2, data_info=DATA_INFO, decoder:str='mlp', signal_mode:str='magnitude', normalize_mode:str='z', freq_dropout:float=0.3, laser_dropout:float=0.3, save_logits:bool=False):
+    def __init__(self, d_model:int=128, pnt_num_heads:int=2, pnt_num_layers:int=2, seq_num_heads:int=2, seq_num_layers:int=2, data_info=DATA_INFO, decoder:str='mlp', decoder_num_heads:int=2, decoder_num_layers:int=2, signal_mode:str='magnitude', normalize_mode:str='z', freq_dropout:float=0.3, laser_dropout:float=0.3, save_logits:bool=False):
         super().__init__()
 
         # encoder
@@ -134,7 +162,7 @@ class VibrationTransformer(ComposerModel):
         self.register_buffer("freqs_laser", precompute_freqs_cis_2d(d_model, data_info['n_laser_rows'], data_info['n_laser_cols'])) # for laser grid
 
         # decoder
-        self.decoder = build_decoder(decoder, d_model, data_info['out_h'], data_info['out_w'])
+        self.decoder = build_decoder(decoder, d_model, data_info['out_h'], data_info['out_w'], decoder_num_heads, decoder_num_layers)
 
         # metrics
         self.train_metrics, self.val_metrics = create_metrics(data_info), create_metrics(data_info)
@@ -149,16 +177,18 @@ class VibrationTransformer(ComposerModel):
         # flatten so FreqEncoder processes all lasers AND all batches in parallel
         speaker = speaker.repeat_interleave(L) if (speaker := batch.get('speakers_encoded', None)) is not None else None # (BL,D)
         x = self.freq_encoder(x.flatten(0, 1), speaker).reshape(B, L, -1)  # (B,L,P,C,PS) -> (B,L,D)
-        x = dropout(x, (B, L), self.laser_dropout, self.training)  # drop whole lasers
+        # drop entire laser positions by setting them to zero, don't actually remove them
+        x, keep = dropout(x, (B, L), self.laser_dropout, self.training)
+        key_padding_mask = pad_mask(keep, B)  # (B,L+1), True = ignore; None if not dropping
 
         # LaserEncoder learns patterns between ALL the lasers shining on the box
         x = apply_rope(x, self.freqs_laser) # (B,L,D) -> (B,L,D)
         x = torch.cat((self.cls_token.expand(B, -1, -1), x), dim=1)  # (B,L,D) (1,1,D) -> (B,L+1,D)
-        output = self.laser_encoder(x)  # (B,L+1,D) -> (B,L+1,D)
-        cls_embedding = output[:, 0, :]  # (B,L+1,D) -> (B,D)
+        output = self.laser_encoder(x, src_key_padding_mask=key_padding_mask)  # (B,L+1,D) -> (B,L+1,D)
 
         # Predict segmentation mask
-        mask_logits = self.decoder(cls_embedding) # (B,D) -> (B,H,W)
+        decoder_input = output if isinstance(self.decoder, AttnDecoder) else output[:, 0, :]
+        mask_logits = self.decoder(decoder_input, key_padding_mask) if isinstance(self.decoder, AttnDecoder) else self.decoder(decoder_input) # (B,L+1,D) or (B,D) -> (B,H,W)
         mask_pred = mask_logits.sigmoid()
         return dict(mask_pred=mask_pred, mask_logits=mask_logits if self.save_logits else None)
 
