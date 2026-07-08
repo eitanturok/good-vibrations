@@ -155,7 +155,9 @@ def convert_to_mds(mds_path:Path, rows:list, key, x_shape, y_shape, verbose:int)
     lines = "\n".join([json.dumps(r) for r in index_rows])
     (mds_path / "dataset.jsonl").write_text(lines)
     if verbose: print(f"Wrote {len(rows)} samples to {mds_path=}")
-    return mds_path
+    # MDSWriter(out=key) actually wrote the shards + index.json to mds_path/key (relative to the
+    # chdir above), one level deeper than mds_path itself -- that's the path StreamingDataset needs.
+    return mds_path / key
 
 
 #***** 5 post-process all samples in a base sample directory *****
@@ -186,7 +188,7 @@ def post_process(base_sample_dir:Path, mds_dir:Path, is_empty_box:bool, out_h:in
         shutil.rmtree(mds_path)
     elif mds_path.exists() and (mds_path / "dataset.jsonl").exists():
         if verbose: print(f"Cache hit: reusing existing MDS at {mds_path}\nMDS: {mds_path} ({len(rows)} samples)")
-        return mds_path
+        return mds_path / key
 
     # symlink base_sample_dir to MDS directory
     symlink(base_sample_dir, mds_path, do_save)

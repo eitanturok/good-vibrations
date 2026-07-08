@@ -9,27 +9,19 @@ def find_notch_mask(freqs: np.ndarray, spike_freqs: list[float], half_width_hz: 
         mask |= np.abs(freqs - f) <= half_width_hz
     return mask
 
-def _endpoint(real, imag, freqs, center_hz, side, offset_hz, window_hz, F):
-    """Median real/imag over a small window centered offset_hz away from center_hz (side=-1 below, +1 above),
-    used as a robust, leakage-clear interpolation endpoint (as opposed to the single bin adjacent to the notch,
-    which can itself still be depressed/elevated by spectral leakage from the spike)."""
-    target = center_hz + side * offset_hz
-    in_window = np.abs(freqs - target) <= window_hz / 2
-    idx = np.flatnonzero(in_window)
-    if idx.size == 0:  # fall back to the nearest single bin if the window is empty (e.g. near spectrum edge)
-        idx = np.array([np.argmin(np.abs(freqs - target))])
-    idx = idx[(idx >= 0) & (idx < F)]
-    return np.median(real[..., idx, :], axis=-2, keepdims=True), np.median(imag[..., idx, :], axis=-2, keepdims=True)
-
 def interpolate_notch(fft: np.ndarray, freqs: np.ndarray, spike_freqs: list[float] = [60.0, 100.0],
-                       half_width_hz: float = 1.0, endpoint_offset_hz: float = 5.0, endpoint_window_hz: float = 2.0) -> np.ndarray:
-    """Linearly interpolate the complex FFT across each notch band. The band itself (what gets
-    replaced) is +/- half_width_hz around each spike_freq. The interpolation endpoints are NOT the
-    bins immediately adjacent to the band -- those can still be slightly depressed/elevated by
-    spectral leakage from the spike -- but the median magnitude over a small window centered
-    endpoint_offset_hz away on each side, where the floor is clean. Real and imaginary parts are
-    interpolated independently so phase isn't forced to a spurious value. Leaves everything outside
-    the notch bands untouched.
+                       half_width_hz: float = 3.0, seed: int | None = 0) -> np.ndarray:
+    """Remove narrow-band spikes (e.g. 60/100Hz mains hum) from a complex FFT by replacing each
+    notch band (+/- half_width_hz around each spike_freq) with a smooth fill: MAGNITUDE is linearly
+    interpolated between the two bins immediately outside the band (a scalar, always well-behaved),
+    and each notch bin gets a phase drawn uniformly at random in [-pi, pi].
+
+    Interpolating real/imag parts directly (a straight line through the complex plane between two
+    near-random-phase noise bins) is NOT valid here: it can pass close to the origin in the middle
+    of the band even when both endpoints have normal magnitude, collapsing the fill toward 0. Since
+    the surrounding noise floor has no coherent phase relationship between bins, randomizing phase
+    while interpolating only the (always-positive, well-behaved) magnitude reproduces what genuine
+    floor bins look like.
 
     fft: (B,L,F,2) complex. freqs: (F,) in Hz, same ordering as fft's F axis.
     """
@@ -37,22 +29,26 @@ def interpolate_notch(fft: np.ndarray, freqs: np.ndarray, spike_freqs: list[floa
     if not notch.any(): return fft.copy()
 
     F = freqs.shape[0]
-    real, imag = fft.real.astype(np.float64).copy(), fft.imag.astype(np.float64).copy()
+    mag = np.abs(fft).astype(np.float64)
+    out = fft.copy()
+    rng = np.random.default_rng(seed)
 
-    # find contiguous notch runs so each gets interpolated against its own pair of endpoints
+    # find contiguous notch runs so each gets interpolated against its own pair of endpoint bins
     edges = np.flatnonzero(np.diff(np.concatenate(([0], notch.view(np.int8), [0]))))
     starts, ends = edges[0::2], edges[1::2]  # [start, end) index pairs, in bin space
 
     for start, end in zip(starts, ends):
-        center_hz = (freqs[start] + freqs[end - 1]) / 2
-        lo_val, hi_val = (_endpoint(real, imag, freqs, center_hz, -1, endpoint_offset_hz, endpoint_window_hz, F),
-                          _endpoint(real, imag, freqs, center_hz, +1, endpoint_offset_hz, endpoint_window_hz, F))
-        (lo_real, lo_imag), (hi_real, hi_imag) = lo_val, hi_val
+        lo, hi = start - 1, end  # bin just before / just after the notch
+        n = end - start
+        shape = fft.shape[:-2] + (n,) + fft.shape[-1:]  # (...,n,C)
+        if lo < 0 or hi >= F:  # spike at spectrum edge: fall back to nearest valid neighbor's magnitude
+            src = hi if lo < 0 else lo
+            fill_mag = np.broadcast_to(mag[..., src:src + 1, :], shape)
+        else:
+            w = ((freqs[start:end] - freqs[lo]) / (freqs[hi] - freqs[lo])).reshape(-1, 1)
+            fill_mag = mag[..., lo:lo + 1, :] * (1 - w) + mag[..., hi:hi + 1, :] * w
 
-        band_freqs = freqs[start:end]
-        f_lo, f_hi = center_hz - endpoint_offset_hz, center_hz + endpoint_offset_hz
-        w = ((band_freqs - f_lo) / (f_hi - f_lo)).clip(0, 1).reshape(-1, 1)
-        real[..., start:end, :] = lo_real * (1 - w) + hi_real * w
-        imag[..., start:end, :] = lo_imag * (1 - w) + hi_imag * w
+        phase = rng.uniform(-np.pi, np.pi, size=shape)
+        out[..., start:end, :] = (fill_mag * np.exp(1j * phase)).astype(fft.dtype)
 
-    return (real + 1j * imag).astype(fft.dtype)
+    return out
