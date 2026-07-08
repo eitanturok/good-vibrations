@@ -164,8 +164,8 @@ def post_process(base_sample_dir:Path, mds_dir:Path, is_empty_box:bool, out_h:in
     # collect complete samples (both X and y present) + their flattened metadata
     rows, skipped_ids = {}, []
     for sample_dir in sorted(base_sample_dir.glob("*")):
-        files = [sample_dir / f].exists() for f in SAMPLE_FILES] + [sample_dir / "image" / f].exists() for f in IMAGE_FILES] + [sample_dir / "vibration" / f].exists() for f in VIBRATION_FILES]
-        if not any([sample_dir / f].exists() for f in files]):
+        files = [sample_dir / f for f in SAMPLE_FILES] + [sample_dir / "image" / f for f in IMAGE_FILES] + [sample_dir / "vibration" / f for f in VIBRATION_FILES]
+        if not any(f.exists() for f in files):
             skipped_ids.append(sample_dir.name)
             continue
         rows[sample_dir.name] = {k: v for d in load(sample_dir / "metadata.jsonl") for k, v in d.items()}

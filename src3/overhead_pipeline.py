@@ -121,6 +121,10 @@ def draw_mask(overhead: Image.Image, segment_mask: Image.Image, com: tuple[float
 
 #***** 5 add speaker to overhead image *****
 
+def speaker_padding(w: int, h: int) -> int:
+    """Padding (px) draw_speaker adds around an image of size (w, h) to make room for the speaker icon."""
+    return max(w, h) // 5
+
 def draw_speaker(overhead: Image.Image, speaker: int | None = None) -> Image.Image:
     # load lazily to not interefere with modal import
     SPEAKER_IMG = Path(__file__).parent.parent / "assets/speaker.png"
@@ -130,7 +134,7 @@ def draw_speaker(overhead: Image.Image, speaker: int | None = None) -> Image.Ima
     W, H = overhead.size
 
     # add gray padding around the image and place a speaker icon
-    pad = max(W, H) // 5  # padding size relative to image
+    pad = speaker_padding(W, H)  # padding size relative to image
     canvas_w, canvas_h = W + 2 * pad, H + 2 * pad
     canvas = Image.new("RGBA", (canvas_w, canvas_h), (220, 220, 220, 255))
     canvas.paste(overhead, (pad, pad))  # original image centered in canvas
