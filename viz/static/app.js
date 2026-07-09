@@ -108,6 +108,16 @@ const colorKey = s => S.colorBy === "speaker" ? `spk ${s.speaker}`
   : S.colorBy === "output_id" ? `pos ${s.output_id}`
   : (S.runData[S.runs[0]]?.samples[s.sample_id]?.split || "?");
 const label = s => `#${s.sample_id} · p${(+s.output_id).toString()} · spk${s.speaker}`;
+// richer two-line title for the detail modal/panels: "Mask: Sample #id Run run-id" then
+// "box, n object(s), spk N | mse=…, com_dist=…" -- the modal title (no run) just omits the Run
+// clause and the metrics clause, since a gt-only view has no prediction to report metrics for.
+const detailTitle = (s, run, rec) => {
+  const head = run ? `Mask: Sample #${s.sample_id} Run ${run}` : `Mask: Sample #${s.sample_id}`;
+  const objects = `${s.n_objects} ${s.object}${s.n_objects === 1 ? "" : "s"}`;
+  let meta = `${s.box} box, ${objects}, spk ${s.speaker}`;
+  if (rec) meta += ` | mse=${fmt(rec.mse, 5)}, com_dist=${fmt(rec.com_dist)}`;
+  return { head, meta };
+};
 const runBadgeColor = v => v == null ? MUTED : v < 0.05 ? GOOD : v < 0.15 ? WARN : BAD;
 
 // ===== plotly base =====
@@ -1037,7 +1047,9 @@ async function openDetail(sampleId, run) {
   let pred = null;
   if (run) { await ensureRunMasks(run, [sampleId]); pred = S.runMasks[run][sampleId]; if (!pred) return; }
 
-  $("#modal-title").textContent = run ? `${label(s)} — ${run}` : label(s);
+  const t = detailTitle(s, run, rec);
+  $("#modal-title").textContent = t.head;
+  $("#modal-subtitle").textContent = t.meta;
   $("#modal-meta-sample").innerHTML = sampleMetaRows(s);
   $("#modal-meta-pred-group").hidden = !run;
   if (run) $("#modal-meta-pred").innerHTML = predMetaRows(run, rec);
@@ -1066,8 +1078,11 @@ async function openDetail(sampleId, run) {
       x += g.measureText(text).width + 14;
     }
   };
-  const panelHead = (title, checked) => `<div class="sub m-panel-head">
-    <span>${title}</span>
+  // each panel's own caption repeats the full identifying info (sample/run/box/object/spk/mse/
+  // com_dist) rather than just a bare kind label -- so a screenshot of a single panel is
+  // self-identifying without needing the modal's shared header to be in frame too.
+  const panelHead = (kind, checked) => `<div class="sub m-panel-head">
+    <span><b>${kind}</b> — ${t.head}<br><span class="m-panel-meta">${t.meta}</span></span>
     <label class="check-line"><input type="checkbox" class="m-photo-toggle" ${checked ? "checked" : ""}> show overhead</label>
   </div>`;
   // build the whole canvas (incl. crosses + legend) before touching the DOM, then swap it in with
@@ -1077,7 +1092,7 @@ async function openDetail(sampleId, run) {
 
   if (!run) {
     // gt-only mode: a single panel, its own overhead toggle, nothing else to show
-    side.innerHTML = `${panelHead(label(s), true)}<div class="m-side-row"></div>`;
+    side.innerHTML = `${panelHead("ground truth", true)}<div class="m-side-row"></div>`;
     const slot = side.querySelector(".m-side-row");
     const renderGt = async withPhoto => {
       const cv = await layeredMaskCanvas(sampleId, [{ mask: gt, rgb: [24, 178, 24], label: "ground truth" }], withPhoto);
@@ -1092,7 +1107,7 @@ async function openDetail(sampleId, run) {
   }
 
   // panel 1: side by side, each with its own overhead toggle
-  side.innerHTML = `${panelHead(`${label(s)} — ${run}`, true)}<div style="display:flex;gap:8px" class="m-side-row"></div>`;
+  side.innerHTML = `${panelHead("side by side", true)}<div style="display:flex;gap:8px" class="m-side-row"></div>`;
   const sideRow = side.querySelector(".m-side-row");
   const renderSide = async withPhoto => {
     const [gtCv, predCv] = await Promise.all([
@@ -1110,7 +1125,7 @@ async function openDetail(sampleId, run) {
   renderSide(true);
 
   // panel 2: both masks combined on one plot, pred layered on top of gt
-  combined.innerHTML = `${panelHead(`${label(s)} — ${run}`, true)}<div class="m-combined-slot"></div>`;
+  combined.innerHTML = `${panelHead("combined", true)}<div class="m-combined-slot"></div>`;
   const combinedSlot = combined.querySelector(".m-combined-slot");
   const renderCombined = async withPhoto => {
     const cv = await layeredMaskCanvas(sampleId, [
@@ -1131,7 +1146,7 @@ async function openDetail(sampleId, run) {
   // its own plain background, but it's there if you want to see it in physical context. Still
   // gets a real colorbar (drawn alongside, not part of the photo canvas) for the 0..1 alpha scale.
   const diffMask = pred.map((row, r) => row.map((v, c) => v - gt[r][c]));
-  diff.innerHTML = `${panelHead(`${label(s)} — ${run}`, false)}
+  diff.innerHTML = `${panelHead("diff", false)}
     <div style="display:flex;align-items:flex-start;gap:10px">
       <div class="m-diff-slot"></div>
       <canvas class="m-diff-colorbar" width="34" height="200" title="red = pred extra · green = gt missed"></canvas>
@@ -1189,7 +1204,12 @@ function showHoverReadout(x, y, text) {
     _hoverReadout.className = "hover-readout";
     document.body.appendChild(_hoverReadout);
   }
-  _hoverReadout.textContent = text;
+  _hoverReadout.textContent = "";
+  for (const line of text.split("\n")) {
+    _hoverReadout.appendChild(document.createTextNode(line));
+    _hoverReadout.appendChild(document.createElement("br"));
+  }
+  _hoverReadout.lastChild.remove();
   _hoverReadout.style.left = `${x + 14}px`;
   _hoverReadout.style.top = `${y + 14}px`;
   _hoverReadout.style.display = "block";
@@ -1225,8 +1245,9 @@ function layeredMaskCanvas(sampleId, layers, withPhoto) {
       const rect = cv.getBoundingClientRect();
       const c = Math.min(W - 1, Math.max(0, Math.floor((e.clientX - rect.left) / rect.width * W)));
       const r = Math.min(H - 1, Math.max(0, Math.floor((e.clientY - rect.top) / rect.height * H)));
-      const text = layers.map(({ mask, label }) => `${label ? label + " " : ""}${mask[r][c].toFixed(3)}`).join(" · ");
-      showHoverReadout(e.clientX, e.clientY, `(x ${c}, y ${r}) ${text}`);
+      const varName = { "ground truth": "mask_true", "prediction": "mask_pred", "gt missed": "mask_true", "pred extra": "mask_pred" };
+      const lines = layers.map(({ mask, label }) => `${varName[label] || label || "mask"}[${c},${r}] = ${mask[r][c].toFixed(3)}`);
+      showHoverReadout(e.clientX, e.clientY, lines.join("\n"));
     };
     cv.onmouseleave = hideHoverReadout;
     return cv;

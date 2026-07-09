@@ -255,7 +255,8 @@ button.mini { background: none; border: 0; padding: 0 2px; font: inherit; }
   background: var(--surface); border: 1px solid var(--grid); border-radius: 10px;
   width: min(1000px, 94vw); max-height: 92vh; overflow: auto; padding: 12px;
 }
-#modal .sheet h3 { color: var(--ink); font-size: 13px; font-weight: 600; margin-bottom: 8px; }
+#modal .sheet h3 { color: var(--ink); font-size: 13px; font-weight: 600; margin-bottom: 2px; }
+#modal-subtitle { margin-bottom: 8px; }
 /* two side-by-side blocks -- sample metadata (fixed facts about the sample) vs prediction
    metadata (this run's output for it) -- kept visually distinct so it's clear which facts
    come from the dataset and which come from the model */
@@ -273,10 +274,12 @@ button.mini { background: none; border: 0; padding: 0 2px; font: inherit; }
 #modal .views { display: flex; flex-direction: column; gap: 14px; }
 #modal .views > div:empty { display: none; }
 #modal .close { float: right; }
-/* panel header: title left, overhead toggle right, single line -- the gt/pred legend now lives
-   as a watermark burned into the canvas itself instead of a second caption line here */
-.m-panel-head { display: flex; align-items: center; justify-content: space-between; margin: 4px 0 6px; text-align: left; }
-.m-panel-head .check-line { margin-top: 0; }
+/* panel header: title/meta left, overhead toggle right -- each panel repeats full identifying
+   info so a screenshot of a single panel is self-identifying; the gt/pred legend still lives
+   as a watermark burned into the canvas itself */
+.m-panel-head { display: flex; align-items: flex-start; justify-content: space-between; margin: 4px 0 6px; text-align: left; gap: 10px; }
+.m-panel-head .check-line { margin-top: 1px; flex: none; white-space: nowrap; }
+.m-panel-meta { color: var(--muted); font-weight: 400; }
 
 /* image lightbox (overhead photo, click-to-enlarge) */
 #lightbox {

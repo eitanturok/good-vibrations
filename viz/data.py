@@ -1,7 +1,7 @@
 """Data layer for the vibrations dashboard.
 
 Scans data/samples for metadata, reduces FFTs on demand, and extracts
-per-sample predictions + metrics from runs/<name>/outputs/*.pt files.
+per-sample predictions + metrics from runs/<name>/outputs_history/*.pt files.
 All conventions follow what is actually on disk (notebook 46's naming),
 not the newer constants in src3.
 """
@@ -104,7 +104,7 @@ def empty_box_groups() -> list[dict]:
 def list_runs() -> list[str]:
     runs = []
     for d in sorted(RUNS_DIR.iterdir()):
-        out = d / "outputs"
+        out = d / "outputs_history"
         if out.is_dir() and any(out.rglob("*.pt")):
             runs.append((d.stat().st_mtime, d.name))
     runs.sort(key=lambda t: t[0], reverse=True)
@@ -112,10 +112,10 @@ def list_runs() -> list[str]:
 
 
 def data_version() -> str:
-    """Cheap change stamp: sample count + run names + outputs mtimes."""
+    """Cheap change stamp: sample count + run names + outputs_history mtimes."""
     parts = [str(sum(1 for _ in SAMPLES_DIR.iterdir()))]
     for name in list_runs():
-        out = RUNS_DIR / name / "outputs"
+        out = RUNS_DIR / name / "outputs_history"
         parts.append(f"{name}:{max((p.stat().st_mtime for p in out.rglob('*.pt')), default=0):.0f}")
     return hashlib.md5("|".join(parts).encode()).hexdigest()[:12]
 
@@ -160,7 +160,7 @@ def _com_rc(mask: np.ndarray) -> np.ndarray:
 
 
 def _run_key(run: str) -> str:
-    files = sorted((RUNS_DIR / run / "outputs").rglob("*.pt"))
+    files = sorted((RUNS_DIR / run / "outputs_history").rglob("*.pt"))
     sig = "|".join(f"{p.relative_to(RUNS_DIR)}:{p.stat().st_mtime:.0f}:{p.stat().st_size}" for p in files)
     return hashlib.md5(sig.encode()).hexdigest()[:12]
 
@@ -177,8 +177,8 @@ def extract_run(run: str) -> dict:
 
     recs = {k: [] for k in ["sample_id", "epoch", "split", "mse", "com_dist",
                             "pred_row", "pred_col", "masks"]}
-    for p in sorted((RUNS_DIR / run / "outputs").rglob("*.pt")):
-        rel = p.relative_to(RUNS_DIR / run / "outputs")
+    for p in sorted((RUNS_DIR / run / "outputs_history").rglob("*.pt")):
+        rel = p.relative_to(RUNS_DIR / run / "outputs_history")
         split = rel.parts[0] if rel.parts[0] != "eval" else rel.parts[1]
         epoch = int(re.match(r"ep(\d+)-ba(\d+)", p.stem).group(1))
         d = torch.load(p, map_location="cpu", weights_only=False)
