@@ -69,8 +69,8 @@ class OutputSaver(Callback):
         # during training land on the real epoch (ep0050, ep0100, ...) instead of ep0000
         epoch = state.timestamp.get(self.save_interval.unit).value
         if self.force_save or epoch % self.save_interval.value == 0:
-            outputs = dict(mask_pred=_to_cpu(state.outputs['mask_pred']), mask_true=_to_cpu(state.batch['mask_true']),
-                           info=state.batch['info'], fft=_to_cpu(state.batch['fft']))
+            outputs = dict(mask_pred=_to_cpu(state.outputs['mask_pred']), mask_logits=_to_cpu(state.outputs['mask_logits']),
+                           mask_true=_to_cpu(state.batch['mask_true']), info=state.batch['info'], fft=_to_cpu(state.batch['fft']))
 
             # local disk is the ground truth: write it first and let it raise before any logger is touched,
             # so a logger destination never ends up with data that wasn't also saved locally
