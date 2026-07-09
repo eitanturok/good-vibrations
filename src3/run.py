@@ -26,7 +26,6 @@ from composer.callbacks import RuntimeEstimator, SpeedMonitor, OOMObserver, NaNM
 from composer.callbacks.speed_monitor import GPU_AVAILABLE_FLOPS
 
 # RTX 5080 isn't in composer's GPU_AVAILABLE_FLOPS table yet, so MFU can't be computed. Patch it in here
-# rather than editing the installed package. Specs (dense, non-sparse) from NVIDIA's Blackwell datasheet.
 GPU_AVAILABLE_FLOPS['nvidia geforce rtx 5080'] = {
     'fp32': 56.3e12,
     'tf32': 56.3e12,
@@ -41,7 +40,7 @@ GPU_AVAILABLE_FLOPS['nvidia geforce rtx 5080'] = {
 from icecream import install; install()
 import wandb
 
-from callbacks import MaskVisualizer, OutputSaver
+from callbacks import VizSegMask, OutputSaver
 from dataset import build_dataset
 from model import VibrationTransformer
 
@@ -52,8 +51,7 @@ def get_parser():
     parser.add_argument("--num-workers",                type=int,   default=4)
     parser.add_argument("--debug",                      type=int,   default=0)
     parser.add_argument("--verbose",                    type=int,   default=2, help="If >=2, show torch.compile (TorchDynamo) logs.")
-    parser.add_argument("--no-train",                   action="store_true", default=False)
-    parser.add_argument("--no-eval",                    action="store_true", default=False)
+    parser.add_argument("--eval-only",                  action="store_true", default=False, help="Skip training, just eval a loaded checkpoint (requires --checkpoint-path).")
     # data
     parser.add_argument("--n-samples",                  type=int,   default=None)
     parser.add_argument("--mds-path",                   type=str,   default=r"D:/eturok/experiment-22/data/mds/3dd5526e5199d80d")
@@ -88,10 +86,9 @@ def get_parser():
     parser.add_argument("--lr",                         type=float, default=1e-4)
     parser.add_argument("--max-duration",               type=str,   default="2500ep")
     # eval
-    parser.add_argument("--eval-batch-size",            type=int,   default=128)
+    parser.add_argument("--eval-batch-size",            type=int,   default=108) # wandb caps images logged in a single call to 108, so eval batch size should be <= 108 to log all images
     parser.add_argument("--eval-interval",              type=str,   default="50ep")
-    parser.add_argument("--outputs-interval",           type=str,   default="100ep")
-    parser.add_argument("--outputs-dir",                type=str,   default=None, help="Where to save eval .pt outputs. If not set, defaults to the run's outputs dir.")
+    parser.add_argument("--outputs-dir",                type=str,   default=None, help="Where to save eval .pt outputs. If not set, defaults to the run's outputs_history dir (same dir the training-time history callback writes to).")
     # run
     parser.add_argument("--run-name",                   type=str,   default=None)
     # checkpointing
@@ -151,54 +148,11 @@ def cleanup(trainer, *others):
 
 # **** train / eval ****
 
-def run_train(args, device, model, train_loader, eval_loader, data_info):
-    """Fit the model. Returns the trained model (moved back to cpu)."""
-    optimizer = torch.optim.Adam(model.parameters(), args.lr, fused=True)
-
-    config = data_info | args.__dict__ | dict(gpu_name=torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu", num_parameters=sum([p_.numel() for p_ in model.parameters()]))
-    wandb_logger = WandBLogger("better-tsa", group="metal", name=args.run_name, init_kwargs={"settings": wandb.Settings(x_disable_stats=False), "config": config, "save_code": True, "id": args.run_name, "resume": "allow"})
-    file_logger = FileLogger(f"runs/{{run_name}}/logs-rank{{rank}}.txt")
-    loggers = [wandb_logger, file_logger]
-
-    profiler = None
-    if args.debug > 0:
-        profiler = Profiler(
-            trace_handlers=[JSONTraceHandler(folder=f"runs/{{run_name}}/composer_profiler", merged_trace_filename=f"runs/{{run_name}}/merged_trace_node{{node_rank}}.json",
-                                            overwrite=True)],
-            schedule=cyclic_schedule(wait=0, warmup=0, active=1, repeat=1),
-            torch_prof_folder=f"runs/{{run_name}}/torch_profiler", torch_prof_remote_file_name=f"runs/{{run_name}}/torch_profiler",
-            torch_prof_overwrite=True, torch_prof_memory_filename=None,
-            )
-
-    callbacks=[SpeedMonitor(1), OOMObserver(folder=f"runs/{{run_name}}/torch_traces", remote_file_name=None), NaNMonitor(), RuntimeEstimator(skip_batches=64, time_unit="minutes"), SystemMetricsMonitor(),
-               MaskVisualizer(args.eval_interval),
-               # keep per-epoch prediction history (masks only, no fft) so the viz dashboard can animate training later;
-               # the final full dump still goes to outputs/ via run_eval's OutputSaver
-               OutputSaver(args.outputs_interval, f"runs/{{run_name}}/outputs_history", overwrite=True, save_fft=False),
-               ]
-    trainer = Trainer(run_name=args.run_name, model=model, optimizers=optimizer, train_dataloader=train_loader, auto_log_hparams=False,
-                    eval_dataloader=eval_loader, max_duration=args.max_duration, seed=args.seed, eval_interval=args.eval_interval,
-                    device=device, save_metrics=True, log_to_console=True, progress_bar=False,
-                    autoresume=True if args.run_name else None, save_folder=f"runs/{{run_name}}/checkpoints", save_interval=args.checkpoint_interval,
-                    loggers=loggers, callbacks=callbacks, profiler=profiler,
-                    compile_config=None if args.no_compile else {"mode": args.compile_mode})
-
-    trainer.fit()
-    run_name = trainer.state.run_name
-    trainer.close()
-    return model, run_name
-
-def run_eval(model, train_loader, eval_loader, outputs_dir, load_path=None, no_compile=False, compile_mode="max-autotune"):
-    """Run a full eval pass and save .pt outputs. Returns outputs_dir."""
-    outputs_dir = Path(outputs_dir)
-    outputs_dir.mkdir(parents=True, exist_ok=True)
-
-    data_loaders = eval_loader + [Evaluator(label='train', dataloader=train_loader)]
-    trainer = Trainer(model=model, load_path=load_path, callbacks=OutputSaver('1ep', str(outputs_dir), overwrite=True), progress_bar=False, log_to_console=True,
-                    compile_config=None if no_compile else {"mode": compile_mode})
-    trainer.eval(data_loaders)
-    cleanup(trainer, data_loaders, eval_loader, train_loader)
-    return outputs_dir
+def eval_boundary(trainer, boundary_loaders):
+    saver = next(cb for cb in trainer.state.callbacks if isinstance(cb, OutputSaver))
+    saver.force_save = True
+    try: trainer.eval(boundary_loaders)
+    finally: saver.force_save = False
 
 @app.function(
     gpu="A10",
@@ -210,8 +164,7 @@ def run(**kwargs):
     # parse args
     args = get_parser().parse_args()  # get defaults
     args.__dict__.update(kwargs)  # apply overrides from cli
-    assert not args.no_train or args.checkpoint_path, "--checkpoint-path is required when using --no-train"
-    assert not args.no_eval or not args.no_train, "nothing to do: both --no-train and --no-eval were passed"
+    assert not args.eval_only or args.checkpoint_path, "--checkpoint-path is required when using --eval-only"
 
     # set seeds for reproducibility before initializing model + dataloader
     seed_all(args.seed)
@@ -230,26 +183,55 @@ def run(**kwargs):
     # make model
     data_info = dict(out_h=args.out_h, out_w=args.out_w, n_laser_rows=args.n_laser_rows, n_laser_cols=args.n_laser_cols, patch_size=args.patch_size, n_freqs=args.n_freqs)
     model = VibrationTransformer(args.d_model, args.pnt_num_heads, args.pnt_num_layers, args.seq_num_heads, args.seq_num_layers, data_info, args.decoder, args.decoder_num_heads, args.decoder_num_layers, freq_dropout=args.freq_dropout, laser_dropout=args.laser_dropout)
-    run_name = args.run_name
+    load_path = str(args.checkpoint_path) if args.checkpoint_path else None
 
-    # train
-    if not args.no_train:
-        train_loader, eval_loader = build_dataset(
-            args.mds_path, batch_size=args.batch_size, eval_batch_size=args.eval_batch_size,
-            test_size=args.test_size, seed=args.seed, num_workers=args.num_workers,
-            speakers=args.speakers, n_objects=args.n_objects, box=args.box, n_samples=args.n_samples)
-        model, run_name = run_train(args, device, model, train_loader, eval_loader, data_info)
+    # make dataset
+    train_loader, eval_loader = build_dataset(
+        args.mds_path, batch_size=args.batch_size, eval_batch_size=args.eval_batch_size,
+        test_size=args.test_size, seed=args.seed, num_workers=args.num_workers,
+        speakers=args.speakers, n_objects=args.n_objects, box=args.box, n_samples=args.n_samples)
+    boundary_loaders = eval_loader + [Evaluator(label='train', dataloader=train_loader)]
 
-    # eval
-    if not args.no_eval:
-        model.save_logits = True
-        load_path = str(args.checkpoint_path) if args.no_train else None
-        outputs_dir = args.outputs_dir or f"runs/{run_name}/outputs"
-        train_loader, eval_loader = build_dataset(
-            args.mds_path, batch_size=args.batch_size, eval_batch_size=args.eval_batch_size,
-            test_size=args.test_size, seed=args.seed, num_workers=args.num_workers,
-            speakers=args.speakers, n_objects=args.n_objects, box=args.box, n_samples=args.n_samples)
-        run_eval(model, train_loader, eval_loader, outputs_dir, load_path=load_path, no_compile=args.no_compile, compile_mode=args.compile_mode)
+    # logger
+    loggers = []
+    if not args.eval_only:
+        config = data_info | args.__dict__ | dict(gpu_name=torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu", num_parameters=sum([p_.numel() for p_ in model.parameters()]))
+        wandb_logger = WandBLogger("better-tsa", group="metal", name=args.run_name, init_kwargs={"settings": wandb.Settings(x_disable_stats=False), "config": config, "save_code": True, "id": args.run_name, "resume": "allow"})
+        file_logger = FileLogger(f"runs/{{run_name}}/logs-rank{{rank}}.txt")
+        loggers = [wandb_logger, file_logger]
+
+    # profiler
+    profiler = None
+    if not args.eval_only and args.debug > 0:
+        profiler = Profiler(
+            trace_handlers=[JSONTraceHandler(folder=f"runs/{{run_name}}/composer_profiler", merged_trace_filename=f"runs/{{run_name}}/merged_trace_node{{node_rank}}.json",
+                                            overwrite=True)],
+            schedule=cyclic_schedule(wait=0, warmup=0, active=1, repeat=1),
+            torch_prof_folder=f"runs/{{run_name}}/torch_profiler", torch_prof_remote_file_name=f"runs/{{run_name}}/torch_profiler",
+            torch_prof_overwrite=True, torch_prof_memory_filename=None,
+            )
+
+    # callbacks: only monitor/checkpoint-adjacent callbacks are training-only; OutputSaver always runs
+    callbacks = [OutputSaver(args.eval_interval, f"runs/{{run_name}}/outputs_history", overwrite=True, visualizer=VizSegMask()),
+                 SpeedMonitor(1), OOMObserver(folder=f"runs/{{run_name}}/torch_traces", remote_file_name=None), NaNMonitor(),
+                RuntimeEstimator(skip_batches=64, time_unit="minutes"), SystemMetricsMonitor()]
+
+    # optimizer
+    optimizer = torch.optim.Adam(model.parameters(), args.lr, fused=True) if not args.eval_only else None
+
+    # trainer
+    trainer = Trainer(run_name=args.run_name, model=model, optimizers=optimizer, train_dataloader=train_loader, auto_log_hparams=False,
+                    eval_dataloader=eval_loader, max_duration=args.max_duration if not args.eval_only else None, seed=args.seed, eval_interval=args.eval_interval,
+                    device=device, save_metrics=True, log_to_console=True, progress_bar=False, load_path=load_path,
+                    autoresume=True if not args.eval_only and args.run_name else None, save_folder=f"runs/{{run_name}}/checkpoints" if not args.eval_only else None, save_interval=args.checkpoint_interval,
+                    loggers=loggers, callbacks=callbacks, profiler=profiler,
+                    compile_config=None if args.no_compile else {"mode": args.compile_mode})
+
+    eval_boundary(trainer, boundary_loaders)  # eval before training starts
+    if not args.eval_only:
+        trainer.fit()
+        eval_boundary(trainer, boundary_loaders)  # eval after training ends
+    cleanup(trainer, boundary_loaders, eval_loader, train_loader)
 
 @app.local_entrypoint()
 def main(*args):

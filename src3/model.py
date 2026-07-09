@@ -150,7 +150,7 @@ class FreqEncoder(nn.Module):
 #***** 4 model *****
 
 class VibrationTransformer(ComposerModel):
-    def __init__(self, d_model:int=128, pnt_num_heads:int=2, pnt_num_layers:int=2, seq_num_heads:int=2, seq_num_layers:int=2, data_info=DATA_INFO, decoder:str='mlp', decoder_num_heads:int=2, decoder_num_layers:int=2, freq_dropout:float=0.3, laser_dropout:float=0.3, save_logits:bool=False):
+    def __init__(self, d_model:int=128, pnt_num_heads:int=2, pnt_num_layers:int=2, seq_num_heads:int=2, seq_num_layers:int=2, data_info=DATA_INFO, decoder:str='mlp', decoder_num_heads:int=2, decoder_num_layers:int=2, freq_dropout:float=0.3, laser_dropout:float=0.3):
         super().__init__()
 
         # encoder
@@ -167,7 +167,6 @@ class VibrationTransformer(ComposerModel):
 
         # metrics
         self.train_metrics, self.val_metrics = create_metrics(data_info), create_metrics(data_info)
-        self.save_logits = save_logits
 
     def forward(self, batch):
         # B=batch size, L=n_lasers, C=n_coordinates=2, PS=patch_size, D=d_model
@@ -191,7 +190,7 @@ class VibrationTransformer(ComposerModel):
         decoder_input = output if isinstance(self.decoder, AttnDecoder) else output[:, 0, :]
         mask_logits = self.decoder(decoder_input, key_padding_mask) if isinstance(self.decoder, AttnDecoder) else self.decoder(decoder_input) # (B,L+1,D) or (B,D) -> (B,H,W)
         mask_pred = mask_logits.sigmoid()
-        return dict(mask_pred=mask_pred, mask_logits=mask_logits if self.save_logits else None)
+        return dict(mask_pred=mask_pred, mask_logits=mask_logits)
 
     def loss(self, outputs, batch):
         # mse is averaged over (B,H,W) so the error is independent of the out_h out_w we choose
