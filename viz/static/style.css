@@ -61,7 +61,23 @@ body {
 #filters-scroll { flex: 1; min-height: 0; }
 #filters-scroll .panel-body { overflow-y: auto; }
 
-#display { grid-area: display; display: grid; grid-template-rows: minmax(0, 1fr) minmax(0, 1fr); gap: 8px; min-height: 0; min-width: 0; }
+#display { grid-area: display; display: grid; grid-template-rows: auto minmax(0, 1fr) minmax(0, 1fr); gap: 8px; min-height: 0; min-width: 0; }
+
+#bench-panel { min-height: 0; }
+#bench-panel .panel-body { position: static; padding: 8px 10px; }
+#bench-strip { display: flex; flex-wrap: wrap; gap: 8px; min-height: 0; }
+#bench-strip:empty::after { content: "empty — click \"+ bench\" on a table row, or \"+ add filtered table\" above"; color: var(--muted); font-size: 12px; }
+.bench-card {
+  position: relative; display: flex; flex-direction: column; gap: 3px; width: 108px;
+  background: var(--surface-2); border: 1px solid var(--grid); border-radius: 6px; padding: 5px;
+}
+.bench-card img { width: 100%; border-radius: 4px; display: block; }
+.bench-card .bench-card-id { font-size: 11px; font-weight: 700; color: var(--ink); }
+.bench-card .bench-card-x {
+  position: absolute; top: 3px; right: 5px; color: var(--muted); cursor: pointer; font-size: 12px;
+  background: rgba(0,0,0,0.45); border-radius: 50%; width: 16px; height: 16px; text-align: center; line-height: 16px;
+}
+.bench-card .bench-card-x:hover { color: var(--ink); }
 .row2 { display: grid; grid-template-columns: 1fr 2fr; gap: 8px; min-height: 0; }
 
 /* ---------- panels ---------- */
@@ -97,6 +113,15 @@ section.panel {
 .chip .x:hover { color: var(--ink); }
 .facet-label { color: var(--muted); font-size: 10px; text-transform: uppercase; letter-spacing: .06em; margin: 8px 0 4px; }
 .facet-label:first-child { margin-top: 0; }
+
+#range-filters { display: flex; flex-direction: column; gap: 4px; }
+.range-row { display: grid; grid-template-columns: 62px 1fr 1fr; gap: 4px; align-items: center; }
+.range-row span { color: var(--ink-2); font-size: 11px; }
+.range-row input {
+  width: 100%; background: var(--surface-2); border: 1px solid var(--grid); border-radius: 4px;
+  color: var(--ink); font-size: 11px; padding: 3px 5px;
+}
+.range-row input:focus { outline: none; border-color: var(--accent); }
 
 .spatial-legend { display: flex; justify-content: space-between; margin-top: 4px; font-size: 10px; color: var(--muted); }
 .spatial-legend .mini { margin-left: 4px; }
@@ -175,6 +200,12 @@ button.mini { background: none; border: 0; padding: 0 2px; font: inherit; }
 .play.playing { border-color: var(--accent); color: var(--ink); background: rgba(57, 135, 229, 0.16); }
 .row-x { color: var(--muted); cursor: pointer; padding: 0 4px; }
 .row-x:hover { color: var(--bad); }
+.row-bench {
+  color: var(--muted); cursor: pointer; padding: 1px 6px; font-size: 10.5px;
+  border: 1px solid var(--grid); border-radius: 20px; margin-right: 4px;
+}
+.row-bench:hover { border-color: var(--accent); color: var(--ink); }
+.row-bench.active { border-color: var(--accent); color: var(--ink); background: rgba(57, 135, 229, 0.16); }
 
 /* compact view: a real table -- first column is the ground-truth/sample thumbnail (sortable by
    sample_id or position), each following column is one run's prediction thumbnail (sortable by
@@ -200,12 +231,14 @@ button.mini { background: none; border: 0; padding: 0 2px; font: inherit; }
 }
 .compact-table tbody tr { border-bottom: 1px solid var(--grid); }
 .compact-table tbody tr:hover { background: var(--surface-2); }
-.compact-table tbody tr.hovered { background: rgba(57, 135, 229, 0.10); }
-.compact-table tbody tr.ghost-row { background: rgba(255, 255, 255, 0.05); font-style: italic; }
 .compact-table td.run-col { border-left: 1px solid var(--grid); }
 .compact-cap { font-size: 10.5px; color: var(--muted); margin-bottom: 4px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 220px; }
 .compact-id { font-size: 12.5px; font-weight: 700; color: var(--ink); }
-.idx-col { color: var(--muted); font-size: 10.5px; text-align: right; width: 1%; white-space: nowrap; }
+.idx-col {
+  color: var(--muted); font-size: 10.5px; text-align: center; width: 54px; min-width: 54px; white-space: nowrap;
+  display: flex; flex-direction: column; align-items: center; gap: 4px;
+}
+.idx-col .row-bench { margin-right: 0; padding: 1px 5px; font-size: 9.5px; }
 .compact-cell img.thumb, .compact-cell canvas.thumb {
   display: block; width: 220px; border-radius: 4px; cursor: pointer; image-rendering: pixelated;
 }

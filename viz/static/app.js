@@ -16,10 +16,16 @@ const runColor = name => run_cat[S.runs.indexOf(name) % 8];
 // ===== state =====
 const S = {
   man: null,
-  filters: {},                     // facet -> Set of active values (narrows "add matching" candidates only)
-  pool: new Map(),                 // sample_id -> sample — the ONE thing every view renders
-  ghost: null,                     // { ids:[sample_id], label } transient hover preview, not in pool
-  cursor: null,                    // output_id keyboard cursor on the position map
+  filters: {},                     // facet -> Set of active values; live-filters what's shown from the pool
+  numFilters: {                    // range filters, persistent & reversible like S.filters, checked by numFilterPasses
+    mse: null,                       // {lo, hi} | null — checked against any loaded run's record for the sample
+    com_dist: null,                  // {lo, hi} | null — same, run-agnostic ("passes if any loaded run passes")
+    com_row: null,                   // {lo, hi} | null — on the sample itself, not run-scoped
+    com_col: null,                   // {lo, hi} | null
+  },
+  pool: new Map(),                 // sample_id -> sample — drives the table only
+  bench: new Map(),                // sample_id -> sample — drives the box + fft viewers only, added to explicitly
+  cursor: null,                    // output_id cursor on the position map (keyboard nav + mouse hover)
   lasers: new Set([...Array(100).keys()]),
   dirs: "xy", logy: true, norm: true, avgSpeaker: false, diffEmpty: false, emptyBaseline: null,
   colorBy: "speaker",
@@ -56,6 +62,28 @@ function candidatePasses(s, skipFacet = null) {
       continue;
     }
     if (!set.has(s[f])) return false;
+  }
+  return numFilterPasses(s);
+}
+// checks S.numFilters ranges against a sample. mse/com_dist live on run records, not the sample
+// itself, so they're checked as "passes for at least one loaded run" -- with no run loaded (or no
+// runs matching) a set mse/com_dist filter rejects everything, which is the honest behavior since
+// there's no data to filter on yet, rather than silently ignoring the filter.
+function numFilterPasses(s) {
+  const { mse, com_dist, com_row, com_col } = S.numFilters;
+  const inRange = (v, r) => v != null && v >= r.lo && v <= r.hi;
+  if (com_row && !inRange(s.com_row, com_row)) return false;
+  if (com_col && !inRange(s.com_col, com_col)) return false;
+  if (mse || com_dist) {
+    const runs = S.runs.filter(r => S.runData[r]);
+    const passesAnyRun = runs.some(r => {
+      const rec = S.runData[r].samples[s.sample_id];
+      if (!rec) return false;
+      if (mse && !inRange(rec.mse, mse)) return false;
+      if (com_dist && !inRange(rec.com_dist, com_dist)) return false;
+      return true;
+    });
+    if (!passesAnyRun) return false;
   }
   return true;
 }
@@ -127,7 +155,7 @@ async function boot() {
 }
 
 function renderAll() {
-  renderFacets(); renderPosmap(); renderPoolCount(); renderEmptyChips();
+  renderFacets(); renderPosmap(); renderPoolCount(); renderBenchCount(); renderBenchStrip(); renderEmptyChips();
   updateFFT(); updateBox(); renderSamplesView();
 }
 
@@ -145,11 +173,12 @@ function removeFilteredOut() {
   for (const [id, s] of S.pool) if (!candidatePasses(s)) S.pool.delete(id);
   renderAll();
 }
-// facet chips live-filter the pool view: toggling a chip off immediately hides matching pooled
-// samples everywhere (table/compact/panels/fft/box); toggling it back on brings them right back,
-// since pool membership itself (S.pool) is never touched here -- only what's shown. This applies
-// to every facet, not just split; "remove filtered-out" is the separate, deliberate, non-reversible
-// action for when you actually want to drop samples from the pool for good.
+// facet chips live-filter the table's view of the pool: toggling a chip off immediately hides
+// matching pooled samples from the table; toggling it back on brings them right back, since pool
+// membership itself (S.pool) is never touched here -- only what's shown. This applies to every
+// facet, not just split; "remove filtered-out" is the separate, deliberate, non-reversible action
+// for when you actually want to drop samples from the pool for good. The table's filters do NOT
+// affect the bench (box/fft) pool below -- that's a separate, explicitly-curated selection.
 function poolSamples() { return [...S.pool.values()].filter(s => candidatePasses(s)); }
 
 function renderPoolCount() {
@@ -159,6 +188,31 @@ function renderPoolCount() {
     : `${shown} of ${S.pool.size} samples shown`;
 }
 $("#pool-clear").onclick = clearPool;
+
+// ===== bench (box + fft viewer selection, independent of the table's pool/filters) =====
+function addToBench(samples) { for (const s of samples) S.bench.set(s.sample_id, s); renderAll(); }
+function removeFromBench(ids) { for (const id of ids) S.bench.delete(id); renderAll(); }
+function clearBench() { S.bench.clear(); renderAll(); }
+function benchSamples() { return [...S.bench.values()]; }
+function renderBenchCount() { $("#bench-count").textContent = `${S.bench.size} sample${S.bench.size === 1 ? "" : "s"}`; }
+$("#bench-clear").onclick = clearBench;
+$("#bench-add-filtered").onclick = () => addToBench(poolSamples());
+
+// simple thumbnail-card strip: this is the single, unambiguous place to see exactly what's
+// currently feeding the box + fft viewers below, so it's never a mystery why those plots show
+// what they show. Kept deliberately plain (id + photo + remove) -- no metrics, no masks, no
+// per-run detail -- richer inspection stays in the existing per-sample modal (click a table thumb).
+function renderBenchStrip() {
+  const strip = $("#bench-strip");
+  strip.innerHTML = benchSamples().map(s => `
+    <div class="bench-card" data-id="${s.sample_id}">
+      <span class="bench-card-x" title="remove from workbench">✕</span>
+      <img loading="lazy" src="/media/${s.sample_id}/thumb" alt="">
+      <span class="bench-card-id">#${s.sample_id} · p${+s.output_id}</span>
+    </div>`).join("");
+  strip.querySelectorAll(".bench-card-x").forEach(x => x.onclick = () =>
+    removeFromBench([+x.closest(".bench-card").dataset.id]));
+}
 $("#pool-remove-filtered").onclick = removeFilteredOut;
 
 // ===== facet chips ("add matching" candidate narrowing only) =====
@@ -205,6 +259,19 @@ function toggleFilter(f, v) {
 }
 $("#add-matching").onclick = () => addToPool(matchingCandidates());
 
+// ===== numeric range filters (S.numFilters) =====
+const applyRangeFilters = debounce(renderAll, 200);
+document.querySelectorAll("#range-filters .range-row").forEach(row => {
+  const field = row.dataset.field, loEl = row.querySelector(".range-lo"), hiEl = row.querySelector(".range-hi");
+  const sync = () => {
+    const lo = loEl.value === "" ? -Infinity : +loEl.value, hi = hiEl.value === "" ? Infinity : +hiEl.value;
+    S.numFilters[field] = (loEl.value === "" && hiEl.value === "") ? null : { lo, hi };
+    applyRangeFilters();
+  };
+  loEl.addEventListener("input", sync);
+  hiEl.addEventListener("input", sync);
+});
+
 // ===== search / add-by-id box =====
 $("#sample-add").addEventListener("keydown", e => {
   if (e.key !== "Enter") return;
@@ -215,9 +282,42 @@ $("#sample-add").addEventListener("keydown", e => {
   addToPool(found);
   input.value = "";
 });
+// numeric comparator token, e.g. "mse<0.05", "com_dist>=0.02", "com_row:10-20"
+const NUM_TOKEN_RE = /^(mse|com_dist|com_row|com_col)(<=|>=|<|>|:)(-?\d+\.?\d*)(?:-(-?\d+\.?\d*))?$/;
+
+// resolves one search-box query (comma-separated tokens) to a concrete, one-shot list of samples
+// to add now -- NOT a persistent filter (that's S.numFilters, set via the sidebar range inputs).
+// "run:" sets scope for any mse/com_dist tokens later in the SAME call; "spk:" narrows to samples
+// with that speaker among whatever the rest of the query already resolved (applied last).
 function parseAddInput(text) {
   const out = new Map();
+  let scopeRun = null, spkFilter = null, sawResolvingToken = false;
   for (let tok of text.split(",").map(t => t.trim()).filter(Boolean)) {
+    const runTok = tok.match(/^run:(.+)$/i);
+    if (runTok) { scopeRun = runTok[1]; continue; }
+    const spkTok = tok.match(/^spk:?(\d+)$/i);
+    if (spkTok) { spkFilter = +spkTok[1]; continue; }
+    sawResolvingToken = true;
+    const numTok = tok.match(NUM_TOKEN_RE);
+    if (numTok) {
+      const [, field, cmp, a, b] = numTok;
+      const runScoped = field === "mse" || field === "com_dist";
+      const runs = runScoped ? (scopeRun ? [scopeRun] : (S.runs.length === 1 ? S.runs : null)) : null;
+      if (runScoped && !runs) continue;   // ambiguous run scope (0 or 2+ runs loaded, no run: given) -- skip token
+      for (const s of S.man.samples) {
+        const v = runScoped ? null : s[field];
+        let val = v;
+        if (runScoped) {
+          const rec = S.runData[runs[0]] && S.runData[runs[0]].samples[s.sample_id];
+          val = rec ? rec[field] : null;
+        }
+        if (val == null) continue;
+        const passes = cmp === "<" ? val < +a : cmp === "<=" ? val <= +a : cmp === ">" ? val > +a
+          : cmp === ">=" ? val >= +a : (val >= +a && val <= +b);
+        if (passes) out.set(s.sample_id, s);
+      }
+      continue;
+    }
     if (/^[po]/i.test(tok) && /^[po]0*\d+$/i.test(tok)) {
       const oid = tok.slice(1).padStart(6, "0");
       for (const s of GROUPS.get(oid) || []) out.set(s.sample_id, s);
@@ -230,7 +330,11 @@ function parseAddInput(text) {
     }
     if (/^\d+$/.test(tok) && SAMPLE.has(+tok)) out.set(+tok, SAMPLE.get(+tok));
   }
-  return [...out.values()];
+  // "spk:3" with nothing else to narrow means "all samples with that speaker", not "narrow an
+  // empty set down to nothing" -- fall back to the whole dataset as the base in that case.
+  let result = sawResolvingToken ? [...out.values()] : S.man.samples;
+  if (spkFilter != null) result = result.filter(s => s.speaker === spkFilter);
+  return result;
 }
 
 // ===== merged speaker + position map =====
@@ -279,7 +383,7 @@ function renderPosmap() {
     const [x, y] = posXY(cv, s);
     const inPool = samples.some(s2 => S.pool.has(s2.sample_id));
     const alive = samples.some(s2 => candidatePasses(s2));
-    const highlighted = oid === S.cursor || (S.ghost && S.ghost.oid === oid);
+    const highlighted = oid === S.cursor;
     g.beginPath(); g.arc(x, y, inPool ? 5 : 3.5, 0, 7);
     g.globalAlpha = alive ? 1 : 0.22;
     g.fillStyle = inPool ? colorFor(s) : (highlighted ? INK : MUTED);
@@ -311,10 +415,11 @@ function nearestSpeaker(x, y, maxD = 16) {
   cv.addEventListener("mousemove", e => {
     const [x, y] = pos(e);
     const d = nearestDot(x, y);
-    if (d) { setGhostPosition(d.oid); return; }
-    setGhost(null);
+    const next = d ? d.oid : null;
+    if (next === S.cursor) return;
+    S.cursor = next;
+    renderPosmap();
   });
-  cv.addEventListener("mouseleave", () => setGhost(null));
   cv.addEventListener("click", e => {
     const [x, y] = pos(e);
     const spk = nearestSpeaker(x, y);
@@ -338,7 +443,7 @@ function nearestSpeaker(x, y, maxD = 16) {
       const dist = vx * vx + vy * vy + 2 * (dx ? vy * vy : vx * vx);
       if (dist < bd) { bd = dist; best = d; }
     }
-    if (best) { S.cursor = best.oid; setGhostPosition(best.oid); }
+    if (best) { S.cursor = best.oid; renderPosmap(); }
   });
 }
 function toggleGroupInPool(oid) {
@@ -354,25 +459,6 @@ function removeAllPositions() {
   // only drops samples that came from a real position (not empty-box, not a bare run/search add) —
   // scoped removal, mirroring what "all" would have added, not a blanket pool clear
   removeFromPool([...S.pool.values()].filter(s => s.com_row >= 0).map(s => s.sample_id));
-}
-function setGhostPosition(oid) {
-  const prev = S.ghost && S.ghost.oid;
-  if (oid === prev) return;
-  const samples = (GROUPS.get(oid) || []).filter(s => candidatePasses(s));
-  S.ghost = { oid, ids: samples.map(s => s.sample_id) };
-  renderPosmap(); updateFFT(); updateBox(); renderSamplesView();
-}
-// skipTableRerender: table-row hover already has a live row on screen (ghost rows are only
-// for samples NOT in the pool, and table hover only ever targets pooled rows) — re-rendering
-// the whole table on every mouseenter tore down and rebuilt buttons mid-click, breaking the
-// audio play buttons. Only repaint highlight classes for that case; other hover sources
-// (position map, panel cards) still need the full re-render since they can introduce new rows.
-function setGhost(next, skipTableRerender = false) {
-  const prevOid = S.ghost && S.ghost.oid;
-  if (next === null && prevOid === undefined) return;
-  S.ghost = next;
-  renderPosmap(); updateFFT(); updateBox();
-  if (skipTableRerender) highlightRows(); else renderSamplesView();
 }
 
 // empty-box chip row
@@ -470,11 +556,10 @@ const updateFFT = debounce(async () => {
     Plotly.react("fft-plot", [], emptyLayout("no empty-box sample available in this dataset"));
     return;
   }
-  const pooled = poolSamples();
+  const pooled = benchSamples();
   const ids = pooled.map(s => s.sample_id);
-  if (S.ghost) for (const id of S.ghost.ids) if (!ids.includes(id)) ids.push(id);
   if (S.lasers.size === 0) { Plotly.react("fft-plot", [], emptyLayout("select at least one laser")); return; }
-  if (!ids.length) { Plotly.react("fft-plot", [], emptyLayout("add samples (position map, search box, or a run) to plot their fft")); return; }
+  if (!ids.length) { Plotly.react("fft-plot", [], emptyLayout("add samples to the workbench (+bench in the table, or \"add filtered to bench\")")); return; }
 
   let key;
   try {
@@ -493,7 +578,6 @@ const updateFFT = debounce(async () => {
     if (curves.length) emptyMean = curves[0].map((_, i) => curves.reduce((a, c) => a + c[i], 0) / curves.length);
   }
 
-  const pinnedIds = new Set(ids.filter(id => S.pool.has(id)));
   const traces = [];
   if (S.avgSpeaker) {
     // one line per speaker, averaged over every pooled position that has that speaker —
@@ -517,16 +601,15 @@ const updateFFT = debounce(async () => {
       const s = SAMPLE.get(id);
       if (!curve || !s) continue;
       if (emptyMean) curve = curve.map((v, i) => v - emptyMean[i]);
-      const isGhost = !pinnedIds.has(id);
       const ck = colorKey(s);
       traces.push({
         type: "scattergl", mode: "lines", x: S.freqs, y: curve,
-        name: ck, legendgroup: ck, showlegend: !isGhost && !seen.has(ck),
-        line: { width: isGhost ? 1 : 1.6, color: isGhost ? INK : colorFor(s), dash: isGhost ? "dot" : "solid" },
-        opacity: isGhost ? 0.75 : 0.9,
+        name: ck, legendgroup: ck, showlegend: !seen.has(ck),
+        line: { width: 1.6, color: colorFor(s) },
+        opacity: 0.9,
         hovertemplate: `${label(s)} · ${s.layout}<br>%{x:.0f} Hz · %{y:.4f}<extra></extra>`,
       });
-      if (!isGhost) seen.add(ck);
+      seen.add(ck);
     }
   }
 
@@ -623,7 +706,7 @@ function maskCanvas(mask, mode, cls = "") {
 
 // ===== box viewer =====
 const updateBox = debounce(async () => {
-  const pooled = poolSamples();
+  const pooled = benchSamples();
   const traces = [];
   const bg = [...GROUPS.values()].map(g => g[0]).filter(s => s.com_row >= 0);
   traces.push({ type: "scatter", mode: "markers", showlegend: false, hoverinfo: "skip",
@@ -641,11 +724,6 @@ const updateBox = debounce(async () => {
       hovertemplate: `p${+oid} · ${s.layout} · gt com (${s.com_row.toFixed(1)}, ${s.com_col.toFixed(1)})<extra></extra>`,
     });
     seen.add(ck);
-  }
-  if (S.ghost) {
-    const s = (GROUPS.get(S.ghost.oid) || [])[0];
-    if (s && s.com_row >= 0) traces.push({ type: "scatter", mode: "markers", showlegend: false, hoverinfo: "skip",
-      x: [s.com_col], y: [s.com_row], marker: { size: 12, color: "rgba(0,0,0,0)", line: { width: 2, color: INK } } });
   }
   for (const run of S.runs) {
     const rd = S.runData[run];
@@ -693,22 +771,6 @@ const updateBox = debounce(async () => {
         const m = S.runMasks[run] && S.runMasks[run][s.sample_id];
         if (m) traces.push(contourTrace(m, runColor(run)));
       }
-  }
-  if (S.contours && S.ghost) {
-    // preview the hovered (not-yet-pooled) sample's contour in a light, dashed line — same
-    // ghost-before-you-commit convention as the fft/table hover previews
-    const ghostSample = SAMPLE.get(S.ghost.ids[0]);
-    if (ghostSample) {
-      try {
-        await ensureGtMasks([ghostSample.sample_id]);
-        if (S.gtMasks[ghostSample.sample_id]) traces.push(contourTrace(S.gtMasks[ghostSample.sample_id], "#ffffff", true));
-        for (const run of S.runs) {
-          await ensureRunMasks(run, [ghostSample.sample_id]);
-          const m = S.runMasks[run] && S.runMasks[run][ghostSample.sample_id];
-          if (m) traces.push(contourTrace(m, runColor(run), true));
-        }
-      } catch (e) { console.error(e); }
-    }
   }
   Plotly.react("box-plot", traces, LAYOUT({
     margin: { l: 30, r: 6, t: 6, b: 24 },
@@ -778,12 +840,6 @@ function wirePlayButtons(root) {
     currentAudio.play();
   });
 }
-function highlightRows() {
-  const ids = new Set(S.ghost ? S.ghost.ids : []);
-  document.querySelectorAll("#compact-wrap tbody tr:not(.ghost-row)").forEach(tr =>
-    tr.classList.toggle("hovered", ids.has(+tr.dataset.id)));
-}
-
 // small white cross at the ground-truth center of mass, drawn directly on an overlay canvas
 function drawComCross(cv, s) {
   if (!s || s.com_row < 0) return;
@@ -794,11 +850,9 @@ function drawComCross(cv, s) {
   g.beginPath(); g.moveTo(x - r, y); g.lineTo(x + r, y); g.moveTo(x, y - r); g.lineTo(x, y + r); g.stroke();
 }
 
-function rowHtml(s, isGhost, activeRuns, idx) {
-  const gtCell = isGhost ? `<img class="thumb" loading="lazy" src="/media/${s.sample_id}/thumb" alt="" data-id="${s.sample_id}">`
-    : `<span class="overlay-slot" data-id="${s.sample_id}" data-kind="gt"></span>`;
+function rowHtml(s, activeRuns, idx) {
+  const gtCell = `<span class="overlay-slot" data-id="${s.sample_id}" data-kind="gt"></span>`;
   const predCells = activeRuns.map(r => {
-    if (isGhost) return "";
     const rec = S.runData[r] && S.runData[r].samples[s.sample_id];
     const cap = rec
       ? `${rec.split.replace("unseen_", "u-")} · mse ${fmt(rec.mse, 5)} · com ${fmt(rec.com_dist)}`
@@ -810,9 +864,14 @@ function rowHtml(s, isGhost, activeRuns, idx) {
       <span class="overlay-slot" data-id="${s.sample_id}" data-run="${r}" data-kind="pred"></span>
     </div></td>`;
   }).join("");
-  return `<tr data-id="${s.sample_id}" class="${isGhost ? "ghost-row" : ""}">
-    <td class="idx-col">${isGhost ? "" : idx}</td>
-    <td>${isGhost ? "" : `<span class="row-x" title="remove">✕</span>`}
+  const inBench = S.bench.has(s.sample_id);
+  return `<tr data-id="${s.sample_id}">
+    <td class="idx-col">
+      ${idx}
+      <span class="row-bench${inBench ? " active" : ""}" title="${inBench ? "remove from workbench" : "add to workbench (box + fft viewers)"}">${inBench ? "✓" : "+"} bench</span>
+    </td>
+    <td>
+      <span class="row-x" title="remove from table">✕</span>
       <div class="compact-cell">
         <div class="compact-cap"><span class="swatch" style="background:${colorFor(s)}"></span><span class="compact-id">#${s.sample_id}</span> · p${+s.output_id} · spk${s.speaker} · ${s.layout} · com (${s.com_row.toFixed(1)}, ${s.com_col.toFixed(1)})</div>
         ${gtCell}
@@ -828,8 +887,7 @@ async function renderCompact() {
   const gen = ++_compactRenderGen;
   const wrap = $("#compact-wrap");
   const rows = sortedPool();
-  const ghostRows = S.ghost ? S.ghost.ids.map(id => SAMPLE.get(id)).filter(s => s && !S.pool.has(s.sample_id)) : [];
-  if (!rows.length && !ghostRows.length) {
+  if (!rows.length) {
     if (gen !== _compactRenderGen) return;
     wrap.innerHTML = `<div class="hint" style="padding:12px">add samples — pick a run above, click a position, or use "add matching" / the search box in dataset filters</div>`;
     return;
@@ -851,25 +909,24 @@ async function renderCompact() {
     </th>`).join("")}
   </tr></thead>`;
 
-  const tb = ghostRows.map(s => rowHtml(s, true, activeRuns, null)).join("")
-    + rows.map((s, i) => rowHtml(s, false, activeRuns, i + 1)).join("");
+  const tb = rows.map((s, i) => rowHtml(s, activeRuns, i + 1)).join("");
   if (gen !== _compactRenderGen) return;
   wrap.innerHTML = `<table class="compact-table">${thead}<tbody>${tb}</tbody></table>`;
 
   observeRowsForFill(wrap);   // lazy: only paint overlay canvases for rows scrolled into view
   if (gen !== _compactRenderGen) return;
   wrap.querySelectorAll("[data-sort-key]").forEach(el => el.onclick = e => { e.stopPropagation(); setSort(el.dataset.sortKey); });
-  wrap.querySelectorAll("tbody tr:not(.ghost-row)").forEach(tr => {
-    tr.onmouseenter = () => setGhost({ oid: null, ids: [+tr.dataset.id] }, true);
-    tr.onmouseleave = () => setGhost(null, true);
-  });
   wrap.querySelectorAll(".row-x").forEach(x => x.onclick = e => {
     e.stopPropagation();
     removeFromPool([+e.target.closest("tr").dataset.id]);
   });
+  wrap.querySelectorAll(".row-bench").forEach(x => x.onclick = e => {
+    e.stopPropagation();
+    const id = +e.target.closest("tr").dataset.id;
+    S.bench.has(id) ? removeFromBench([id]) : addToBench([SAMPLE.get(id)]);
+  });
   wrap.querySelectorAll("img.thumb").forEach(img => img.onclick = () => openLightbox(img.src));
   wirePlayButtons(wrap);
-  highlightRows();
 }
 
 // with the whole dataset + several runs loaded by default, painting every overlay canvas eagerly
@@ -1182,7 +1239,7 @@ function layeredMaskCanvas(sampleId, layers, withPhoto) {
   });
 }
 document.addEventListener("keydown", e => {
-  if (e.key === "Escape") { $("#modal").classList.remove("open"); $("#lightbox").classList.remove("open"); setGhost(null); }
+  if (e.key === "Escape") { $("#modal").classList.remove("open"); $("#lightbox").classList.remove("open"); }
 });
 $("#modal").onclick = e => { if (e.target.id === "modal") $("#modal").classList.remove("open"); };
 
