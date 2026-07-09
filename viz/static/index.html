@@ -91,12 +91,7 @@
     </div>
 
     <section class="panel" id="fft-runs-panel">
-      <div class="panel-head">
-        <div class="seg" id="fft-tabs">
-          <button data-tab="fft" class="active">fft</button>
-          <button data-tab="runs">runs</button>
-        </div>
-      </div>
+      <div class="panel-head">fft</div>
       <div class="panel-body" style="display:flex">
         <div id="fft-runs-controls">
           <div id="fft-controls">
@@ -118,20 +113,9 @@
             <label class="check-line"><input type="checkbox" id="diff-empty-check"> diff vs empty</label>
             <div class="ctrl-line" id="empty-select-line" hidden>baseline <select id="empty-select"></select></div>
           </div>
-          <div id="runs-controls" hidden>
-            <div class="facet-label">metric</div>
-            <select id="run-metric" style="width:100%">
-              <option value="com_dist">com dist</option>
-              <option value="mse">mse</option>
-            </select>
-          </div>
         </div>
         <div id="fft-runs-plots">
           <div id="fft-plot" class="plot"></div>
-          <div id="runs-plot-wrap" class="plot" style="display:none">
-            <div id="position-focus-strip" class="hint" style="padding:4px 10px"></div>
-            <div id="runs-plot" class="plot" style="top:20px"></div>
-          </div>
         </div>
       </div>
     </section>
@@ -141,11 +125,19 @@
 <div id="modal"><div class="sheet">
   <button class="btn close" onclick="document.getElementById('modal').classList.remove('open')">esc</button>
   <h3 id="modal-title"></h3>
-  <table class="meta-table" id="modal-meta"></table>
+  <div class="meta-groups">
+    <div class="meta-group sample">
+      <div class="meta-group-label">sample</div>
+      <table class="meta-table" id="modal-meta-sample"></table>
+    </div>
+    <div class="meta-group prediction" id="modal-meta-pred-group">
+      <div class="meta-group-label">prediction</div>
+      <table class="meta-table" id="modal-meta-pred"></table>
+    </div>
+  </div>
   <div class="views" id="modal-views">
-    <div id="m-gt-overlay"></div>
-    <div id="m-pred-overlay"></div>
     <div id="m-side"></div>
+    <div id="m-combined"></div>
     <div id="m-diff"></div>
   </div>
 </div></div>

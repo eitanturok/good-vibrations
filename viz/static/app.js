@@ -30,7 +30,7 @@ const S = {
   fftCache: new Map(),             // `${key}|${id}` -> curve
   freqs: null,
   sort: { key: "sample_id", dir: 1 },
-  runMetric: "com_dist", contours: false,
+  contours: false,
   version: null,
   fftZoom: null,                   // {x:[lo,hi], y:[lo,hi]} preserved across redraws
 };
@@ -99,6 +99,7 @@ const emptyLayout = msg => LAYOUT({
 });
 
 // ===== boot =====
+let _bootedOnce = false;
 async function boot() {
   S.man = await jget("/api/manifest");
   S.version = S.man.version;
@@ -112,12 +113,22 @@ async function boot() {
   // drop pool members whose sample no longer exists (data changed underneath us)
   for (const id of [...S.pool.keys()]) if (!SAMPLE.has(id)) S.pool.delete(id);
   buildLaserGrid(); buildRunSelect(); buildEmptySelect(); renderRunChips();
+
+  // first load only: default to the whole dataset, so there's something useful on screen
+  // without manual setup. Runs are still opt-in via the run-add dropdown. Later re-boots
+  // (triggered by the live-update poll picking up a data change) must not repopulate on top
+  // of the user's own pool.
+  if (!_bootedOnce) {
+    _bootedOnce = true;
+    for (const s of S.man.samples) S.pool.set(s.sample_id, s);
+  }
+
   renderAll();
 }
 
 function renderAll() {
   renderFacets(); renderPosmap(); renderPoolCount(); renderEmptyChips();
-  updateFFT(); updateBox(); renderSamplesView(); renderRunsPanel();
+  updateFFT(); updateBox(); renderSamplesView();
 }
 
 // ===== pool =====
@@ -349,7 +360,7 @@ function setGhostPosition(oid) {
   if (oid === prev) return;
   const samples = (GROUPS.get(oid) || []).filter(s => candidatePasses(s));
   S.ghost = { oid, ids: samples.map(s => s.sample_id) };
-  renderPosmap(); updateFFT(); updateBox(); renderSamplesView(); renderRunsPanel();
+  renderPosmap(); updateFFT(); updateBox(); renderSamplesView();
 }
 // skipTableRerender: table-row hover already has a live row on screen (ghost rows are only
 // for samples NOT in the pool, and table hover only ever targets pooled rows) — re-rendering
@@ -360,7 +371,7 @@ function setGhost(next, skipTableRerender = false) {
   const prevOid = S.ghost && S.ghost.oid;
   if (next === null && prevOid === undefined) return;
   S.ghost = next;
-  renderPosmap(); updateFFT(); updateBox(); renderRunsPanel();
+  renderPosmap(); updateFFT(); updateBox();
   if (skipTableRerender) highlightRows(); else renderSamplesView();
 }
 
@@ -541,17 +552,19 @@ function buildRunSelect() {
 }
 $("#run-add").onchange = e => { if (e.target.value) addRun(e.target.value); e.target.value = ""; };
 
-async function addRun(name) {
+async function addRun(name, silent = false) {
   if (S.runs.includes(name)) return;
   S.runs.push(name);
-  renderRunChips();
+  if (!silent) renderRunChips();
   try {
     S.runData[name] = await jget(`/api/run/${name}`);
     // bulk-populate the pool with every sample in this run (all splits, including train)
-    addToPool(Object.keys(S.runData[name].samples).map(id => SAMPLE.get(+id)).filter(Boolean));
+    const samples = Object.keys(S.runData[name].samples).map(id => SAMPLE.get(+id)).filter(Boolean);
+    for (const s of samples) S.pool.set(s.sample_id, s);
   } catch (err) {
     console.error(err); S.runs = S.runs.filter(r => r !== name);
   }
+  if (silent) return;
   renderRunChips(); buildRunSelect();
   renderAll();
 }
@@ -781,17 +794,28 @@ function drawComCross(cv, s) {
   g.beginPath(); g.moveTo(x - r, y); g.lineTo(x + r, y); g.moveTo(x, y - r); g.lineTo(x, y + r); g.stroke();
 }
 
-function rowHtml(s, isGhost, activeRuns) {
+function rowHtml(s, isGhost, activeRuns, idx) {
   const gtCell = isGhost ? `<img class="thumb" loading="lazy" src="/media/${s.sample_id}/thumb" alt="" data-id="${s.sample_id}">`
     : `<span class="overlay-slot" data-id="${s.sample_id}" data-kind="gt"></span>`;
-  const predCells = activeRuns.map(r => isGhost ? "" : `<td class="run-col">
-    <div class="compact-cell" data-run="${r}"><span class="overlay-slot" data-id="${s.sample_id}" data-run="${r}" data-kind="pred"></span></td>`).join("");
+  const predCells = activeRuns.map(r => {
+    if (isGhost) return "";
+    const rec = S.runData[r] && S.runData[r].samples[s.sample_id];
+    const cap = rec
+      ? `${rec.split.replace("unseen_", "u-")} · mse ${fmt(rec.mse, 5)} · com ${fmt(rec.com_dist)}`
+      : `not in run`;
+    return `<td class="run-col">
+    <div class="compact-cell" data-run="${r}">
+      <div class="compact-cap"><span class="swatch" style="background:${colorFor(s)}"></span><span class="compact-id">#${s.sample_id}</span></div>
+      <div class="compact-cap" style="color:${runColor(r)}">${cap}</div>
+      <span class="overlay-slot" data-id="${s.sample_id}" data-run="${r}" data-kind="pred"></span>
+    </div></td>`;
+  }).join("");
   return `<tr data-id="${s.sample_id}" class="${isGhost ? "ghost-row" : ""}">
+    <td class="idx-col">${isGhost ? "" : idx}</td>
     <td>${isGhost ? "" : `<span class="row-x" title="remove">✕</span>`}
       <div class="compact-cell">
-        <div class="compact-cap"><span class="swatch" style="background:${colorFor(s)}"></span><span class="compact-id">#${s.sample_id}</span> · spk${s.speaker} · ${s.layout} · com (${s.com_row.toFixed(1)}, ${s.com_col.toFixed(1)})</div>
+        <div class="compact-cap"><span class="swatch" style="background:${colorFor(s)}"></span><span class="compact-id">#${s.sample_id}</span> · p${+s.output_id} · spk${s.speaker} · ${s.layout} · com (${s.com_row.toFixed(1)}, ${s.com_col.toFixed(1)})</div>
         ${gtCell}
-        <div class="compact-cap"><button class="play" data-src="/media/${s.sample_id}/audio">in ▶</button> <button class="play" data-src="/media/${s.sample_id}/recovered">rec ▶</button></div>
       </div>
     </td>
     ${predCells}</tr>`;
@@ -811,22 +835,28 @@ async function renderCompact() {
     return;
   }
   const activeRuns = S.runs.filter(r => S.runData[r]);
-  for (const run of activeRuns) await ensureRunMasks(run, rows.map(s => s.sample_id)).catch(console.error);
   if (gen !== _compactRenderGen) return;
 
-  const arrow = k => S.sort.key === k ? (S.sort.dir > 0 ? " ↑" : " ↓") : "";
+  // the active sort column needs to be unmistakable, not just an arrow buried in dense header
+  // text -- give it its own pill (accent bg + arrow) so it reads at a glance which column/run
+  // and metric the table is currently ordered by
+  const sortSpan = (k, l) => S.sort.key === k
+    ? `<span data-sort-key="${k}" class="sort-active">${l} ${S.sort.dir > 0 ? "↑" : "↓"}</span>`
+    : `<span data-sort-key="${k}">${l}</span>`;
   const thead = `<thead><tr>
-    <th>${GT_SORT_COLS.map(([k, l]) => `<span data-sort-key="${k}" style="cursor:pointer">${l}${arrow(k)}</span>`).join(" · ")} — ground truth</th>
+    <th class="idx-col">index</th>
+    <th>${GT_SORT_COLS.map(([k, l]) => sortSpan(k, l)).join(" · ")} — ground truth</th>
     ${activeRuns.map(r => `<th class="run-col" style="color:${runColor(r)}">${r}
-      <span style="color:${INK};font-weight:400"> — ${RUN_SORT_COLS.map(([k, l]) => `<span data-sort-key="run:${r}:${k}" style="cursor:pointer">${l}${arrow(`run:${r}:${k}`)}</span>`).join(" · ")}</span>
+      <span style="color:${INK};font-weight:400"> — ${RUN_SORT_COLS.map(([k, l]) => sortSpan(`run:${r}:${k}`, l)).join(" · ")}</span>
     </th>`).join("")}
   </tr></thead>`;
 
-  const tb = ghostRows.map(s => rowHtml(s, true, activeRuns)).join("") + rows.map(s => rowHtml(s, false, activeRuns)).join("");
+  const tb = ghostRows.map(s => rowHtml(s, true, activeRuns, null)).join("")
+    + rows.map((s, i) => rowHtml(s, false, activeRuns, i + 1)).join("");
   if (gen !== _compactRenderGen) return;
   wrap.innerHTML = `<table class="compact-table">${thead}<tbody>${tb}</tbody></table>`;
 
-  fillOverlayStacks(wrap);   // fire-and-forget: don't block the rest of the row wiring on it
+  observeRowsForFill(wrap);   // lazy: only paint overlay canvases for rows scrolled into view
   if (gen !== _compactRenderGen) return;
   wrap.querySelectorAll("[data-sort-key]").forEach(el => el.onclick = e => { e.stopPropagation(); setSort(el.dataset.sortKey); });
   wrap.querySelectorAll("tbody tr:not(.ghost-row)").forEach(tr => {
@@ -840,6 +870,25 @@ async function renderCompact() {
   wrap.querySelectorAll("img.thumb").forEach(img => img.onclick = () => openLightbox(img.src));
   wirePlayButtons(wrap);
   highlightRows();
+}
+
+// with the whole dataset + several runs loaded by default, painting every overlay canvas eagerly
+// means thousands of serial thumbnail fetches before anything is visible. Instead, only fill a
+// row's overlay slots once it's scrolled near the viewport -- the table stays responsive
+// immediately and fills in as you scroll, same data, no eager cost for off-screen rows.
+let _rowObserver = null;
+function observeRowsForFill(root) {
+  if (_rowObserver) _rowObserver.disconnect();
+  _rowObserver = new IntersectionObserver(entries => {
+    for (const e of entries) {
+      if (!e.isIntersecting) continue;
+      _rowObserver.unobserve(e.target);
+      fillOverlayStacks(e.target).catch(console.error);
+    }
+  // ~130px per row (220px-wide thumbnail + captions) -> 1300px covers ~10 rows of prefetch
+  // ahead of/behind the visible viewport in each scroll direction, so scrolling doesn't outrun fills
+  }, { root: root, rootMargin: "1300px 0px" });
+  root.querySelectorAll("tbody tr").forEach(tr => _rowObserver.observe(tr));
 }
 
 // fills every ".overlay-slot" in root: kind="gt" -> overhead + gt mask + com cross, opens the
@@ -893,78 +942,23 @@ function openLightbox(srcOrCanvas) {
 }
 $("#lightbox").onclick = () => $("#lightbox").classList.remove("open");
 
-// ===== runs panel =====
-$("#run-metric").onchange = e => { S.runMetric = e.target.value; renderRunsPanel(); };
-
-async function renderRunsPanel() {
-  const runs = S.runs.filter(r => S.runData[r]);
-  const metric = S.runMetric, metricLabel = metric === "mse" ? "mse" : "com_dist";
-
-  // position-focus strip: show every active run's metric for the cursor/ghost position, all speakers
-  const focusOid = S.cursor || (S.ghost && S.ghost.oid);
-  const strip = $("#position-focus-strip");
-  if (focusOid && runs.length) {
-    const samples = GROUPS.get(focusOid) || [];
-    const parts = runs.map(r => {
-      const vals = samples.map(s => S.runData[r].samples[s.sample_id]?.[metric]).filter(v => v != null);
-      const avg = vals.length ? (vals.reduce((a, b) => a + b, 0) / vals.length) : null;
-      return `<span style="color:${runColor(r)}">${r}</span> ${fmt(avg)}`;
-    });
-    strip.innerHTML = `p${+focusOid}: ${parts.join(" · ")}`;
-  } else {
-    strip.textContent = runs.length ? "hover/select a position to see per-run performance there" : "";
-  }
-
-  if (!runs.length) { Plotly.react("runs-plot", [], emptyLayout("add a run (top bar) to see metrics")); return; }
-  const splits = [...new Set(runs.flatMap(r => Object.keys(S.runData[r].aggregates)))];
-  const traces = [];
-  for (const r of runs) {
-    traces.push({
-      type: "bar", name: r, legendgroup: r, marker: { color: runColor(r) },
-      x: splits.map(s => s.replace("unseen_", "u-")), y: splits.map(s => S.runData[r].aggregates[s]?.[metricLabel] ?? null),
-      xaxis: "x", yaxis: "y",
-      hovertemplate: `${r} · %{x}<br>${metricLabel} %{y:.4f}<extra></extra>`,
-    });
-    const bySpk = {};
-    for (const [sid, rec] of Object.entries(S.runData[r].samples)) {
-      if (rec.split === "train" || rec[metricLabel] == null) continue;
-      const s = SAMPLE.get(+sid);
-      if (!s) continue;
-      (bySpk[s.speaker] = bySpk[s.speaker] || []).push(rec[metricLabel]);
-    }
-    const spks = S.man.facets.speaker;
-    traces.push({
-      type: "bar", name: r, legendgroup: r, showlegend: false, marker: { color: runColor(r) },
-      x: spks.map(String), y: spks.map(k => bySpk[k] ? bySpk[k].reduce((a, b) => a + b) / bySpk[k].length : null),
-      xaxis: "x2", yaxis: "y2",
-      hovertemplate: `${r} · speaker %{x}<br>mean ${metricLabel} %{y:.4f}<extra></extra>`,
-    });
-  }
-  Plotly.react("runs-plot", traces, LAYOUT({
-    barmode: "group", bargap: 0.25,
-    margin: { l: 44, r: 10, t: 8, b: 58 },   // extra room: split tick labels ("u-pos_speaker") wrap in a narrow column and clipped the axis title with the default margin
-    xaxis: AXIS({ domain: [0, 0.44], title: { text: `${metricLabel} by split`, font: { size: 11 }, standoff: 14 }, tickangle: -30 }),
-    yaxis: AXIS({}),
-    xaxis2: AXIS({ domain: [0.56, 1], title: { text: `eval ${metricLabel} by speaker`, font: { size: 11 }, standoff: 14 } }),
-    yaxis2: AXIS({ anchor: "x2" }),
-  }), CONFIG);
-}
-
 // ===== detail modal (mask comparison) =====
-// metadata table shared by both the gt-only and prediction detail modes -- id, spk, layout, n,
-// gt com, and the two playable audio clips, exactly as requested (plus the run's own metrics
-// appended as extra rows when a run is open)
-function metaTableRows(s, run, rec) {
+// two separate tables so it's unambiguous which facts are fixed dataset properties of the
+// sample vs which come from this run's prediction of it
+function sampleMetaRows(s) {
   const rows = [
     ["id", `#${s.sample_id}`], ["speaker", s.speaker], ["layout", s.layout], ["n objects", s.n_objects],
     ["gt com", `(${s.com_row.toFixed(1)}, ${s.com_col.toFixed(1)})`],
     ["audio", `<button class="play" data-src="/media/${s.sample_id}/audio">in ▶</button> <button class="play" data-src="/media/${s.sample_id}/recovered">rec ▶</button>`],
   ];
-  if (run) rows.push(
+  return rows.map(([k, v]) => `<tr><td>${k}</td><td>${v}</td></tr>`).join("");
+}
+function predMetaRows(run, rec) {
+  const rows = [
     ["run", run], ["split", rec?.split.replace("unseen_", "u-") ?? "?"],
     ["mse", fmt(rec?.mse, 6)], ["com_dist", fmt(rec?.com_dist)],
     ["pred com", `(${fmt(rec?.pred_row, 1)}, ${fmt(rec?.pred_col, 1)})`],
-  );
+  ];
   return rows.map(([k, v]) => `<tr><td>${k}</td><td>${v}</td></tr>`).join("");
 }
 
@@ -972,6 +966,10 @@ function metaTableRows(s, run, rec) {
 // are natively 256x104 (checked across the dataset); scaling every image/heatmap to the same
 // width keeps gt/pred/diff/overlay visually comparable and never squished relative to each other
 const DETAIL_IMG_W = 460;
+
+// gt com = light green cross, pred com = light red cross -- consistent everywhere in the modal
+// so the two marks are distinguishable at a glance without reading a legend
+const GT_COM_MARK = "#8fe08f", PRED_COM_MARK = "#f09a9a";
 
 async function openDetail(sampleId, run) {
   const s = SAMPLE.get(sampleId);
@@ -983,89 +981,181 @@ async function openDetail(sampleId, run) {
   if (run) { await ensureRunMasks(run, [sampleId]); pred = S.runMasks[run][sampleId]; if (!pred) return; }
 
   $("#modal-title").textContent = run ? `${label(s)} — ${run}` : label(s);
-  $("#modal-meta").innerHTML = metaTableRows(s, run, rec);
+  $("#modal-meta-sample").innerHTML = sampleMetaRows(s);
+  $("#modal-meta-pred-group").hidden = !run;
+  if (run) $("#modal-meta-pred").innerHTML = predMetaRows(run, rec);
   $("#modal").classList.add("open");
-
-  const H = gt.length, W = gt[0].length;
-  const detailH = Math.round(DETAIL_IMG_W * H / W);
   wirePlayButtons($("#modal"));
 
-  const gtOverlay = $("#m-gt-overlay"), predOverlay = $("#m-pred-overlay"), side = $("#m-side"), diff = $("#m-diff");
-  gtOverlay.innerHTML = `<div class="sub" style="text-align:center;margin:4px 0">overhead + ground truth overlay</div>`;
-  maskOverlayCanvas(sampleId, gt, [24, 178, 24], "ground truth").then(cv => {
-    drawComCross(cv, s);
+  const side = $("#m-side"), combined = $("#m-combined"), diff = $("#m-diff");
+  side.innerHTML = ""; combined.innerHTML = ""; diff.innerHTML = "";
+
+  const drawCross = (cv, row, col, color) => {
+    const g = cv.getContext("2d");
+    const x = (col + 0.5) / S.man.out_w * cv.width, y = (row + 0.5) / S.man.out_h * cv.height;
+    const r = Math.max(4, cv.width * 0.02);
+    g.strokeStyle = color; g.lineWidth = 2;
+    g.beginPath(); g.moveTo(x - r, y); g.lineTo(x + r, y); g.moveTo(x, y - r); g.lineTo(x, y + r); g.stroke();
+  };
+  // small red/green legend watermark burned directly into the canvas corner -- replaces a
+  // separate caption line, so the panel header can stay a single line (title + toggle only)
+  const drawLegend = (cv, ...words) => {
+    const g = cv.getContext("2d");
+    g.font = `${Math.round(cv.width * 0.032)}px system-ui`; g.textBaseline = "top";
+    let x = 8;
+    for (const [text, color] of words) {
+      g.fillStyle = "rgba(0,0,0,0.55)"; g.fillRect(x - 3, 5, g.measureText(text).width + 6, cv.width * 0.045);
+      g.fillStyle = color; g.fillText(text, x, 7);
+      x += g.measureText(text).width + 14;
+    }
+  };
+  const panelHead = (title, checked) => `<div class="sub m-panel-head">
+    <span>${title}</span>
+    <label class="check-line"><input type="checkbox" class="m-photo-toggle" ${checked ? "checked" : ""}> show overhead</label>
+  </div>`;
+  // build the whole canvas (incl. crosses + legend) before touching the DOM, then swap it in with
+  // one replaceChildren call -- writing innerHTML="" first and appending later (after the photo
+  // finishes loading) left a visible blank gap on every toggle click, which read as a screen flicker
+  const swapSlot = (slot, cv) => slot.replaceChildren(cv);
+
+  if (!run) {
+    // gt-only mode: a single panel, its own overhead toggle, nothing else to show
+    side.innerHTML = `${panelHead(label(s), true)}<div class="m-side-row"></div>`;
+    const slot = side.querySelector(".m-side-row");
+    const renderGt = async withPhoto => {
+      const cv = await layeredMaskCanvas(sampleId, [{ mask: gt, rgb: [24, 178, 24], label: "ground truth" }], withPhoto);
+      drawCross(cv, s.com_row, s.com_col, GT_COM_MARK);
+      drawLegend(cv, ["ground truth", "#8fe08f"]);
+      cv.style.cssText = `width:${DETAIL_IMG_W}px;border-radius:6px;display:block`;
+      swapSlot(slot, cv);
+    };
+    side.querySelector(".m-photo-toggle").onchange = e => renderGt(e.target.checked);
+    renderGt(true);
+    return;
+  }
+
+  // panel 1: side by side, each with its own overhead toggle
+  side.innerHTML = `${panelHead(`${label(s)} — ${run}`, true)}<div style="display:flex;gap:8px" class="m-side-row"></div>`;
+  const sideRow = side.querySelector(".m-side-row");
+  const renderSide = async withPhoto => {
+    const [gtCv, predCv] = await Promise.all([
+      layeredMaskCanvas(sampleId, [{ mask: gt, rgb: [24, 178, 24], label: "ground truth" }], withPhoto),
+      layeredMaskCanvas(sampleId, [{ mask: pred, rgb: [224, 82, 82], label: "prediction" }], withPhoto),
+    ]);
+    drawCross(gtCv, s.com_row, s.com_col, GT_COM_MARK);
+    drawCross(predCv, rec.pred_row, rec.pred_col, PRED_COM_MARK);
+    drawLegend(gtCv, ["ground truth", "#8fe08f"]);
+    drawLegend(predCv, ["predicted", "#f09a9a"]);
+    for (const cv of [gtCv, predCv]) cv.style.cssText = `width:${DETAIL_IMG_W}px;border-radius:6px;display:block`;
+    sideRow.replaceChildren(gtCv, predCv);
+  };
+  side.querySelector(".m-photo-toggle").onchange = e => renderSide(e.target.checked);
+  renderSide(true);
+
+  // panel 2: both masks combined on one plot, pred layered on top of gt
+  combined.innerHTML = `${panelHead(`${label(s)} — ${run}`, true)}<div class="m-combined-slot"></div>`;
+  const combinedSlot = combined.querySelector(".m-combined-slot");
+  const renderCombined = async withPhoto => {
+    const cv = await layeredMaskCanvas(sampleId, [
+      { mask: gt, rgb: [24, 178, 24], label: "ground truth" },
+      { mask: pred, rgb: [224, 82, 82], label: "prediction" },
+    ], withPhoto);
+    drawCross(cv, s.com_row, s.com_col, GT_COM_MARK);
+    drawCross(cv, rec.pred_row, rec.pred_col, PRED_COM_MARK);
+    drawLegend(cv, ["predicted", "#f09a9a"], ["ground truth", "#8fe08f"]);
     cv.style.cssText = `width:${DETAIL_IMG_W}px;border-radius:6px;display:block`;
-    gtOverlay.appendChild(cv);
-  });
+    swapSlot(combinedSlot, cv);
+  };
+  combined.querySelector(".m-photo-toggle").onchange = e => renderCombined(e.target.checked);
+  renderCombined(true);
 
-  if (!run) { predOverlay.innerHTML = ""; side.innerHTML = ""; diff.innerHTML = ""; return; }
-
-  predOverlay.innerHTML = `<div class="sub" style="text-align:center;margin:4px 0">overhead + prediction overlay</div>`;
-  overlayCanvas(sampleId, pred).then(cv => {
-    drawComCross(cv, s);
-    cv.style.cssText = `width:${DETAIL_IMG_W}px;border-radius:6px;display:block`;
-    predOverlay.appendChild(cv);
-  });
-
-  const comMarks = (ax = "") => [
-    { type: "scatter", x: [s.com_col], y: [s.com_row], mode: "markers", showlegend: false, hoverinfo: "skip",
-      xaxis: "x" + ax, yaxis: "y" + ax, marker: { symbol: "cross-thin", size: 11, line: { width: 2, color: "#fff" } } },
-    { type: "scatter", x: [rec.pred_col], y: [rec.pred_row], mode: "markers", showlegend: false, hoverinfo: "skip",
-      xaxis: "x" + ax, yaxis: "y" + ax, marker: { symbol: "x-thin", size: 11, line: { width: 2, color: "#fff" } } },
-  ];
-  const axes = over => ({
-    xaxis: AXIS({ range: [-0.5, W - 0.5], constrain: "domain", visible: false }),
-    yaxis: AXIS({ range: [H - 0.5, -0.5], scaleanchor: over ? "x" : undefined, visible: false }),
-    margin: { l: 6, r: 6, t: 22, b: 6 }, showlegend: false,
-    width: over ? DETAIL_IMG_W : DETAIL_IMG_W * 2 + 12, height: detailH + 28,
-  });
-  const heat = (z, colorscale, name) => ({ type: "heatmap", z, colorscale, showscale: false, name,
-    hovertemplate: "(%{y}, %{x}) %{z:.3f}<extra>" + name + "</extra>" });
-  const GT_SCALE = [[0, SURFACE], [1, "#18b218"]], PRED_SCALE = [[0, SURFACE], [1, "#e05252"]];
-  const DIFF_SCALE = [[0, "#18b218"], [0.5, "#383835"], [1, "#e05252"]];
-
-  side.innerHTML = "";
-  Plotly.newPlot(side, [
-    Object.assign(heat(gt, GT_SCALE, "ground truth"), { xaxis: "x", yaxis: "y" }),
-    Object.assign(heat(pred, PRED_SCALE, "prediction"), { xaxis: "x2", yaxis: "y2" }),
-    ...comMarks(), ...comMarks("2"),
-  ], LAYOUT({
-    ...axes(false), title: { text: "ground truth (green) · prediction (red)", font: { size: 11 }, x: 0.5 },
-    xaxis: AXIS({ domain: [0, 0.485], range: [-0.5, W - 0.5], visible: false }),
-    yaxis: AXIS({ range: [H - 0.5, -0.5], visible: false }),
-    xaxis2: AXIS({ domain: [0.515, 1], range: [-0.5, W - 0.5], visible: false }),
-    yaxis2: AXIS({ range: [H - 0.5, -0.5], anchor: "x2", visible: false }),
-  }), CONFIG);
-
+  // panel 3: diff -- canvas-based (not plotly heatmap) so it can share the same overhead-photo
+  // toggle as the other two panels; defaults OFF since the diff coloring is usually clearer on
+  // its own plain background, but it's there if you want to see it in physical context. Still
+  // gets a real colorbar (drawn alongside, not part of the photo canvas) for the 0..1 alpha scale.
   const diffMask = pred.map((row, r) => row.map((v, c) => v - gt[r][c]));
-  diff.innerHTML = "";
-  Plotly.newPlot(diff, [
-    Object.assign(heat(diffMask, DIFF_SCALE, "pred − gt"), { zmid: 0, zmin: -1, zmax: 1, showscale: true,
-      colorbar: { thickness: 8, outlinewidth: 0, tickfont: { color: MUTED } } }),
-    ...comMarks(),
-  ], LAYOUT({ ...axes(true), title: { text: "diff: red = pred extra · green = gt missed", font: { size: 11 }, x: 0.5 } }), CONFIG);
+  diff.innerHTML = `${panelHead(`${label(s)} — ${run}`, false)}
+    <div style="display:flex;align-items:flex-start;gap:10px">
+      <div class="m-diff-slot"></div>
+      <canvas class="m-diff-colorbar" width="34" height="200" title="red = pred extra · green = gt missed"></canvas>
+    </div>`;
+  const diffSlot = diff.querySelector(".m-diff-slot");
+  drawDiffColorbar(diff.querySelector(".m-diff-colorbar"));
+  const renderDiff = async withPhoto => {
+    // two-layer diff render: positive (pred extra) in red, negative (gt missed) in green
+    const posMask = diffMask.map(row => row.map(v => Math.max(v, 0)));
+    const negMask = diffMask.map(row => row.map(v => Math.max(-v, 0)));
+    const cv = await layeredMaskCanvas(sampleId, [
+      { mask: negMask, rgb: [24, 178, 24], label: "gt missed" },
+      { mask: posMask, rgb: [224, 82, 82], label: "pred extra" },
+    ], withPhoto);
+    drawCross(cv, s.com_row, s.com_col, GT_COM_MARK);
+    drawCross(cv, rec.pred_row, rec.pred_col, PRED_COM_MARK);
+    drawLegend(cv, ["predicted", "#f09a9a"], ["ground truth", "#8fe08f"]);
+    cv.style.cssText = `width:${DETAIL_IMG_W}px;border-radius:6px;display:block`;
+    swapSlot(diffSlot, cv);
+  };
+  diff.querySelector(".m-photo-toggle").onchange = e => renderDiff(e.target.checked);
+  renderDiff(false);
+}
+
+// vertical diverging colorbar for the diff panel: green (gt missed) -> surface -> red (pred extra)
+function drawDiffColorbar(cv) {
+  const g = cv.getContext("2d");
+  const grad = g.createLinearGradient(0, 0, 0, cv.height);
+  grad.addColorStop(0, "#e05252"); grad.addColorStop(0.5, SURFACE); grad.addColorStop(1, "#18b218");
+  g.fillStyle = grad; g.fillRect(0, 0, 18, cv.height);
+  g.fillStyle = MUTED; g.font = "10px system-ui"; g.textBaseline = "middle";
+  g.fillText("1", 22, 6); g.fillText("0", 22, cv.height / 2); g.fillText("-1", 22, cv.height - 6);
 }
 
 // overhead photo with the predicted mask painted on top in translucent red — this is the
 // default thumbnail in table/panel views once a run is loaded, since seeing the prediction
 // against the real photo is the main thing being looked at, not the bare photo
-function overlayCanvas(sampleId, pred) {
-  return maskOverlayCanvas(sampleId, pred, [224, 82, 82]);
+function overlayCanvas(sampleId, pred, label = "prediction") {
+  return maskOverlayCanvas(sampleId, pred, [224, 82, 82], label);
 }
 
 // generic overhead + translucent-mask overlay, with a live hover tooltip reporting the exact
 // mask value under the cursor (native <title>, cheap and works everywhere a canvas can go)
 function maskOverlayCanvas(sampleId, mask, rgb, label = "") {
-  return new Promise(resolve => {
-    const img = new Image();
-    img.src = `/media/${sampleId}/thumb`;
-    img.onload = () => {
-      const H = mask.length, W = mask[0].length;
-      const cv = document.createElement("canvas");
-      cv.width = img.naturalWidth; cv.height = img.naturalHeight;
-      const g = cv.getContext("2d");
-      g.drawImage(img, 0, 0);
-      const cw = cv.width / W, ch = cv.height / H;
+  return layeredMaskCanvas(sampleId, [{ mask, rgb, label }], true);
+}
+
+// fast cursor-following readout for mask-canvas hover -- native <title> tooltips have a ~1s
+// delay and vanish on any mouse move, which reads as "hover doesn't work" when scrubbing across
+// a mask to compare values. A single reused floating div instead shows instantly and tracks the cursor.
+let _hoverReadout = null;
+function showHoverReadout(x, y, text) {
+  if (!_hoverReadout) {
+    _hoverReadout = document.createElement("div");
+    _hoverReadout.className = "hover-readout";
+    document.body.appendChild(_hoverReadout);
+  }
+  _hoverReadout.textContent = text;
+  _hoverReadout.style.left = `${x + 14}px`;
+  _hoverReadout.style.top = `${y + 14}px`;
+  _hoverReadout.style.display = "block";
+}
+function hideHoverReadout() {
+  if (_hoverReadout) _hoverReadout.style.display = "none";
+}
+
+// draws one or more mask layers (each own color, painted in order so later layers sit on top),
+// either over the real overhead photo or over a plain surface-colored background. Used by the
+// detail modal's side-by-side / combined panels so the same renderer handles both the
+// "with overhead" and "without overhead" toggle states, and by maskOverlayCanvas for the
+// always-with-overhead thumbnails elsewhere. Hover reports every layer's value at that cell.
+function layeredMaskCanvas(sampleId, layers, withPhoto) {
+  const H = layers[0].mask.length, W = layers[0].mask[0].length;
+  const paint = img => {
+    const cv = document.createElement("canvas");
+    cv.width = img ? img.naturalWidth : W * 8; cv.height = img ? img.naturalHeight : H * 8;
+    const g = cv.getContext("2d");
+    if (img) g.drawImage(img, 0, 0);
+    else { g.fillStyle = SURFACE; g.fillRect(0, 0, cv.width, cv.height); }
+    const cw = cv.width / W, ch = cv.height / H;
+    for (const { mask, rgb } of layers) {
       for (let r = 0; r < H; r++) for (let c = 0; c < W; c++) {
         const v = mask[r][c];
         if (v > 0.05) {
@@ -1073,14 +1163,22 @@ function maskOverlayCanvas(sampleId, mask, rgb, label = "") {
           g.fillRect(c * cw, r * ch, cw + 0.5, ch + 0.5);
         }
       }
-      cv.onmousemove = e => {
-        const rect = cv.getBoundingClientRect();
-        const c = Math.min(W - 1, Math.max(0, Math.floor((e.clientX - rect.left) / rect.width * W)));
-        const r = Math.min(H - 1, Math.max(0, Math.floor((e.clientY - rect.top) / rect.height * H)));
-        cv.title = `${label ? label + " · " : ""}(${r}, ${c}) = ${mask[r][c].toFixed(3)}`;
-      };
-      resolve(cv);
+    }
+    cv.onmousemove = e => {
+      const rect = cv.getBoundingClientRect();
+      const c = Math.min(W - 1, Math.max(0, Math.floor((e.clientX - rect.left) / rect.width * W)));
+      const r = Math.min(H - 1, Math.max(0, Math.floor((e.clientY - rect.top) / rect.height * H)));
+      const text = layers.map(({ mask, label }) => `${label ? label + " " : ""}${mask[r][c].toFixed(3)}`).join(" · ");
+      showHoverReadout(e.clientX, e.clientY, `(x ${c}, y ${r}) ${text}`);
     };
+    cv.onmouseleave = hideHoverReadout;
+    return cv;
+  };
+  if (!withPhoto) return Promise.resolve(paint(null));
+  return new Promise(resolve => {
+    const img = new Image();
+    img.src = `/media/${sampleId}/thumb`;
+    img.onload = () => resolve(paint(img));
   });
 }
 document.addEventListener("keydown", e => {
@@ -1096,23 +1194,6 @@ $("#sidebar-toggle").onclick = () => {
   shell.classList.toggle("sidebar-hidden");
   $("#sidebar-toggle").textContent = shell.classList.contains("sidebar-hidden") ? "›" : "‹";
   if (!shell.classList.contains("sidebar-hidden")) setTimeout(renderPosmap, 190); // zero width while hidden; repaint once the slide-in transition finishes
-};
-
-// ===== fft / runs tab toggle =====
-$("#fft-tabs").onclick = e => {
-  if (!e.target.dataset.tab) return;
-  const tab = e.target.dataset.tab;
-  for (const b of $("#fft-tabs").children) b.classList.toggle("active", b === e.target);
-  $("#fft-plot").style.display = tab === "fft" ? "" : "none";
-  $("#runs-plot-wrap").style.display = tab === "runs" ? "" : "none";
-  $("#fft-controls").hidden = tab !== "fft";
-  $("#runs-controls").hidden = tab !== "runs";
-  // Plotly.react on a just-unhidden container reads its size before the browser has finished
-  // laying it out (display:none -> block happens in the same tick), so it renders at a stale
-  // size and the axis titles land outside the visible box. Force a resize on the next frame,
-  // once layout has actually settled, to pull the plot back to its real container size.
-  if (tab === "fft") { updateFFT(); }
-  else { renderRunsPanel(); requestAnimationFrame(() => Plotly.Plots.resize("runs-plot")); }
 };
 
 // ===== live updates =====

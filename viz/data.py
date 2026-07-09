@@ -106,8 +106,9 @@ def list_runs() -> list[str]:
     for d in sorted(RUNS_DIR.iterdir()):
         out = d / "outputs"
         if out.is_dir() and any(out.rglob("*.pt")):
-            runs.append(d.name)
-    return runs
+            runs.append((d.stat().st_mtime, d.name))
+    runs.sort(key=lambda t: t[0], reverse=True)
+    return [name for _, name in runs]
 
 
 def data_version() -> str:
