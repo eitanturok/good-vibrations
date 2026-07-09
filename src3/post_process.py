@@ -131,7 +131,10 @@ def convert_to_mds(mds_path:Path, rows:list, key, x_shape, y_shape, verbose:int)
         for i, (sample_dir, meta) in enumerate(rows):
             X = np.load(sample_dir / "X.npy").astype(np.float32)   # (1, L, P, PS, C)
             y = np.load(sample_dir / "y.npy").astype(np.float32)   # (out_h, out_w)
-            # X = np.squeeze(X, axis=0) if X.ndim == 5 and X.shape[0] == 1 else X # todo: do I need this?
+            # model.py's VibrationTransformer.forward expects (B,L,P,C,PS) per-sample (no leading
+            # singleton) -- the leading 1 here is just X.npy's on-disk batch dim from post-processing
+            # a single sample at a time, and must be dropped before writing into the MDS shard.
+            X = np.squeeze(X, axis=0) if X.ndim == 5 and X.shape[0] == 1 else X
             assert X.shape == x_shape, f"{sample_dir.name}: X.shape={X.shape} != {x_shape}"
             assert y.shape == y_shape, f"{sample_dir.name}: y.shape={y.shape} != {y_shape}"
 
@@ -151,13 +154,15 @@ def convert_to_mds(mds_path:Path, rows:list, key, x_shape, y_shape, verbose:int)
     finally:
         os.chdir(cwd)
 
-    # dataset-level sidecar
+    # dataset-level sidecar: written alongside the shards (mds_path/key), not mds_path itself --
+    # MDSWriter(out=key) wrote shards + index.json to mds_path/key (relative to the chdir above,
+    # since `key` was passed as a relative dir name), and dataset.py's build_dataset expects
+    # dataset.jsonl in that same directory as the shards it streams from.
+    shards_path = mds_path / key
     lines = "\n".join([json.dumps(r) for r in index_rows])
-    (mds_path / "dataset.jsonl").write_text(lines)
-    if verbose: print(f"Wrote {len(rows)} samples to {mds_path=}")
-    # MDSWriter(out=key) actually wrote the shards + index.json to mds_path/key (relative to the
-    # chdir above), one level deeper than mds_path itself -- that's the path StreamingDataset needs.
-    return mds_path / key
+    (shards_path / "dataset.jsonl").write_text(lines)
+    if verbose: print(f"Wrote {len(rows)} samples to {shards_path=}")
+    return shards_path
 
 
 #***** 5 post-process all samples in a base sample directory *****
@@ -186,8 +191,8 @@ def post_process(base_sample_dir:Path, mds_dir:Path, is_empty_box:bool, out_h:in
     if mds_path.exists() and force:
         if verbose: print(f"--force: deleting cached MDS at {mds_path} and rebuilding")
         shutil.rmtree(mds_path)
-    elif mds_path.exists() and (mds_path / "dataset.jsonl").exists():
-        if verbose: print(f"Cache hit: reusing existing MDS at {mds_path}\nMDS: {mds_path} ({len(rows)} samples)")
+    elif mds_path.exists() and (mds_path / key / "dataset.jsonl").exists():
+        if verbose: print(f"Cache hit: reusing existing MDS at {mds_path / key}\nMDS: {mds_path / key} ({len(rows)} samples)")
         return mds_path / key
 
     # symlink base_sample_dir to MDS directory
@@ -200,7 +205,7 @@ def post_process(base_sample_dir:Path, mds_dir:Path, is_empty_box:bool, out_h:in
 
     # convert to MDS
     n_lasers, n_freqs = rows[sample_ids[0]]["n_lasers"], rows[sample_ids[0]]["n_freqs"]
-    x_shape, y_shape = (1, n_lasers, n_freqs // patch_size, patch_size, 2), (out_h, out_w)
+    x_shape, y_shape = (n_lasers, n_freqs // patch_size, patch_size, 2), (out_h, out_w)
     mds_path = convert_to_mds(mds_path, rows, key, x_shape, y_shape, verbose)
     return mds_path
 

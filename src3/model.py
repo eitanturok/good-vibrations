@@ -86,7 +86,7 @@ class MLPMidDecoder(nn.Module):
     def forward(self, cls): return self.net(cls).view(-1, self.out_h, self.out_w)
 
 class AttnDecoder(nn.Module):
-    def __init__(self, d_model, out_h, out_w, num_heads:int=2, num_layers:int=2):
+    def __init__(self, d_model, out_h, out_w, num_heads:int=2, num_layers:int=2, do_rope:bool=True):
         super().__init__()
         self.out_h, self.out_w = out_h, out_w
         self.query_seed = nn.Parameter(torch.zeros(1, 1, d_model))
@@ -95,12 +95,13 @@ class AttnDecoder(nn.Module):
         layer = nn.TransformerDecoderLayer(d_model=d_model, nhead=num_heads, batch_first=True)
         self.layers = nn.TransformerDecoder(layer, num_layers=num_layers)
         self.head = nn.Linear(d_model, 1)
+        self.do_rope = do_rope
 
     def forward(self, memory, memory_key_padding_mask=None):
         # memory: (B,S,D) per-laser token sequence to cross-attend into (S = L+1, includes cls token)
         B = memory.shape[0]
         queries = self.query_seed.expand(B, self.out_h * self.out_w, -1)  # (B,out_h*out_w,D)
-        queries = apply_rope(queries, self.freqs_query)                    # give each query its 2D grid position
+        if self.do_rope: queries = apply_rope(queries, self.freqs_query)                    # give each query its 2D grid position
         out = self.layers(queries, memory, memory_key_padding_mask=memory_key_padding_mask)  # (B,out_h*out_w,D)
         return self.head(out).view(B, self.out_h, self.out_w)
 
@@ -108,6 +109,7 @@ def build_decoder(decoder, d_model, out_h, out_w, decoder_num_heads:int=2, decod
     if decoder == 'mlp': return MLPDecoder(d_model, out_h, out_w)
     if decoder == 'mlp-mid': return MLPMidDecoder(d_model, out_h, out_w)
     if decoder == 'attn': return AttnDecoder(d_model, out_h, out_w, num_heads=decoder_num_heads, num_layers=decoder_num_layers)
+    if decoder == 'attn-no-rope': return AttnDecoder(d_model, out_h, out_w, num_heads=decoder_num_heads, num_layers=decoder_num_layers, do_rope=False)
     raise ValueError(f"Unknown decoder: {decoder}")
 
 #***** 3 encoder *****

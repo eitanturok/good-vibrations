@@ -92,13 +92,13 @@ def build_denotched_dataset(src_dir: Path, dst_dir: Path, mds_dir: Path, signal_
         import shutil
         if verbose: print(f"--force: deleting cached MDS at {mds_path} and rebuilding")
         shutil.rmtree(mds_path)
-    elif mds_path.exists() and (mds_path / "dataset.jsonl").exists():
-        if verbose: print(f"Cache hit: reusing existing MDS at {mds_path}")
+    elif mds_path.exists() and (mds_path / key / "dataset.jsonl").exists():
+        if verbose: print(f"Cache hit: reusing existing MDS at {mds_path / key}")
         return mds_path / key
 
     out_h, out_w = rows[sample_ids[0]]["out_h"], rows[sample_ids[0]]["out_w"]
     n_lasers, n_freqs = rows[sample_ids[0]]["n_lasers"], rows[sample_ids[0]]["n_freqs"]
-    x_shape = (1, n_lasers, n_freqs // patch_size, patch_size, 2)
+    x_shape = (n_lasers, n_freqs // patch_size, patch_size, 2)
     y_shape = (out_h, out_w)
     mds_rows = [(dst_dir / sid, rows[sid]) for sid in sample_ids]
     mds_path = convert_to_mds(mds_path, mds_rows, key, x_shape, y_shape, verbose)

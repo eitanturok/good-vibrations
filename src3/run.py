@@ -51,6 +51,7 @@ def get_parser():
     parser.add_argument("--seed",                       type=int,   default=42)
     parser.add_argument("--num-workers",                type=int,   default=4)
     parser.add_argument("--debug",                      type=int,   default=0)
+    parser.add_argument("--verbose",                    type=int,   default=2, help="If >=2, show torch.compile (TorchDynamo) logs.")
     parser.add_argument("--no-train",                   action="store_true", default=False)
     parser.add_argument("--no-eval",                    action="store_true", default=False)
     # data
@@ -224,7 +225,7 @@ def run(**kwargs):
     if torch.cuda.is_available():
         torch.set_float32_matmul_precision("high")
         torch.backends.cudnn.benchmark = True
-    if not args.no_compile: torch._logging.set_logs(dynamo=logging.INFO)
+    if not args.no_compile and args.verbose >= 2: torch._logging.set_logs(dynamo=logging.INFO)
 
     # make model
     data_info = dict(out_h=args.out_h, out_w=args.out_w, n_laser_rows=args.n_laser_rows, n_laser_cols=args.n_laser_cols, patch_size=args.patch_size, n_freqs=args.n_freqs)
