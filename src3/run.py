@@ -166,11 +166,11 @@ def run(**kwargs):
     args.__dict__.update(kwargs)  # apply overrides from cli
     assert not args.eval_only or args.checkpoint_path, "--checkpoint-path is required when using --eval-only"
 
-    # set seeds for reproducibility before initializing model + dataloader
+    # set seeds for reproducibility BEFORE initializing model + dataloader
     seed_all(args.seed)
     print(f"Set random seed to {args.seed} for reproducibility")
 
-    # set device
+    # device
     device = 'gpu' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu'
     print(f'Using {device=}')
 
@@ -180,12 +180,12 @@ def run(**kwargs):
         torch.backends.cudnn.benchmark = True
     if not args.no_compile and args.verbose >= 2: torch._logging.set_logs(dynamo=logging.INFO)
 
-    # make model
+    # model
     data_info = dict(out_h=args.out_h, out_w=args.out_w, n_laser_rows=args.n_laser_rows, n_laser_cols=args.n_laser_cols, patch_size=args.patch_size, n_freqs=args.n_freqs)
     model = VibrationTransformer(args.d_model, args.pnt_num_heads, args.pnt_num_layers, args.seq_num_heads, args.seq_num_layers, data_info, args.decoder, args.decoder_num_heads, args.decoder_num_layers, freq_dropout=args.freq_dropout, laser_dropout=args.laser_dropout)
     load_path = str(args.checkpoint_path) if args.checkpoint_path else None
 
-    # make dataset
+    # dataset
     train_loader, eval_loader = build_dataset(
         args.mds_path, batch_size=args.batch_size, eval_batch_size=args.eval_batch_size,
         test_size=args.test_size, seed=args.seed, num_workers=args.num_workers,
@@ -211,7 +211,7 @@ def run(**kwargs):
             torch_prof_overwrite=True, torch_prof_memory_filename=None,
             )
 
-    # callbacks: only monitor/checkpoint-adjacent callbacks are training-only; OutputSaver always runs
+    # callbacks
     callbacks = [OutputSaver(args.eval_interval, f"runs/{{run_name}}/outputs_history", overwrite=True, visualizer=VizSegMask()),
                  SpeedMonitor(1), OOMObserver(folder=f"runs/{{run_name}}/torch_traces", remote_file_name=None), NaNMonitor(),
                 RuntimeEstimator(skip_batches=64, time_unit="minutes"), SystemMetricsMonitor()]
