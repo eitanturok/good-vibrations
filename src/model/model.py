@@ -4,7 +4,7 @@ import torch.nn.functional as F
 from composer import ComposerModel
 from torchmetrics import MeanSquaredError, Metric
 
-from dataset import DATA_INFO
+from model.dataset import DATA_INFO
 
 #***** 0 helpers *****
 

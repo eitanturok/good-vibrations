@@ -18,7 +18,7 @@ from pathlib import Path
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src3"))
-from vibrations_pipeline import volume  # the modal "samples" Volume
+from data.vibrations_pipeline import volume  # the modal "samples" Volume
 
 GiB = 2**30
 MB = 2**20

@@ -40,9 +40,9 @@ GPU_AVAILABLE_FLOPS['nvidia geforce rtx 5080'] = {
 from icecream import install; install()
 import wandb
 
-from callbacks import VizSegMask, OutputSaver
-from dataset import build_dataset
-from model import VibrationTransformer
+from model.callbacks import VizSegMask, OutputSaver
+from model.dataset import build_dataset
+from model.model import VibrationTransformer
 
 def get_parser():
     parser = argparse.ArgumentParser()

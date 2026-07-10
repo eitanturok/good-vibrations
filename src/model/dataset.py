@@ -8,7 +8,7 @@ from sklearn.model_selection import train_test_split
 from composer.core import Evaluator, DataSpec
 from streaming import StreamingDataset, MDSWriter
 
-from io_utils import load
+from model.io_utils import load
 
 # ***** 1. turn dataset into MDS format (sharded, streaming) *****
 
