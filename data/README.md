@@ -10,6 +10,7 @@ experiment_dir/
     audio/
         50_1000_3sec/
             audio.mp3
+            spectogram.png
             samples.jsonl
     images/
         000000/
@@ -39,6 +40,7 @@ experiment_dir/
                 02_clean_shifts.npy
                 03_fft.npz
                 04_recovered_audio.mp3
+                05_recovered_spectogram.png
             audio.mp3
             recovered_audio.mp3
             overhead.png
@@ -71,9 +73,10 @@ dataset_dir/
                     02_clean_shifts.npy
                     03_fft.npz
                     04_recovered_audio.wav
-                    05_signaled_fft.npy
-                    06_normalized_fft.npy
-                    07_tokenized_fft.npy
+                    05_recovered_spectogram.png
+                    06_signaled_fft.npy
+                    07_normalized_fft.npy
+                    08_tokenized_fft.npy
                 audio.mp3
                 recovered_audio.mp3
                 overhead.png
