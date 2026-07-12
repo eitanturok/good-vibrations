@@ -8,7 +8,7 @@ from composer import Callback, Logger
 from composer.utils import format_name_with_dist
 from composer.loggers import WandBLogger
 
-from model.model import com_distances, mses
+from model.arch import com_distances, mses
 
 # ***** VizSegMask *****
 # Not a composer Callback: OutputSaver owns the after_forward/eval_after_forward hooks (it's the

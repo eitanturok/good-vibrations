@@ -42,7 +42,7 @@ import wandb
 
 from model.callbacks import VizSegMask, OutputSaver
 from model.dataset import build_dataset
-from model.model import VibrationTransformer
+from model.arch import VibrationTransformer
 
 def get_parser():
     parser = argparse.ArgumentParser()

@@ -178,7 +178,7 @@ def get_box_coverage_key(metadata, mask): return (metadata['box'], metadata['obj
 
 def preview_box_coverage(box_coverage, sample_dir):
     metadata = {'sample_id': ''} if sample_dir is None else {k: v for d in load(sample_dir / "metadata.jsonl") for k, v in d.items()}
-    mask = np.array(load(sample_dir / "outputs/02_segment_mask.png"))
+    mask = np.array(load(sample_dir / "outputs/02_smask.png"))
     key = get_box_coverage_key(metadata, mask)
     box, obj, n_objects, shape = key
     fig, ax = plt.subplots()
@@ -199,7 +199,7 @@ def preview(obj, mode):
 
 #***** copy to sample helpers *****
 
-SHARED_FILES = ["00_raw.png", "01_cropped.png", "02_smask.png", "03_smask.npy", "04_overhead_with_smask.png"]
+SHARED_FILES = ["00_raw.png", "01_resized.png", "02_smask.png", "03_smask.npy", "04_overhead_with_smask.png"]
 COPIED_FILES = ["times.jsonl", "metadata.jsonl"]
 
 def copy_to_sample(sample_dir:Path, output_dir:Path, audio_dir:Path, speaker:int, do_save:bool=True):
