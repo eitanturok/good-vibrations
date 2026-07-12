@@ -7,10 +7,10 @@ logging.getLogger("torch.distributed.elastic.multiprocessing.redirects").setLeve
 import sys, gc, argparse
 from pathlib import Path
 
-# src3 is a scripts dir (bare imports). On Modal it is mounted at /root/src3 -> put it on the path
-# so `from model import ...` resolves both locally (run from src3/) and remotely.
+# src is a scripts dir (bare imports). On Modal it is mounted at /root/src -> put it on the path
+# so `from model import ...` resolves both locally (run from src/) and remotely.
 try:
-    if Path("/root/src3").exists() and "/root/src3" not in sys.path: sys.path.insert(0, "/root/src3")
+    if Path("/root/src").exists() and "/root/src" not in sys.path: sys.path.insert(0, "/root/src")
 except PermissionError:
     pass
 
@@ -113,7 +113,7 @@ image = (
         'mosaicml-streaming', # for streaming dataset
         "git+https://github.com/eitanturok/composer.git@992d49db", # latest commit on my `hf-object-store` branch of composer
         ])
-    .add_local_dir("src3", remote_path="/root/src3")
+    .add_local_dir("src", remote_path="/root/src")
 )
 
 app = modal.App(

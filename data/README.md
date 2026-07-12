@@ -9,7 +9,7 @@ The directory structures are
 experiment_dir/
     audio/
         50_1000_3sec/
-            audio.mp3
+            audio.wav
             spectogram.png
             samples.jsonl
     images/
@@ -39,10 +39,10 @@ experiment_dir/
                 01_raw_shifts.npy
                 02_clean_shifts.npy
                 03_fft.npz
-                04_recovered_audio.mp3
+                04_recovered_audio.wav
                 05_recovered_spectogram.png
-            audio.mp3
-            recovered_audio.mp3
+            audio.wav
+            recovered_audio.wav
             overhead.png
             times.jsonl
             metadata.jsonl
@@ -77,8 +77,8 @@ dataset_dir/
                     06_signaled_fft.npy
                     07_normalized_fft.npy
                     08_tokenized_fft.npy
-                audio.mp3
-                recovered_audio.mp3
+                audio.wav
+                recovered_audio.wav
                 overhead.png
                 metadata.jsonl
                 times.jsonl

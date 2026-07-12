@@ -55,12 +55,12 @@ def post_process_sample(sample_dir:Path, is_empty_box:bool, out_h:int, out_w:int
 
     # post process overhead image (downsample segment mask, compute new center of mass)
     with Timing(f"[sample {sample_id}] post-process overhead image: ", enabled=verbose >= 2):
-        segment_mask = load(sample_dir / "outputs/02_segment_mask.png")
+        segment_mask = load(sample_dir / "image/02_smask.png")
 
         # downsample segment mask to out_h x out_w
         downsampled_segment_mask = downsample(segment_mask, out_h, out_w)
-        save(downsampled_segment_mask, sample_dir / "outputs/06_downsampled_smask.png", do_save)
-        save(np.array(downsampled_segment_mask, dtype=np.float32) / 255.0, sample_dir / "outputs/07_downsampled_smask.npy", do_save)
+        save(downsampled_segment_mask, sample_dir / "image/06_downsampled_smask.png", do_save)
+        save(np.array(downsampled_segment_mask, dtype=np.float32) / 255.0, sample_dir / "image/07_downsampled_smask.npy", do_save)
         append({'downsample': datetime.now(timezone.utc).isoformat()}, sample_dir / 'times.jsonl', do_save)
 
         # compute new center of mass for the downsampled segment mask
@@ -71,35 +71,35 @@ def post_process_sample(sample_dir:Path, is_empty_box:bool, out_h:int, out_w:int
 
     # post process vibrations (extract signal, normalize signal, tokenize)
     with Timing(f"[sample {sample_id}] post-process vibrations: ", enabled=verbose >= 2):
-        fft_npz = load(sample_dir / 'inputs/03_fft.npz')
+        fft_npz = load(sample_dir / 'vibration/03_fft.npz')
         freqs, fft_raw = fft_npz['freqs'], fft_npz['fft']
         if denotch_fn is not None:
             fft_raw = denotch_fn(fft_raw, freqs)
-            save({'fft': fft_raw, 'freqs': freqs, 'n_samples': fft_npz['n_samples']}, sample_dir / 'inputs/03_fft.npz', do_save)
+            save({'fft': fft_raw, 'freqs': freqs, 'n_samples': fft_npz['n_samples']}, sample_dir / 'vibration/03_fft.npz', do_save)
             append({"fft_denotched": datetime.now(timezone.utc).isoformat()}, sample_dir / "times.jsonl", do_save)
         logger.debug(f'[sample {sample_id}] {fft_raw.shape=}=(batch, lasers, _freqs, x/y)')
 
         # extract signal from fft
         fft_signaled = extract_signal(fft_raw, signal_mode).astype(np.float32)  # (B,L,F_,C) -> (B,L,F,C)
         logger.debug(f'[sample {sample_id}] {fft_signaled.shape=}=(batch, lasers, _freqs, x/y)')
-        save(fft_signaled, sample_dir / 'inputs/05_fft_signaled.npy', do_save)
+        save(fft_signaled, sample_dir / 'vibration/06_signaled_fft.npy', do_save)
         append({"fft_signaled": datetime.now(timezone.utc).isoformat()}, sample_dir / "times.jsonl", do_save)
 
         # normalize fft
         fft_normalized = normalize_fft(fft_signaled, normalize_mode, verbose)   # (B,L,F,C) -> (B,L,F,C)
         logger.debug(f'[sample {sample_id}] {fft_normalized.shape=}=(batch, lasers, _freqs, x/y)')
-        save(fft_normalized, sample_dir / 'inputs/06_fft_normalized.npy', do_save)
+        save(fft_normalized, sample_dir / 'vibration/07_normalized_fft.npy', do_save)
         append({"fft_normalized": datetime.now(timezone.utc).isoformat()}, sample_dir / "times.jsonl", do_save)
 
         # tokenize fft
         fft_tokenized = tokenize(fft_normalized, patch_size)                    # (B,L,F,C) -> (B,L,P,PS,C)
         logger.debug(f'[sample {sample_id}] {fft_tokenized.shape=}=(batch, lasers, num_patches, patch_size, x/y)')
-        save(fft_tokenized, sample_dir / 'inputs/07_fft_tokenized.npy', do_save)
+        save(fft_tokenized, sample_dir / 'vibration/08_tokenized_fft.npy', do_save)
         append({"fft_tokenized": datetime.now(timezone.utc).isoformat()}, sample_dir / "times.jsonl", do_save)
 
     # symlink X.npy, y.npy for model input, output
-    symlink(sample_dir / 'outputs/05_processed_fft.npy', sample_dir / 'y.npy', do_save)
-    symlink(sample_dir / 'inputs/07_fft_tokenized.npy', sample_dir / 'X.npy', do_save)
+    symlink(sample_dir / 'vibration/08_tokenized_fft.npy', sample_dir / 'y.npy', do_save)
+    symlink(sample_dir / 'vibration/08_tokenized_fft.npy', sample_dir / 'X.npy', do_save)
 
     n_lasers, n_freqs = fft_raw.shape[1], fft_raw.shape[2]
     append(dict(out_h=out_h, out_w=out_w, signal_mode=signal_mode, normalize_mode=normalize_mode, patch_size=patch_size, n_lasers=n_lasers, n_freqs=n_freqs), sample_dir / "metadata.jsonl", do_save)
@@ -160,7 +160,7 @@ def convert_to_mds(mds_path:Path, rows:list, key, x_shape, y_shape, verbose:int)
     # dataset.jsonl in that same directory as the shards it streams from.
     shards_path = mds_path / key
     lines = "\n".join([json.dumps(r) for r in index_rows])
-    (shards_path / "dataset.jsonl").write_text(lines)
+    (shards_path / "metadata.jsonl").write_text(lines)
     if verbose: print(f"Wrote {len(rows)} samples to {shards_path=}")
     return shards_path
 
@@ -168,7 +168,7 @@ def convert_to_mds(mds_path:Path, rows:list, key, x_shape, y_shape, verbose:int)
 #***** 5 post-process all samples in a base sample directory *****
 
 IMAGE_FILES = ["00_raw.png", "01_cropped.png", "02_smask.png", "03_smask.npy", "04_overhead_with_smask.png", "05_overhead_with_smask_and_speaker.png", "06_downsampled_smask.png", "07_downsampled_smask.npy"]
-VIBRATION_FILES = ["00_raw_vibrations.npy", "01_raw_shifts.npy", "02_clean_shifts.npy", "03_fft.npz", "05_fft_signaled.npy", "06_fft_normalized.npy", "07_fft_tokenized.npy"]
+VIBRATION_FILES = ["00_raw_vibrations.npy", "01_raw_shifts.npy", "02_clean_shifts.npy", "03_fft.npz", "06_signaled_fft.npy", "07_normalized_fft.npy", "08_tokenized_fft.npy"]
 SAMPLE_FILES = ["X.npy", "y.npy", "metadata.jsonl", "times.jsonl", "audio.mp3", "recovered_audio.mp3", "overhead.png"]
 
 def post_process(base_sample_dir:Path, mds_dir:Path, is_empty_box:bool, out_h:int, out_w:int, signal_mode:str, normalize_mode:str, patch_size:int, force:bool=False, verbose:int=1, do_save:bool=True, denotch_fn=None):
@@ -191,7 +191,7 @@ def post_process(base_sample_dir:Path, mds_dir:Path, is_empty_box:bool, out_h:in
     if mds_path.exists() and force:
         if verbose: print(f"--force: deleting cached MDS at {mds_path} and rebuilding")
         shutil.rmtree(mds_path)
-    elif mds_path.exists() and (mds_path / key / "dataset.jsonl").exists():
+    elif mds_path.exists() and (mds_path / key / "metadata.jsonl").exists():
         if verbose: print(f"Cache hit: reusing existing MDS at {mds_path / key}\nMDS: {mds_path / key} ({len(rows)} samples)")
         return mds_path / key
 

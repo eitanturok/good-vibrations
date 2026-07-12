@@ -157,8 +157,8 @@ def build_dataset(mds_path: str | Path, batch_size: int = 64, eval_batch_size: i
     generator = torch.Generator().manual_seed(seed)
     dataset = VibrationDataset(local=mds_path)
 
-    # load dataset.jsonl (skip line 0: dataset-level info now comes from args, not the sidecar)
-    lines = (Path(mds_path) / "dataset.jsonl").read_text().strip().splitlines()
+    # load metadata.jsonl (skip line 0: dataset-level info now comes from args, not the sidecar)
+    lines = (Path(mds_path) / "metadata.jsonl").read_text().strip().splitlines()
     index = [json.loads(line) for line in lines[1:] if line]
 
     # filter the dataset by speakers, n_objects, box, n_samples

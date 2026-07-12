@@ -7,10 +7,10 @@ import modal
 import numpy as np
 from scipy.signal import butter, resample, sosfiltfilt
 
-# when running inside a Modal container, src3 is mounted at /src3 but this file
-# is copied to /root by Modal's function loader — add /src3 so imports resolve
-if Path("/src3").exists() and str(Path("/src3")) not in sys.path:
-    sys.path.insert(0, "/src3")
+# when running inside a Modal container, src is mounted at /src but this file
+# is copied to /root by Modal's function loader — add /src so imports resolve
+if Path("/src").exists() and str(Path("/src")) not in sys.path:
+    sys.path.insert(0, "/src")
 
 from utils.io_utils import save, append, symlink, Timing, load, modal_upload, modal_download, fix_symlinks, logger
 
@@ -115,31 +115,31 @@ def _process_vibrations_local(sample_dir:Path, min_freq:int=MIN_FREQ, max_freq:i
 
     # turn vibrations into shifts with pclk algorithm
     with Timing(f"[sample {sample_id}] pclk: ", enabled=verbose >= 2):
-        raw_vibrations = load(sample_dir / 'inputs/00_raw_vibrations.npy')
+        raw_vibrations = load(sample_dir / 'vibration/00_raw_vibrations.npy')
         raw_shifts = get_shifts(raw_vibrations, rois, pclk_batch_size, pclk_mode)  # (L, T, 2)
         logger.debug(f'[sample {sample_id}] {raw_shifts.shape=}=(lasers, frames, x/y)')
-        save(raw_shifts, sample_dir / 'inputs/01_raw_shifts.npy', do_save)
+        save(raw_shifts, sample_dir / 'vibration/01_raw_shifts.npy', do_save)
         append({"pclk": datetime.now(timezone.utc).isoformat()}, sample_dir / "times.jsonl", do_save)
 
     # clean the shifts
     with Timing(f"[sample {sample_id}] clean shifts: ", enabled=verbose >= 2):
         clean_shifts = get_clean_shifts(raw_shifts[None], fps, min_freq, max_freq)  # (L,T,2) -> (B,L,T,2)
         logger.debug(f'[sample {sample_id}] {clean_shifts.shape=}=(batch, lasers, frames, x/y)')
-        save(clean_shifts, sample_dir / 'inputs/02_clean_shifts.npy', do_save)
+        save(clean_shifts, sample_dir / 'vibration/02_clean_shifts.npy', do_save)
         append({"clean_shifts": datetime.now(timezone.utc).isoformat()}, sample_dir / "times.jsonl", do_save)
 
     # fft the shifts
     with Timing(f"[sample {sample_id}] fft shifts: ", enabled=verbose >= 2):
         fft, freqs, n_samples = get_fft_shifts(clean_shifts, fps, min_freq, max_freq) # (B,L,T,2) -> (B,L,F,2), (F,) (,)
         logger.debug(f'[sample {sample_id}] {fft.shape=}=(batch, lasers, freq bins, x/y)\n[sample {sample_id}] {freqs.shape=}=(freq bins)\n[sample {sample_id}] {n_samples=}')
-        save({'fft': fft, 'freqs': freqs, 'n_samples': n_samples}, sample_dir / 'inputs/03_fft.npz', do_save)
+        save({'fft': fft, 'freqs': freqs, 'n_samples': n_samples}, sample_dir / 'vibration/03_fft.npz', do_save)
         append({"fft_shifts": datetime.now(timezone.utc).isoformat()}, sample_dir / "times.jsonl", do_save)
 
     # recover audio from fft
     with Timing(f"[sample {sample_id}] recover audio: ", enabled=verbose >= 2):
         recovered_audio = get_recovered_audio(fft, n_samples, fps, audio_sample_rate, min_freq, max_freq)
-        save((recovered_audio, audio_sample_rate), sample_dir / 'inputs/04_recovered_audio.wav', do_save)
-        symlink(sample_dir / 'inputs/04_recovered_audio.wav', sample_dir / 'recovered_audio.wav', do_save)
+        save((recovered_audio, audio_sample_rate), sample_dir / 'vibration/04_recovered_audio.wav', do_save)
+        symlink(sample_dir / 'vibration/04_recovered_audio.wav', sample_dir / 'recovered_audio.wav', do_save)
         append({"recover_audio": datetime.now(timezone.utc).isoformat()}, sample_dir / "times.jsonl", do_save)
 
     # update tracking
@@ -149,7 +149,7 @@ def save_vibrations(raw_vibrations:np.ndarray, sample_dir:Path, audio_dir:Path, 
     sample_id = sample_dir.name
 
     # save raw vibrations RAM->DISK (~2.7 GB per sample)
-    raw_vibration_path = sample_dir / 'inputs/00_raw_vibrations.npy'
+    raw_vibration_path = sample_dir / 'vibration/00_raw_vibrations.npy'
     with Timing(f'[sample {sample_id}] save raw vibrations RAM->DISK::{raw_vibration_path}: ', enabled=verbose >= 2):
         save(raw_vibrations, raw_vibration_path, do_save)
         timestamp = datetime.now(timezone.utc).isoformat()
@@ -166,8 +166,8 @@ def save_vibrations(raw_vibrations:np.ndarray, sample_dir:Path, audio_dir:Path, 
 #     modal.Image.from_registry("nvidia/cuda:12.2.2-cudnn8-devel-ubuntu22.04", add_python="3.11")
 #     .env({"PYTHONUNBUFFERED": "1"})   # flush all prints so they show immedietally in modal logs
 #     .pip_install("cupy-cuda12x", "numpy", "tqdm", "scipy", "matplotlib", "pillow", "ipython")
-#     .add_local_dir(Path(__file__).parent, remote_path="/src3/data")
-#     .add_local_dir(Path(__file__).parents[2] / "utils", remote_path="/src3/utils")
+#     .add_local_dir(Path(__file__).parent, remote_path="/src/data")
+#     .add_local_dir(Path(__file__).parents[2] / "utils", remote_path="/src/utils")
 # )
 
 # @app.function(
@@ -178,13 +178,13 @@ def save_vibrations(raw_vibrations:np.ndarray, sample_dir:Path, audio_dir:Path, 
 # )
 # def _process_vibrations_modal(sample_dir_name: str, **kwargs):
 #     import sys
-#     sys.path.insert(0, "/src3")
+#     sys.path.insert(0, "/src")
 #     volume.reload()
 #     from data.vibrate import _process_vibrations_local
 #     _process_vibrations_local(VOLUME_PATH / sample_dir_name, **kwargs)
 #     volume.commit()
 
-VIBRATION_FILES = ["01_raw_shifts.npy", "02_clean_shifts.npy", "03_fft.npz", "04_recovered_audio.wav", "05_processed_fft.npy"]
+VIBRATION_FILES = ["00_raw_vibrations.npy", "01_raw_shifts.npy", "02_clean_shifts.npy", "03_fft.npz", "04_recovered_audio.wav"]
 
 def process_vibrations(sample_dir:Path, use_modal:bool=True, do_save:bool=True, verbose:int=1):
     sample_id = sample_dir.name
@@ -205,7 +205,7 @@ def process_vibrations(sample_dir:Path, use_modal:bool=True, do_save:bool=True, 
 
     # # download processed vibrations modal_volume->DISK
     # with Timing(f'[sample {sample_id}] download processed vibrations modal_volume->DISK::{sample_dir}: ', enabled=verbose >= 1):
-    #     for f in VIBRATION_FILES: modal_download(volume, f"{sample_dir.name}/inputs/{f}", sample_dir / f"inputs/{f}")
+    #     for f in VIBRATION_FILES: modal_download(volume, f"{sample_dir.name}/vibration/{f}", sample_dir / f"vibration/{f}")
     #     fix_symlinks(sample_dir)
     #     append({"modal_upload": upload_timestamp}, sample_dir / "times.jsonl", do_save)
     #     append({"modal_download": datetime.now(timezone.utc).isoformat()}, sample_dir / "times.jsonl", do_save)

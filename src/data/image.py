@@ -150,7 +150,7 @@ def process_overhead(raw_overhead: Image.Image, output_dir: Path, left: float = 
     # resize image
     with Timing(f"[output {output_id}] resize the overhead image: ", enabled=verbose >= 2):
         resized_overhead = resize(raw_overhead, left, right, up, down, max_side)
-        save(resized_overhead, output_dir / "01_resized.png", do_save)
+        save(resized_overhead, output_dir / "01_cropped.png", do_save)
         append({'resized_overhead': datetime.now(timezone.utc).isoformat()}, output_dir / 'times.jsonl', do_save)
 
     # segment mask on modal with SAM3
@@ -182,9 +182,9 @@ def make_overhead(sample_dir:Path, output_dir:Path, speaker:int, verbose:int=1, 
     # add speaker to overhead image with smask, center of mass
     sample_id = sample_dir.name
     with Timing(f"[sample {sample_id}] visualize overhead image: ", enabled=verbose >= 2):
-        overhead_with_smask = load(sample_dir / 'outputs/04_overhead_with_smask.png', 'image')
+        overhead_with_smask = load(sample_dir / 'image/04_overhead_with_smask.png', 'image')
         overhead = draw_speaker(overhead_with_smask, speaker)
-        save(overhead, sample_dir / 'outputs/05_overhead_with_smask_and_speaker.png', do_save)
+        save(overhead, sample_dir / 'image/05_overhead_with_speaker.png', do_save)
         timestamp = datetime.now(timezone.utc).isoformat()
         append({f'viz_overhead_with_smask_and_speaker/sample_{sample_id}': timestamp}, output_dir / 'times.jsonl', do_save)
         append({f'viz_overhead_with_smask_and_speaker': timestamp}, sample_dir / 'times.jsonl', do_save)
