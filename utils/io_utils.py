@@ -1,5 +1,5 @@
 
-import contextlib, functools, os, threading, time, json, shutil
+import contextlib, functools, logging, os, sys, threading, time, json, shutil
 from pathlib import Path
 from datetime import datetime, timezone
 
@@ -10,26 +10,55 @@ from PIL import Image
 from IPython.display import Audio
 from scipy.io.wavfile import write as wav_write, read as wav_read
 
+#***** logging *****
+
+logger = logging.getLogger('good_vibrations')
+if not logger.handlers:
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    _console = logging.StreamHandler(sys.stdout)
+    _console.setFormatter(logging.Formatter('%(message)s'))
+    logger.addHandler(_console)
+
+def setup_logger(experiment_dir=None, verbose:int=1, do_save:bool=True):
+    # console shows what verbose asks for; logs.md always captures everything down to DEBUG
+    logger.setLevel(logging.DEBUG)
+    for h in list(logger.handlers): logger.removeHandler(h); h.close()
+    console = logging.StreamHandler(sys.stdout)
+    # verbose 0/1: no text in the notebook (logs.md still gets everything); verbose>=2: text in the notebook too
+    console.setLevel(logging.DEBUG if verbose >= 2 else logging.WARNING)
+    console.setFormatter(logging.Formatter('%(message)s'))
+    logger.addHandler(console)
+    if experiment_dir is not None and do_save:
+        log_path = Path(experiment_dir) / 'logs.md'
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        if not log_path.exists(): log_path.write_text('# Experiment logs\n\n', encoding='utf-8')
+        file = logging.FileHandler(log_path, encoding='utf-8')
+        file.setLevel(logging.DEBUG)
+        file.setFormatter(logging.Formatter('- `%(asctime)s` **%(levelname)s** %(message)s', datefmt='%Y-%m-%d %H:%M:%S'))
+        logger.addHandler(file)
+    return logger
+
 #***** timing *****
 
 class Timing(contextlib.ContextDecorator):
     def __init__(self, prefix="", enter="", on_exit=None, enabled=True): self.prefix, self.enter, self.on_exit, self.enabled = prefix, enter, on_exit, enabled
+    def _log(self, msg): (logger.info if self.enabled else logger.debug)(msg)
     def __enter__(self):
         self.st = time.perf_counter_ns()
-        if self.enabled and self.enter: print(self.enter)
+        if self.enter: self._log(self.enter)
     def __exit__(self, *exc):
         self.et = time.perf_counter_ns() - self.st
-        if self.enabled: print(f"{self.prefix}{self.et*1e-6:6.2f} ms" + (self.on_exit(self.et) if self.on_exit else ""))
+        self._log(f"{self.prefix}{self.et*1e-6:6.2f} ms" + (self.on_exit(self.et) if self.on_exit else ""))
 
 #***** resource usage *****
 
 def print_system_usage(path, label="", verbose=1):
-    if verbose < 1: return
     total, used, _ = shutil.disk_usage(path)
     ram = psutil.virtual_memory()
     GB = 2**30
     prefix = f"{label} " if label else ""
-    print(f"{prefix}disk: {used/GB:.2f}/{total/GB:.2f} GB used | RAM: {ram.used/GB:.2f}/{ram.total/GB:.2f} GB used | threads: {threading.active_count()}/{psutil.Process().num_threads()} active")
+    logger.debug(f"{prefix}disk: {used/GB:.2f}/{total/GB:.2f} GB used | RAM: {ram.used/GB:.2f}/{ram.total/GB:.2f} GB used | threads: {threading.active_count()}/{psutil.Process().num_threads()} active")
 
 #***** file helpers *****
 
@@ -125,16 +154,22 @@ def symlink(src:Path|str, dst:Path|str, enabled:bool=True):
 
 #***** preview helpers *****
 
+def _draw_image(ax, image):
+    ax.imshow(np.array(image))
+    ax.axis('off')
+
+def _draw_vibration_image(ax, frame_recording):
+    MINMAX = (np.percentile(frame_recording[-100:],10), np.percentile(frame_recording[-100:],90))
+    ax.imshow(frame_recording[10],vmin=MINMAX[0],vmax=MINMAX[1])
+
 def preview_image(image:np.ndarray):
-    plt.figure(figsize=(12, 6))
-    plt.imshow(np.array(image))
-    plt.axis('off')
+    fig, ax = plt.subplots(figsize=(12, 6))
+    _draw_image(ax, image)
     plt.show()
 
 def preview_vibration_image(frame_recording):
-    plt.figure(figsize=(12,6))
-    MINMAX = (np.percentile(frame_recording[-100:],10), np.percentile(frame_recording[-100:],90))
-    plt.imshow(frame_recording[10],vmin=MINMAX[0],vmax=MINMAX[1])
+    fig, ax = plt.subplots(figsize=(12, 6))
+    _draw_vibration_image(ax, frame_recording)
     plt.show()
 
 
@@ -176,15 +211,29 @@ def preview_vibration_video(frame_recording):
 
 def get_box_coverage_key(metadata, mask): return (metadata['box'], metadata['object'], metadata['n_objects'], mask.shape)
 
-def preview_box_coverage(box_coverage, sample_dir):
+def _draw_box_coverage(ax, box_coverage, sample_dir):
     metadata = {'sample_id': ''} if sample_dir is None else {k: v for d in load(sample_dir / "metadata.jsonl") for k, v in d.items()}
     mask = np.array(load(sample_dir / "outputs/02_smask.png"))
     key = get_box_coverage_key(metadata, mask)
     box, obj, n_objects, shape = key
-    fig, ax = plt.subplots()
     im = ax.imshow(box_coverage[key]['mask'], cmap='Blues')
     plt.colorbar(im, ax=ax)
     ax.set(title=f"Box Coverage\n{n_objects} {obj} in {box} box ({shape[1]}×{shape[0]}, {len(box_coverage[key]['sample_ids'])} samples)", xlabel='x (downsampled pixel space)', ylabel='y (downsampled pixel space)')
+
+def preview_box_coverage(box_coverage, sample_dir):
+    fig, ax = plt.subplots()
+    _draw_box_coverage(ax, box_coverage, sample_dir)
+    plt.show()
+
+def preview_sample_row(sample_overhead, raw_vibrations, box_coverage, sample_dir, header=''):
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+    _draw_image(axes[0], sample_overhead)
+    axes[0].set_title('Overhead')
+    _draw_vibration_image(axes[1], raw_vibrations)
+    axes[1].set_title('Speckles')
+    _draw_box_coverage(axes[2], box_coverage, sample_dir)
+    if header: fig.suptitle(header, fontsize=14, fontweight='bold', x=0.01, ha='left')
+    fig.tight_layout()
     plt.show()
 
 def preview_audio(samples, sample_rate): return Audio(samples, rate=sample_rate)
@@ -194,6 +243,7 @@ def preview(obj, mode):
     if mode == 'vibration_image': return preview_vibration_image(obj)
     if mode == 'vibration_video': return preview_vibration_video(obj)
     if mode == 'box_coverage': return preview_box_coverage(*obj)
+    if mode == 'sample_row': return preview_sample_row(*obj)
     if mode == 'audio': return preview_audio(*obj)
     else: raise ValueError(f'{mode=} not recognized')
 
