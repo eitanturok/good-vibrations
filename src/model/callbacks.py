@@ -10,11 +10,6 @@ from composer.loggers import WandBLogger
 
 from model.arch import com_distances, mses
 
-# ***** VizSegMask *****
-# Not a composer Callback: OutputSaver owns the after_forward/eval_after_forward hooks (it's the
-# thing that knows local disk is the ground truth) and calls VizSegMask.upload(path, ...) itself,
-# once the local save has already succeeded. This makes "save-before-upload" structural rather than
-# a fact about callback list order in run.py, which would silently break if the list were reordered.
 
 MAX_WANDB_IMAGES = 108  # wandb.Image caps any single log_images call at this many items
 
