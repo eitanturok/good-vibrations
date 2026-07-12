@@ -1,13 +1,11 @@
+"""Segment an image on modal"""
 from pathlib import Path
-
 
 import modal
 import numpy as np
 from PIL import Image
 
-
 app = modal.App("segment")
-_src3 = Path(__file__).parent
 
 modal_image = (
     modal.Image.from_registry("nvidia/cuda:12.8.0-devel-ubuntu22.04", add_python="3.12")

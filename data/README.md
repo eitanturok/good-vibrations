@@ -1,0 +1,90 @@
+The data lives in two differnet directories:
+* `experiment_dir` stores the data we recorded and partially processes it
+* `dataset_dir` stores the fully processed dataset and formats it as MDS files which we pass to our deep learning model
+
+We seperate these two because the dataset format changes depending on the modal architecture.
+
+The directory structures are
+```
+experiment_dir/
+    audio/
+        50_1000_3sec/
+            audio.mp3
+            samples.jsonl
+    images/
+        000000/
+            00_raw.png
+            01_cropped.png
+            02_smask.png
+            03_smask.npy
+            04_overhead_with_smask.png
+            samples.jsonl
+    samples/
+        000000/
+            laser/
+                00_roi_rows.png
+                01_roi_cols.png
+                02_roi.png
+                03_speckles.png
+            image/
+                00_raw.png
+                01_cropped.png
+                02_smask.png
+                03_smask.npy
+                04_overhead_with_smask.png
+                05_overhead_with_speaker.png
+            vibration/
+                00_raw_vibrations.npy
+                01_raw_shifts.npy
+                02_clean_shifts.npy
+                03_fft.npz
+                04_recovered_audio.mp3
+            audio.mp3
+            recovered_audio.mp3
+            overhead.png
+            times.jsonl
+            metadata.jsonl
+```
+
+```
+dataset_dir/
+    dataset-1/
+        samples/
+            000000/
+                laser/
+                    00_roi_rows.png
+                    01_roi_cols.png
+                    02_roi_grid.png
+                    03_speckles.png
+                image/
+                    00_raw.png
+                    01_cropped.png
+                    02_smask.png
+                    03_smask.npy
+                    04_overhead_with_smask.png
+                    05_overhead_with_speaker.png
+                    06_downsampled_smask.png
+                    07_downsampled_smask.npy
+                vibration/
+                    00_raw_vibrations.npy
+                    01_raw_shifts.npy
+                    02_clean_shifts.npy
+                    03_fft.npz
+                    04_recovered_audio.wav
+                    05_signaled_fft.npy
+                    06_normalized_fft.npy
+                    07_tokenized_fft.npy
+                audio.mp3
+                recovered_audio.mp3
+                overhead.png
+                metadata.jsonl
+                times.jsonl
+                X.npy
+                Y.npy
+        mds/ 			
+            metadata.jsonl
+            index.jsonl
+            shards_00.jsonl
+            shards_01.jsonl
+            shards_02.jsonl
+```

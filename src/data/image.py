@@ -1,3 +1,5 @@
+"""Take overhead image of what's in the box, segment it, and process it."""
+
 from pathlib import Path
 from datetime import datetime, timezone
 

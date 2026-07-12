@@ -9,7 +9,6 @@ media/
 artifacts/
 runs/
 tmp/
-data/
 data-denotched/
 
 # Byte-compiled / optimized / DLL files
