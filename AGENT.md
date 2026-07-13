@@ -20,7 +20,9 @@ Our processed dataset is (`fft`, `smask`).
 
 We then train a model to predict `smask` given `fft`.
 
-Our data is stored as
+To see how the data is strucutred, read `data/README.md`.
+
+Logs about the data can be found in `experiment_dir/logs.md` and in `modal app APP-ID logs`. These logs should be the first place you check when there is an issue with data processing.
 
 # Literature
 Previosuly, my lab predicted how much liquid is in a container from the vibrations `assets\Kichler_Learning_to_See_Inside_Opaque_Liquid_Containers_using_Speckle_Vibrometry_ICCV_2025_paper.pdf`. This was a classification problem. We are now trying to do a generation problem. We use the same physical setup from the experiment.

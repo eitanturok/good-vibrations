@@ -20,7 +20,9 @@ from pathlib import Path
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor
 
-sys.path.insert(0, str(Path(__file__).parent))
+REPO = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO))           # utils.*
+sys.path.insert(0, str(REPO / "src"))   # data.*
 
 import modal
 from utils.io_utils import Timing, modal_upload, modal_download, fix_symlinks, append, load

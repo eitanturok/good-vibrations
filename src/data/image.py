@@ -1,5 +1,6 @@
 """Take overhead image of what's in the box, segment it, and process it."""
 
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from datetime import datetime, timezone
 
@@ -38,10 +39,17 @@ def segment(image: Image.Image, objects: dict[str, int], prompts: dict[str, str]
 
     if is_empty_box: return _organize(object_names, [[(0.0, np.zeros(4), np.zeros((h, w), dtype=bool))] * c for c in counts])
 
-    # launch non-blocking parallel segmention on modal
+    # launch parallel segmentation on modal via threads + .remote(), not .spawn()+.get():
+    # .spawn()+.get() polls Modal's control plane for the result rather than holding a live
+    # connection, which measured 3-5s of overhead per call even on an already-warm container
+    # (vs ~0.7-0.9s for .remote()) -- see segment2_results.md. Real threads give the same
+    # parallelism across objects without that polling tax.
+    # top_k=count filters to the top-scoring detections server-side, before the result gets
+    # serialized -- shipping all ~200 raw candidate masks over the network when only `count`
+    # are ever used cost 10s+ per call for nothing (see segment2.py's payload_size_test).
     segmenter = modal.Cls.from_name("segment", "Segmenter")()
-    calls = [segmenter.run.spawn(image, prompts[t], scale=segment_scale) for t in object_names] # non-blocking, parallel
-    outs = [call.get() for call in calls] # block until all are done
+    with ThreadPoolExecutor(max_workers=len(object_names)) as executor:
+        outs = list(executor.map(lambda args: segmenter.run.remote(image, prompts[args[0]], scale=segment_scale, top_k=args[1]), zip(object_names, counts)))
 
     all_detections = []
     for out, count in zip(outs, counts):

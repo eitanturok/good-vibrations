@@ -21,6 +21,7 @@ modal_image = (
     .apt_install("git")
     .pip_install("transformers", "Pillow", "torch", "torchvision", "accelerate")
     .run_function(_download_sam3_weights, secrets=[modal.Secret.from_name("huggingface")])
+    .env({"HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1"})  # after baking -- offline mode would break the download step itself
 )
 
 # ***** old SAM3-image-model Segmenter: always collapses to a single top-1 mask, kept for reference *****
@@ -60,14 +61,24 @@ modal_image = (
 class Segmenter:
     @modal.enter()
     def load(self):
+        """Cold-start optimizations (measured ~2x faster @modal.enter(), see segment2_results.md):
+        - direct submodule imports instead of top-level `transformers` (skips its lazy
+          cross-architecture registry scan just to resolve two class names).
+        - HF_HUB_OFFLINE/TRANSFORMERS_OFFLINE (set on modal_image) so from_pretrained() can't
+          attempt any network metadata check even though the checkpoint is already baked in.
+        - load weights directly in bf16 (torch_dtype=) straight onto the GPU (device_map=),
+          instead of loading fp32 on CPU then a separate .to(device) call.
+        """
         import time
         t0 = time.perf_counter()
 
         import torch
         print(f"[timing] import torch: {time.perf_counter()-t0:.3f}s", flush=True); t1 = time.perf_counter()
 
-        from transformers import Sam3Model, Sam3Processor
-        print(f"[timing] import transformers Sam3Model/Sam3Processor: {time.perf_counter()-t1:.3f}s", flush=True); t1 = time.perf_counter()
+        # much faster than `import transformers`b/c transformers is a huge package
+        from transformers.models.sam3.modeling_sam3 import Sam3Model
+        from transformers.models.sam3.processing_sam3 import Sam3Processor
+        print(f"[timing] import Sam3Model/Sam3Processor (direct submodule, not top-level transformers): {time.perf_counter()-t1:.3f}s", flush=True); t1 = time.perf_counter()
 
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         print(f"[timing] torch.cuda.is_available() check (device={self.device}): {time.perf_counter()-t1:.3f}s", flush=True); t1 = time.perf_counter()
@@ -75,12 +86,9 @@ class Segmenter:
         self.processor = Sam3Processor.from_pretrained("facebook/sam3")
         print(f"[timing] Sam3Processor.from_pretrained: {time.perf_counter()-t1:.3f}s", flush=True); t1 = time.perf_counter()
 
-        model = Sam3Model.from_pretrained("facebook/sam3")
-        print(f"[timing] Sam3Model.from_pretrained (read weights from local disk + build module tree): {time.perf_counter()-t1:.3f}s", flush=True); t1 = time.perf_counter()
-
-        self.model = model.to(self.device)
+        self.model = Sam3Model.from_pretrained("facebook/sam3", torch_dtype=torch.bfloat16, device_map=self.device)
         if self.device == "cuda": torch.cuda.synchronize()
-        print(f"[timing] model.to({self.device!r}) (transfer weights over PCIe to GPU memory): {time.perf_counter()-t1:.3f}s", flush=True); t1 = time.perf_counter()
+        print(f"[timing] Sam3Model.from_pretrained (bf16, device_map={self.device!r} -- loads straight onto GPU): {time.perf_counter()-t1:.3f}s", flush=True)
 
         print(f"[timing] TOTAL @modal.enter() load(): {time.perf_counter()-t0:.3f}s", flush=True)
 
@@ -100,7 +108,7 @@ class Segmenter:
         mask_image = mask_image.resize(self.original_size, resample=Image.NEAREST)
         return np.array(mask_image) > 0
 
-    def inference(self, image: np.ndarray, prompt: str, input_boxes: list | None = None, input_boxes_labels: list | None = None) -> dict:
+    def inference(self, image: np.ndarray, prompt: str, input_boxes: list | None = None, input_boxes_labels: list | None = None, top_k: int | None = None) -> dict:
         """Run SAM3 on an already-downsampled image array, prompted by text and/or boxes.
 
         Returns a dict with:
@@ -114,6 +122,7 @@ class Segmenter:
 
         t0 = time.perf_counter()
         inputs = self.processor(images=image, text=prompt, return_tensors="pt", input_boxes=[input_boxes] if input_boxes else None, input_boxes_labels=[input_boxes_labels] if input_boxes_labels else None,).to(self.device)
+        inputs["pixel_values"] = inputs["pixel_values"].to(torch.bfloat16)  # match bf16 model weights
         if self.device == "cuda": torch.cuda.synchronize()
         print(f"[timing] processor(...) preprocessing + .to(device): {time.perf_counter()-t0:.3f}s", flush=True); t1 = time.perf_counter()
 
@@ -122,13 +131,22 @@ class Segmenter:
         print(f"[timing] model forward pass: {time.perf_counter()-t1:.3f}s", flush=True); t1 = time.perf_counter()
 
         result = self.processor.post_process_instance_segmentation(outputs, threshold=0.0, mask_threshold=0.5, target_sizes=inputs["original_sizes"].tolist())[0]
-        result = {k: v.float().cpu().numpy() if torch.is_tensor(v) else v for k, v in result.items()}
-        print(f"[timing] post_process_instance_segmentation + .cpu().numpy(): {time.perf_counter()-t1:.3f}s", flush=True)
+
+        if top_k is not None and len(result["scores"]) > top_k:
+            order = torch.argsort(result["scores"], descending=True)[:top_k]
+            result = {k: v[order] for k, v in result.items()}
+
+        result = {
+            "scores": result["scores"].float().cpu().numpy(),
+            "boxes": result["boxes"].float().cpu().numpy(),
+            "masks": result["masks"].cpu().numpy().astype(bool),  # bool not float32: already binarized by mask_threshold, 4x smaller
+        }
+        print(f"[timing] post_process_instance_segmentation + top_k filter + .cpu().numpy(): {time.perf_counter()-t1:.3f}s", flush=True)
         print(f"[timing] TOTAL inference(): {time.perf_counter()-t0:.3f}s", flush=True)
         return result
 
     @modal.method()
-    def run(self, image: Image.Image, prompt: str, input_boxes: list | None = None, input_boxes_labels: list | None = None, scale: float = 1.0) -> dict:
+    def run(self, image: Image.Image, prompt: str, input_boxes: list | None = None, input_boxes_labels: list | None = None, scale: float = 1.0, top_k: int | None = None) -> dict:
         """Downsample the image, run inference, then upsample the resulting masks back to the original resolution."""
 
         # downsample so SAM-3 inference runs faster
@@ -136,9 +154,9 @@ class Segmenter:
         scaled_boxes = [[x1 * self.scale, y1 * self.scale, x2 * self.scale, y2 * self.scale] for x1, y1, x2, y2 in input_boxes] if input_boxes else None
 
         # inference: only convert to a numpy array right before calling the model
-        result = self.inference(image=np.array(downsampled), prompt=prompt, input_boxes=scaled_boxes, input_boxes_labels=input_boxes_labels)
+        result = self.inference(image=np.array(downsampled), prompt=prompt, input_boxes=scaled_boxes, input_boxes_labels=input_boxes_labels, top_k=top_k)
 
-        # upsample
+        # upsample (only top_k masks now, not all ~200 candidates)
         result["masks"] = np.stack([self.upsample(mask) for mask in result["masks"]]) if len(result["masks"]) else result["masks"]
         result["boxes"] = result["boxes"] / self.scale
         return result

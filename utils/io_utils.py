@@ -209,7 +209,7 @@ def preview_vibration_video(frame_recording):
     video_player       = videoPlayerv2(get_frame_func,N_frames,resize_factor=resize_factor)
     video_player.play_video(move_window=0,show_frame_number=show_frame_number)
 
-def get_box_coverage_key(metadata, mask): return (metadata['box'], metadata['object'], metadata['n_objects'], mask.shape)
+def get_box_coverage_key(metadata, mask): return (metadata['box'], str(metadata['objects'] if 'objects' in metadata else metadata['object']), metadata['n_objects'], mask.shape)
 
 def _draw_box_coverage(ax, box_coverage, sample_dir):
     metadata = {'sample_id': ''} if sample_dir is None else {k: v for d in load(sample_dir / "metadata.jsonl") for k, v in d.items()}
