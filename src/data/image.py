@@ -27,24 +27,33 @@ def resize(image: Image.Image, left: float, right: float, up: float, down: float
 
 #***** 2 segment image on modal *****
 
-def segment(image: Image.Image, prompt: str, is_empty_box: bool) -> Image.Image:
-    """Segment an image. Returns a grayscale PIL image — white (255) where the object is, black (0) elsewhere."""
-    # Connect to modal app
-    segmenter = modal.Cls.from_name("segment", "Segmenter")()
-    # segment
-    image = np.array(image.convert("RGB"), dtype=np.uint8)
-    mask = np.zeros(image.shape[:2]) if is_empty_box else segmenter.run.remote(image, prompt)
-    return Image.fromarray(mask.astype(np.uint8) * 255, mode="L")
+def segment(segmenter, image: Image.Image, prompt: str, count: int, input_boxes: list | None = None, input_boxes_labels: list | None = None, scale: float = 1.0) -> list[tuple[float, np.ndarray, np.ndarray]]:
+    """Call Segmenter.run.remote() once for this prompt (one object type),
+    then return its top `count` detections ranked by score, highest first --
+    e.g. count=2 picks out the two distinct highest-scoring cubes from one
+    "black cube" call, rather than calling twice and getting the same cube
+    both times. Padded with placeholders (score=0.0, empty box, all-False
+    mask) if fewer than `count` are found."""
+    w, h = image.size
+    out = segmenter.run.remote(image, prompt, input_boxes, input_boxes_labels, scale)
+    order = np.argsort(out["scores"])[::-1][:count]
+    detections = [(float(out["scores"][i]), np.asarray(out["boxes"][i]), np.asarray(out["masks"][i], dtype=bool)) for i in order]
+    detections += [(0.0, np.zeros(4), np.zeros((h, w), dtype=bool))] * (count - len(detections))
+    return detections
 
 #***** 3 center of mass *****
 
-def center_of_mass(mask: Image.Image) -> tuple[float, float]:
-    """Return (row, col) center of mass of a mask with values in [0, 1]."""
-    mask = np.array(mask, dtype=np.float32) / 255.0
+def center_of_mass(mask: np.ndarray) -> tuple[float, float]:
+    """Return (row, col) center of mass of a mask array. Callers must pass a
+    numpy array (cast with np.array(...) first if starting from a PIL Image).
+    Values normalized by /255 if they look like 0-255, otherwise used as-is."""
+    mask = mask.astype(np.float32)
+    if mask.max() > 1.0: mask = mask / 255.0
     H, W = mask.shape
     rows = np.arange(H)
     cols = np.arange(W)
     total = mask.sum()
+    if total == 0: return (-1.0, -1.0)
     row = (mask * rows[:, None]).sum() / total
     col = (mask * cols[None, :]).sum() / total
     return row.item(), col.item()
@@ -126,6 +135,8 @@ def draw_speaker(overhead: Image.Image, speaker: int | None = None) -> Image.Ima
 #***** 6 group each stage of the pipeline; add timing, save to files ******
 
 DEFAULT_PROMPT = "A black metal cube sitting on the floor of an open cardboard box from a bird's eye view."
+DEFAULT_OBJECTS = {"cube": 1}
+DEFAULT_PROMPTS = {"cube": DEFAULT_PROMPT}
 
 def capture_overhead(overhead_cam, capture_image_fxn, output_dir:Path, verbose:int=1, do_save:bool=1) -> Image.Image:
     output_id = output_dir.name
@@ -143,7 +154,9 @@ def save_overhead(image, output_dir:Path, verbose:int=1, do_save:bool=1):
         append({'save_overhead': datetime.now(timezone.utc).isoformat()}, output_dir / 'times.jsonl', do_save)
 
 def process_overhead(raw_overhead: Image.Image, output_dir: Path, left: float = 0.15, right: float = 0.67, up: float = 0.08, down: float = 0.7, max_side:int=256,
-                      prompt: str = DEFAULT_PROMPT, is_empty_box:bool=False, verbose: int = 1, do_save:bool=True):
+                      objects: dict[str, int] = DEFAULT_OBJECTS, prompts: dict[str, str] = DEFAULT_PROMPTS, is_empty_box:bool=False, verbose: int = 1, do_save:bool=True):
+    from src.data.segment import label_map, label_map_image, plot_smask
+
     output_id = output_dir.name
     if verbose >= 2: print(f"[output {output_id}] Box is {'not '*int(not is_empty_box)}empty")
 
@@ -153,40 +166,79 @@ def process_overhead(raw_overhead: Image.Image, output_dir: Path, left: float = 
         save(resized_overhead, output_dir / "01_cropped.png", do_save)
         append({'resized_overhead': datetime.now(timezone.utc).isoformat()}, output_dir / 'times.jsonl', do_save)
 
-    # segment mask on modal with SAM3
-    with Timing(f"[output {output_id}] segment the overhead image: ", enabled=verbose >= 2):
-        segment_mask = segment(resized_overhead, prompt, is_empty_box) # todo: make sync, not async
+    # segment + save each object type, one at a time: run its prompt ONCE and take
+    # the top `count` ranked detections for that type (not `count` separate calls
+    # with the same prompt, which would just find the same object every time),
+    # then immediately write each instance's mask + center of mass + confidence + box
+    with Timing(f"[output {output_id}] segment and save each object: ", enabled=verbose >= 2):
+        segmenter = None if is_empty_box else modal.Cls.from_name("segment", "Segmenter")()
+        h, w = np.array(resized_overhead).shape[:2]
+
+        names, scores, boxes, masks, object_records = [], [], [], [], []
+        for type_name, count in objects.items():
+            # 1. run segmentation once for this object type, ranked top `count` detections
+            detections = [(0.0, np.zeros(4), np.zeros((h, w), dtype=bool))] * count if is_empty_box else segment(segmenter, resized_overhead, prompts[type_name], count)
+
+            for i, (score, box, mask) in enumerate(detections):
+                name = f"{type_name}{i + 1}"
+                names.append(name); scores.append(score); boxes.append(box); masks.append(mask)
+
+                # 2. save this object's mask + metadata
+                save(Image.fromarray((mask * 255).astype(np.uint8), mode="L"), output_dir / f"smasks/{name}.png", do_save)
+                save(mask.astype(np.float32), output_dir / f"smasks/{name}.npy", do_save)
+                com_i = center_of_mass(np.array(mask))
+                object_records.append({"name": name, "com": com_i, "score": float(score), "box": np.asarray(box).tolist()})
+
+        result = {"names": names, "scores": np.array(scores), "boxes": np.stack(boxes), "masks": np.stack(masks)}
+        append(object_records, output_dir / "smasks/metadata.jsonl", do_save)
+        save(label_map_image(result["masks"]), output_dir / "smasks/all.png", do_save)
+        save(label_map(result["masks"]), output_dir / "smasks/all.npy", do_save)
+        append({'segment_and_save': datetime.now(timezone.utc).isoformat()}, output_dir / 'times.jsonl', do_save)
+        if verbose >= 2: print(f"[output {output_id}] {object_records=}")
+
+    # union mask (boolean OR of all object masks) — kept for backward compat
+    with Timing(f"[output {output_id}] union mask of the overhead image: ", enabled=verbose >= 2):
+        union_mask = result["masks"].any(axis=0) if len(result["masks"]) else np.zeros((h, w), dtype=bool)
+        segment_mask = Image.fromarray(union_mask.astype(np.uint8) * 255, mode="L")
         save(segment_mask, output_dir / "02_smask.png", do_save)
-        save(np.array(segment_mask, dtype=np.float32) / 255.0, output_dir / "03_smask.npy", do_save)
-        append({'segment_mask': datetime.now(timezone.utc).isoformat()}, output_dir / 'times.jsonl', do_save)
+        save(union_mask.astype(np.float32), output_dir / "03_smask.npy", do_save)
+        append({'union_mask': datetime.now(timezone.utc).isoformat()}, output_dir / 'times.jsonl', do_save)
 
-    # center of mass
+    # per-object COMs + their average, across all real (non-placeholder) objects
     with Timing(f"[output {output_id}] center of mass of the overhead image: ", enabled=verbose >= 2):
-        com = (-1, -1) if is_empty_box else center_of_mass(segment_mask)
+        real_records = [r for r in object_records if r["score"] > 0]
+        avg_com = (-1.0, -1.0) if not real_records else tuple(np.mean([r["com"] for r in real_records], axis=0))
+        coms = {r["name"]: r["com"] for r in object_records}
         append({'center_of_mass': datetime.now(timezone.utc).isoformat()}, output_dir / 'times.jsonl', do_save)
-        append([{"com": com}], output_dir / "metadata.jsonl", do_save)
-        if verbose >= 2: print(f"[output {output_id}] {com=}")
+        append([{"coms": coms}, {"avg_com": avg_com}], output_dir / "metadata.jsonl", do_save)
+        if verbose >= 2: print(f"[output {output_id}] {coms=} {avg_com=}")
 
-    # make overhead image with segmentation mask and center of mass, but no speaker
+    # make overhead image with segmentation mask and average center of mass, but no speaker
     with Timing(f"[output {output_id}] visualize overhead image: ", enabled=verbose >= 2):
-        overhead_with_smask = draw_mask(resized_overhead, segment_mask, com, is_empty_box)
-        save(overhead_with_smask, output_dir / "04_overhead_with_smask.png", do_save)
-        append({'viz_overhead_with_smask': datetime.now(timezone.utc).isoformat()}, output_dir / 'times.jsonl', do_save)
+        overhead_masked = draw_mask(resized_overhead, segment_mask, avg_com, is_empty_box)
+        save(overhead_masked, output_dir / "04_overhead_masked.png", do_save)
+        append({'viz_overhead_masked': datetime.now(timezone.utc).isoformat()}, output_dir / 'times.jsonl', do_save)
+
+    # make overhead image with masks + boxes + confidence scores for every object
+    with Timing(f"[output {output_id}] score overhead image: ", enabled=verbose >= 2):
+        overhead_scored = plot_smask(result, resized_overhead, result["names"], show=False)
+        save(overhead_scored, output_dir / "05_overhead_scored.png", do_save)
+        append({'viz_overhead_scored': datetime.now(timezone.utc).isoformat()}, output_dir / 'times.jsonl', do_save)
 
     # update tracking status
     append({'process_overhead': datetime.now(timezone.utc).isoformat()}, output_dir / 'times.jsonl', do_save)
 
-    return overhead_with_smask
+    return overhead_scored, result
 
 def make_overhead(sample_dir:Path, output_dir:Path, speaker:int, verbose:int=1, do_save:bool=True) -> Image.Image:
     # add speaker to overhead image with smask, center of mass
     sample_id = sample_dir.name
     with Timing(f"[sample {sample_id}] visualize overhead image: ", enabled=verbose >= 2):
-        overhead_with_smask = load(sample_dir / 'image/04_overhead_with_smask.png', 'image')
-        overhead = draw_speaker(overhead_with_smask, speaker)
-        save(overhead, sample_dir / 'image/05_overhead_with_speaker.png', do_save)
+        overhead_masked = load(sample_dir / 'image/04_overhead_masked.png', 'image')
+        overhead = draw_speaker(overhead_masked, speaker)
+        save(overhead, sample_dir / 'image/06_overhead_speaker.png', do_save)
         timestamp = datetime.now(timezone.utc).isoformat()
-        append({f'viz_overhead_with_smask_and_speaker/sample_{sample_id}': timestamp}, output_dir / 'times.jsonl', do_save)
-        append({f'viz_overhead_with_smask_and_speaker': timestamp}, sample_dir / 'times.jsonl', do_save)
+        append({f'viz_overhead_speaker/sample_{sample_id}': timestamp}, output_dir / 'times.jsonl', do_save)
+        append({f'viz_overhead_speaker': timestamp}, sample_dir / 'times.jsonl', do_save)
 
     return overhead

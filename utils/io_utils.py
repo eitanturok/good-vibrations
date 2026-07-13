@@ -213,7 +213,7 @@ def get_box_coverage_key(metadata, mask): return (metadata['box'], metadata['obj
 
 def _draw_box_coverage(ax, box_coverage, sample_dir):
     metadata = {'sample_id': ''} if sample_dir is None else {k: v for d in load(sample_dir / "metadata.jsonl") for k, v in d.items()}
-    mask = np.array(load(sample_dir / "outputs/02_smask.png"))
+    mask = np.array(load(sample_dir / "image/02_smask.png"))
     key = get_box_coverage_key(metadata, mask)
     box, obj, n_objects, shape = key
     im = ax.imshow(box_coverage[key]['mask'], cmap='Blues')
@@ -238,26 +238,51 @@ def preview_sample_row(sample_overhead, raw_vibrations, box_coverage, sample_dir
 
 def preview_audio(samples, sample_rate): return Audio(samples, rate=sample_rate)
 
+def plot_position(result: dict, image, objects:list[str]|None=None, header:str='', alpha:float=0.45) -> None:
+    """Two-panel figure for one overhead position, styled like preview_sample_row.
+    Left: masks + boxes + confidence labels (plot_smask). Right: the same
+    masks, same colors, no image/boxes/overlap -- what the masks actually
+    look like. header is shown as a bold suptitle (e.g. the output/sample id
+    range). Shown for every new position captured during an experiment."""
+    from src.data.segment import plot_smask, label_map_image
+
+    objects = objects if objects is not None else result["names"]
+    fig, axes = plt.subplots(1, 2, figsize=(20, 10))
+
+    left = plot_smask(result, image, objects, alpha=alpha, show=False)
+    _draw_image(axes[0], left)
+    axes[0].set_title("masks + boxes + confidence")
+
+    _draw_image(axes[1], label_map_image(result["masks"]))
+    axes[1].set_title("masks only")
+
+    if header: fig.suptitle(header, fontsize=14, fontweight='bold', x=0.01, ha='left')
+    fig.tight_layout()
+    plt.show()
+
 def preview(obj, mode):
     if mode == 'image': return preview_image(obj)
     if mode == 'vibration_image': return preview_vibration_image(obj)
     if mode == 'vibration_video': return preview_vibration_video(obj)
     if mode == 'box_coverage': return preview_box_coverage(*obj)
     if mode == 'sample_row': return preview_sample_row(*obj)
+    if mode == 'smask': return plot_position(*obj)
     if mode == 'audio': return preview_audio(*obj)
     else: raise ValueError(f'{mode=} not recognized')
 
 #***** copy to sample helpers *****
 
-SHARED_FILES = ["00_raw.png", "01_cropped.png", "02_smask.png", "03_smask.npy", "04_overhead_with_smask.png"]
+SHARED_FILES = ["00_raw.png", "01_cropped.png", "02_smask.png", "03_smask.npy", "04_overhead_masked.png", "05_overhead_scored.png"]
+SHARED_DIRS = ["smasks"]
 COPIED_FILES = ["times.jsonl", "metadata.jsonl"]
 
 def copy_to_sample(sample_dir:Path, output_dir:Path, audio_dir:Path, speaker:int, do_save:bool=True):
     sample_id = sample_dir.name
 
     # symlink the shared+copy artifacts from output_dir to the current sample_dir
-    assert all((output_dir / a).exists() for a in SHARED_FILES+COPIED_FILES), f"[sample {sample_id}] Missing shared or copied artifact"
+    assert all((output_dir / a).exists() for a in SHARED_FILES+SHARED_DIRS+COPIED_FILES), f"[sample {sample_id}] Missing shared or copied artifact"
     for artifact in SHARED_FILES: symlink(output_dir / artifact, sample_dir / f"image/{artifact}", do_save)
+    for d in SHARED_DIRS: symlink(output_dir / d, sample_dir / f"image/{d}", do_save)
     for artifact in COPIED_FILES: copy(output_dir / artifact, sample_dir / artifact, do_save)
 
     # symlink the audio file from audio_dir to the current sample_dir

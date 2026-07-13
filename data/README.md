@@ -18,15 +18,19 @@ experiment_dir/
             01_cropped.png
             02_smask.png
             03_smask.npy
-            04_overhead_with_smask.png
+            04_overhead_masked.png     (mask overlay + avg COM crosshair, no boxes/confidence)
+            05_overhead_scored.png     (mask + boxes + confidence labels)
             samples.jsonl
             smasks/
                 cube1.png
                 cube1.npy
                 cube2.png
                 cube2.npy
-                all_objs.png
-                all_objs.npy
+                cylinder1.png
+                cylinder1.npy
+                all.png                (all objects, one solid color each, no overlap/boxes)
+                all.npy                (label map: 0=bg, i+1=object i)
+                metadata.jsonl         (per-object: name, com, score, box)
     samples/
         000000/
             laser/
@@ -35,12 +39,14 @@ experiment_dir/
                 02_roi.png
                 03_speckles.png
             image/
-                00_raw.png
-                01_cropped.png
-                02_smask.png
-                03_smask.npy
-                04_overhead_with_smask.png
-                05_overhead_with_speaker.png
+                00_raw.png              (symlink)
+                01_cropped.png          (symlink)
+                02_smask.png            (symlink)
+                03_smask.npy            (symlink)
+                04_overhead_masked.png  (symlink)
+                05_overhead_scored.png  (symlink)
+                06_overhead_speaker.png (adds speaker icon to 04_overhead_masked.png)
+                smasks/                 (symlink to images/000000/smasks/)
             vibration/
                 00_raw_vibrations.npy
                 01_raw_shifts.npy
@@ -50,7 +56,7 @@ experiment_dir/
                 05_recovered_spectogram.png
             audio.wav
             recovered_audio.wav
-            overhead.png
+            overhead.png             (symlink to image/06_overhead_speaker.png)
             times.jsonl
             metadata.jsonl
 ```

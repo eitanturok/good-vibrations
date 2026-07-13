@@ -48,17 +48,17 @@ def process_sample(sample_dir: Path, batch_size: int, pclk_mode: str, do_save: b
         rois = [r for r in rois if (r[2], r[3]) == full]
         print(f"  (batched mode: kept {len(rois)} full-size {full} ROIs)")
 
-    raw = step("load_raw", lambda: load(sample_dir / "inputs/00_raw_vibrations.npy"))
+    raw = step("load_raw", lambda: load(sample_dir / "vibration/00_raw_vibrations.npy"))
     raw_shifts = step("pclk", lambda: get_shifts(raw, rois, batch_size, pclk_mode))          # (L, T, 2)
     clean_shifts = step("clean_shifts", lambda: get_clean_shifts(raw_shifts[None], fps))     # (B, L, T, 2)
     fft, freqs, n_samples = step("fft", lambda: get_fft_shifts(clean_shifts, fps))           # (B, L, F, 2)
     audio = step("recover_audio", lambda: get_recovered_audio(fft, n_samples, fps))
 
     def save_outputs():
-        save(raw_shifts, sample_dir / "inputs/01_raw_shifts.npy", do_save)
-        save(clean_shifts, sample_dir / "inputs/02_clean_shifts.npy", do_save)
-        save({"fft": fft, "freqs": freqs, "n_samples": n_samples}, sample_dir / "inputs/03_fft.npz", do_save)
-        save((audio, 22050), sample_dir / "inputs/04_recovered_audio.wav", do_save)
+        save(raw_shifts, sample_dir / "vibration/01_raw_shifts.npy", do_save)
+        save(clean_shifts, sample_dir / "vibration/02_clean_shifts.npy", do_save)
+        save({"fft": fft, "freqs": freqs, "n_samples": n_samples}, sample_dir / "vibration/03_fft.npz", do_save)
+        save((audio, 22050), sample_dir / "vibration/04_recovered_audio.wav", do_save)
     step("save_outputs", save_outputs)
 
     times["TOTAL"] = sum(times.values())
@@ -73,7 +73,7 @@ def main():
     p.add_argument("--no-save", action="store_true", help="Skip writing pipeline outputs to the sample dirs.")
     args = p.parse_args()
 
-    raw_paths = sorted(Path(args.dir).rglob("**/inputs/00_raw_vibrations.npy"))[: args.n]
+    raw_paths = sorted(Path(args.dir).rglob("**/vibration/00_raw_vibrations.npy"))[: args.n]
     if not raw_paths: sys.exit(f"no raw vibration files found under {args.dir}")
 
     all_times = []
