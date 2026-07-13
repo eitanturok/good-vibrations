@@ -20,6 +20,13 @@ experiment_dir/
             03_smask.npy
             04_overhead_with_smask.png
             samples.jsonl
+            smasks/
+                cube1.png
+                cube1.npy
+                cube2.png
+                cube2.npy
+                all_objs.png
+                all_objs.npy
     samples/
         000000/
             laser/
