@@ -13,6 +13,8 @@ from pathlib import Path
 
 import numpy as np
 
+from utils.metrics import center_of_mass
+
 ROOT = Path(__file__).resolve().parent.parent
 SAMPLES_DIR = ROOT / "data" / "samples"
 RUNS_DIR = ROOT / "runs"
@@ -150,15 +152,6 @@ def fft_curve(sample_id: int, lasers: list[int] | None, dirs: str, norm: bool = 
 
 # ***** runs *****
 
-def _com_rc(mask: np.ndarray) -> np.ndarray:
-    """(N, H, W) -> (N, 2) center of mass as (row, col); matches src3/model.py com()."""
-    h, w = mask.shape[-2:]
-    total = mask.sum(axis=(-2, -1)).clip(min=1e-6)
-    rows = (mask.sum(-1) * np.arange(h)).sum(-1) / total
-    cols = (mask.sum(-2) * np.arange(w)).sum(-1) / total
-    return np.stack([rows, cols], axis=-1)
-
-
 def _run_key(run: str) -> str:
     files = sorted((RUNS_DIR / run / "outputs_history").rglob("*.pt"))
     sig = "|".join(f"{p.relative_to(RUNS_DIR)}:{p.stat().st_mtime:.0f}:{p.stat().st_size}" for p in files)
@@ -186,7 +179,7 @@ def extract_run(run: str) -> dict:
         true = d["mask_true"].float().numpy()
         h, w = pred.shape[-2:]
         mse = ((pred - true) ** 2).mean(axis=(-2, -1))
-        com_p, com_t = _com_rc(pred), _com_rc(true)
+        com_p, com_t = center_of_mass(pred), center_of_mass(true)
         norm = np.array([h - 1, w - 1], dtype=np.float64)
         com_dist = np.linalg.norm((com_p - com_t) / norm, axis=-1)
         com_dist[true.sum(axis=(-2, -1)) <= 0] = np.nan  # metric skips empty GT

@@ -133,32 +133,34 @@ def _rect_overlap(a, b):
     return max(0, min(ax2, bx2) - max(ax1, bx1)) * max(0, min(ay2, by2) - max(ay1, by1))
 
 
-def _label_candidates(x1, y1, x2, y2, label_w, label_h, img_w, img_h):
-    """Up to 12 spots touching one side of the box and otherwise fully
-    outside it: north/south at 3 offsets along that edge, east/west at 3
-    offsets along that edge. Dropped if there's no room in the image."""
+def _label_candidates(x1, y1, x2, y2, label_w, label_h, img_w, img_h, gap):
+    """Up to 12 spots clear of the box by `gap` pixels, touching neither it
+    nor the object it wraps: north/south at 3 offsets along that edge,
+    east/west at 3 offsets along that edge. Dropped if there's no room."""
     candidates = []
-    for y in (y1 - label_h, y2):  # north, south
+    for y in (y1 - label_h - gap, y2 + gap):  # north, south
         if 0 <= y <= img_h - label_h:
             for x in (x1, (x1 + x2 - label_w) / 2, x2 - label_w):
                 candidates.append((max(0, min(x, img_w - label_w)), y))
-    for x in (x2, x1 - label_w):  # east, west
+    for x in (x2 + gap, x1 - label_w - gap):  # east, west
         if 0 <= x <= img_w - label_w:
             for y in (y1, (y1 + y2 - label_h) / 2, y2 - label_h):
                 candidates.append((x, max(0, min(y, img_h - label_h))))
     return candidates
 
 
-def plot_smask(result: dict, image: Image.Image, objects: list[str], score_threshold: float = 0.0, top_k: int | None = None, alpha: float = 0.45, box_width: int = 2, box_padding: int = 10, show: bool = True) -> Image.Image:
+def plot_smask(result: dict, image: Image.Image, objects: list[str], score_threshold: float = 0.0, top_k: int | None = None, alpha: float = 0.3, box_width: int = 2, box_padding: int = 10, label_gap: int = 6, show: bool = True) -> Image.Image:
     """Draw each detected object's mask (alpha-blended, one color per object),
     box, and "<label> <score>" tag directly on `image`. box_padding expands
     each drawn box outward from the mask (in pixels) so the frame doesn't hug
-    the mask edge. Each label is placed at whichever of up to 12 spots around
-    its box overlaps the least other masks/labels, staying fully in bounds.
-    `objects` labels detections in score-descending order (cycled if
-    shorter); top_k defaults to len(objects) so exactly one detection per
-    prompted object is drawn. Set show=False to skip the matplotlib figure
-    and just get the composited PIL image back."""
+    the mask edge; label_gap further clears the label from that padded box
+    (so it's never covered by the box outline). Each label is placed at
+    whichever of up to 12 spots around its box overlaps the least other
+    masks/labels, staying fully in bounds. `objects` labels detections in
+    score-descending order (cycled if shorter); top_k defaults to
+    len(objects) so exactly one detection per prompted object is drawn. Set
+    show=False to skip the matplotlib figure and just get the composited PIL
+    image back."""
     top_k = len(objects) if top_k is None else top_k
     masks, boxes, scores = result["masks"], result["boxes"], result["scores"]
 
@@ -188,8 +190,8 @@ def plot_smask(result: dict, image: Image.Image, objects: list[str], score_thres
 
         text = f"{objects[i % len(objects)]} {_format_score(scores[i])}"
         label_w, label_h = draw.textbbox((0, 0), text, font=font)[2:]
-        candidates = _label_candidates(x1, y1, x2, y2, label_w, label_h, img_w, img_h) or \
-                     [(max(0, min(x1, img_w - label_w)), max(0, min(y1 - label_h, img_h - label_h)))]
+        candidates = _label_candidates(x1, y1, x2, y2, label_w, label_h, img_w, img_h, label_gap) or \
+                     [(max(0, min(x1, img_w - label_w)), min(y2 + label_gap, img_h - label_h))]  # fallback: below the box, never inside it
 
         def overlap(pos):
             rect = (pos[0], pos[1], pos[0] + label_w, pos[1] + label_h)

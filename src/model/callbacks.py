@@ -28,9 +28,7 @@ class VizSegMask:
         return np.array(canvas)
 
     def _render_batch(self, mask_pred: torch.Tensor, mask_true: torch.Tensor, info: dict) -> list[np.ndarray]:
-        h, w = mask_pred.shape[-2:]
-        xs, ys = torch.arange(w).float(), torch.arange(h).float()
-        com_dists = com_distances(mask_pred, mask_true, xs, ys, epsilon=1e-6, normalize=True).numpy()
+        com_dists = com_distances(mask_pred, mask_true, epsilon=1e-6, normalize=True).numpy()
         mse_vals = mses(mask_pred, mask_true).numpy()
         pred_np, true_np = mask_pred.numpy(), mask_true.numpy()
         return [self._render(pred_np, true_np, info, mse_vals, com_dists, i) for i in range(len(pred_np))]

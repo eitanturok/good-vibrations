@@ -228,17 +228,17 @@ def preview_box_coverage(box_coverage, sample_dir):
 def preview_sample_row(sample_overhead, raw_vibrations, box_coverage, sample_dir, header=''):
     fig, axes = plt.subplots(1, 3, figsize=(18, 5))
     _draw_image(axes[0], sample_overhead)
-    axes[0].set_title('Overhead')
+    axes[0].set_title('Overhead Image')
     _draw_vibration_image(axes[1], raw_vibrations)
-    axes[1].set_title('Speckles')
+    axes[1].set_title('Laser Speckles')
     _draw_box_coverage(axes[2], box_coverage, sample_dir)
-    if header: fig.suptitle(header, fontsize=14, fontweight='bold', x=0.01, ha='left')
+    if header: fig.suptitle(header, fontsize=20, fontweight='bold')
     fig.tight_layout()
     plt.show()
 
 def preview_audio(samples, sample_rate): return Audio(samples, rate=sample_rate)
 
-def plot_position(result: dict, image, objects:list[str]|None=None, header:str='', alpha:float=0.45) -> None:
+def plot_position(result: dict, image, objects:list[str]|None=None, header:str='', alpha:float=0.3) -> None:
     """Two-panel figure for one overhead position, styled like preview_sample_row.
     Left: masks + boxes + confidence labels (plot_smask). Right: the same
     masks, same colors, no image/boxes/overlap -- what the masks actually
@@ -247,7 +247,12 @@ def plot_position(result: dict, image, objects:list[str]|None=None, header:str='
     from src.data.segment import plot_smask, label_map_image
 
     objects = objects if objects is not None else result["names"]
-    fig, axes = plt.subplots(1, 2, figsize=(20, 10))
+
+    # size the figure to the image's own aspect ratio so imshow doesn't pad
+    # each panel with blank space above/below to keep a square axes box
+    img_w, img_h = image.size
+    fig_w = 20
+    fig, axes = plt.subplots(1, 2, figsize=(fig_w, fig_w / 2 * img_h / img_w))
 
     left = plot_smask(result, image, objects, alpha=alpha, show=False)
     _draw_image(axes[0], left)
@@ -256,7 +261,7 @@ def plot_position(result: dict, image, objects:list[str]|None=None, header:str='
     _draw_image(axes[1], label_map_image(result["masks"]))
     axes[1].set_title("masks only")
 
-    if header: fig.suptitle(header, fontsize=14, fontweight='bold', x=0.01, ha='left')
+    if header: fig.suptitle(header, fontsize=20, fontweight='bold')
     fig.tight_layout()
     plt.show()
 

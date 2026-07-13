@@ -8,56 +8,33 @@ import numpy as np
 from PIL import Image, ImageDraw
 
 from utils.io_utils import save, load, append, Timing
+from utils.metrics import center_of_mass
 
 
-#***** 1 resize *****
+#***** 1 crop *****
 
-def resize(image: Image.Image, left: float, right: float, up: float, down: float, max_side:int) -> Image.Image:
+def crop(image: Image.Image, left: float, right: float, up: float, down: float, max_side:int) -> Image.Image:
     """Crop so only box in the image. Downscale image so segmentation model inference runs faster."""
     # crop
     w, h = image.size
-    image = image.crop((int(w * left), int(h * up), int(w * right), int(h * down)))
-
-    # downscale image so its longest side <= max_side, preserving aspect ratio
-    w, h = image.size
-    if max(w, h) <= max_side: return image
-    scale = max_side / max(w, h)
-    return image.resize((int(w * scale), int(h * scale)), resample=Image.LANCZOS)
-
+    return image.crop((int(w * left), int(h * up), int(w * right), int(h * down)))
 
 #***** 2 segment image on modal *****
 
-def segment(segmenter, image: Image.Image, prompt: str, count: int, input_boxes: list | None = None, input_boxes_labels: list | None = None, scale: float = 1.0) -> list[tuple[float, np.ndarray, np.ndarray]]:
-    """Call Segmenter.run.remote() once for this prompt (one object type),
-    then return its top `count` detections ranked by score, highest first --
-    e.g. count=2 picks out the two distinct highest-scoring cubes from one
-    "black cube" call, rather than calling twice and getting the same cube
-    both times. Padded with placeholders (score=0.0, empty box, all-False
-    mask) if fewer than `count` are found."""
+def segment(segmenter, image: Image.Image, prompts: list[str], counts: list[int]) -> list[list[tuple[float, np.ndarray, np.ndarray]]]:
+    """Segment every object in parallel on modal."""
     w, h = image.size
-    out = segmenter.run.remote(image, prompt, input_boxes, input_boxes_labels, scale)
-    order = np.argsort(out["scores"])[::-1][:count]
-    detections = [(float(out["scores"][i]), np.asarray(out["boxes"][i]), np.asarray(out["masks"][i], dtype=bool)) for i in order]
-    detections += [(0.0, np.zeros(4), np.zeros((h, w), dtype=bool))] * (count - len(detections))
-    return detections
-
-#***** 3 center of mass *****
-
-def center_of_mass(mask: np.ndarray) -> tuple[float, float]:
-    """Return (row, col) center of mass of a mask array. Callers must pass a
-    numpy array (cast with np.array(...) first if starting from a PIL Image).
-    Values normalized by /255 if they look like 0-255, otherwise used as-is."""
-    mask = mask.astype(np.float32)
-    if mask.max() > 1.0: mask = mask / 255.0
-    H, W = mask.shape
-    rows = np.arange(H)
-    cols = np.arange(W)
-    total = mask.sum()
-    if total == 0: return (-1.0, -1.0)
-    row = (mask * rows[:, None]).sum() / total
-    col = (mask * cols[None, :]).sum() / total
-    return row.item(), col.item()
-
+    # launch non-blocking parallel segmention on modal
+    calls = [segmenter.run.spawn(image, prompt) for prompt in prompts]
+    # block until all the segmention jobs have finished
+    outs = [call.get() for call in calls]
+    results = []
+    for out, count in zip(outs, counts):
+        order = np.argsort(out["scores"])[::-1][:count]
+        detections = [(float(out["scores"][i]), np.asarray(out["boxes"][i]), np.asarray(out["masks"][i], dtype=bool)) for i in order]
+        detections += [(0.0, np.zeros(4), np.zeros((h, w), dtype=bool))] * (count - len(detections))
+        results.append(detections)
+    return results
 
 #***** 4 add smask to overhead image *****
 
@@ -160,25 +137,28 @@ def process_overhead(raw_overhead: Image.Image, output_dir: Path, left: float = 
     output_id = output_dir.name
     if verbose >= 2: print(f"[output {output_id}] Box is {'not '*int(not is_empty_box)}empty")
 
-    # resize image
-    with Timing(f"[output {output_id}] resize the overhead image: ", enabled=verbose >= 2):
-        resized_overhead = resize(raw_overhead, left, right, up, down, max_side)
-        save(resized_overhead, output_dir / "01_cropped.png", do_save)
-        append({'resized_overhead': datetime.now(timezone.utc).isoformat()}, output_dir / 'times.jsonl', do_save)
+    # crop image
+    with Timing(f"[output {output_id}] crop the overhead image: ", enabled=verbose >= 2):
+        cropped_overhead = crop(raw_overhead, left, right, up, down, max_side)
+        save(cropped_overhead, output_dir / "01_cropped.png", do_save)
+        append({'cropped_overhead': datetime.now(timezone.utc).isoformat()}, output_dir / 'times.jsonl', do_save)
 
-    # segment + save each object type, one at a time: run its prompt ONCE and take
-    # the top `count` ranked detections for that type (not `count` separate calls
-    # with the same prompt, which would just find the same object every time),
-    # then immediately write each instance's mask + center of mass + confidence + box
+    # segment every object type in parallel (segment() spawns all types' calls
+    # concurrently), then loop over the results to save each instance's
+    # mask + center of mass + confidence + box
     with Timing(f"[output {output_id}] segment and save each object: ", enabled=verbose >= 2):
-        segmenter = None if is_empty_box else modal.Cls.from_name("segment", "Segmenter")()
-        h, w = np.array(resized_overhead).shape[:2]
+        h, w = np.array(cropped_overhead).shape[:2]
+        type_names = list(objects.keys())
+        counts = [objects[t] for t in type_names]
+
+        if is_empty_box:
+            all_detections = [[(0.0, np.zeros(4), np.zeros((h, w), dtype=bool))] * c for c in counts]
+        else:
+            segmenter = modal.Cls.from_name("segment", "Segmenter")()
+            all_detections = segment(segmenter, cropped_overhead, [prompts[t] for t in type_names], counts)
 
         names, scores, boxes, masks, object_records = [], [], [], [], []
-        for type_name, count in objects.items():
-            # 1. run segmentation once for this object type, ranked top `count` detections
-            detections = [(0.0, np.zeros(4), np.zeros((h, w), dtype=bool))] * count if is_empty_box else segment(segmenter, resized_overhead, prompts[type_name], count)
-
+        for type_name, detections in zip(type_names, all_detections):
             for i, (score, box, mask) in enumerate(detections):
                 name = f"{type_name}{i + 1}"
                 names.append(name); scores.append(score); boxes.append(box); masks.append(mask)
@@ -186,7 +166,7 @@ def process_overhead(raw_overhead: Image.Image, output_dir: Path, left: float = 
                 # 2. save this object's mask + metadata
                 save(Image.fromarray((mask * 255).astype(np.uint8), mode="L"), output_dir / f"smasks/{name}.png", do_save)
                 save(mask.astype(np.float32), output_dir / f"smasks/{name}.npy", do_save)
-                com_i = center_of_mass(np.array(mask))
+                com_i = center_of_mass(mask)
                 object_records.append({"name": name, "com": com_i, "score": float(score), "box": np.asarray(box).tolist()})
 
         result = {"names": names, "scores": np.array(scores), "boxes": np.stack(boxes), "masks": np.stack(masks)}
@@ -215,13 +195,13 @@ def process_overhead(raw_overhead: Image.Image, output_dir: Path, left: float = 
 
     # make overhead image with segmentation mask and average center of mass, but no speaker
     with Timing(f"[output {output_id}] visualize overhead image: ", enabled=verbose >= 2):
-        overhead_masked = draw_mask(resized_overhead, segment_mask, avg_com, is_empty_box)
+        overhead_masked = draw_mask(cropped_overhead, segment_mask, avg_com, is_empty_box)
         save(overhead_masked, output_dir / "04_overhead_masked.png", do_save)
         append({'viz_overhead_masked': datetime.now(timezone.utc).isoformat()}, output_dir / 'times.jsonl', do_save)
 
     # make overhead image with masks + boxes + confidence scores for every object
     with Timing(f"[output {output_id}] score overhead image: ", enabled=verbose >= 2):
-        overhead_scored = plot_smask(result, resized_overhead, result["names"], show=False)
+        overhead_scored = plot_smask(result, cropped_overhead, result["names"], show=False)
         save(overhead_scored, output_dir / "05_overhead_scored.png", do_save)
         append({'viz_overhead_scored': datetime.now(timezone.utc).isoformat()}, output_dir / 'times.jsonl', do_save)
 

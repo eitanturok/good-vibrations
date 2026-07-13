@@ -5,6 +5,7 @@ from composer import ComposerModel
 from torchmetrics import MeanSquaredError, Metric
 
 from model.dataset import DATA_INFO
+from utils.metrics import center_of_mass
 
 #***** 0 helpers *****
 
@@ -27,38 +28,29 @@ def apply_rope(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
 
 #***** 1 metrics *****
 
-def com(mask, xs, ys, epsilon, normalize):
-    total = mask.sum((-2, -1), keepdim=True).clamp(min=epsilon)
-    cx = (xs * mask.sum(-2)).sum(-1) / total.squeeze()
-    cy = (ys * mask.sum(-1)).sum(-1) / total.squeeze()
-    if normalize: cx, cy = cx / (len(xs) - 1), cy / (len(ys) - 1)
-    return torch.stack([cx, cy], dim=-1)
-
-def com_distances(mask_pred, mask_true, xs, ys, epsilon, normalize):
-    com_dist = com(mask_pred, xs, ys, epsilon, normalize) - com(mask_true, xs, ys, epsilon, normalize)
+def com_distances(mask_pred, mask_true, epsilon, normalize):
+    com_dist = center_of_mass(mask_pred, normalize=normalize, epsilon=epsilon) - center_of_mass(mask_true, normalize=normalize, epsilon=epsilon)
     return torch.linalg.norm(com_dist, ord=2, dim=-1)
 
 def mses(mask_pred, mask_true):
     return (mask_pred - mask_true).square().mean(dim=(-2, -1))
 
 class CenterOfMassDistance(Metric):
-    def __init__(self, out_h:int, out_w:int, norm:int=2, epsilon:float=1e-6):
+    def __init__(self, norm:int=2, epsilon:float=1e-6):
         super().__init__()
         self.p, self.epsilon = norm, epsilon
-        self.register_buffer("xs", torch.arange(out_w).float())
-        self.register_buffer("ys", torch.arange(out_h).float())
         self.add_state("total", default=torch.tensor(0.0), dist_reduce_fx="sum")
         self.add_state("count", default=torch.tensor(0), dist_reduce_fx="sum")
 
     def update(self, mask_pred, mask_true):
         valid = mask_true.sum((-2, -1)) > 0  # skip empty ground-truth masks
         if not valid.any(): return
-        com_distances_ = com_distances(mask_pred[valid], mask_true[valid], self.xs, self.ys, self.epsilon, normalize=True)
+        com_distances_ = com_distances(mask_pred[valid], mask_true[valid], self.epsilon, normalize=True)
         self.total, self.count = self.total + com_distances_.sum(), self.count + valid.sum()
 
     def compute(self): return self.total / self.count
 
-def create_metrics(data_info): return {"mse": MeanSquaredError(), 'com-distance': CenterOfMassDistance(data_info['out_h'], data_info['out_w'])}
+def create_metrics(data_info): return {"mse": MeanSquaredError(), 'com-distance': CenterOfMassDistance()}
 
 #***** 2 decoder *****
 
