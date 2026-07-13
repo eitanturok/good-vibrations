@@ -21,20 +21,36 @@ def crop(image: Image.Image, left: float, right: float, up: float, down: float, 
 
 #***** 2 segment image on modal *****
 
-def segment(segmenter, image: Image.Image, prompts: list[str], counts: list[int]) -> list[list[tuple[float, np.ndarray, np.ndarray]]]:
-    """Segment every object in parallel on modal."""
+def _organize(object_names, all_detections):
+    names, scores, boxes, masks = [], [], [], []
+    for object_name, detections in zip(object_names, all_detections):
+        for i, (score, box, mask) in enumerate(detections):
+            name = f"{object_name}{i + 1}"
+            names.append(name); scores.append(score); boxes.append(box); masks.append(mask)
+    return {"names": names, "scores": np.array(scores), "boxes": np.stack(boxes), "masks": np.stack(masks)}
+
+
+def segment(image: Image.Image, objects: dict[str, int], prompts: dict[str, str], is_empty_box: bool = False, segment_scale: float = 1.0) -> dict:
+    """Segment every object in parallel on modal and return the flattened per-instance {names, scores, boxes, masks} dict. """
     w, h = image.size
+    object_names = list(objects.keys())
+    counts = [objects[t] for t in object_names]
+
+    if is_empty_box: return _organize(object_names, [[(0.0, np.zeros(4), np.zeros((h, w), dtype=bool))] * c for c in counts])
+
     # launch non-blocking parallel segmention on modal
-    calls = [segmenter.run.spawn(image, prompt) for prompt in prompts]
-    # block until all the segmention jobs have finished
-    outs = [call.get() for call in calls]
-    results = []
+    segmenter = modal.Cls.from_name("segment", "Segmenter")()
+    calls = [segmenter.run.spawn(image, prompts[t], scale=segment_scale) for t in object_names] # non-blocking, parallel
+    outs = [call.get() for call in calls] # block until all are done
+
+    all_detections = []
     for out, count in zip(outs, counts):
         order = np.argsort(out["scores"])[::-1][:count]
         detections = [(float(out["scores"][i]), np.asarray(out["boxes"][i]), np.asarray(out["masks"][i], dtype=bool)) for i in order]
         detections += [(0.0, np.zeros(4), np.zeros((h, w), dtype=bool))] * (count - len(detections))
-        results.append(detections)
-    return results
+        all_detections.append(detections)
+
+    return _organize(object_names, all_detections)
 
 #***** 4 add smask to overhead image *****
 
@@ -53,12 +69,16 @@ def draw_mask(overhead: Image.Image, segment_mask: Image.Image, com: tuple[float
     W, H = overhead.size
 
     # crosshair at center of mass (com is in mask coordinates — scale to image size)
+    draw = ImageDraw.Draw(overhead)
     if not is_empty_box:
-        draw = ImageDraw.Draw(overhead)
         cx, cy = int(com[1]), int(com[0])
         r = max(3, W // 60)
         draw.line([(cx - r, cy), (cx + r, cy)], fill=(144, 238, 144, 255), width=2)
         draw.line([(cx, cy - r), (cx, cy + r)], fill=(144, 238, 144, 255), width=2)
+
+    # image resolution, bottom-right corner
+    pad = max(4, W // 100)
+    draw.text((W - pad, H - pad), f"{W}×{H}", fill=(255, 255, 255, 255), anchor="rd")
 
     return overhead.convert("RGB")
 
@@ -131,7 +151,7 @@ def save_overhead(image, output_dir:Path, verbose:int=1, do_save:bool=1):
         append({'save_overhead': datetime.now(timezone.utc).isoformat()}, output_dir / 'times.jsonl', do_save)
 
 def process_overhead(raw_overhead: Image.Image, output_dir: Path, left: float = 0.15, right: float = 0.67, up: float = 0.08, down: float = 0.7, max_side:int=256,
-                      objects: dict[str, int] = DEFAULT_OBJECTS, prompts: dict[str, str] = DEFAULT_PROMPTS, is_empty_box:bool=False, verbose: int = 1, do_save:bool=True):
+                      objects: dict[str, int] = DEFAULT_OBJECTS, prompts: dict[str, str] = DEFAULT_PROMPTS, is_empty_box:bool=False, segment_scale: float = 1.0, verbose: int = 1, do_save:bool=True):
     from src.data.segment import label_map, label_map_image, plot_smask
 
     output_id = output_dir.name
@@ -143,33 +163,16 @@ def process_overhead(raw_overhead: Image.Image, output_dir: Path, left: float = 
         save(cropped_overhead, output_dir / "01_cropped.png", do_save)
         append({'cropped_overhead': datetime.now(timezone.utc).isoformat()}, output_dir / 'times.jsonl', do_save)
 
-    # segment every object type in parallel (segment() spawns all types' calls
-    # concurrently), then loop over the results to save each instance's
-    # mask + center of mass + confidence + box
-    with Timing(f"[output {output_id}] segment and save each object: ", enabled=verbose >= 2):
-        h, w = np.array(cropped_overhead).shape[:2]
-        type_names = list(objects.keys())
-        counts = [objects[t] for t in type_names]
+    # segment image
+    with Timing(f"[output {output_id}] segment the image: ", enabled=verbose >= 2):
+        result = segment(cropped_overhead, objects, prompts, is_empty_box, segment_scale)
 
-        if is_empty_box:
-            all_detections = [[(0.0, np.zeros(4), np.zeros((h, w), dtype=bool))] * c for c in counts]
-        else:
-            segmenter = modal.Cls.from_name("segment", "Segmenter")()
-            all_detections = segment(segmenter, cropped_overhead, [prompts[t] for t in type_names], counts)
+        for name, mask in zip(result["names"], result["masks"]):
+            save(Image.fromarray((mask * 255).astype(np.uint8), mode="L"), output_dir / f"smasks/{name}.png", do_save)
+            save(mask.astype(np.float32), output_dir / f"smasks/{name}.npy", do_save)
 
-        names, scores, boxes, masks, object_records = [], [], [], [], []
-        for type_name, detections in zip(type_names, all_detections):
-            for i, (score, box, mask) in enumerate(detections):
-                name = f"{type_name}{i + 1}"
-                names.append(name); scores.append(score); boxes.append(box); masks.append(mask)
-
-                # 2. save this object's mask + metadata
-                save(Image.fromarray((mask * 255).astype(np.uint8), mode="L"), output_dir / f"smasks/{name}.png", do_save)
-                save(mask.astype(np.float32), output_dir / f"smasks/{name}.npy", do_save)
-                com_i = center_of_mass(mask)
-                object_records.append({"name": name, "com": com_i, "score": float(score), "box": np.asarray(box).tolist()})
-
-        result = {"names": names, "scores": np.array(scores), "boxes": np.stack(boxes), "masks": np.stack(masks)}
+        object_records = [{"name": name, "com": center_of_mass(mask), "score": float(score), "box": np.asarray(box).tolist()}
+                           for name, score, box, mask in zip(result["names"], result["scores"], result["boxes"], result["masks"])]
         append(object_records, output_dir / "smasks/metadata.jsonl", do_save)
         save(label_map_image(result["masks"]), output_dir / "smasks/all.png", do_save)
         save(label_map(result["masks"]), output_dir / "smasks/all.npy", do_save)
@@ -178,7 +181,7 @@ def process_overhead(raw_overhead: Image.Image, output_dir: Path, left: float = 
 
     # union mask (boolean OR of all object masks) — kept for backward compat
     with Timing(f"[output {output_id}] union mask of the overhead image: ", enabled=verbose >= 2):
-        union_mask = result["masks"].any(axis=0) if len(result["masks"]) else np.zeros((h, w), dtype=bool)
+        union_mask = result["masks"].any(axis=0)
         segment_mask = Image.fromarray(union_mask.astype(np.uint8) * 255, mode="L")
         save(segment_mask, output_dir / "02_smask.png", do_save)
         save(union_mask.astype(np.float32), output_dir / "03_smask.npy", do_save)
