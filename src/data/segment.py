@@ -7,11 +7,20 @@ from PIL import Image, ImageDraw, ImageFont
 
 app = modal.App("segment")
 
+
+def _download_sam3_weights():
+    """Runs once at image build time so the ~3GB checkpoint is baked into the image layer."""
+    from transformers import Sam3Model, Sam3Processor
+    Sam3Processor.from_pretrained("facebook/sam3")
+    Sam3Model.from_pretrained("facebook/sam3")
+
+
 modal_image = (
     modal.Image.from_registry("nvidia/cuda:12.8.0-devel-ubuntu22.04", add_python="3.12")
     .entrypoint([])
     .apt_install("git")
     .pip_install("transformers", "Pillow", "torch", "torchvision", "accelerate")
+    .run_function(_download_sam3_weights, secrets=[modal.Secret.from_name("huggingface")])
 )
 
 # ***** old SAM3-image-model Segmenter: always collapses to a single top-1 mask, kept for reference *****
@@ -51,12 +60,29 @@ modal_image = (
 class Segmenter:
     @modal.enter()
     def load(self):
+        import time
+        t0 = time.perf_counter()
+
         import torch
+        print(f"[timing] import torch: {time.perf_counter()-t0:.3f}s", flush=True); t1 = time.perf_counter()
+
         from transformers import Sam3Model, Sam3Processor
+        print(f"[timing] import transformers Sam3Model/Sam3Processor: {time.perf_counter()-t1:.3f}s", flush=True); t1 = time.perf_counter()
 
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        print(f"[timing] torch.cuda.is_available() check (device={self.device}): {time.perf_counter()-t1:.3f}s", flush=True); t1 = time.perf_counter()
+
         self.processor = Sam3Processor.from_pretrained("facebook/sam3")
-        self.model = Sam3Model.from_pretrained("facebook/sam3").to(self.device)
+        print(f"[timing] Sam3Processor.from_pretrained: {time.perf_counter()-t1:.3f}s", flush=True); t1 = time.perf_counter()
+
+        model = Sam3Model.from_pretrained("facebook/sam3")
+        print(f"[timing] Sam3Model.from_pretrained (read weights from local disk + build module tree): {time.perf_counter()-t1:.3f}s", flush=True); t1 = time.perf_counter()
+
+        self.model = model.to(self.device)
+        if self.device == "cuda": torch.cuda.synchronize()
+        print(f"[timing] model.to({self.device!r}) (transfer weights over PCIe to GPU memory): {time.perf_counter()-t1:.3f}s", flush=True); t1 = time.perf_counter()
+
+        print(f"[timing] TOTAL @modal.enter() load(): {time.perf_counter()-t0:.3f}s", flush=True)
 
     def downsample(self, image: Image.Image, scale: float) -> Image.Image:
         """Resize both sides by scale (e.g. 0.25 shrinks each side to a quarter),
@@ -83,11 +109,22 @@ class Segmenter:
               per kept instance, in the input image's coordinates.
             - masks (np.ndarray): binary mask per kept instance, shape (num_instances, height, width).
         """
+        import time
         import torch
+
+        t0 = time.perf_counter()
         inputs = self.processor(images=image, text=prompt, return_tensors="pt", input_boxes=[input_boxes] if input_boxes else None, input_boxes_labels=[input_boxes_labels] if input_boxes_labels else None,).to(self.device)
+        if self.device == "cuda": torch.cuda.synchronize()
+        print(f"[timing] processor(...) preprocessing + .to(device): {time.perf_counter()-t0:.3f}s", flush=True); t1 = time.perf_counter()
+
         with torch.no_grad(): outputs = self.model(**inputs)
+        if self.device == "cuda": torch.cuda.synchronize()
+        print(f"[timing] model forward pass: {time.perf_counter()-t1:.3f}s", flush=True); t1 = time.perf_counter()
+
         result = self.processor.post_process_instance_segmentation(outputs, threshold=0.0, mask_threshold=0.5, target_sizes=inputs["original_sizes"].tolist())[0]
         result = {k: v.float().cpu().numpy() if torch.is_tensor(v) else v for k, v in result.items()}
+        print(f"[timing] post_process_instance_segmentation + .cpu().numpy(): {time.perf_counter()-t1:.3f}s", flush=True)
+        print(f"[timing] TOTAL inference(): {time.perf_counter()-t0:.3f}s", flush=True)
         return result
 
     @modal.method()
