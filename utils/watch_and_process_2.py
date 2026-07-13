@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
-"""Two-pool vibration watcher.
+"""Watch a directory for raw vibration captures and process them with pclk, either
+locally or on Modal.
 
-Decouples the bandwidth-bound UPLOAD from the GPU COMPUTE (Modal) and DOWNLOAD so
-no thread ever blocks on remote processing:
+Local: pclk saturates the GPU on its own (batched_optimized batches all ROIs into
+one call), so a single background worker processes samples one at a time — extra
+threads would just contend for VRAM, not add throughput.
 
-  upload pool    : raw file ready -> upload -> spawn modal job (non-blocking)
-  download poller: cheaply polls each running job; the instant one finishes,
-                   hands the (small) download to the download pool
-
-One `jobs` dict is the single source of truth (mirrored to jobs.jsonl for crash
-recovery + idempotency). Separate --upload-workers / --download-workers knobs.
+Modal: upload (bandwidth-bound) and remote compute are decoupled into two pools so
+neither blocks the other — upload workers spawn jobs and move on; a poller hands
+each finished job to a download worker as soon as it's ready.
 """
 import sys
 import time
+import queue
 import argparse
 import threading
 import traceback
@@ -24,7 +24,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 import modal
 from utils.io_utils import Timing, modal_upload, modal_download, fix_symlinks, append, load
-from data.vibrations_pipeline import app, volume, process_vibrations_modal, VIBRATION_FILES
+from data.vibrate import app, volume, process_vibrations, _process_vibrations_modal, VIBRATION_FILES
 
 MIN_READY_BYTES = 1 * 2**20  # reject files caught mid-write at a few KB/MB
 
@@ -37,134 +37,171 @@ def is_file_ready(path: Path, check_interval: float = 1.0) -> bool:
     except (OSError, PermissionError):
         return False  # locked by the writer; retry next tick
 
-def poll_status(call_id: str) -> tuple[str, tuple[str, str] | None]:
-    """get(timeout=0) IS the done-check: returns if finished, raises TimeoutError if
-    still running, raises the remote error if the job crashed. On failure the returned
-    error is (message, traceback) so the poller can persist why the job died."""
-    try:
-        modal.FunctionCall.from_id(call_id).get(timeout=0)
-        return "done", None
-    except modal.exception.TimeoutError:
-        return "running", None
-    except Exception as e:
-        return "failed", (f"{type(e).__name__}: {e}", traceback.format_exc())
+class LocalEngine:
+    """Runs pclk on this machine's GPU. One worker: batched_optimized already
+    saturates the GPU per-sample, so concurrent samples would only add VRAM
+    contention, not speed."""
+    def __init__(self, pclk_mode: str, pclk_batch_size: int, verbose: int):
+        self.pclk_mode, self.pclk_batch_size, self.verbose = pclk_mode, pclk_batch_size, verbose
+        self.q: queue.Queue[Path] = queue.Queue()
+        self.done = set()
+        threading.Thread(target=self._worker, daemon=True).start()
+
+    def submit(self, sample_dir: Path):
+        if sample_dir.name in self.done: return
+        self.done.add(sample_dir.name)
+        self.q.put(sample_dir)
+
+    def _worker(self):
+        while True:
+            sample_dir = self.q.get()
+            sid = sample_dir.name
+            try:
+                process_vibrations(sample_dir, use_modal=False, pclk_mode=self.pclk_mode,
+                                    pclk_batch_size=self.pclk_batch_size, do_save=True, verbose=self.verbose)
+                print(f"✅ [sample {sid}] complete.")
+            except Exception as e:
+                print(f"❌ [sample {sid}] local processing failed: {e}", file=sys.stderr)
+                traceback.print_exc()
+
+class ModalEngine:
+    """Two-pool upload/spawn/poll/download so the bandwidth-bound upload never
+    blocks on remote GPU compute, and results download the moment they're ready."""
+    def __init__(self, pclk_mode: str, pclk_batch_size: int, verbose: int, watch_path: Path,
+                 upload_workers: int, download_workers: int, poll_rate: float):
+        self.pclk_mode, self.pclk_batch_size, self.verbose = pclk_mode, pclk_batch_size, verbose
+        self.poll_rate = poll_rate
+        self.ledger_path = watch_path / "jobs.jsonl"
+        self.failed_path = watch_path / "failed_samples.jsonl"
+        self.jobs = {}       # sample_id -> {"status", "call_id", "sample_dir"}
+        self.lock = threading.Lock()
+        if self.ledger_path.exists():
+            latest = {r["sample_id"]: r for r in load(self.ledger_path)}
+            self.jobs.update({sid: {k: r[k] for k in ("status", "call_id", "sample_dir")}
+                               for sid, r in latest.items() if r["status"] in ("done", "running")})
+            running = sum(j["status"] == "running" for j in self.jobs.values())
+            if running: print(f"🔄 reconnected to {running} in-flight modal job(s) from ledger.")
+
+        self.upload_pool = ThreadPoolExecutor(max_workers=upload_workers, thread_name_prefix="up")
+        self.download_pool = ThreadPoolExecutor(max_workers=download_workers, thread_name_prefix="down")
+        threading.Thread(target=self._poll_loop, daemon=True).start()
+
+    def _set_status(self, sid, status, sample_dir, call_id=None):
+        row = {"sample_id": sid, "status": status, "call_id": call_id, "sample_dir": str(sample_dir),
+               "time": datetime.now(timezone.utc).isoformat()}
+        with self.lock:
+            self.jobs[sid] = {"status": status, "call_id": call_id, "sample_dir": str(sample_dir)}
+            append(row, self.ledger_path)
+
+    def _record_failure(self, sid, sample_dir, phase, error, tb, call_id=None):
+        row = {"sample_id": sid, "phase": phase, "error": error, "traceback": tb, "call_id": call_id,
+               "sample_dir": str(sample_dir), "time": datetime.now(timezone.utc).isoformat()}
+        with self.lock:
+            append(row, self.failed_path)
+
+    def submit(self, sample_dir: Path):
+        sid = sample_dir.name
+        with self.lock:
+            if sid in self.jobs and self.jobs[sid]["status"] != "failed": return
+        self._set_status(sid, "uploading", sample_dir)
+        self.upload_pool.submit(self._upload_worker, sample_dir)
+
+    def _upload_worker(self, sample_dir: Path):
+        sid = sample_dir.name
+        try:
+            with Timing(f"⬆️  [sample {sid}] upload: ", enabled=self.verbose >= 1):
+                modal_upload(volume, sample_dir, verbose=self.verbose)
+            fc = _process_vibrations_modal.spawn(sid, pclk_batch_size=self.pclk_batch_size,
+                                                  pclk_mode=self.pclk_mode, verbose=self.verbose)
+            self._set_status(sid, "running", sample_dir, fc.object_id)
+            print(f"🚀 [sample {sid}] spawned modal job {fc.object_id}")
+        except Exception as e:
+            print(f"❌ [sample {sid}] upload/spawn failed: {e}", file=sys.stderr)
+            self._record_failure(sid, sample_dir, "upload", f"{type(e).__name__}: {e}", traceback.format_exc())
+            self._set_status(sid, "failed", sample_dir)  # scan will retry it
+
+    def _download_worker(self, sample_dir: Path, call_id: str):
+        sid = sample_dir.name
+        try:
+            with Timing(f"⬇️  [sample {sid}] download: ", enabled=self.verbose >= 1):
+                for f in VIBRATION_FILES:
+                    modal_download(volume, f"{sid}/vibration/{f}", sample_dir / f"vibration/{f}")
+                fix_symlinks(sample_dir)
+            self._set_status(sid, "done", sample_dir, call_id)
+            print(f"✅ [sample {sid}] complete.")
+        except Exception as e:
+            print(f"❌ [sample {sid}] download failed: {e}", file=sys.stderr)
+            self._record_failure(sid, sample_dir, "download", f"{type(e).__name__}: {e}", traceback.format_exc(), call_id)
+            self._set_status(sid, "failed", sample_dir, call_id)  # scan will retry it
+
+    def _poll_status(self, call_id: str) -> tuple[str, tuple[str, str] | None]:
+        try:
+            modal.FunctionCall.from_id(call_id).get(timeout=0)
+            return "done", None
+        except modal.exception.TimeoutError:
+            return "running", None
+        except Exception as e:
+            return "failed", (f"{type(e).__name__}: {e}", traceback.format_exc())
+
+    def _poll_loop(self):
+        while True:
+            with self.lock:
+                running = [(sid, j["call_id"], Path(j["sample_dir"])) for sid, j in self.jobs.items() if j["status"] == "running"]
+            for sid, call_id, sample_dir in running:
+                status, err = self._poll_status(call_id)
+                if status == "done":
+                    self._set_status(sid, "downloading", sample_dir, call_id)  # leaves "running" so we stop polling it
+                    self.download_pool.submit(self._download_worker, sample_dir, call_id)
+                elif status == "failed":
+                    msg, tb = err
+                    print(f"❌ [sample {sid}] modal job {call_id} FAILED: {msg}", file=sys.stderr)
+                    self._record_failure(sid, sample_dir, "modal_job", msg, tb, call_id)
+                    self._set_status(sid, "failed", sample_dir, call_id)
+            time.sleep(self.poll_rate)
 
 def main():
-    p = argparse.ArgumentParser(description="Two-pool (upload / download) vibration watcher.")
+    p = argparse.ArgumentParser(description="Watch a directory and process raw vibrations with pclk, locally or on Modal.")
     p.add_argument("--dir", required=True, help="Directory to watch for raw vibration files.")
-    p.add_argument("--upload-workers", type=int, default=2, help="Parallel uploaders (bandwidth-bound; keep low).")
-    p.add_argument("--download-workers", type=int, default=4, help="Parallel downloaders (results are small).")
-    p.add_argument("--verbose", type=int, default=1, help="Verbosity level.")
+    p.add_argument("--modal", action="store_true", help="Process on Modal instead of locally (default: local).")
+    p.add_argument("--pclk-mode", default="batched_optimized", choices=["sequential", "batched", "batched_optimized"])
+    p.add_argument("--pclk-batch-size", type=int, default=256)
+    p.add_argument("--upload-workers", type=int, default=2, help="[modal only] parallel uploaders (bandwidth-bound; keep low).")
+    p.add_argument("--download-workers", type=int, default=4, help="[modal only] parallel downloaders (results are small).")
+    p.add_argument("--verbose", type=int, default=1)
     p.add_argument("--poll-rate", type=float, default=2.0, help="Seconds between scan / job-poll ticks.")
     args = p.parse_args()
 
     watch_path = Path(args.dir).resolve()
-    ledger_path = watch_path / "jobs.jsonl"
-    failed_path = watch_path / "failed_samples.jsonl"
-    verbose = args.verbose
-
-    jobs = {}                    # sample_id -> {"status", "call_id", "sample_dir"}  (single source of truth)
-    lock = threading.Lock()      # guards `jobs` and the ledger / failed-log appends
-
-    def set_status(sid, status, sample_dir, call_id=None):
-        row = {"sample_id": sid, "status": status, "call_id": call_id, "sample_dir": str(sample_dir),
-               "time": datetime.now(timezone.utc).isoformat()}
-        with lock:
-            jobs[sid] = {"status": status, "call_id": call_id, "sample_dir": str(sample_dir)}
-            append(row, ledger_path)  # append-only; last row per sample wins on reload
-
-    def record_failure(sid, sample_dir, phase, error, tb, call_id=None):
-        """Append a failed modal instance to failed_samples.jsonl (sample id, error, traceback, timestamp)."""
-        row = {"sample_id": sid, "phase": phase, "error": error, "traceback": tb, "call_id": call_id,
-               "sample_dir": str(sample_dir), "time": datetime.now(timezone.utc).isoformat()}
-        with lock:
-            append(row, failed_path)
-
     print("=" * 80)
-    print(f"👁️  TWO-POOL WATCHER | {watch_path} | up={args.upload_workers} down={args.download_workers}")
+    print(f"👁️  WATCHER | {watch_path} | engine={'modal' if args.modal else 'local'} | pclk={args.pclk_mode} (batch={args.pclk_batch_size})")
     print("=" * 80)
 
-    # recover from ledger: keep done (skip) + running (reconnect); retry everything else from scratch
-    if ledger_path.exists():
-        latest = {r["sample_id"]: r for r in load(ledger_path)}
-        jobs.update({sid: {k: r[k] for k in ("status", "call_id", "sample_dir")}
-                     for sid, r in latest.items() if r["status"] in ("done", "running")})
-        running = sum(j["status"] == "running" for j in jobs.values())
-        if running:
-            print(f"🔄 reconnected to {running} in-flight modal job(s) from ledger.")
+    def watch_loop(engine):
+        seen_done = set()
+        while True:
+            for npy_path in watch_path.rglob("**/vibration/00_raw_vibrations.npy"):
+                sample_dir = npy_path.parents[1]
+                sid = sample_dir.name
+                if sid in seen_done: continue
+                if (sample_dir / "vibration/03_fft.npz").exists():
+                    seen_done.add(sid)
+                    continue
+                if not is_file_ready(npy_path): continue
+                print(f"📥 [sample {sid}] raw ready ({npy_path.stat().st_size / 1e9:.2f} GB). Queuing...")
+                engine.submit(sample_dir)
+            time.sleep(args.poll_rate)
 
-    with app.run():
-        upload_pool = ThreadPoolExecutor(max_workers=args.upload_workers, thread_name_prefix="up")
-        download_pool = ThreadPoolExecutor(max_workers=args.download_workers, thread_name_prefix="down")
-
-        def upload_worker(sample_dir):
-            sid = sample_dir.name
-            try:
-                with Timing(f"⬆️  [sample {sid}] upload: ", enabled=verbose >= 1):
-                    modal_upload(volume, sample_dir, verbose=verbose)
-                fc = process_vibrations_modal.spawn(sid, pclk_batch_size=1024, pclk_mode="sequential", verbose=verbose)
-                set_status(sid, "running", sample_dir, fc.object_id)
-                print(f"🚀 [sample {sid}] spawned modal job {fc.object_id}")
-            except Exception as e:
-                print(f"❌ [sample {sid}] upload/spawn failed: {e}", file=sys.stderr)
-                record_failure(sid, sample_dir, "upload", f"{type(e).__name__}: {e}", traceback.format_exc())
-                set_status(sid, "failed", sample_dir)  # scan will retry it
-
-        def download_worker(sample_dir, call_id):
-            sid = sample_dir.name
-            try:
-                with Timing(f"⬇️  [sample {sid}] download: ", enabled=verbose >= 1):
-                    for f in VIBRATION_FILES:
-                        modal_download(volume, f"{sid}/inputs/{f}", sample_dir / f"inputs/{f}")
-                    fix_symlinks(sample_dir)
-                set_status(sid, "done", sample_dir, call_id)
-                print(f"✅ [sample {sid}] complete.")
-            except Exception as e:
-                print(f"❌ [sample {sid}] download failed: {e}", file=sys.stderr)
-                record_failure(sid, sample_dir, "download", f"{type(e).__name__}: {e}", traceback.format_exc(), call_id)
-                set_status(sid, "failed", sample_dir, call_id)  # scan will retry it
-
-        def poll_loop():
-            while True:
-                with lock:
-                    running = [(sid, j["call_id"], Path(j["sample_dir"])) for sid, j in jobs.items() if j["status"] == "running"]
-                for sid, call_id, sample_dir in running:
-                    status, err = poll_status(call_id)
-                    if status == "done":
-                        set_status(sid, "downloading", sample_dir, call_id)  # leaves "running" so we stop polling it
-                        download_pool.submit(download_worker, sample_dir, call_id)
-                    elif status == "failed":
-                        msg, tb = err
-                        print(f"❌ [sample {sid}] modal job {call_id} FAILED: {msg}", file=sys.stderr)
-                        record_failure(sid, sample_dir, "modal_job", msg, tb, call_id)
-                        set_status(sid, "failed", sample_dir, call_id)
-                time.sleep(args.poll_rate)
-
-        threading.Thread(target=poll_loop, daemon=True).start()
-
-        try:
-            print("⚡ Modal app running. Watching for raw vibrations...")
-            while True:
-                for npy_path in watch_path.rglob("**/inputs/00_raw_vibrations.npy"):
-                    sample_dir = npy_path.parents[1]
-                    sid = sample_dir.name
-                    with lock:
-                        if sid in jobs and jobs[sid]["status"] != "failed":
-                            continue  # in-flight or done
-                    if (sample_dir / "inputs/05_processed_fft.npy").exists():
-                        set_status(sid, "done", sample_dir)
-                        continue
-                    if not is_file_ready(npy_path):
-                        continue
-                    set_status(sid, "uploading", sample_dir)
-                    print(f"📥 [sample {sid}] raw ready ({npy_path.stat().st_size / 1e9:.2f} GB). Queuing upload...")
-                    upload_pool.submit(upload_worker, sample_dir)
-                time.sleep(args.poll_rate)
-        except KeyboardInterrupt:
-            print("\n🛑 Shutting down pools...")
-            upload_pool.shutdown(wait=True)
-            download_pool.shutdown(wait=True)
-            print("👋 Stopped. In-flight modal jobs are tracked in the ledger.")
+    try:
+        if args.modal:
+            with app.run():
+                engine = ModalEngine(args.pclk_mode, args.pclk_batch_size, args.verbose, watch_path,
+                                      args.upload_workers, args.download_workers, args.poll_rate)
+                watch_loop(engine)
+        else:
+            engine = LocalEngine(args.pclk_mode, args.pclk_batch_size, args.verbose)
+            watch_loop(engine)
+    except KeyboardInterrupt:
+        print("\n🛑 Stopped. In-flight modal jobs (if any) are tracked in the ledger.")
 
 if __name__ == "__main__":
     main()

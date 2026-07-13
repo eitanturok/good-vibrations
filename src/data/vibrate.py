@@ -108,7 +108,7 @@ def get_recovered_audio(fft: np.ndarray, n_samples:int, fs: float, audio_sample_
 
 #***** 5 group steps and add timing, save to files ******
 
-def _process_vibrations_local(sample_dir:Path, min_freq:int=MIN_FREQ, max_freq:int=MAX_FREQ, audio_sample_rate:int=22050, signal_mode:str='magnitude', normalize_mode:str='std-sample', patch_size:int=256, pclk_batch_size:int=1024, pclk_mode:str='sequential', verbose:int=1, do_save:bool=True):
+def _process_vibrations_local(sample_dir:Path, min_freq:int=MIN_FREQ, max_freq:int=MAX_FREQ, audio_sample_rate:int=22050, signal_mode:str='magnitude', normalize_mode:str='std-sample', patch_size:int=256, pclk_batch_size:int=256, pclk_mode:str='batched_optimized', verbose:int=1, do_save:bool=True):
     sample_id = sample_dir.name
     metadata = {k: v for d in load(sample_dir / 'metadata.jsonl') for k, v in d.items()}
     fps, rois = int(metadata['fps']), metadata['roi']
@@ -158,60 +158,60 @@ def save_vibrations(raw_vibrations:np.ndarray, sample_dir:Path, audio_dir:Path, 
 
 #****** 6 run on modal *****
 
-# app = modal.App("pclk")
-# volume = modal.Volume.from_name("samples", create_if_missing=True)
-# VOLUME_PATH = Path("/samples")
+app = modal.App("pclk")
+volume = modal.Volume.from_name("samples", create_if_missing=True)
+VOLUME_PATH = Path("/samples")
 
-# cuda_image = (
-#     modal.Image.from_registry("nvidia/cuda:12.2.2-cudnn8-devel-ubuntu22.04", add_python="3.11")
-#     .env({"PYTHONUNBUFFERED": "1"})   # flush all prints so they show immedietally in modal logs
-#     .pip_install("cupy-cuda12x", "numpy", "tqdm", "scipy", "matplotlib", "pillow", "ipython")
-#     .add_local_dir(Path(__file__).parent, remote_path="/src/data")
-#     .add_local_dir(Path(__file__).parents[2] / "utils", remote_path="/src/utils")
-# )
+cuda_image = (
+    modal.Image.from_registry("nvidia/cuda:12.2.2-cudnn8-devel-ubuntu22.04", add_python="3.11")
+    .env({"PYTHONUNBUFFERED": "1"})   # flush all prints so they show immedietally in modal logs
+    .pip_install("cupy-cuda12x", "numpy", "tqdm", "scipy", "matplotlib", "pillow", "ipython")
+    .add_local_dir(Path(__file__).parent, remote_path="/src/data")
+    .add_local_dir(Path(__file__).parents[2] / "utils", remote_path="/src/utils")
+)
 
-# @app.function(
-#     gpu="A10G",
-#     image=cuda_image,
-#     timeout=60*10, # timeout after 10 minutes
-#     volumes={VOLUME_PATH: volume},
-# )
-# def _process_vibrations_modal(sample_dir_name: str, **kwargs):
-#     import sys
-#     sys.path.insert(0, "/src")
-#     volume.reload()
-#     from data.vibrate import _process_vibrations_local
-#     _process_vibrations_local(VOLUME_PATH / sample_dir_name, **kwargs)
-#     volume.commit()
+@app.function(
+    gpu="A10G",
+    image=cuda_image,
+    timeout=60*10, # timeout after 10 minutes
+    volumes={VOLUME_PATH: volume},
+)
+def _process_vibrations_modal(sample_dir_name: str, **kwargs):
+    import sys
+    sys.path.insert(0, "/src")
+    volume.reload()
+    from data.vibrate import _process_vibrations_local
+    _process_vibrations_local(VOLUME_PATH / sample_dir_name, **kwargs)
+    volume.commit()
 
 VIBRATION_FILES = ["00_raw_vibrations.npy", "01_raw_shifts.npy", "02_clean_shifts.npy", "03_fft.npz", "04_recovered_audio.wav"]
 
-def process_vibrations(sample_dir:Path, use_modal:bool=True, do_save:bool=True, verbose:int=1):
+def process_vibrations(sample_dir:Path, use_modal:bool=False, pclk_mode:str='batched_optimized', pclk_batch_size:int=256, do_save:bool=True, verbose:int=1):
     sample_id = sample_dir.name
 
     # run locally
     if not use_modal:
         with Timing(f'[sample {sample_id}] process vibrations locally: ', enabled=verbose >= 1):
-            return _process_vibrations_local(sample_dir, do_save=do_save, verbose=verbose)
+            return _process_vibrations_local(sample_dir, pclk_mode=pclk_mode, pclk_batch_size=pclk_batch_size, do_save=do_save, verbose=verbose)
 
-    # # upload raw vibrations DISK->modal_volume
-    # with Timing(f'[sample {sample_id}] upload raw vibrations DISK->modal_volume: ', enabled=verbose >= 1):
-    #     modal_upload(volume, sample_dir, verbose=verbose)
-    #     upload_timestamp = datetime.now(timezone.utc).isoformat()
+    # upload raw vibrations DISK->modal_volume
+    with Timing(f'[sample {sample_id}] upload raw vibrations DISK->modal_volume: ', enabled=verbose >= 1):
+        modal_upload(volume, sample_dir, verbose=verbose)
+        upload_timestamp = datetime.now(timezone.utc).isoformat()
 
-    # # process raw vibrations remotely
-    # with Timing(f'[sample {sample_id}] process vibrations on modal: ', enabled=verbose >= 1):
-    #     _process_vibrations_modal.remote(sample_dir.name, pclk_batch_size=1024, pclk_mode='sequential', verbose=verbose)
+    # process raw vibrations remotely
+    with Timing(f'[sample {sample_id}] process vibrations on modal: ', enabled=verbose >= 1):
+        _process_vibrations_modal.remote(sample_dir.name, pclk_batch_size=pclk_batch_size, pclk_mode=pclk_mode, verbose=verbose)
 
-    # # download processed vibrations modal_volume->DISK
-    # with Timing(f'[sample {sample_id}] download processed vibrations modal_volume->DISK::{sample_dir}: ', enabled=verbose >= 1):
-    #     for f in VIBRATION_FILES: modal_download(volume, f"{sample_dir.name}/vibration/{f}", sample_dir / f"vibration/{f}")
-    #     fix_symlinks(sample_dir)
-    #     append({"modal_upload": upload_timestamp}, sample_dir / "times.jsonl", do_save)
-    #     append({"modal_download": datetime.now(timezone.utc).isoformat()}, sample_dir / "times.jsonl", do_save)
+    # download processed vibrations modal_volume->DISK
+    with Timing(f'[sample {sample_id}] download processed vibrations modal_volume->DISK::{sample_dir}: ', enabled=verbose >= 1):
+        for f in VIBRATION_FILES: modal_download(volume, f"{sample_dir.name}/vibration/{f}", sample_dir / f"vibration/{f}")
+        fix_symlinks(sample_dir)
+        append({"modal_upload": upload_timestamp}, sample_dir / "times.jsonl", do_save)
+        append({"modal_download": datetime.now(timezone.utc).isoformat()}, sample_dir / "times.jsonl", do_save)
 
-def save_and_process_vibrations(raw_vibrations:np.ndarray, sample_dir:Path, audio_dir:Path, min_freq:int, max_freq:int, use_modal:bool=True, do_save:bool=True, verbose:int=1):
+def save_and_process_vibrations(raw_vibrations:np.ndarray, sample_dir:Path, audio_dir:Path, min_freq:int, max_freq:int, use_modal:bool=False, pclk_mode:str='batched_optimized', pclk_batch_size:int=256, do_save:bool=True, verbose:int=1):
     save_vibrations(raw_vibrations, sample_dir, audio_dir, do_save, verbose)
     # delete vibrations as soon as we finish saving it
     del raw_vibrations
-    process_vibrations(sample_dir, use_modal, do_save, verbose)
+    process_vibrations(sample_dir, use_modal, pclk_mode, pclk_batch_size, do_save, verbose)
