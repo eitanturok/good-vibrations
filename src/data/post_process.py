@@ -1,4 +1,4 @@
-import argparse, json, hashlib, shutil, os
+import argparse, json, hashlib, shutil, os, subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -236,6 +236,28 @@ def post_process(base_sample_dir:Path, base_dataset_dir:Path, dataset_name:str|N
 
 #***** 6 CLI *****
 
+REMOTE_HOST = "ethantu@132.76.83.154"
+REMOTE_BASE_DIR = "/home/ethantu/workspace/good-vibrations/datasets"
+
+def scp_to_remote(local_path:Path, remote_host:str, remote_base_dir:str, verbose:int):
+    remote_parent = f"{remote_base_dir}/{local_path.parent.name}"
+    remote_path = f"{remote_parent}/{local_path.name}"
+    local_hash_path = local_path.parent / "hash.txt"
+
+    # skip re-sending if the remote already has this exact dataset (same hash.txt content)
+    remote_hash = subprocess.run(["ssh", remote_host, f"cat {remote_parent}/hash.txt"], capture_output=True, text=True).stdout.strip()
+    if remote_hash and remote_hash == local_hash_path.read_text().strip():
+        if verbose: print(f"Remote already up to date (hash {remote_hash}) -- skipping scp to {remote_host}:{remote_path}")
+        return
+
+    with Timing("scp: ", enter=f"Sending {local_path} to {remote_host}:{remote_path} ...", enabled=verbose):
+        # inherit stdout/stderr (not captured) so scp's own progress meter streams live; scp -r
+        # can't create a missing remote parent dir, so mkdir -p it over ssh first. hash.txt is
+        # sent last so a remote hash.txt only appears once the transfer actually completed.
+        subprocess.run(["ssh", remote_host, f"mkdir -p {remote_parent}"], check=True)
+        subprocess.run(["scp", "-r", str(local_path), f"{remote_host}:{remote_path}"], check=True)
+        subprocess.run(["scp", str(local_hash_path), f"{remote_host}:{remote_parent}/hash.txt"], check=True)
+
 def parse_args():
     p = argparse.ArgumentParser(description="Post-process raw samples into an MDS dataset.")
     p.add_argument("base_sample_dir",       type=Path)
@@ -249,6 +271,9 @@ def parse_args():
     p.add_argument("--force",               action="store_true")
     p.add_argument("--verbose",             type=int, default=1)
     p.add_argument("--no-save",             dest="do_save", action="store_false")
+    p.add_argument("--no-scp",              dest="do_scp", action="store_false", help="Skip scp-ing the mds dir to the remote machine after post-processing.")
+    p.add_argument("--remote-host",         type=str, default=REMOTE_HOST)
+    p.add_argument("--remote-base-dir",     type=str, default=REMOTE_BASE_DIR)
     return p.parse_args()
 
 if __name__ == "__main__":
@@ -257,9 +282,12 @@ if __name__ == "__main__":
     n_samples = len((mds_path / "metadata.jsonl").read_text().strip().splitlines())
     print(f"MDS written to {mds_path} ({n_samples} samples)")
 
-    samples_dir = mds_path.parent / "samples"
-    n_sample_dirs = sum(1 for p in samples_dir.iterdir() if p.is_dir())
-    print(f"mds:     {n_samples} samples, {human_size(dir_size(mds_path))}, {mds_path.resolve()}")
-    print(f"samples: {n_sample_dirs} samples, {human_size(dir_size(samples_dir))}, {samples_dir.resolve()}")
+    try:
+        if args.do_scp: scp_to_remote(mds_path, args.remote_host, args.remote_base_dir, args.verbose)
+    finally:
+        samples_dir = mds_path.parent / "samples"
+        n_sample_dirs = sum(1 for p in samples_dir.iterdir() if p.is_dir())
+        print(f"mds:     {n_samples} samples, {human_size(dir_size(mds_path))}, {mds_path.resolve()}")
+        print(f"samples: {n_sample_dirs} samples, {human_size(dir_size(samples_dir))} (no symlinks) / {human_size(dir_size(samples_dir, follow_symlinks=True))} (with symlinks), {samples_dir.resolve()}")
 
 
