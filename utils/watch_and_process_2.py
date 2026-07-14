@@ -185,12 +185,15 @@ def main():
                 sample_dir = npy_path.parents[1]
                 sid = sample_dir.name
                 if sid in seen_done: continue
-                if (sample_dir / "vibration/03_fft.npz").exists():
-                    seen_done.add(sid)
-                    continue
                 if not is_file_ready(npy_path): continue
-                print(f"📥 [sample {sid}] raw ready ({npy_path.stat().st_size / 1e9:.2f} GB). Queuing...")
+                pclk_done = (sample_dir / "vibration/01_raw_shifts.npy").exists()
+                status = "pclk already done, compressing only" if pclk_done else "pclk + compress"
+                print(f"📥 [sample {sid}] raw ready ({npy_path.stat().st_size / 1e9:.2f} GB) -- {status}. Queuing...")
                 engine.submit(sample_dir)
+                # mark as seen once queued, not on some "done" file -- the raw .npy only
+                # disappears once _process_vibrations compresses it away, and relying on
+                # e.g. fft.npz existing missed samples processed before compression existed
+                seen_done.add(sid)
             time.sleep(args.poll_rate)
 
     try:
