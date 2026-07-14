@@ -48,26 +48,23 @@ def get_parser():
     parser = argparse.ArgumentParser()
     # system
     parser.add_argument("--seed",                       type=int,   default=42)
-    parser.add_argument("--num-workers",                type=int,   default=4)
     parser.add_argument("--debug",                      type=int,   default=0)
     parser.add_argument("--verbose",                    type=int,   default=2, help="If >=2, show torch.compile (TorchDynamo) logs.")
-    parser.add_argument("--eval-only",                  action="store_true", default=False, help="Skip training, just eval a loaded checkpoint (requires --checkpoint-path).")
-    # data
-    parser.add_argument("--n-samples",                  type=int,   default=None)
+    # build data
     parser.add_argument("--mds-path",                   type=str,   default=r"D:/eturok/experiment-22/data/mds/3dd5526e5199d80d")
+    parser.add_argument("--num-workers",                type=int,   default=4)
     parser.add_argument("--test-size",                  type=float, default=0.2)
-    parser.add_argument("--out-h",                      type=int,   default=18)
-    parser.add_argument("--out-w",                      type=int,   default=44)
+    parser.add_argument("--out-h",                      type=int,   default=20)
+    parser.add_argument("--out-w",                      type=int,   default=40)
     parser.add_argument("--n-laser-rows",               type=int,   default=10)
     parser.add_argument("--n-laser-cols",               type=int,   default=10)
     parser.add_argument("--patch-size",                 type=int,   default=256)
     parser.add_argument("--n-freqs",                    type=int,   default=3328)
-    parser.add_argument("--signal-mode",                type=str,   default='magnitude')
-    parser.add_argument("--normalize-mode",              type=str,   default='z-global')
+    # filter data
+    parser.add_argument("--n-samples",                  type=int,   default=None)
     parser.add_argument("--speakers",                   type=int,   default=None)
     parser.add_argument("--n-objects",                  type=int,   default=None)
     parser.add_argument("--box",                        type=str,   default=None)
-    parser.add_argument("--dry-run",                    action="store_true", default=False)
     # model
     parser.add_argument("--decoder",                     type=str,   default='mlp')
     parser.add_argument("--decoder-num-heads",          type=int,   default=2)
@@ -86,11 +83,13 @@ def get_parser():
     parser.add_argument("--lr",                         type=float, default=1e-4)
     parser.add_argument("--max-duration",               type=str,   default="2500ep")
     # eval
+    parser.add_argument("--eval-only",                  action="store_true", default=False, help="Skip training, just eval a loaded checkpoint (requires --checkpoint-path).")
     parser.add_argument("--eval-batch-size",            type=int,   default=108) # wandb caps images logged in a single call to 108, so eval batch size should be <= 108 to log all images
     parser.add_argument("--eval-interval",              type=str,   default="50ep")
     parser.add_argument("--outputs-dir",                type=str,   default=None, help="Where to save eval .pt outputs. If not set, defaults to the run's outputs_history dir (same dir the training-time history callback writes to).")
     # run
     parser.add_argument("--run-name",                   type=str,   default=None)
+    parser.add_argument("--dry-run",                    action="store_true", default=False)
     # checkpointing
     parser.add_argument("--checkpoint-path",            type=str,   default=None, help="Checkpoint to load for eval. If not set, defaults to the run's latest checkpoint.")
     parser.add_argument("--checkpoint-interval",        type=str,   default="500ep")
