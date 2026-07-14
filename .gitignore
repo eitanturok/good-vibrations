@@ -6,10 +6,10 @@ checkpoints/
 data/processed/
 visualizations/
 media/
-artifacts/
 runs/
 tmp/
-data-denotched/
+datasets/
+data/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
