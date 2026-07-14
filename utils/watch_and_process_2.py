@@ -26,7 +26,7 @@ sys.path.insert(0, str(REPO / "src"))   # data.*
 
 import modal
 from utils.io_utils import Timing, modal_upload, modal_download, fix_symlinks, append, load
-from data.vibrate import app, volume, process_vibrations, _process_vibrations_modal, VIBRATION_FILES
+from data.vibrate import app, volume, process_vibrations, _process_vibrations_modal, PROCESSED_FILES
 
 MIN_READY_BYTES = 1 * 2**20  # reject files caught mid-write at a few KB/MB
 
@@ -43,8 +43,8 @@ class LocalEngine:
     """Runs pclk on this machine's GPU. One worker: batched_optimized already
     saturates the GPU per-sample, so concurrent samples would only add VRAM
     contention, not speed."""
-    def __init__(self, pclk_mode: str, pclk_batch_size: int, verbose: int):
-        self.pclk_mode, self.pclk_batch_size, self.verbose = pclk_mode, pclk_batch_size, verbose
+    def __init__(self, pclk_mode: str, pclk_batch_size: int, verbose: int, cleanup_raw_vibrations: str):
+        self.pclk_mode, self.pclk_batch_size, self.verbose, self.cleanup_raw_vibrations = pclk_mode, pclk_batch_size, verbose, cleanup_raw_vibrations
         self.q: queue.Queue[Path] = queue.Queue()
         self.done = set()
         threading.Thread(target=self._worker, daemon=True).start()
@@ -60,7 +60,8 @@ class LocalEngine:
             sid = sample_dir.name
             try:
                 process_vibrations(sample_dir, use_modal=False, pclk_mode=self.pclk_mode,
-                                    pclk_batch_size=self.pclk_batch_size, do_save=True, verbose=self.verbose)
+                                    pclk_batch_size=self.pclk_batch_size, do_save=True, verbose=self.verbose,
+                                    cleanup_raw_vibrations=self.cleanup_raw_vibrations)
                 print(f"✅ [sample {sid}] complete.")
             except Exception as e:
                 print(f"❌ [sample {sid}] local processing failed: {e}", file=sys.stderr)
@@ -69,9 +70,9 @@ class LocalEngine:
 class ModalEngine:
     """Two-pool upload/spawn/poll/download so the bandwidth-bound upload never
     blocks on remote GPU compute, and results download the moment they're ready."""
-    def __init__(self, pclk_mode: str, pclk_batch_size: int, verbose: int, watch_path: Path,
+    def __init__(self, pclk_mode: str, pclk_batch_size: int, verbose: int, cleanup_raw_vibrations: str, watch_path: Path,
                  upload_workers: int, download_workers: int, poll_rate: float):
-        self.pclk_mode, self.pclk_batch_size, self.verbose = pclk_mode, pclk_batch_size, verbose
+        self.pclk_mode, self.pclk_batch_size, self.verbose, self.cleanup_raw_vibrations = pclk_mode, pclk_batch_size, verbose, cleanup_raw_vibrations
         self.poll_rate = poll_rate
         self.ledger_path = watch_path / "jobs.jsonl"
         self.failed_path = watch_path / "failed_samples.jsonl"
@@ -114,7 +115,7 @@ class ModalEngine:
             with Timing(f"⬆️  [sample {sid}] upload: ", enabled=self.verbose >= 1):
                 modal_upload(volume, sample_dir, verbose=self.verbose)
             fc = _process_vibrations_modal.spawn(sid, pclk_batch_size=self.pclk_batch_size,
-                                                  pclk_mode=self.pclk_mode, verbose=self.verbose)
+                                                  pclk_mode=self.pclk_mode, verbose=self.verbose, cleanup_raw_vibrations=self.cleanup_raw_vibrations)
             self._set_status(sid, "running", sample_dir, fc.object_id)
             print(f"🚀 [sample {sid}] spawned modal job {fc.object_id}")
         except Exception as e:
@@ -125,8 +126,9 @@ class ModalEngine:
     def _download_worker(self, sample_dir: Path, call_id: str):
         sid = sample_dir.name
         try:
+            files = PROCESSED_FILES + (["00_raw_vibrations.npy.bz2"] if self.cleanup_raw_vibrations == 'compress' else [])
             with Timing(f"⬇️  [sample {sid}] download: ", enabled=self.verbose >= 1):
-                for f in VIBRATION_FILES:
+                for f in files:
                     modal_download(volume, f"{sid}/vibration/{f}", sample_dir / f"vibration/{f}")
                 fix_symlinks(sample_dir)
             self._set_status(sid, "done", sample_dir, call_id)
@@ -171,11 +173,13 @@ def main():
     p.add_argument("--download-workers", type=int, default=4, help="[modal only] parallel downloaders (results are small).")
     p.add_argument("--verbose", type=int, default=1)
     p.add_argument("--poll-rate", type=float, default=2.0, help="Seconds between scan / job-poll ticks.")
+    p.add_argument("--cleanup-raw-vibrations", default="compress", choices=["compress", "delete"],
+                    help="What to do with the raw vibrations file once pclk is done with it.")
     args = p.parse_args()
 
     watch_path = Path(args.dir).resolve()
     print("=" * 80)
-    print(f"👁️  WATCHER | {watch_path} | engine={'modal' if args.modal else 'local'} | pclk={args.pclk_mode} (batch={args.pclk_batch_size})")
+    print(f"👁️  WATCHER | {watch_path} | engine={'modal' if args.modal else 'local'} | pclk={args.pclk_mode} (batch={args.pclk_batch_size}) | cleanup={args.cleanup_raw_vibrations}")
     print("=" * 80)
 
     def watch_loop(engine):
@@ -187,23 +191,23 @@ def main():
                 if sid in seen_done: continue
                 if not is_file_ready(npy_path): continue
                 pclk_done = (sample_dir / "vibration/01_raw_shifts.npy").exists()
-                status = "pclk already done, compressing only" if pclk_done else "pclk + compress"
+                status = f"pclk already done, {args.cleanup_raw_vibrations} only" if pclk_done else f"pclk + {args.cleanup_raw_vibrations}"
                 print(f"📥 [sample {sid}] raw ready ({npy_path.stat().st_size / 1e9:.2f} GB) -- {status}. Queuing...")
                 engine.submit(sample_dir)
                 # mark as seen once queued, not on some "done" file -- the raw .npy only
-                # disappears once _process_vibrations compresses it away, and relying on
-                # e.g. fft.npz existing missed samples processed before compression existed
+                # disappears once _process_vibrations compresses/deletes it, and relying on
+                # e.g. fft.npz existing missed samples processed before this step existed
                 seen_done.add(sid)
             time.sleep(args.poll_rate)
 
     try:
         if args.modal:
             with app.run():
-                engine = ModalEngine(args.pclk_mode, args.pclk_batch_size, args.verbose, watch_path,
-                                      args.upload_workers, args.download_workers, args.poll_rate)
+                engine = ModalEngine(args.pclk_mode, args.pclk_batch_size, args.verbose, args.cleanup_raw_vibrations,
+                                      watch_path, args.upload_workers, args.download_workers, args.poll_rate)
                 watch_loop(engine)
         else:
-            engine = LocalEngine(args.pclk_mode, args.pclk_batch_size, args.verbose)
+            engine = LocalEngine(args.pclk_mode, args.pclk_batch_size, args.verbose, args.cleanup_raw_vibrations)
             watch_loop(engine)
     except KeyboardInterrupt:
         print("\n🛑 Stopped. In-flight modal jobs (if any) are tracked in the ledger.")
