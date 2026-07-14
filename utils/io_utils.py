@@ -60,6 +60,16 @@ def print_system_usage(path, label="", verbose=1):
     prefix = f"{label} " if label else ""
     logger.debug(f"{prefix}disk: {used/GB:.2f}/{total/GB:.2f} GB used | RAM: {ram.used/GB:.2f}/{ram.total/GB:.2f} GB used | threads: {threading.active_count()}/{psutil.Process().num_threads()} active")
 
+
+def human_size(n:int) -> str:
+    return next((f"{n / d:.2f} {suffix}" for d, suffix in [(1 << 30, "GB"), (1 << 20, "MB"), (1 << 10, "KB")] if n >= d), f"{n} B")
+
+def dir_size(path:Path) -> int:
+    # lstat (not stat) so symlinked files count their link size, not the target's -- this reports
+    # actual disk usage inside `path`, not the size of data it merely points at elsewhere.
+    return sum(p.lstat().st_size for p in path.rglob("*") if p.is_file() or p.is_symlink())
+
+
 #***** file helpers *****
 
 def paths_to_str(x):

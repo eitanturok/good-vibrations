@@ -51,7 +51,7 @@ def get_parser():
     parser.add_argument("--debug",                      type=int,   default=0)
     parser.add_argument("--verbose",                    type=int,   default=2, help="If >=2, show torch.compile (TorchDynamo) logs.")
     # build data
-    parser.add_argument("--mds-path",                   type=str,   default=r"D:/eturok/experiment-22/data/mds/3dd5526e5199d80d")
+    parser.add_argument("--mds-dir",                    type=str,   default=r"D:/eturok/datasets/000-cylinder-dataset/mds")
     parser.add_argument("--num-workers",                type=int,   default=4)
     parser.add_argument("--test-size",                  type=float, default=0.2)
     parser.add_argument("--out-h",                      type=int,   default=20)
@@ -186,7 +186,7 @@ def run(**kwargs):
 
     # dataset
     train_loader, eval_loader = build_dataset(
-        args.mds_path, batch_size=args.batch_size, eval_batch_size=args.eval_batch_size,
+        args.mds_dir, batch_size=args.batch_size, eval_batch_size=args.eval_batch_size,
         test_size=args.test_size, seed=args.seed, num_workers=args.num_workers,
         speakers=args.speakers, n_objects=args.n_objects, box=args.box, n_samples=args.n_samples)
     boundary_loaders = eval_loader + [Evaluator(label='train', dataloader=train_loader)]

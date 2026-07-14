@@ -6,7 +6,7 @@ import numpy as np
 from PIL import Image
 from streaming import MDSWriter
 
-from utils.io_utils import load, save, append, symlink, copy, Timing, logger
+from utils.io_utils import load, save, append, symlink, copy, Timing, logger, human_size, dir_size
 from utils.metrics import center_of_mass
 
 #***** 1 post-process image (downsample overhead image) *****
@@ -166,8 +166,20 @@ def convert_to_mds(dataset_dir:Path, rows:list, patch_size:int, out_h:int, out_w
 
 #***** 5 post-process all samples in a base sample directory *****
 
-def post_process(base_sample_dir:Path, dataset_dir:Path, out_h:int, out_w:int, signal_mode:str, normalize_mode:str, patch_size:int, force:bool=False, verbose:int=1, do_save:bool=True, denotch_fn=None):
-    samples_dir, mds_dir, hash_path = dataset_dir / "samples", dataset_dir / "mds", dataset_dir / "hash.txt"
+def resolve_dataset_dir(base_dataset_dir:Path, dataset_name:str|None, key:str) -> Path:
+    # A dataset name may get reused across runs with different params/data -- version it as
+    # "NNN" or "NNN-<name>" under base_dataset_dir so different params never silently
+    # collide/overwrite. Reuse an existing numbered dir if its hash.txt already matches this
+    # exact param/data combination, else allocate the next increasing number.
+    suffix = f"-{dataset_name}" if dataset_name else ""
+    existing = sorted(base_dataset_dir.glob(f"[0-9][0-9][0-9]{suffix}")) if base_dataset_dir.exists() else []
+    for p in existing:
+        hash_path = p / "hash.txt"
+        if hash_path.exists() and hash_path.read_text().strip() == key: return p
+    next_n = max((int(p.name[:3]) for p in existing), default=-1) + 1
+    return base_dataset_dir / f"{next_n:03d}{suffix}"
+
+def post_process(base_sample_dir:Path, base_dataset_dir:Path, dataset_name:str|None, out_h:int, out_w:int, signal_mode:str, normalize_mode:str, patch_size:int, force:bool=False, verbose:int=1, do_save:bool=True, denotch_fn=None):
 
     # collect complete samples + metadata
     REQUIRED_FILES = ["image/02_smask.png", "vibration/03_fft.npz"]
@@ -186,11 +198,12 @@ def post_process(base_sample_dir:Path, dataset_dir:Path, out_h:int, out_w:int, s
         for f, ids in missing_by_file.items():
             if ids: print(f"missing {f!r}: {ids}")
 
-    # hash and check for skip -- compared against a hash.txt sidecar instead of encoding the hash
-    # in a directory name, so the MDS shards always live at a stable dataset_dir/mds path.
+    # hash and check for skip
     with Timing("Hashing: ", enter=f"Hashing metadata of {len(sample_ids)} samples to compute cache key ...", enabled=verbose):
-        payload = {sample_id: {k: v for d in load(base_sample_dir / sample_id / "metadata.jsonl") for k, v in d.items()} for sample_id in sample_ids}
-        key = hashlib.sha1(json.dumps(payload | MDS_COLUMNS, sort_keys=True, default=str).encode()).hexdigest()[:16]
+        key = hashlib.sha1(json.dumps(rows | MDS_COLUMNS, sort_keys=True, default=str).encode()).hexdigest()[:16]
+
+    dataset_dir = resolve_dataset_dir(base_dataset_dir, dataset_name, key)
+    samples_dir, mds_dir, hash_path = dataset_dir / "samples", dataset_dir / "mds", dataset_dir / "hash.txt"
     cached_key = hash_path.read_text().strip() if hash_path.exists() else None
     if not force and cached_key == key and mds_dir.exists() and (mds_dir / "metadata.jsonl").exists():
         if verbose: print(f"Cache hit: reusing existing MDS at {mds_dir}\nMDS: {mds_dir} ({len(rows)} samples)")
@@ -223,35 +236,28 @@ def post_process(base_sample_dir:Path, dataset_dir:Path, out_h:int, out_w:int, s
 
 #***** 6 CLI *****
 
-def human_size(n:int) -> str:
-    return next((f"{n / d:.2f} {suffix}" for d, suffix in [(1 << 30, "GB"), (1 << 20, "MB"), (1 << 10, "KB")] if n >= d), f"{n} B")
-
-def dir_size(path:Path) -> int:
-    # lstat (not stat) so symlinked files count their link size, not the target's -- this reports
-    # actual disk usage inside `path`, not the size of data it merely points at elsewhere.
-    return sum(p.lstat().st_size for p in path.rglob("*") if p.is_file() or p.is_symlink())
-
 def parse_args():
     p = argparse.ArgumentParser(description="Post-process raw samples into an MDS dataset.")
-    p.add_argument("base_sample_dir", type=Path)
-    p.add_argument("dataset_dir", type=Path, help="Output dir: gets samples/ (working copies) and mds/ (shards) subdirs, plus a hash.txt cache key.")
-    p.add_argument("--out_h", type=int, default=20)
-    p.add_argument("--out_w", type=int, default=40)
-    p.add_argument("--signal_mode", type=str, default="magnitude", choices=["magnitude", "complex", "mag_phase"])
-    p.add_argument("--normalize_mode", type=str, default="std-sample", choices=["std-sample", "z-sample"])
-    p.add_argument("--patch_size", type=int, default=256)
-    p.add_argument("--force", action="store_true")
-    p.add_argument("--verbose", type=int, default=1)
-    p.add_argument("--no_save", dest="do_save", action="store_false")
+    p.add_argument("base_sample_dir",       type=Path)
+    p.add_argument("base_dataset_dir",      type=Path, nargs="?", default=Path(r"D:\eturok\datasets"), help="Parent dir for versioned dataset dirs.")
+    p.add_argument("--dataset-name",        type=str, default=None, help="If not given, the versioned dir is just the number (e.g. '000') with no name suffix.")
+    p.add_argument("--out-h",               type=int, default=20)
+    p.add_argument("--out-w",               type=int, default=40)
+    p.add_argument("--signal-mode",         type=str, default="magnitude", choices=["magnitude", "complex", "mag_phase"])
+    p.add_argument("--normalize-mode",      type=str, default="std-sample", choices=["std-sample", "z-sample"])
+    p.add_argument("--patch-size",          type=int, default=256)
+    p.add_argument("--force",               action="store_true")
+    p.add_argument("--verbose",             type=int, default=1)
+    p.add_argument("--no-save",             dest="do_save", action="store_false")
     return p.parse_args()
 
 if __name__ == "__main__":
     args = parse_args()
-    mds_path = post_process(args.base_sample_dir, args.dataset_dir, args.out_h, args.out_w, args.signal_mode, args.normalize_mode, args.patch_size, force=args.force, verbose=args.verbose, do_save=args.do_save)
+    mds_path = post_process(args.base_sample_dir, args.base_dataset_dir, args.dataset_name, args.out_h, args.out_w, args.signal_mode, args.normalize_mode, args.patch_size, force=args.force, verbose=args.verbose, do_save=args.do_save)
     n_samples = len((mds_path / "metadata.jsonl").read_text().strip().splitlines())
     print(f"MDS written to {mds_path} ({n_samples} samples)")
 
-    samples_dir = args.dataset_dir / "samples"
+    samples_dir = mds_path.parent / "samples"
     n_sample_dirs = sum(1 for p in samples_dir.iterdir() if p.is_dir())
     print(f"mds:     {n_samples} samples, {human_size(dir_size(mds_path))}, {mds_path.resolve()}")
     print(f"samples: {n_sample_dirs} samples, {human_size(dir_size(samples_dir))}, {samples_dir.resolve()}")
