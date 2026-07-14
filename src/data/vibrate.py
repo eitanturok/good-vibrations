@@ -12,7 +12,7 @@ from scipy.signal import butter, resample, sosfiltfilt
 if Path("/src").exists() and str(Path("/src")) not in sys.path:
     sys.path.insert(0, "/src")
 
-from utils.io_utils import save, append, symlink, Timing, load, modal_upload, modal_download, fix_symlinks, logger
+from utils.io_utils import save, append, symlink, Timing, load, modal_upload, modal_download, fix_symlinks, Bz2Compressor, logger
 
 MIN_FREQ, MAX_FREQ = 50, 1000
 
@@ -108,18 +108,32 @@ def get_recovered_audio(fft: np.ndarray, n_samples:int, fs: float, audio_sample_
 
 #***** 5 group steps and add timing, save to files ******
 
-def _process_vibrations_local(sample_dir:Path, min_freq:int=MIN_FREQ, max_freq:int=MAX_FREQ, audio_sample_rate:int=22050, signal_mode:str='magnitude', normalize_mode:str='std-sample', patch_size:int=256, pclk_batch_size:int=256, pclk_mode:str='batched_optimized', verbose:int=1, do_save:bool=True):
+def _process_vibrations(sample_dir:Path, min_freq:int=MIN_FREQ, max_freq:int=MAX_FREQ, audio_sample_rate:int=22050, signal_mode:str='magnitude', normalize_mode:str='std-sample', patch_size:int=256, pclk_batch_size:int=256, pclk_mode:str='batched_optimized', verbose:int=1, do_save:bool=True):
     sample_id = sample_dir.name
     metadata = {k: v for d in load(sample_dir / 'metadata.jsonl') for k, v in d.items()}
     fps, rois = int(metadata['fps']), metadata['roi']
 
     # turn vibrations into shifts with pclk algorithm
     with Timing(f"[sample {sample_id}] pclk: ", enabled=verbose >= 2):
-        raw_vibrations = load(sample_dir / 'vibration/00_raw_vibrations.npy')
+        raw_vibration_path = sample_dir / 'vibration/00_raw_vibrations.npy'
+        raw_vibrations = load(raw_vibration_path)
         raw_shifts = get_shifts(raw_vibrations, rois, pclk_batch_size, pclk_mode)  # (L, T, 2)
         logger.debug(f'[sample {sample_id}] {raw_shifts.shape=}=(lasers, frames, x/y)')
         save(raw_shifts, sample_dir / 'vibration/01_raw_shifts.npy', do_save)
         append({"pclk": datetime.now(timezone.utc).isoformat()}, sample_dir / "times.jsonl", do_save)
+
+    # compress the raw vibrations, then delete the uncompressed original
+    with Timing(f"[sample {sample_id}] compress raw vibrations: ", enabled=verbose >= 2):
+        if do_save:
+            old_bytes = raw_vibration_path.stat().st_size
+            compressed = Bz2Compressor().compress(raw_vibrations)
+            compressed_path = raw_vibration_path.with_suffix(raw_vibration_path.suffix + '.bz2')
+            compressed_path.write_bytes(compressed)
+            new_bytes = len(compressed)
+            raw_vibration_path.unlink()
+            print(f"[sample {sample_id}] compressed raw vibrations: {old_bytes}->{new_bytes} bytes (ratio={old_bytes/new_bytes:.2f}x)")
+        del raw_vibrations
+        append({"compress_raw_vibrations": datetime.now(timezone.utc).isoformat()}, sample_dir / "times.jsonl", do_save)
 
     # clean the shifts
     with Timing(f"[sample {sample_id}] clean shifts: ", enabled=verbose >= 2):
@@ -180,11 +194,13 @@ def _process_vibrations_modal(sample_dir_name: str, **kwargs):
     import sys
     sys.path.insert(0, "/src")
     volume.reload()
-    from data.vibrate import _process_vibrations_local
-    _process_vibrations_local(VOLUME_PATH / sample_dir_name, **kwargs)
+    from data.vibrate import _process_vibrations
+    _process_vibrations(VOLUME_PATH / sample_dir_name, **kwargs)
     volume.commit()
 
-VIBRATION_FILES = ["00_raw_vibrations.npy", "01_raw_shifts.npy", "02_clean_shifts.npy", "03_fft.npz", "04_recovered_audio.wav"]
+def _process_vibrations_local(**kwargs): return _process_vibrations(**kwargs)
+
+VIBRATION_FILES = ["00_raw_vibrations.npy.bz2", "01_raw_shifts.npy", "02_clean_shifts.npy", "03_fft.npz", "04_recovered_audio.wav"]
 
 def process_vibrations(sample_dir:Path, use_modal:bool=False, pclk_mode:str='batched_optimized', pclk_batch_size:int=256, do_save:bool=True, verbose:int=1):
     sample_id = sample_dir.name

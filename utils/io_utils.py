@@ -1,5 +1,5 @@
 
-import contextlib, functools, logging, os, sys, threading, time, json, shutil
+import bz2, contextlib, functools, logging, os, sys, threading, time, json, shutil
 from pathlib import Path
 from datetime import datetime, timezone
 
@@ -141,6 +141,26 @@ def copy(src:Path|str, dst:Path|str, enabled:bool=True):
     dst.parent.mkdir(parents=True, exist_ok=True)
     if src.is_dir(): shutil.copytree(src, dst, dirs_exist_ok=True)
     else: shutil.copy2(src, dst)
+
+class Bz2Compressor:
+    """Lossless numpy array compressor using bz2 level 9 -- the pick that sits on
+    the time/ratio Pareto frontier for this project's raw vibration arrays
+    (~4.2x ratio in under a second per 30 MB, see src/data/compress_pareto.png).
+    lzma gets a better ratio (~6.8x) but costs ~30 min per 2.7 GB array, too
+    slow for per-sample pipeline use."""
+
+    LEVEL = 9
+
+    def compress(self, arr:np.ndarray) -> bytes:
+        arr = np.ascontiguousarray(arr)
+        header = json.dumps({"shape": arr.shape, "dtype": str(arr.dtype)}).encode()
+        return len(header).to_bytes(4, "big") + header + bz2.compress(arr.tobytes(), self.LEVEL)
+
+    def decompress(self, blob:bytes) -> np.ndarray:
+        header_len = int.from_bytes(blob[:4], "big")
+        meta = json.loads(blob[4:4 + header_len])
+        raw = bz2.decompress(blob[4 + header_len:])
+        return np.frombuffer(raw, dtype=meta["dtype"]).reshape(meta["shape"])
 
 def symlink(src:Path|str, dst:Path|str, enabled:bool=True):
     if not enabled: return
