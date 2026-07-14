@@ -1,0 +1,4 @@
+[
+  {"label": "full result: all 200 candidates\n(threshold=0.0), float32 masks", "time_ms": 14214.7, "status": "baseline"},
+  {"label": "top_k=2 filtered server-side,\nbool masks (client round trip)", "time_ms": 737.9, "status": "speedup"}
+]
