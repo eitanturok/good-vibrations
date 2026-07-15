@@ -46,10 +46,10 @@ def compute_fft(audio: np.ndarray, fs: int) -> tuple[np.ndarray, np.ndarray]:
 
 #***** 2 spectrogram *****
 
-def compute_spectrogram(audio: np.ndarray, fs: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+def compute_spectrogram(audio: np.ndarray, fs: int, nperseg:int = 4096) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Compute the spectrogram of audio. Returns (freqs, times, Sxx)."""
     audio = audio.astype(np.float32)
-    freqs, times, Sxx = spectrogram(audio, fs=fs)
+    freqs, times, Sxx = spectrogram(audio, fs=fs, nperseg=nperseg, noverlap = nperseg // 3, nfft=nperseg*4)
     return freqs, times, Sxx
 
 #***** 3 load precomputed artifacts *****
