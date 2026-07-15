@@ -21,13 +21,11 @@ MIN_FREQ, MAX_FREQ = 50, 1000
 
 #***** 0 capture vibrations *****
 
-def get_vibrations(cam, speaker, play_audio_fxn, capture_n_frames_fxn, audio_dir:Path, sample_dir:Path, height:int, width:int, n_frames:int, n_capture_seconds=3.1, verbose=1, do_save=True):
+def get_vibrations(cam, speaker, play_audio_fxn, capture_n_frames_fxn, audio_dir:Path, height:int, width:int, n_frames:int, n_capture_seconds=3.1):
     t_start = time.perf_counter()
     play_audio_fxn(audio_dir / 'audio.wav', speaker, wait=False)
-    logger.debug(f'[sample {sample_id}] capturing {n_frames} frames')
     try:
-        raw_vibrations, _ = capture_n_frames_fxn(cam, n_frames, height, width) # *cam.get_im_size()[::-1]
-        logger.debug(f'[sample {sample_id}] {raw_vibrations.shape=}=(frames, height, width)')
+        raw_vibrations, _ = capture_n_frames_fxn(cam, n_frames, height, width)
     finally:
         # always wait for audio to finish — even if capture throws — so the next
         # sample's play_audio call never overlaps with this one
@@ -46,12 +44,14 @@ def get_shifts(frame_recording:np.ndarray, rois: list[list[int]], batch_size: in
     if pclk_mode == "batched_optimized":
         crops = np.stack([frame_recording[:, y:y+h, x:x+w] for x, y, w, h in rois])  # (L, T, H, W)
         return compute_shifts_for_all_rois_batched_optimized(crops, batch_size)        # (L, T, 2)
-    else:
+    elif pclk_mode == 'sequential':
         from tqdm import tqdm
         all_shifts = []
         for x, y, w, h in tqdm(rois):
             all_shifts.append(compute_shifts_for_roi(frame_recording[:, y:y+h, x:x+w], batch_size))
         return np.stack(all_shifts, axis=0)  # (L, T, 2)
+    else:
+        raise ValueError(f'Incorrect value {pclk_mode=}')
 
 #***** 2 clean speckle shifts *****
 
@@ -112,7 +112,9 @@ def capture_vibrations(cam, speaker, play_audio_fxn, capture_n_frames_fxn, audio
     n_frames = int(n_capture_seconds * fps)
 
     with Timing(f"[sample {sample_id}] record vibrations: ", enabled=verbose >= 2):
-        raw_vibrations = get_vibrations(cam, speaker, play_audio_fxn, capture_n_frames_fxn, audio_dir, sample_dir, height, width, n_frames, n_capture_seconds, verbose, do_save)
+        logger.debug(f'[sample {sample_id}] capturing {n_frames} frames')
+        raw_vibrations = get_vibrations(sample_id, cam, speaker, play_audio_fxn, capture_n_frames_fxn, audio_dir, height, width, n_frames, n_capture_seconds)
+        logger.debug(f'[sample {sample_id}] {raw_vibrations.shape=}=(frames, height, width)')
 
     return raw_vibrations
 
@@ -129,7 +131,6 @@ def save_vibrations(raw_vibrations:np.ndarray, sample_dir:Path, audio_dir:Path, 
 
 def _process_vibrations(sample_dir:Path, min_freq:int=MIN_FREQ, max_freq:int=MAX_FREQ, audio_sample_rate:int=22050, pclk_batch_size:int=256, pclk_mode:str='batched_optimized', 
                         verbose:int=1, do_save:bool=True, cleanup_raw_vibrations:str='compress', spectrogram_video:bool=True):
-    assert cleanup_raw_vibrations in ('compress', 'delete'), f"{cleanup_raw_vibrations=} must be 'compress' or 'delete'"
     sample_id = sample_dir.name
     metadata = {k: v for d in load(sample_dir / 'metadata.jsonl') for k, v in d.items()}
     fps, rois = int(metadata['fps']), metadata['roi']
