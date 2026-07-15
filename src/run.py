@@ -22,7 +22,7 @@ from composer.core import Evaluator
 from composer.profiler import JSONTraceHandler, cyclic_schedule
 from composer.profiler.profiler import Profiler
 from composer.loggers import WandBLogger, FileLogger
-from composer.callbacks import RuntimeEstimator, SpeedMonitor, OOMObserver, NaNMonitor, SystemMetricsMonitor
+from composer.callbacks import RuntimeEstimator, SpeedMonitor, OOMObserver, NaNMonitor, SystemMetricsMonitor, OptimizerMonitor
 from composer.callbacks.speed_monitor import GPU_AVAILABLE_FLOPS
 
 # RTX 5080 isn't in composer's GPU_AVAILABLE_FLOPS table yet, so MFU can't be computed. Patch it in here
@@ -214,7 +214,8 @@ def run(**kwargs):
     # callbacks
     callbacks = [OutputSaver(args.eval_interval, f"runs/{{run_name}}/outputs_history", overwrite=True, visualizer=VizSegMask()),
                  SpeedMonitor(1), OOMObserver(folder=f"runs/{{run_name}}/torch_traces", remote_file_name=None), NaNMonitor(),
-                RuntimeEstimator(skip_batches=64, time_unit="minutes"), SystemMetricsMonitor()]
+                RuntimeEstimator(skip_batches=64, time_unit="minutes"), SystemMetricsMonitor(),
+                OptimizerMonitor(log_optimizer_metrics=True, batch_log_interval=10)]
 
     # optimizer
     optimizer = torch.optim.Adam(model.parameters(), args.lr, fused=True) if not args.eval_only else None
