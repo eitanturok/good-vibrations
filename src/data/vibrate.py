@@ -155,7 +155,7 @@ def _process_vibrations(sample_dir:Path, min_freq:int=MIN_FREQ, max_freq:int=MAX
             save(raw_shifts, raw_shifts_path, do_save)
             append({"pclk": datetime.now(timezone.utc).isoformat()}, sample_dir / "times.jsonl", do_save)
 
-    # pclk is done with the raw vibrations -- compress or delete them (skip if already handled)
+    # delete or compress the raw vibrations
     with Timing(f"[sample {sample_id}] {cleanup_raw_vibrations} raw vibrations: ", enabled=verbose >= 2):
         if do_save and raw_vibration_path.exists():
             old_bytes = raw_vibration_path.stat().st_size
@@ -197,8 +197,6 @@ def _process_vibrations(sample_dir:Path, min_freq:int=MIN_FREQ, max_freq:int=MAX
         save({'freqs': spec_freqs, 'times': spec_times, 'Sxx': Sxx}, sample_dir / 'vibration/05_spectrogram.npz', do_save)
         append({"spectrogram": datetime.now(timezone.utc).isoformat()}, sample_dir / "times.jsonl", do_save)
 
-    # spectrogram video with a moving playhead, audio muxed in
-    with Timing(f"[sample {sample_id}] spectrogram video: ", enabled=verbose >= 2):
         make_spectrogram_video(spec_freqs, spec_times, Sxx, recovered_audio, audio_sample_rate, sample_dir / 'vibration/06_spectrogram.mp4', enabled=do_save)
         symlink(sample_dir / 'vibration/06_spectrogram.mp4', sample_dir / 'spectrogram.mp4', do_save)
         append({"spectrogram_video": datetime.now(timezone.utc).isoformat()}, sample_dir / "times.jsonl", do_save)
