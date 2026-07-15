@@ -12,10 +12,56 @@ from scipy.io.wavfile import write as wav_write, read as wav_read
 
 #***** video helpers *****
 
-def make_spectrogram_video(freqs:np.ndarray, times:np.ndarray, Sxx:np.ndarray, audio:np.ndarray, sample_rate:int, out_path:Path, fps:int=20, enabled:bool=True):
+def plot_fft(freqs:np.ndarray, fft:np.ndarray, out_path:Path, enabled:bool=True):
+    """Render a static PNG of FFT magnitude vs. frequency."""
+    if not enabled: return
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    mag = np.abs(fft)
+
+    fig, ax = plt.subplots(figsize=(10, 5), dpi=100)
+    ax.plot(freqs, mag, color='#3b82f6', linewidth=1)
+    ax.set(xlabel='Frequency (Hz)', ylabel='Magnitude', title='FFT Magnitude')
+    ax.grid(True, alpha=0.3)
+    for spine in ('top', 'right'): ax.spines[spine].set_visible(False)
+    fig.tight_layout()
+    fig.savefig(out_path)
+    plt.close(fig)
+
+    return out_path
+
+def _draw_spectrogram(ax, freqs:np.ndarray, times:np.ndarray, Sxx_db:np.ndarray):
+    """Draw the spectrogram image onto `ax`, titled with the clip duration, and with the
+    lowest/highest time values always present as explicit x-axis tick labels."""
+    duration = times[-1] - times[0]
+    im = ax.imshow(Sxx_db, origin='lower', aspect='auto', extent=[times[0], times[-1], freqs[0], freqs[-1]], cmap='viridis')
+    ax.set(xlabel='Time (s)', ylabel='Frequency (Hz)', title=f'Spectrogram ({duration:.2f}s)')
+    ax.set_xlim(times[0], times[-1])
+    n_inner_ticks = max(0, len(ax.get_xticks()) - 2)
+    ax.set_xticks(np.linspace(times[0], times[-1], n_inner_ticks + 2))
+    return im
+
+def plot_spectrogram(freqs:np.ndarray, times:np.ndarray, Sxx:np.ndarray, out_path:Path, enabled:bool=True):
+    """Render a static PNG of the spectrogram (dB scale), same styling as
+    make_spectrogram_video's frames but without the playback line or audio mux."""
+    if not enabled: return
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    Sxx_db = 10 * np.log10(Sxx + 1e-10)
+
+    fig, ax = plt.subplots(figsize=(10, 5), dpi=100)
+    im = _draw_spectrogram(ax, freqs, times, Sxx_db)
+    fig.colorbar(im, ax=ax, label='Power (dB)')
+    fig.tight_layout()
+    fig.savefig(out_path)
+    plt.close(fig)
+
+    return out_path
+
+def make_spectrogram_video(freqs:np.ndarray, times:np.ndarray, Sxx:np.ndarray, audio:np.ndarray, sample_rate:int, out_path:Path, fps:int=20, figsize:tuple[float,float]=(6, 3), dpi:int=80, enabled:bool=True):
     """Render an mp4 of the spectrogram (dB scale) with a vertical line tracking playback
     position, muxed with `audio` as the soundtrack. Requires the `imageio-ffmpeg` package
-    (bundles a portable ffmpeg binary, no system install needed)."""
+    (bundles a portable ffmpeg binary, no system install needed). Pixel size is figsize*dpi."""
     if not enabled: return
     import subprocess, tempfile
     import cv2
@@ -27,10 +73,9 @@ def make_spectrogram_video(freqs:np.ndarray, times:np.ndarray, Sxx:np.ndarray, a
     n_frames = max(1, int(len(audio) / sample_rate * fps))
     Sxx_db = 10 * np.log10(Sxx + 1e-10)
 
-    fig, ax = plt.subplots(figsize=(10, 5), dpi=100)
+    fig, ax = plt.subplots(figsize=figsize, dpi=dpi)
     FigureCanvasAgg(fig)
-    im = ax.imshow(Sxx_db, origin='lower', aspect='auto', extent=[times[0], times[-1], freqs[0], freqs[-1]], cmap='viridis')
-    ax.set(xlabel='Time (s)', ylabel='Frequency (Hz)', title='Spectrogram')
+    im = _draw_spectrogram(ax, freqs, times, Sxx_db)
     fig.colorbar(im, ax=ax, label='Power (dB)')
     line = ax.axvline(times[0], color='red', linewidth=2)
     fig.tight_layout()
