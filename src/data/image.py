@@ -33,22 +33,47 @@ def _organize(object_names, all_detections):
 
 
 def segment(image: Image.Image, objects: dict[str, int], prompts: dict[str, str], is_empty_box: bool = False, segment_scale: float = 1.0) -> dict:
-    """Segment every object in parallel on modal and return the flattened per-instance {names, scores, boxes, masks} dict. """
+    """Segment every object in parallel on modal and return the flattened per-instance {names, scores, boxes, masks} dict.
+
+    Objects sharing a prompt (e.g. bullet + cylinder both prompted "Metal circle") are grouped
+    into ONE call with top_k = their combined count, and the distinct top instances are then
+    distributed among them. Calling per-object instead would give every such object the same
+    global top-1 detection — identical masks stacked on top of each other.
+
+    Assignment rule for a shared prompt: the top instances (by score) are ordered LEFT-TO-RIGHT
+    by mask center-of-mass and handed to the sharing objects in `objects` dict order. So
+    objects={'cylinder': 1, 'bullet': 1} guarantees cylinder = leftmost metal circle,
+    bullet = rightmost — arrange the physical objects to match the dict order."""
     w, h = image.size
     object_names = list(objects.keys())
-    counts = [objects[t] for t in object_names]
 
-    if is_empty_box: return _organize('empty_box', [[(0.0, np.zeros(4), np.zeros((h, w), dtype=bool))]])
+    if is_empty_box: return _organize(['empty_box'], [[(0.0, np.zeros(4), np.zeros((h, w), dtype=bool))]])
+
+    # one modal call per UNIQUE prompt, top_k = combined count of the objects sharing it
+    unique_prompts = list(dict.fromkeys(prompts[name] for name in object_names))
+    total_by_prompt = {p: sum(objects[n] for n in object_names if prompts[n] == p) for p in unique_prompts}
 
     # launch parallel segmentation on modal via threads + .remote()
     segmenter = modal.Cls.from_name("segment", "Segmenter")()
-    with ThreadPoolExecutor(max_workers=len(object_names)) as executor:
-        outs = list(executor.map(lambda args: segmenter.run.remote(image, prompts[args[0]], scale=segment_scale, top_k=args[1]), zip(object_names, counts)))
+    with ThreadPoolExecutor(max_workers=len(unique_prompts)) as executor:
+        outs = dict(zip(unique_prompts, executor.map(lambda p: segmenter.run.remote(image, p, scale=segment_scale, top_k=total_by_prompt[p]), unique_prompts)))
+
+    # per prompt: keep the top instances by score, then order them left-to-right by mask COM —
+    # the objects sharing the prompt consume them in `objects` dict order (see docstring)
+    def _com_col(mask):
+        cols = np.nonzero(mask)[1]
+        return cols.mean() if len(cols) else np.inf  # empty masks sort last
+    remaining = {}
+    for p, out in outs.items():
+        order = np.argsort(out["scores"])[::-1][:total_by_prompt[p]]
+        detections = [(float(out["scores"][i]), np.asarray(out["boxes"][i]), np.asarray(out["masks"][i], dtype=bool)) for i in order]
+        remaining[p] = sorted(detections, key=lambda d: _com_col(d[2]))
 
     all_detections = []
-    for out, count in zip(outs, counts):
-        order = np.argsort(out["scores"])[::-1][:count]
-        detections = [(float(out["scores"][i]), np.asarray(out["boxes"][i]), np.asarray(out["masks"][i], dtype=bool)) for i in order]
+    for name in object_names:
+        count = objects[name]
+        detections = remaining[prompts[name]][:count]
+        del remaining[prompts[name]][:count]
         detections += [(0.0, np.zeros(4), np.zeros((h, w), dtype=bool))] * (count - len(detections))
         all_detections.append(detections)
 

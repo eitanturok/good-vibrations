@@ -24,8 +24,13 @@ REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))           # utils.*
 sys.path.insert(0, str(REPO / "src"))   # data.*
 
+import matplotlib
+matplotlib.use("Agg")  # plots render in worker threads; Tk backends require the main thread
+
 import modal
-from utils.io_utils import Timing, modal_upload, modal_download, fix_symlinks, append, load
+
+from utils.io_utils import modal_upload, modal_download, fix_symlinks, append, load
+from utils.helpers import Timing
 from data.vibrate import app, volume, process_vibrations, _process_vibrations_modal, PROCESSED_FILES
 
 MIN_READY_BYTES = 1 * 2**20  # reject files caught mid-write at a few KB/MB

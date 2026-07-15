@@ -231,7 +231,8 @@ def plot_live_image(result:dict, image, objects:list[str]|None, audio_samples:np
     """Live 4-panel row shown once per overhead image during recording:
     overhead (masks+boxes+confidence+COMs), masks only, FFT of the original audio,
     spectrogram of the original audio — followed by a playable Audio widget of it."""
-    fig, axes = plt.subplots(1, 4, figsize=(24, 5), dpi=80)
+    # overhead panel is double-width, so the row has 5 unit slots like plot_live_sample's
+    fig, axes = plt.subplots(1, 4, figsize=(30, 5), dpi=80, gridspec_kw={'width_ratios': [2, 1, 1, 1]})
     _draw_overhead_full(axes[0], result, image, objects, alpha=alpha)
     _draw_coms(axes[0], result)
     axes[0].set_title('Overhead')
