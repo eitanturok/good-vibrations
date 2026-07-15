@@ -10,16 +10,16 @@ experiment_dir/
     audio/
         50_1000_3sec/
             audio.wav
-            spectogram.png
+            spectrogram.png
             samples.jsonl
     images/
         000000/
             00_raw.png
             01_cropped.png
             02_smask.png
-            03_smask.npy
-            04_overhead_masked.png     (mask overlay + avg COM crosshair, no boxes/confidence)
-            05_overhead_scored.png     (mask + boxes + confidence labels)
+            02_smask.npy
+            03_overhead_masked.png     (mask overlay + avg COM crosshair, no boxes/confidence)
+            04_overhead_scored.png     (mask + boxes + confidence labels)
             samples.jsonl
             smasks/
                 cube1.png
@@ -42,10 +42,10 @@ experiment_dir/
                 00_raw.png              (symlink)
                 01_cropped.png          (symlink)
                 02_smask.png            (symlink)
-                03_smask.npy            (symlink)
-                04_overhead_masked.png  (symlink)
-                05_overhead_scored.png  (symlink)
-                06_overhead_speaker.png (adds speaker icon to 04_overhead_masked.png)
+                02_smask.npy            (symlink)
+                03_overhead_masked.png  (symlink)
+                04_overhead_scored.png  (symlink)
+                05_overhead_speaker.png (adds speaker icon to 03_overhead_masked.png)
                 smasks/                 (symlink to images/000000/smasks/)
             vibration/
                 00_raw_vibrations.npy
@@ -53,10 +53,12 @@ experiment_dir/
                 02_clean_shifts.npy
                 03_fft.npz
                 04_recovered_audio.wav
-                05_recovered_spectogram.png
+                05_spectrogram.npz
+                05_spectrogram.png
+                05_spectrogram.mp4
             audio.wav
             recovered_audio.wav
-            overhead.png             (symlink to image/06_overhead_speaker.png)
+            overhead.png             (symlink to image/05_overhead_speaker.png)
             times.jsonl
             metadata.jsonl
 ```
@@ -75,18 +77,18 @@ dataset_dir/
                     00_raw.png
                     01_cropped.png
                     02_smask.png
-                    03_smask.npy
-                    04_overhead_with_smask.png
-                    05_overhead_with_speaker.png
-                    06_downsampled_smask.png
-                    07_downsampled_smask.npy
+                    02_smask.npy
+                    03_overhead_with_smask.png
+                    04_overhead_with_speaker.png
+                    05_downsampled_smask.png
+                    05_downsampled_smask.npy
                 vibration/
                     00_raw_vibrations.npy
                     01_raw_shifts.npy
                     02_clean_shifts.npy
                     03_fft.npz
                     04_recovered_audio.wav
-                    05_recovered_spectogram.png
+                    05_spectrogram.png
                     06_signaled_fft.npy
                     07_normalized_fft.npy
                     08_tokenized_fft.npy

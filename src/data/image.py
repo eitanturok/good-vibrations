@@ -192,7 +192,7 @@ def process_overhead(raw_overhead: Image.Image, output_dir: Path, left: float = 
         union_mask = result["masks"].any(axis=0)
         segment_mask = Image.fromarray(union_mask.astype(np.uint8) * 255, mode="L")
         save(segment_mask, output_dir / "02_smask.png", do_save)
-        save(union_mask.astype(np.float32), output_dir / "03_smask.npy", do_save)
+        save(union_mask.astype(np.float32), output_dir / "02_smask.npy", do_save)
         append({'union_mask': datetime.now(timezone.utc).isoformat()}, output_dir / 'times.jsonl', do_save)
 
     # per-object COMs + their average, across all real (non-placeholder) objects
@@ -207,13 +207,13 @@ def process_overhead(raw_overhead: Image.Image, output_dir: Path, left: float = 
     # make overhead image with segmentation mask and average center of mass, but no speaker
     with Timing(f"[output {output_id}] visualize overhead image: ", enabled=verbose >= 2):
         overhead_masked = draw_mask(cropped_overhead, segment_mask, avg_com, is_empty_box)
-        save(overhead_masked, output_dir / "04_overhead_masked.png", do_save)
+        save(overhead_masked, output_dir / "03_overhead_masked.png", do_save)
         append({'viz_overhead_masked': datetime.now(timezone.utc).isoformat()}, output_dir / 'times.jsonl', do_save)
 
     # make overhead image with masks + boxes + confidence scores for every object
     with Timing(f"[output {output_id}] score overhead image: ", enabled=verbose >= 2):
         overhead_scored = plot_smask(result, cropped_overhead, result["names"], show=False)
-        save(overhead_scored, output_dir / "05_overhead_scored.png", do_save)
+        save(overhead_scored, output_dir / "04_overhead_scored.png", do_save)
         append({'viz_overhead_scored': datetime.now(timezone.utc).isoformat()}, output_dir / 'times.jsonl', do_save)
 
     # update tracking status
@@ -225,9 +225,9 @@ def make_overhead(sample_dir:Path, output_dir:Path, speaker:int, verbose:int=1, 
     # add speaker to overhead image with smask, center of mass
     sample_id = sample_dir.name
     with Timing(f"[sample {sample_id}] visualize overhead image: ", enabled=verbose >= 2):
-        overhead_masked = load(sample_dir / 'image/04_overhead_masked.png', 'image')
+        overhead_masked = load(sample_dir / 'image/03_overhead_masked.png', 'image')
         overhead = draw_speaker(overhead_masked, speaker)
-        save(overhead, sample_dir / 'image/06_overhead_speaker.png', do_save)
+        save(overhead, sample_dir / 'image/05_overhead_speaker.png', do_save)
         timestamp = datetime.now(timezone.utc).isoformat()
         append({f'viz_overhead_speaker/sample_{sample_id}': timestamp}, output_dir / 'times.jsonl', do_save)
         append({f'viz_overhead_speaker': timestamp}, sample_dir / 'times.jsonl', do_save)

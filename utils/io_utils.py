@@ -126,7 +126,7 @@ class Bz2Compressor:
 
 #***** copy to sample helpers *****
 
-SHARED_FILES = ["00_raw.png", "01_cropped.png", "02_smask.png", "03_smask.npy", "04_overhead_masked.png", "05_overhead_scored.png"]
+SHARED_FILES = ["00_raw.png", "01_cropped.png", "02_smask.png", "02_smask.npy", "03_overhead_masked.png", "04_overhead_scored.png"]
 SHARED_DIRS = ["smasks"]
 COPIED_FILES = ["times.jsonl", "metadata.jsonl"]
 

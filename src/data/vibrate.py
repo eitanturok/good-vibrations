@@ -12,9 +12,9 @@ from scipy.signal import butter, resample, sosfiltfilt, spectrogram
 if Path("/src").exists() and str(Path("/src")) not in sys.path:
     sys.path.insert(0, "/src")
 
-from utils.io_utils import save, append, symlink, load, modal_upload, modal_download, fix_symlinks, Bz2Compressor
+from utils.io_utils import save, append, symlink, copy, load, modal_upload, modal_download, fix_symlinks, Bz2Compressor
 from utils.helpers import Timing, logger
-from utils.viz import make_spectrogram_video
+from utils.viz import make_spectrogram_video, plot_spectrogram
 
 MIN_FREQ, MAX_FREQ = 50, 1000
 
@@ -141,15 +141,14 @@ def _process_vibrations(sample_dir:Path, min_freq:int=MIN_FREQ, max_freq:int=MAX
     sample_id = sample_dir.name
     metadata = {k: v for d in load(sample_dir / 'metadata.jsonl') for k, v in d.items()}
     fps, rois = int(metadata['fps']), metadata['roi']
+    raw_vibration_path, raw_shifts_path = sample_dir / 'vibration/00_raw_vibrations.npy', sample_dir / 'vibration/01_raw_shifts.npy'
 
-    # turn vibrations into shifts with pclk algorithm (skip if a previous run already computed this)
-    raw_vibration_path = sample_dir / 'vibration/00_raw_vibrations.npy'
-    raw_shifts_path = sample_dir / 'vibration/01_raw_shifts.npy'
-    if raw_shifts_path.exists():
-        raw_shifts = load(raw_shifts_path)
-        logger.debug(f'[sample {sample_id}] pclk already computed, loaded {raw_shifts.shape=} from disk')
-    else:
-        with Timing(f"[sample {sample_id}] pclk: ", enabled=verbose >= 2):
+    # pclk algorithm turna vibrations into shifts
+    with Timing(f"[sample {sample_id}] pclk: ", enabled=verbose >= 2):
+        if raw_shifts_path.exists():
+            raw_shifts = load(raw_shifts_path)
+            logger.debug(f'[sample {sample_id}] pclk already computed, loaded {raw_shifts.shape=} from disk')
+        else:
             raw_shifts = get_shifts(load(raw_vibration_path), rois, pclk_batch_size, pclk_mode)  # (L, T, 2)
             logger.debug(f'[sample {sample_id}] {raw_shifts.shape=}=(lasers, frames, x/y)')
             save(raw_shifts, raw_shifts_path, do_save)
@@ -195,10 +194,11 @@ def _process_vibrations(sample_dir:Path, min_freq:int=MIN_FREQ, max_freq:int=MAX
         spec_freqs, spec_times, Sxx = get_spectrogram(recovered_audio, audio_sample_rate)
         logger.debug(f'[sample {sample_id}] {Sxx.shape=}=(freq bins, time bins)')
         save({'freqs': spec_freqs, 'times': spec_times, 'Sxx': Sxx}, sample_dir / 'vibration/05_spectrogram.npz', do_save)
+        plot_spectrogram(spec_freqs, spec_times, Sxx, sample_dir / 'vibration/05_spectrogram.png', enabled=do_save)
         append({"spectrogram": datetime.now(timezone.utc).isoformat()}, sample_dir / "times.jsonl", do_save)
 
-        make_spectrogram_video(spec_freqs, spec_times, Sxx, recovered_audio, audio_sample_rate, sample_dir / 'vibration/06_spectrogram.mp4', enabled=do_save)
-        symlink(sample_dir / 'vibration/06_spectrogram.mp4', sample_dir / 'spectrogram.mp4', do_save)
+        make_spectrogram_video(spec_freqs, spec_times, Sxx, recovered_audio, audio_sample_rate, sample_dir / 'vibration/05_spectrogram.mp4', enabled=do_save)
+        symlink(sample_dir / 'vibration/05_spectrogram.mp4', sample_dir / 'spectrogram.mp4', do_save)
         append({"spectrogram_video": datetime.now(timezone.utc).isoformat()}, sample_dir / "times.jsonl", do_save)
 
     # update tracking
@@ -235,7 +235,7 @@ def _process_vibrations_modal(sample_dir_name: str, **kwargs):
     _process_vibrations(VOLUME_PATH / sample_dir_name, **kwargs)
     volume.commit()
 
-PROCESSED_FILES = ["01_raw_shifts.npy", "02_clean_shifts.npy", "03_fft.npz", "04_recovered_audio.wav", "05_spectrogram.npz", "06_spectrogram.mp4"]
+PROCESSED_FILES = ["01_raw_shifts.npy", "02_clean_shifts.npy", "03_fft.npz", "04_recovered_audio.wav", "05_spectrogram.npz", "05_spectrogram.png", "05_spectrogram.mp4"]
 
 def process_vibrations(sample_dir:Path, use_modal:bool=False, pclk_mode:str='batched_optimized', pclk_batch_size:int=256, do_save:bool=True, verbose:int=1, cleanup_raw_vibrations:str='compress'):
     sample_id = sample_dir.name
