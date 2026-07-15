@@ -37,6 +37,7 @@ dependencies = [
     "torchcodec==0.5.*",
     "fastapi>=0.139.0",
     "uvicorn>=0.51.0",
+    "imageio-ffmpeg>=0.5.1",
 ]
 
 [project.optional-dependencies]

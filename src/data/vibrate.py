@@ -5,35 +5,33 @@ from pathlib import Path
 
 import modal
 import numpy as np
-from scipy.signal import butter, resample, sosfiltfilt
+from scipy.signal import butter, resample, sosfiltfilt, spectrogram
 
 # when running inside a Modal container, src is mounted at /src but this file
 # is copied to /root by Modal's function loader — add /src so imports resolve
 if Path("/src").exists() and str(Path("/src")) not in sys.path:
     sys.path.insert(0, "/src")
 
-from utils.io_utils import save, append, symlink, Timing, load, modal_upload, modal_download, fix_symlinks, Bz2Compressor, logger
+from utils.io_utils import save, append, symlink, load, modal_upload, modal_download, fix_symlinks, Bz2Compressor
+from utils.helpers import Timing, logger
+from utils.viz import make_spectrogram_video
 
 MIN_FREQ, MAX_FREQ = 50, 1000
 
 #***** 0 capture vibrations *****
 
-def capture_vibrations(cam, speaker, play_audio_fxn, capture_n_frames_fxn, audio_dir:Path, sample_dir:Path, height:int, width:int, n_capture_seconds=3.1, fps:int=2500, verbose=1, do_save=True):
-    sample_id = sample_dir.name
-    n_frames = int(n_capture_seconds * fps)
-
-    with Timing(f"[sample {sample_id}] record vibrations: ", enabled=verbose >= 2):
-        t_start = time.perf_counter()
-        play_audio_fxn(audio_dir / 'audio.wav', speaker, wait=False)
-        logger.debug(f'[sample {sample_id}] capturing {n_frames} frames')
-        try:
-            raw_vibrations, _ = capture_n_frames_fxn(cam, n_frames, height, width) # *cam.get_im_size()[::-1]
-            logger.debug(f'[sample {sample_id}] {raw_vibrations.shape=}=(frames, height, width)')
-        finally:
-            # always wait for audio to finish — even if capture throws — so the next
-            # sample's play_audio call never overlaps with this one
-            remaining = n_capture_seconds - (time.perf_counter() - t_start)
-            if remaining > 0: time.sleep(remaining)
+def get_vibrations(cam, speaker, play_audio_fxn, capture_n_frames_fxn, audio_dir:Path, sample_dir:Path, height:int, width:int, n_frames:int, n_capture_seconds=3.1, verbose=1, do_save=True):
+    t_start = time.perf_counter()
+    play_audio_fxn(audio_dir / 'audio.wav', speaker, wait=False)
+    logger.debug(f'[sample {sample_id}] capturing {n_frames} frames')
+    try:
+        raw_vibrations, _ = capture_n_frames_fxn(cam, n_frames, height, width) # *cam.get_im_size()[::-1]
+        logger.debug(f'[sample {sample_id}] {raw_vibrations.shape=}=(frames, height, width)')
+    finally:
+        # always wait for audio to finish — even if capture throws — so the next
+        # sample's play_audio call never overlaps with this one
+        remaining = n_capture_seconds - (time.perf_counter() - t_start)
+        if remaining > 0: time.sleep(remaining)
 
     return raw_vibrations
 
@@ -106,7 +104,37 @@ def get_recovered_audio(fft: np.ndarray, n_samples:int, fs: float, audio_sample_
     audio = audio / (np.max(np.abs(audio)) + 1e-8)
     return (audio * MAX_INT16_VAL).astype(np.int16)
 
-#***** 5 group steps and add timing, save to files ******
+#***** 5 spectrogram from recovered audio *****
+
+def get_spectrogram(audio: np.ndarray, sample_rate: int, nperseg: int = 256, noverlap: int | None = None) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Compute a magnitude spectrogram of the recovered audio via scipy's FFT-based STFT (fast).
+
+    Output: freqs (F,), times (T,), Sxx (F, T)
+    """
+    freqs, times, Sxx = spectrogram(audio.astype(np.float32), fs=sample_rate, nperseg=nperseg, noverlap=noverlap)
+    return freqs, times, Sxx
+
+#***** 6 group steps and add timing, save to files ******
+
+def capture_vibrations(cam, speaker, play_audio_fxn, capture_n_frames_fxn, audio_dir:Path, sample_dir:Path, height:int, width:int, n_capture_seconds=3.1, fps:int=2500, verbose=1, do_save=True):
+    sample_id = sample_dir.name
+    n_frames = int(n_capture_seconds * fps)
+
+    with Timing(f"[sample {sample_id}] record vibrations: ", enabled=verbose >= 2):
+        raw_vibrations = get_vibrations(cam, speaker, play_audio_fxn, capture_n_frames_fxn, audio_dir, sample_dir, height, width, n_frames, n_capture_seconds, verbose, do_save)
+
+    return raw_vibrations
+
+def save_vibrations(raw_vibrations:np.ndarray, sample_dir:Path, audio_dir:Path, do_save:bool=True, verbose:int=1):
+    sample_id = sample_dir.name
+
+    # save raw vibrations RAM->DISK (~2.7 GB per sample)
+    raw_vibration_path = sample_dir / 'vibration/00_raw_vibrations.npy'
+    with Timing(f'[sample {sample_id}] save raw vibrations RAM->DISK::{raw_vibration_path}: ', enabled=verbose >= 2):
+        save(raw_vibrations, raw_vibration_path, do_save)
+        timestamp = datetime.now(timezone.utc).isoformat()
+        append({"save_vibrations": timestamp}, sample_dir / "times.jsonl", do_save)
+        append({"sample_id": sample_id, "time": timestamp}, audio_dir.parent / "samples.jsonl", do_save)
 
 def _process_vibrations(sample_dir:Path, min_freq:int=MIN_FREQ, max_freq:int=MAX_FREQ, audio_sample_rate:int=22050, signal_mode:str='magnitude', normalize_mode:str='std-sample', patch_size:int=256, pclk_batch_size:int=256, pclk_mode:str='batched_optimized', verbose:int=1, do_save:bool=True, cleanup_raw_vibrations:str='compress'):
     assert cleanup_raw_vibrations in ('compress', 'delete'), f"{cleanup_raw_vibrations=} must be 'compress' or 'delete'"
@@ -162,21 +190,26 @@ def _process_vibrations(sample_dir:Path, min_freq:int=MIN_FREQ, max_freq:int=MAX
         symlink(sample_dir / 'vibration/04_recovered_audio.wav', sample_dir / 'recovered_audio.wav', do_save)
         append({"recover_audio": datetime.now(timezone.utc).isoformat()}, sample_dir / "times.jsonl", do_save)
 
+    # spectrogram of recovered audio
+    with Timing(f"[sample {sample_id}] spectrogram: ", enabled=verbose >= 2):
+        spec_freqs, spec_times, Sxx = get_spectrogram(recovered_audio, audio_sample_rate)
+        logger.debug(f'[sample {sample_id}] {Sxx.shape=}=(freq bins, time bins)')
+        save({'freqs': spec_freqs, 'times': spec_times, 'Sxx': Sxx}, sample_dir / 'vibration/05_spectrogram.npz', do_save)
+        append({"spectrogram": datetime.now(timezone.utc).isoformat()}, sample_dir / "times.jsonl", do_save)
+
+    # spectrogram video with a moving playhead, audio muxed in
+    with Timing(f"[sample {sample_id}] spectrogram video: ", enabled=verbose >= 2):
+        make_spectrogram_video(spec_freqs, spec_times, Sxx, recovered_audio, audio_sample_rate, sample_dir / 'vibration/06_spectrogram.mp4', enabled=do_save)
+        symlink(sample_dir / 'vibration/06_spectrogram.mp4', sample_dir / 'spectrogram.mp4', do_save)
+        append({"spectrogram_video": datetime.now(timezone.utc).isoformat()}, sample_dir / "times.jsonl", do_save)
+
     # update tracking
     append({"process_vibrations": datetime.now(timezone.utc).isoformat()}, sample_dir / "times.jsonl", do_save)
 
-def save_vibrations(raw_vibrations:np.ndarray, sample_dir:Path, audio_dir:Path, do_save:bool=True, verbose:int=1):
-    sample_id = sample_dir.name
 
-    # save raw vibrations RAM->DISK (~2.7 GB per sample)
-    raw_vibration_path = sample_dir / 'vibration/00_raw_vibrations.npy'
-    with Timing(f'[sample {sample_id}] save raw vibrations RAM->DISK::{raw_vibration_path}: ', enabled=verbose >= 2):
-        save(raw_vibrations, raw_vibration_path, do_save)
-        timestamp = datetime.now(timezone.utc).isoformat()
-        append({"save_vibrations": timestamp}, sample_dir / "times.jsonl", do_save)
-        append({"sample_id": sample_id, "time": timestamp}, audio_dir.parent / "samples.jsonl", do_save)
+#****** 6 run locally and on modal *****
 
-#****** 6 run on modal *****
+def _process_vibrations_local(sample_dir, **kwargs): return _process_vibrations(sample_dir, **kwargs)
 
 app = modal.App("pclk")
 volume = modal.Volume.from_name("samples", create_if_missing=True)
@@ -185,7 +218,7 @@ VOLUME_PATH = Path("/samples")
 cuda_image = (
     modal.Image.from_registry("nvidia/cuda:12.2.2-cudnn8-devel-ubuntu22.04", add_python="3.11")
     .env({"PYTHONUNBUFFERED": "1"})   # flush all prints so they show immedietally in modal logs
-    .pip_install("cupy-cuda12x", "numpy", "tqdm", "scipy", "matplotlib", "pillow", "ipython")
+    .pip_install("cupy-cuda12x", "numpy", "tqdm", "scipy", "matplotlib", "pillow", "ipython", "opencv-python-headless", "imageio-ffmpeg")
     .add_local_dir(Path(__file__).parent, remote_path="/src/data")
     .add_local_dir(Path(__file__).parents[2] / "utils", remote_path="/src/utils")
 )
@@ -204,9 +237,7 @@ def _process_vibrations_modal(sample_dir_name: str, **kwargs):
     _process_vibrations(VOLUME_PATH / sample_dir_name, **kwargs)
     volume.commit()
 
-def _process_vibrations_local(sample_dir, **kwargs): return _process_vibrations(sample_dir, **kwargs)
-
-PROCESSED_FILES = ["01_raw_shifts.npy", "02_clean_shifts.npy", "03_fft.npz", "04_recovered_audio.wav"]
+PROCESSED_FILES = ["01_raw_shifts.npy", "02_clean_shifts.npy", "03_fft.npz", "04_recovered_audio.wav", "05_spectrogram.npz", "06_spectrogram.mp4"]
 
 def process_vibrations(sample_dir:Path, use_modal:bool=False, pclk_mode:str='batched_optimized', pclk_batch_size:int=256, do_save:bool=True, verbose:int=1, cleanup_raw_vibrations:str='compress'):
     sample_id = sample_dir.name

@@ -29,8 +29,9 @@ def make_spectrogram_video(freqs:np.ndarray, times:np.ndarray, Sxx:np.ndarray, a
 
     fig, ax = plt.subplots(figsize=(10, 5), dpi=100)
     FigureCanvasAgg(fig)
-    ax.imshow(Sxx_db, origin='lower', aspect='auto', extent=[times[0], times[-1], freqs[0], freqs[-1]], cmap='viridis')
+    im = ax.imshow(Sxx_db, origin='lower', aspect='auto', extent=[times[0], times[-1], freqs[0], freqs[-1]], cmap='viridis')
     ax.set(xlabel='Time (s)', ylabel='Frequency (Hz)', title='Spectrogram')
+    fig.colorbar(im, ax=ax, label='Power (dB)')
     line = ax.axvline(times[0], color='red', linewidth=2)
     fig.tight_layout()
 
