@@ -283,6 +283,8 @@ def process_vibrations(sample_dir:Path, raw_vibrations:np.ndarray=None, use_moda
         append({"modal_upload": upload_timestamp}, sample_dir / "times.jsonl", do_save)
         append({"modal_download": datetime.now(timezone.utc).isoformat()}, sample_dir / "times.jsonl", do_save)
 
+    # TODO: doesn't modal remote return this dictionary already? out = f.remote() ?
+    # TODO: can we read in these values from sample_dir? Do we really need process_vbrations to return them?
     # same return contract as the local path, loaded from the files we just downloaded
     fft_data = load(sample_dir / 'vibration/03_fft.npz')
     recovered_audio, audio_sample_rate = load(sample_dir / f'vibration/04_recovered_audio{file_suffix}.wav')
