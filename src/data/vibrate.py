@@ -22,15 +22,32 @@ DEFAULT_RECOVERY_LASER_IDX = 50
 
 #***** 0 capture vibrations *****
 
+_WAV_DURATION_CACHE: dict = {}
+
+def _wav_duration(path:Path) -> float:
+    """Duration of a wav file in seconds, read from the header only (cached per path)."""
+    key = str(path)
+    if key not in _WAV_DURATION_CACHE:
+        import wave
+        with wave.open(str(path)) as w: _WAV_DURATION_CACHE[key] = w.getnframes() / w.getframerate()
+    return _WAV_DURATION_CACHE[key]
+
+AUDIO_SETTLE_SECONDS = 0.25  # guard after playback: the sound lags the software clock by the output
+                             # stream's latency (WASAPI shared mode ~0.1-0.25s), so wait past the wav's
+                             # nominal end before the next play_audio, or back-to-back samples cut/overlap
+                             # each other's tails (heard as a staticky cutoff + restart)
+
 def get_vibrations(cam, speaker, play_audio_fxn, capture_n_frames_fxn, audio_dir:Path, height:int, width:int, n_frames:int, n_capture_seconds=3.1):
     t_start = time.perf_counter()
     play_audio_fxn(audio_dir / 'audio.wav', speaker, wait=False)
     try:
         raw_vibrations, _ = capture_n_frames_fxn(cam, n_frames, height, width)
     finally:
-        # always wait for audio to finish — even if capture throws — so the next
-        # sample's play_audio call never overlaps with this one
-        remaining = n_capture_seconds - (time.perf_counter() - t_start)
+        # always wait for the FULL audio file to play out — even if capture throws or the
+        # capture window (n_capture_seconds) is shorter than the audio — so the next
+        # sample's play_audio call never overlaps/cuts this one
+        min_seconds = max(n_capture_seconds, _wav_duration(audio_dir / 'audio.wav') + AUDIO_SETTLE_SECONDS)
+        remaining = min_seconds - (time.perf_counter() - t_start)
         if remaining > 0: time.sleep(remaining)
 
     return raw_vibrations
@@ -292,6 +309,59 @@ def process_vibrations(sample_dir:Path, raw_vibrations:np.ndarray=None, use_moda
     return {'fft': fft_data['fft'], 'freqs': fft_data['freqs'], 'n_samples': fft_data['n_samples'], 'recovered_audio': recovered_audio,
             'audio_sample_rate': audio_sample_rate, 'spec_freqs': spec_freqs, 'spec_times': spec_times, 'Sxx': Sxx, 'max_freq': MAX_FREQ,
             'laser_idx': recovered_laser, 'xy_idx': xy_idx}
+
+#****** 7 fast display-only path for the live loop *****
+
+def warmup_pclk(verbose:int=1):
+    """Absorb cupy/cuFFT init (~4s) at experiment setup instead of on the first sample.
+    Runs the optimized pclk kernel once on a tiny dummy clip."""
+    from data.pclk import compute_shifts_for_all_rois_batched_optimized
+    with Timing('[warmup] pclk gpu warmup: ', enabled=verbose >= 1):
+        dummy = np.zeros((1, 65, 32, 32), dtype=np.uint8)
+        compute_shifts_for_all_rois_batched_optimized(dummy, batch_size=64, progress=False)
+
+def process_vibrations_2(sample_dir:Path, raw_vibrations:np.ndarray=None, use_modal:bool=False, pclk_mode:str='batched_optimized', pclk_batch_size:int=3000, do_save:bool=True, verbose:int=1, cleanup_raw_vibrations:str|None=None, spectrogram_video:bool=True, laser_idx:int|None=None, xy_idx:int=0):
+    """Fast single-laser display path for the live loop. Same signature and return dict as
+    process_vibrations, same math (get_clean_shifts/get_fft_shifts/get_recovered_audio/
+    compute_spectrogram), but:
+    - pclk runs the optimized batched kernel on just the one ROI crop (no per-frame
+      warp_roll sync loop, no other lasers)
+    - writes nothing to disk and renders no plots — the background watch_and_run pass
+      recomputes and persists everything; the live figures are drawn from the returned arrays
+    use_modal/do_save/cleanup_raw_vibrations/spectrogram_video/pclk_mode are accepted for
+    drop-in compatibility but ignored."""
+    from data.pclk import compute_shifts_for_all_rois_batched_optimized
+    audio_sample_rate = 22050
+    sample_id = sample_dir.name
+    recovered_laser = laser_idx if laser_idx is not None else DEFAULT_RECOVERY_LASER_IDX
+
+    with Timing(f'[sample {sample_id}] process vibrations (fast): ', enabled=verbose >= 1):
+        metadata = {k: v for d in load(sample_dir / 'metadata.jsonl') for k, v in d.items()}
+        fps, rois = int(metadata['fps']), metadata['roi']
+
+        # crop the single ROI up front — never touch the other 99 lasers' pixels
+        with Timing(f"[sample {sample_id}] crop roi: ", enabled=verbose >= 2):
+            if raw_vibrations is None: raw_vibrations = load(sample_dir / 'vibration/00_raw_vibrations.npy')
+            x, y, w, h = rois[recovered_laser]
+            crop = np.ascontiguousarray(raw_vibrations[:, y:y+h, x:x+w])[None]  # (1, T, h, w)
+
+        with Timing(f"[sample {sample_id}] pclk (fast): ", enabled=verbose >= 2):
+            raw_shifts = compute_shifts_for_all_rois_batched_optimized(crop, pclk_batch_size, progress=False)  # (1, T, 2)
+
+        with Timing(f"[sample {sample_id}] clean shifts: ", enabled=verbose >= 2):
+            clean_shifts = get_clean_shifts(raw_shifts[None], fps, MIN_FREQ, MAX_FREQ)  # (1, 1, T, 2)
+
+        with Timing(f"[sample {sample_id}] fft shifts: ", enabled=verbose >= 2):
+            fft, freqs, n_samples = get_fft_shifts(clean_shifts, fps, MIN_FREQ, MAX_FREQ)
+
+        with Timing(f"[sample {sample_id}] recover audio: ", enabled=verbose >= 2):
+            recovered_audio = get_recovered_audio(fft, n_samples, fps, audio_sample_rate, MIN_FREQ, MAX_FREQ, laser_idx=0, xy_idx=xy_idx)
+
+        with Timing(f"[sample {sample_id}] spectrogram: ", enabled=verbose >= 2):
+            spec_freqs, spec_times, Sxx = compute_spectrogram(recovered_audio, audio_sample_rate)
+
+    return {'fft': fft, 'freqs': freqs, 'n_samples': n_samples, 'recovered_audio': recovered_audio, 'audio_sample_rate': audio_sample_rate,
+            'spec_freqs': spec_freqs, 'spec_times': spec_times, 'Sxx': Sxx, 'max_freq': MAX_FREQ, 'laser_idx': recovered_laser, 'xy_idx': xy_idx}
 
 def save_and_process_vibrations(raw_vibrations:np.ndarray, sample_dir:Path, audio_dir:Path, min_freq:int, max_freq:int, use_modal:bool=False, pclk_mode:str='batched_optimized', pclk_batch_size:int=256, do_save:bool=True, verbose:int=1, spectrogram_video:bool=True, laser_idx:int|None=None, xy_idx:int=0):
     save_vibrations(raw_vibrations, sample_dir, audio_dir, do_save, verbose)

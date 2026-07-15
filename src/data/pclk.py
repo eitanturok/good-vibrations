@@ -222,7 +222,7 @@ def compute_shifts_for_all_rois_batched(videos, batch_size):
     return np.cumsum(all_shifts, axis=1)                     # (L, T, 2)
 
 
-def compute_shifts_for_all_rois_batched_optimized(videos, batch_size):
+def compute_shifts_for_all_rois_batched_optimized(videos, batch_size, debug:bool=False, progress:bool=True):
     """Same as compute_shifts_for_all_rois_batched with additional optimizations:
     - hannW_pad precomputed once outside the batch loop
     - hann window applied in-place with *= to avoid broadcast allocation
@@ -232,6 +232,8 @@ def compute_shifts_for_all_rois_batched_optimized(videos, batch_size):
     Args:
         videos: (L, T, H, W) numpy array — all ROI crops stacked (stays on CPU)
         batch_size: number of frame pairs per GPU batch
+        debug: print GPU memory-pool usage at each stage of every batch
+        progress: show the tqdm progress bar over batches
     Returns:
         (L, T, 2) numpy array of cumulative shifts
     """
@@ -252,13 +254,14 @@ def compute_shifts_for_all_rois_batched_optimized(videos, batch_size):
     hannW_pad = _pad(hannW, up_pad, down_pad, left_pad, right_pad)
     pH, pW = hannW_pad.shape
 
-    for i in tqdm(range(N_batches)):
+    for i in tqdm(range(N_batches), disable=not progress):
         start = i * batch_size
         end   = min((i + 1) * batch_size, T - 1)
 
         n_pairs = end - start
         mem = cp.get_default_memory_pool()
-        def mprint(tag): print(f"  [mem {tag}] used={mem.used_bytes()/1e9:.2f}GB total={mem.total_bytes()/1e9:.2f}GB")
+        def mprint(tag):
+            if debug: print(f"  [mem {tag}] used={mem.used_bytes()/1e9:.2f}GB total={mem.total_bytes()/1e9:.2f}GB")
 
         # load left/right frames from CPU separately — never hold full clip on GPU at once
         # pairs are (start, start+1), (start+1, start+2), ..., (end-1, end)

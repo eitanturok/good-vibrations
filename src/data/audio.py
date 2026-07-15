@@ -54,17 +54,24 @@ def compute_spectrogram(audio: np.ndarray, fs: int, nperseg:int = 4096) -> tuple
 
 #***** 3 load precomputed artifacts *****
 
+_AUDIO_ARTIFACTS_CACHE: dict = {}
+
 def load_audio_artifacts(audio_dir: Path) -> tuple[np.ndarray, int, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, float]:
     """Load the precomputed audio artifacts saved by main(). Returns
     (samples, fs, freqs, fft, spec_freqs, spec_times, Sxx, max_freq) with no recomputation.
     max_freq is the audio's highest frequency (f_end from metadata.jsonl), used to cap
-    fft/spectrogram plot axes."""
+    fft/spectrogram plot axes. Cached per directory — the same audio is reused for every
+    image in an experiment, so it's only read from disk once per session."""
     audio_dir = Path(audio_dir)
+    key = str(audio_dir.resolve())
+    if key in _AUDIO_ARTIFACTS_CACHE: return _AUDIO_ARTIFACTS_CACHE[key]
     samples, fs = load(audio_dir / 'audio.wav')
     freqs, fft = load(audio_dir / 'fft.npz', keys=['freqs', 'fft'])
     spec_freqs, spec_times, Sxx = load(audio_dir / 'spectrogram.npz', keys=['freqs', 'times', 'Sxx'])
     metadata = {k: v for d in load(audio_dir / 'metadata.jsonl') for k, v in d.items()}
-    return samples, fs, freqs, fft, spec_freqs, spec_times, Sxx, metadata['f_end']
+    out = (samples, fs, freqs, fft, spec_freqs, spec_times, Sxx, metadata['f_end'])
+    _AUDIO_ARTIFACTS_CACHE[key] = out
+    return out
 
 #***** 4 cli *****
 

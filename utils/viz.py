@@ -33,27 +33,22 @@ def plot_fft(freqs:np.ndarray, fft:np.ndarray, out_path:Path, title:str='FFT Mag
 
     return out_path
 
-def _draw_spectrogram(ax, freqs:np.ndarray, times:np.ndarray, Sxx_db:np.ndarray, label:str=''):
+def _draw_spectrogram(ax, freqs:np.ndarray, times:np.ndarray, Sxx:np.ndarray, label:str='',  max_freq:float|None=None):
     """Draw the spectrogram image onto `ax`, with the lowest/highest time values always
     present as explicit x-axis tick labels. `label` is the full title; it may contain a
     '{duration}' placeholder which is filled with the clip duration in seconds."""
     duration = times[-1] - times[0]
+    Sxx_db = 10 * np.log10(Sxx + 1e-10)
+
     title = label.format(duration=f'{duration:.2f}') if label else f'Spectrogram ({duration:.2f}s)'
     im = ax.imshow(Sxx_db, origin='lower', aspect='auto', extent=[times[0], times[-1], freqs[0], freqs[-1]], cmap='viridis')
     ax.set(xlabel='Time (s)', ylabel='Frequency (Hz)', title=title)
     ax.set_xlim(times[0], times[-1])
     n_inner_ticks = max(0, len(ax.get_xticks()) - 2)
     ax.set_xticks(np.linspace(times[0], times[-1], n_inner_ticks + 2))
-    return im
-
-def _draw_spectrogram_db(ax, freqs:np.ndarray, times:np.ndarray, Sxx:np.ndarray, label:str='', max_freq:float|None=None):
-    """Convert Sxx to dB and draw it onto `ax` (no colorbar/fig handling). `max_freq` caps
-    the y-axis (e.g. the audio's f_end from metadata.jsonl) so original and recovered
-    spectrograms share the same frequency range instead of each one's Nyquist limit."""
-    Sxx_db = 10 * np.log10(Sxx + 1e-10)
-    im = _draw_spectrogram(ax, freqs, times, Sxx_db, label)
     if max_freq is not None: ax.set_ylim(freqs[0], max_freq)
-    return im
+    return im 
+
 
 def plot_spectrogram(freqs:np.ndarray, times:np.ndarray, Sxx:np.ndarray, out_path:Path, label:str='', max_freq:float|None=None, enabled:bool=True):
     """Render a static PNG of the spectrogram (dB scale), same styling as
@@ -63,7 +58,7 @@ def plot_spectrogram(freqs:np.ndarray, times:np.ndarray, Sxx:np.ndarray, out_pat
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     fig, ax = plt.subplots(figsize=(10, 5), dpi=100)
-    im = _draw_spectrogram_db(ax, freqs, times, Sxx, label, max_freq=max_freq)
+    im = _draw_spectrogram(ax, freqs, times, Sxx, label, max_freq=max_freq)
     fig.colorbar(im, ax=ax, label='Power (dB)')
     fig.tight_layout()
     fig.savefig(out_path)
@@ -84,12 +79,10 @@ def make_spectrogram_video(freqs:np.ndarray, times:np.ndarray, Sxx:np.ndarray, a
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     n_frames = max(1, int(len(audio) / sample_rate * fps))
-    Sxx_db = 10 * np.log10(Sxx + 1e-10)
 
     fig, ax = plt.subplots(figsize=figsize, dpi=dpi)
     FigureCanvasAgg(fig)
-    im = _draw_spectrogram(ax, freqs, times, Sxx_db, label)
-    if max_freq is not None: ax.set_ylim(freqs[0], max_freq)
+    im = _draw_spectrogram(ax, freqs, times, Sxx, label, max_freq)
     fig.colorbar(im, ax=ax, label='Power (dB)')
     line = ax.axvline(times[0], color='red', linewidth=2)
     fig.tight_layout()
@@ -127,8 +120,10 @@ def _draw_image(ax, image):
     ax.axis('off')
 
 def _draw_vibration_image(ax, frame_recording):
-    MINMAX = (np.percentile(frame_recording[-100:],10), np.percentile(frame_recording[-100:],90))
-    ax.imshow(frame_recording[10],vmin=MINMAX[0],vmax=MINMAX[1])
+    # estimate contrast percentiles from a strided sample of the last 100 frames — one pass
+    # over ~1/16 of the pixels instead of two passes over all of them, visually identical
+    vmin, vmax = np.percentile(frame_recording[-100:, ::4, ::4], [10, 90])
+    ax.imshow(frame_recording[10], vmin=vmin, vmax=vmax)
 
 def preview_image(image:np.ndarray):
     fig, ax = plt.subplots(figsize=(12, 6))
@@ -236,14 +231,14 @@ def plot_live_image(result:dict, image, objects:list[str]|None, audio_samples:np
     """Live 4-panel row shown once per overhead image during recording:
     overhead (masks+boxes+confidence+COMs), masks only, FFT of the original audio,
     spectrogram of the original audio — followed by a playable Audio widget of it."""
-    fig, axes = plt.subplots(1, 4, figsize=(24, 5))
+    fig, axes = plt.subplots(1, 4, figsize=(24, 5), dpi=80)
     _draw_overhead_full(axes[0], result, image, objects, alpha=alpha)
     _draw_coms(axes[0], result)
     axes[0].set_title('Overhead')
     _draw_masks_only(axes[1], result)
     axes[1].set_title('Masks Only')
     _draw_fft(axes[2], freqs, fft, title='Original Audio FFT', max_freq=max_freq)
-    im = _draw_spectrogram_db(axes[3], spec_freqs, spec_times, Sxx, label='Original Audio Spectrogram: {duration}s', max_freq=max_freq)
+    im = _draw_spectrogram(axes[3], spec_freqs, spec_times, Sxx, label='Original Audio Spectrogram: {duration}s', max_freq=max_freq)
     fig.colorbar(im, ax=axes[3], label='Power (dB)')
     if header: fig.suptitle(header, fontsize=20, fontweight='bold')
     fig.tight_layout()
@@ -258,7 +253,7 @@ def plot_live_sample(sample_overhead, raw_vibrations, box_coverage, sample_dir, 
     spectrogram of the recovered audio — followed by a playable Audio widget of it.
     laser_idx/xy_idx name the laser and x/y channel the audio was recovered from."""
     recovery_label = f"Laser {laser_idx}, {'x' if xy_idx == 0 else 'y'}-axis" if laser_idx is not None else f"{'x' if xy_idx == 0 else 'y'}-axis"
-    fig, axes = plt.subplots(1, 5, figsize=(30, 5))
+    fig, axes = plt.subplots(1, 5, figsize=(30, 5), dpi=80)
     _draw_image(axes[0], sample_overhead)
     _draw_coms(axes[0], result, image=sample_overhead)
     axes[0].set_title('Overhead')
@@ -266,7 +261,7 @@ def plot_live_sample(sample_overhead, raw_vibrations, box_coverage, sample_dir, 
     axes[1].set_title('Laser Speckles')
     _draw_box_coverage(axes[2], box_coverage, sample_dir)
     _draw_fft(axes[3], freqs, _slice_fft(fft, xy_idx), title=f'Recovered Audio FFT, {recovery_label}', max_freq=max_freq)
-    im = _draw_spectrogram_db(axes[4], spec_freqs, spec_times, Sxx, label=f'Recovered Audio Spectrogram: {{duration}}s, {recovery_label}', max_freq=max_freq)
+    im = _draw_spectrogram(axes[4], spec_freqs, spec_times, Sxx, label=f'Recovered Audio Spectrogram: {{duration}}s, {recovery_label}', max_freq=max_freq)
     fig.colorbar(im, ax=axes[4], label='Power (dB)')
     if header: fig.suptitle(header, fontsize=20, fontweight='bold')
     fig.tight_layout()

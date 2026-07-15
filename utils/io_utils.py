@@ -19,6 +19,16 @@ def paths_to_str(x):
     if isinstance(x, tuple): return tuple(paths_to_str(i) for i in x)
     return x
 
+def _save_npy_chunked(f, x: np.ndarray, chunk_bytes: int = 64 * 1024 * 1024):
+    """np.save-compatible .npy writer that releases the GIL. np.save uses ndarray.tofile,
+    which holds the GIL for the entire (multi-second, for our ~3 GB raw vibrations) write and
+    starves the audio playback callback in other threads. Writing the same bytes through
+    io.BufferedWriter in chunks releases the GIL during each OS write."""
+    np.lib.format.write_array_header_1_0(f, np.lib.format.header_data_from_array_1_0(x))
+    mv = memoryview(x).cast('B')
+    for i in range(0, len(mv), chunk_bytes):
+        f.write(mv[i:i + chunk_bytes])
+
 def save(x, path:Path, enabled:bool=True):
     if not enabled: return
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -30,7 +40,9 @@ def save(x, path:Path, enabled:bool=True):
         if not isinstance(x, dict): raise ValueError("save to .npz requires a dict of arrays")
         np.savez(path, **x)
     elif isinstance(x, np.ndarray):
-        with open(path, 'wb') as f: np.save(f, x)
+        with open(path, 'wb') as f:
+            if x.flags['C_CONTIGUOUS'] and x.size > 0: _save_npy_chunked(f, x)
+            else: np.save(f, x)
     elif isinstance(x, Image.Image): x.save(path)
     elif isinstance(x, (dict, list)):
         if isinstance(x, dict): x = [x]
