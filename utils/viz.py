@@ -30,18 +30,20 @@ def plot_fft(freqs:np.ndarray, fft:np.ndarray, out_path:Path, enabled:bool=True)
 
     return out_path
 
-def _draw_spectrogram(ax, freqs:np.ndarray, times:np.ndarray, Sxx_db:np.ndarray):
-    """Draw the spectrogram image onto `ax`, titled with the clip duration, and with the
-    lowest/highest time values always present as explicit x-axis tick labels."""
+def _draw_spectrogram(ax, freqs:np.ndarray, times:np.ndarray, Sxx_db:np.ndarray, label:str=''):
+    """Draw the spectrogram image onto `ax`, titled with the clip duration (and optional
+    extra `label`, e.g. which laser/axis this is), and with the lowest/highest time values
+    always present as explicit x-axis tick labels."""
     duration = times[-1] - times[0]
+    title = f'Spectrogram ({duration:.2f}s)' + (f' — {label}' if label else '')
     im = ax.imshow(Sxx_db, origin='lower', aspect='auto', extent=[times[0], times[-1], freqs[0], freqs[-1]], cmap='viridis')
-    ax.set(xlabel='Time (s)', ylabel='Frequency (Hz)', title=f'Spectrogram ({duration:.2f}s)')
+    ax.set(xlabel='Time (s)', ylabel='Frequency (Hz)', title=title)
     ax.set_xlim(times[0], times[-1])
     n_inner_ticks = max(0, len(ax.get_xticks()) - 2)
     ax.set_xticks(np.linspace(times[0], times[-1], n_inner_ticks + 2))
     return im
 
-def plot_spectrogram(freqs:np.ndarray, times:np.ndarray, Sxx:np.ndarray, out_path:Path, enabled:bool=True):
+def plot_spectrogram(freqs:np.ndarray, times:np.ndarray, Sxx:np.ndarray, out_path:Path, label:str='', enabled:bool=True):
     """Render a static PNG of the spectrogram (dB scale), same styling as
     make_spectrogram_video's frames but without the playback line or audio mux."""
     if not enabled: return
@@ -50,7 +52,7 @@ def plot_spectrogram(freqs:np.ndarray, times:np.ndarray, Sxx:np.ndarray, out_pat
     Sxx_db = 10 * np.log10(Sxx + 1e-10)
 
     fig, ax = plt.subplots(figsize=(10, 5), dpi=100)
-    im = _draw_spectrogram(ax, freqs, times, Sxx_db)
+    im = _draw_spectrogram(ax, freqs, times, Sxx_db, label)
     fig.colorbar(im, ax=ax, label='Power (dB)')
     fig.tight_layout()
     fig.savefig(out_path)
@@ -58,7 +60,7 @@ def plot_spectrogram(freqs:np.ndarray, times:np.ndarray, Sxx:np.ndarray, out_pat
 
     return out_path
 
-def make_spectrogram_video(freqs:np.ndarray, times:np.ndarray, Sxx:np.ndarray, audio:np.ndarray, sample_rate:int, out_path:Path, fps:int=20, figsize:tuple[float,float]=(6, 3), dpi:int=80, enabled:bool=True):
+def make_spectrogram_video(freqs:np.ndarray, times:np.ndarray, Sxx:np.ndarray, audio:np.ndarray, sample_rate:int, out_path:Path, fps:int=20, figsize:tuple[float,float]=(6, 3), dpi:int=80, label:str='', enabled:bool=True):
     """Render an mp4 of the spectrogram (dB scale) with a vertical line tracking playback
     position, muxed with `audio` as the soundtrack. Requires the `imageio-ffmpeg` package
     (bundles a portable ffmpeg binary, no system install needed). Pixel size is figsize*dpi."""
@@ -75,7 +77,7 @@ def make_spectrogram_video(freqs:np.ndarray, times:np.ndarray, Sxx:np.ndarray, a
 
     fig, ax = plt.subplots(figsize=figsize, dpi=dpi)
     FigureCanvasAgg(fig)
-    im = _draw_spectrogram(ax, freqs, times, Sxx_db)
+    im = _draw_spectrogram(ax, freqs, times, Sxx_db, label)
     fig.colorbar(im, ax=ax, label='Power (dB)')
     line = ax.axvline(times[0], color='red', linewidth=2)
     fig.tight_layout()

@@ -201,8 +201,8 @@ def modal_download(volume, remote_path, local_path):
     with open(local_path, 'wb') as f:
         for chunk in volume.read_file(str(remote_path)): f.write(chunk)
 
-def fix_symlinks(sample_dir):
-    for dst_rel, src_rel in SYMLINKS:
+def fix_symlinks(sample_dir, symlinks:list[tuple[str,str]]|None=None):
+    for dst_rel, src_rel in (symlinks if symlinks is not None else SYMLINKS):
         dst, src = sample_dir / dst_rel, sample_dir / src_rel
         if dst.exists() or dst.is_symlink(): dst.unlink()
         dst.symlink_to(src.relative_to(dst.parent))
