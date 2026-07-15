@@ -14,7 +14,7 @@ if Path("/src").exists() and str(Path("/src")) not in sys.path:
 
 from utils.io_utils import save, append, symlink, copy, load, modal_upload, modal_download, fix_symlinks, Bz2Compressor
 from utils.helpers import Timing, logger
-from utils.viz import make_spectrogram_video, plot_spectrogram
+from utils.viz import make_spectrogram_video, plot_spectrogram, plot_fft
 from data.audio import compute_spectrogram
 
 MIN_FREQ, MAX_FREQ = 50, 1000
@@ -118,7 +118,7 @@ def capture_vibrations(cam, speaker, play_audio_fxn, capture_n_frames_fxn, audio
 
     with Timing(f"[sample {sample_id}] record vibrations: ", enabled=verbose >= 2):
         logger.debug(f'[sample {sample_id}] capturing {n_frames} frames')
-        raw_vibrations = get_vibrations(sample_id, cam, speaker, play_audio_fxn, capture_n_frames_fxn, audio_dir, height, width, n_frames, n_capture_seconds)
+        raw_vibrations = get_vibrations(cam, speaker, play_audio_fxn, capture_n_frames_fxn, audio_dir, height, width, n_frames, n_capture_seconds)
         logger.debug(f'[sample {sample_id}] {raw_vibrations.shape=}=(frames, height, width)')
 
     return raw_vibrations
@@ -134,7 +134,7 @@ def save_vibrations(raw_vibrations:np.ndarray, sample_dir:Path, audio_dir:Path, 
         append({"save_vibrations": timestamp}, sample_dir / "times.jsonl", do_save)
         append({"sample_id": sample_id, "time": timestamp}, audio_dir.parent / "samples.jsonl", do_save)
 
-def _process_vibrations(sample_dir:Path, min_freq:int=MIN_FREQ, max_freq:int=MAX_FREQ, audio_sample_rate:int=22050, pclk_batch_size:int=256, pclk_mode:str='batched_optimized',
+def _process_vibrations(sample_dir:Path, raw_vibrations:np.ndarray=None, min_freq:int=MIN_FREQ, max_freq:int=MAX_FREQ, audio_sample_rate:int=22050, pclk_batch_size:int=256, pclk_mode:str='batched_optimized',
                         verbose:int=1, do_save:bool=True, cleanup_raw_vibrations:str='compress', spectrogram_video:bool=True, laser_idx:int|None=None, xy_idx:int=0):
     sample_id = sample_dir.name
     metadata = {k: v for d in load(sample_dir / 'metadata.jsonl') for k, v in d.items()}
@@ -153,24 +153,25 @@ def _process_vibrations(sample_dir:Path, min_freq:int=MIN_FREQ, max_freq:int=MAX
             raw_shifts = load(raw_shifts_path)
             logger.debug(f'[sample {sample_id}] pclk already computed, loaded {raw_shifts.shape=} from disk')
         else:
-            raw_shifts = get_shifts(load(raw_vibration_path), rois, pclk_batch_size, pclk_mode, laser_idx=laser_idx)  # (L, T, 2)
+            raw_shifts = get_shifts(raw_vibrations if raw_vibrations is not None else load(raw_vibration_path), rois, pclk_batch_size, pclk_mode, laser_idx=laser_idx)  # (L, T, 2)
             logger.debug(f'[sample {sample_id}] {raw_shifts.shape=}=(lasers, frames, x/y)')
             save(raw_shifts, raw_shifts_path, do_save)
             append({"pclk": datetime.now(timezone.utc).isoformat()}, sample_dir / "times.jsonl", do_save)
 
-    # delete or compress the raw vibrations
-    with Timing(f"[sample {sample_id}] {cleanup_raw_vibrations} raw vibrations: ", enabled=verbose >= 2):
-        if do_save and raw_vibration_path.exists():
-            old_bytes = raw_vibration_path.stat().st_size
-            if cleanup_raw_vibrations == 'compress':
-                compressed = Bz2Compressor().compress(load(raw_vibration_path))
-                raw_vibration_path.with_suffix(raw_vibration_path.suffix + '.bz2').write_bytes(compressed)
-                new_bytes = len(compressed)
-                print(f"[sample {sample_id}] compressed raw vibrations: {old_bytes}->{new_bytes} bytes (ratio={old_bytes/new_bytes:.2f}x)")
-            else:
-                print(f"[sample {sample_id}] deleted raw vibrations: {old_bytes}->0 bytes")
-            raw_vibration_path.unlink()
-        append({f"{cleanup_raw_vibrations}_raw_vibrations": datetime.now(timezone.utc).isoformat()}, sample_dir / "times.jsonl", do_save)
+            # clean up raw vibrations: delete, compress, or do nothing
+            if raw_vibration_path.exists() and do_save and cleanup_raw_vibrations is not None:
+                old_bytes = raw_vibration_path.stat().st_size
+                if cleanup_raw_vibrations == 'compress':
+                    compressed = Bz2Compressor().compress(load(raw_vibration_path))
+                    raw_vibration_path.with_suffix(raw_vibration_path.suffix + '.bz2').write_bytes(compressed)
+                    new_bytes = len(compressed)
+                    print(f"[sample {sample_id}] compressed raw vibrations: {old_bytes}->{new_bytes} bytes (ratio={old_bytes/new_bytes:.2f}x)")
+                elif cleanup_raw_vibrations == 'delete':
+                    print(f"[sample {sample_id}] deleted raw vibrations: {old_bytes}->0 bytes")
+                else:
+                    raise ValueError(f'invalid value for {cleanup_raw_vibrations=}')
+                raw_vibration_path.unlink()
+            append({f"{cleanup_raw_vibrations}_raw_vibrations": datetime.now(timezone.utc).isoformat()}, sample_dir / "times.jsonl", do_save)
 
     # clean the shifts
     with Timing(f"[sample {sample_id}] clean shifts: ", enabled=verbose >= 2):
@@ -184,6 +185,8 @@ def _process_vibrations(sample_dir:Path, min_freq:int=MIN_FREQ, max_freq:int=MAX
         fft, freqs, n_samples = get_fft_shifts(clean_shifts, fps, min_freq, max_freq) # (B,L,T,2) -> (B,L,F,2), (F,) (,)
         logger.debug(f'[sample {sample_id}] {fft.shape=}=(batch, lasers, freq bins, x/y)\n[sample {sample_id}] {freqs.shape=}=(freq bins)\n[sample {sample_id}] {n_samples=}')
         save({'fft': fft, 'freqs': freqs, 'n_samples': n_samples}, sample_dir / 'vibration/03_fft.npz', do_save)
+        plot_fft(freqs, fft[0, 0 if laser_idx is not None else recovered_laser, :, xy_idx], sample_dir / f'vibration/03_fft{file_suffix}.png',
+                 title=f'Recovered FFT, Laser {recovered_laser}, {axis_label}-axis', max_freq=max_freq, enabled=do_save)
         append({"fft_shifts": datetime.now(timezone.utc).isoformat()}, sample_dir / "times.jsonl", do_save)
 
     # recover audio from fft
@@ -200,16 +203,20 @@ def _process_vibrations(sample_dir:Path, min_freq:int=MIN_FREQ, max_freq:int=MAX
         logger.debug(f'[sample {sample_id}] {Sxx.shape=}=(freq bins, time bins)')
         save({'freqs': spec_freqs, 'times': spec_times, 'Sxx': Sxx}, sample_dir / f'vibration/05_spectrogram{file_suffix}.npz', do_save)
 
-        spec_label = f'Laser {recovered_laser}, {axis_label}-axis'
-        plot_spectrogram(spec_freqs, spec_times, Sxx, sample_dir / f'vibration/05_spectrogram{file_suffix}.png', label=spec_label, enabled=do_save)
+        audio_name = (sample_dir / 'audio.wav').resolve().parent.name  # e.g. chirp_50_1000_3.0sec, via the symlink to audio_dir
+        spec_label = f'Recovered {audio_name} Spectrogram: {{duration}}s, Laser {recovered_laser}, {axis_label}-axis'
+        plot_spectrogram(spec_freqs, spec_times, Sxx, sample_dir / f'vibration/05_spectrogram{file_suffix}.png', label=spec_label, max_freq=max_freq, enabled=do_save)
         append({"spectrogram": datetime.now(timezone.utc).isoformat()}, sample_dir / "times.jsonl", do_save)
 
         if spectrogram_video:
-            make_spectrogram_video(spec_freqs, spec_times, Sxx, recovered_audio, audio_sample_rate, sample_dir / f'vibration/05_spectrogram{file_suffix}.mp4', label=spec_label, enabled=do_save)
+            make_spectrogram_video(spec_freqs, spec_times, Sxx, recovered_audio, audio_sample_rate, sample_dir / f'vibration/05_spectrogram{file_suffix}.mp4', label=spec_label, max_freq=max_freq, enabled=do_save)
             append({"spectrogram_video": datetime.now(timezone.utc).isoformat()}, sample_dir / "times.jsonl", do_save)
 
     # update tracking
     append({"process_vibrations": datetime.now(timezone.utc).isoformat()}, sample_dir / "times.jsonl", do_save)
+
+    return {'fft': fft, 'freqs': freqs, 'n_samples': n_samples, 'recovered_audio': recovered_audio, 'audio_sample_rate': audio_sample_rate,
+            'spec_freqs': spec_freqs, 'spec_times': spec_times, 'Sxx': Sxx, 'max_freq': max_freq, 'laser_idx': recovered_laser, 'xy_idx': xy_idx}
 
 
 #****** 6 run locally and on modal *****
@@ -244,14 +251,15 @@ def _process_vibrations_modal(sample_dir_name: str, **kwargs):
 
 PROCESSED_FILES = ["01_raw_shifts.npy", "02_clean_shifts.npy", "03_fft.npz"]
 
-def process_vibrations(sample_dir:Path, use_modal:bool=False, pclk_mode:str='batched_optimized', pclk_batch_size:int=256, do_save:bool=True, verbose:int=1, cleanup_raw_vibrations:str='compress', spectrogram_video:bool=True, laser_idx:int|None=None, xy_idx:int=0):
+def process_vibrations(sample_dir:Path, raw_vibrations:np.ndarray=None, use_modal:bool=False, pclk_mode:str='batched_optimized', pclk_batch_size:int=256, do_save:bool=True, verbose:int=1, cleanup_raw_vibrations:str|None=None, spectrogram_video:bool=True, laser_idx:int|None=None, xy_idx:int=0):
     sample_id = sample_dir.name
 
     # run locally
     if not use_modal:
         with Timing(f'[sample {sample_id}] process vibrations locally: ', enabled=verbose >= 1):
-            return _process_vibrations_local(sample_dir, pclk_mode=pclk_mode, pclk_batch_size=pclk_batch_size, do_save=do_save, verbose=verbose, cleanup_raw_vibrations=cleanup_raw_vibrations, spectrogram_video=spectrogram_video, laser_idx=laser_idx, xy_idx=xy_idx)
+            return _process_vibrations_local(sample_dir, raw_vibrations=raw_vibrations, pclk_mode=pclk_mode, pclk_batch_size=pclk_batch_size, do_save=do_save, verbose=verbose, cleanup_raw_vibrations=cleanup_raw_vibrations, spectrogram_video=spectrogram_video, laser_idx=laser_idx, xy_idx=xy_idx)
 
+    assert raw_vibrations is None, "On modal, raw_vibrations must be already be saved in sample_dir. Cannot be passed in as a np.ndarray because it is too big"
     # upload raw vibrations DISK->modal_volume
     with Timing(f'[sample {sample_id}] upload raw vibrations DISK->modal_volume: ', enabled=verbose >= 1):
         modal_upload(volume, sample_dir, verbose=verbose)
@@ -266,7 +274,7 @@ def process_vibrations(sample_dir:Path, use_modal:bool=False, pclk_mode:str='bat
     axis_label = 'x' if xy_idx == 0 else 'y'
     file_suffix = f'_laser{recovered_laser}_{axis_label}'
     vibration_files = (PROCESSED_FILES
-        + [f'04_recovered_audio{file_suffix}.wav', f'05_spectrogram{file_suffix}.npz', f'05_spectrogram{file_suffix}.png']
+        + [f'03_fft{file_suffix}.png', f'04_recovered_audio{file_suffix}.wav', f'05_spectrogram{file_suffix}.npz', f'05_spectrogram{file_suffix}.png']
         + (["00_raw_vibrations.npy.bz2"] if cleanup_raw_vibrations == 'compress' else [])
         + ([f'05_spectrogram{file_suffix}.mp4'] if spectrogram_video else []))
     with Timing(f'[sample {sample_id}] download processed vibrations modal_volume->DISK::{sample_dir}: ', enabled=verbose >= 1):
@@ -274,6 +282,14 @@ def process_vibrations(sample_dir:Path, use_modal:bool=False, pclk_mode:str='bat
         fix_symlinks(sample_dir, [("recovered_audio.wav", f"vibration/04_recovered_audio{file_suffix}.wav")])
         append({"modal_upload": upload_timestamp}, sample_dir / "times.jsonl", do_save)
         append({"modal_download": datetime.now(timezone.utc).isoformat()}, sample_dir / "times.jsonl", do_save)
+
+    # same return contract as the local path, loaded from the files we just downloaded
+    fft_data = load(sample_dir / 'vibration/03_fft.npz')
+    recovered_audio, audio_sample_rate = load(sample_dir / f'vibration/04_recovered_audio{file_suffix}.wav')
+    spec_freqs, spec_times, Sxx = load(sample_dir / f'vibration/05_spectrogram{file_suffix}.npz', keys=['freqs', 'times', 'Sxx'])
+    return {'fft': fft_data['fft'], 'freqs': fft_data['freqs'], 'n_samples': fft_data['n_samples'], 'recovered_audio': recovered_audio,
+            'audio_sample_rate': audio_sample_rate, 'spec_freqs': spec_freqs, 'spec_times': spec_times, 'Sxx': Sxx, 'max_freq': MAX_FREQ,
+            'laser_idx': recovered_laser, 'xy_idx': xy_idx}
 
 def save_and_process_vibrations(raw_vibrations:np.ndarray, sample_dir:Path, audio_dir:Path, min_freq:int, max_freq:int, use_modal:bool=False, pclk_mode:str='batched_optimized', pclk_batch_size:int=256, do_save:bool=True, verbose:int=1, spectrogram_video:bool=True, laser_idx:int|None=None, xy_idx:int=0):
     save_vibrations(raw_vibrations, sample_dir, audio_dir, do_save, verbose)

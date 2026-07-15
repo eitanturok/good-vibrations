@@ -8,7 +8,8 @@ import modal
 import numpy as np
 from PIL import Image, ImageDraw
 
-from utils.io_utils import save, load, append, Timing
+from utils.io_utils import save, load, append
+from utils.helpers import Timing
 from utils.metrics import center_of_mass
 
 

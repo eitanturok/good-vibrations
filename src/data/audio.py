@@ -15,7 +15,7 @@ if str(REPO) not in sys.path: sys.path.insert(0, str(REPO))
 import numpy as np
 from scipy.signal import chirp, spectrogram
 
-from utils.io_utils import save
+from utils.io_utils import save, load
 from utils.viz import plot_fft, plot_spectrogram, make_spectrogram_video
 
 T_SEC, T_START, T_END, FS, F_START, F_END = 3.0, 0.1, 0.1, 44100, 50, 1000
@@ -52,7 +52,21 @@ def compute_spectrogram(audio: np.ndarray, fs: int) -> tuple[np.ndarray, np.ndar
     freqs, times, Sxx = spectrogram(audio, fs=fs)
     return freqs, times, Sxx
 
-#***** 3 cli *****
+#***** 3 load precomputed artifacts *****
+
+def load_audio_artifacts(audio_dir: Path) -> tuple[np.ndarray, int, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, float]:
+    """Load the precomputed audio artifacts saved by main(). Returns
+    (samples, fs, freqs, fft, spec_freqs, spec_times, Sxx, max_freq) with no recomputation.
+    max_freq is the audio's highest frequency (f_end from metadata.jsonl), used to cap
+    fft/spectrogram plot axes."""
+    audio_dir = Path(audio_dir)
+    samples, fs = load(audio_dir / 'audio.wav')
+    freqs, fft = load(audio_dir / 'fft.npz', keys=['freqs', 'fft'])
+    spec_freqs, spec_times, Sxx = load(audio_dir / 'spectrogram.npz', keys=['freqs', 'times', 'Sxx'])
+    metadata = {k: v for d in load(audio_dir / 'metadata.jsonl') for k, v in d.items()}
+    return samples, fs, freqs, fft, spec_freqs, spec_times, Sxx, metadata['f_end']
+
+#***** 4 cli *****
 
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -73,15 +87,16 @@ def main():
     save(metadata, out_dir / 'metadata.jsonl')
 
     freqs_fft, fft = compute_fft(audio, args.fs)
-    save(fft, out_dir / 'fft.npy')
-    plot_fft(freqs_fft, fft, out_dir / 'fft.png')
+    save({'freqs': freqs_fft, 'fft': fft}, out_dir / 'fft.npz')
+    plot_fft(freqs_fft, fft, out_dir / 'fft.png', max_freq=args.f_end)
 
     freqs_spec, times, Sxx = compute_spectrogram(audio, args.fs)
-    save(Sxx.astype(np.float32), out_dir / 'spectrogram.npy')
-    plot_spectrogram(freqs_spec, times, Sxx, out_dir / 'spectrogram.png')
-    make_spectrogram_video(freqs_spec, times, Sxx, audio, args.fs, out_dir / 'spectrogram.mp4')
+    save({'freqs': freqs_spec, 'times': times, 'Sxx': Sxx.astype(np.float32)}, out_dir / 'spectrogram.npz')
+    spec_label = f'Original {out_dir.name} Spectrogram: {{duration}}s'
+    plot_spectrogram(freqs_spec, times, Sxx, out_dir / 'spectrogram.png', label=spec_label, max_freq=args.f_end)
+    make_spectrogram_video(freqs_spec, times, Sxx, audio, args.fs, out_dir / 'spectrogram.mp4', label=spec_label, max_freq=args.f_end)
 
-    print(f"saved audio.wav, metadata.jsonl, fft.npy, fft.png, spectrogram.npy, spectrogram.png, spectrogram.mp4 to {out_dir}")
+    print(f"saved audio.wav, metadata.jsonl, fft.npz, fft.png, spectrogram.npz, spectrogram.png, spectrogram.mp4 to {out_dir}")
 
 if __name__ == "__main__":
     main()
