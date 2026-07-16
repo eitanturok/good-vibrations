@@ -22,7 +22,7 @@ class VizSegMask:
             panel = Image.fromarray((arr * 255).clip(0, 255).astype(np.uint8)).resize((pw, ph), Image.NEAREST)
             canvas.paste(panel, (j * (pw + sep), text_height))
             ImageDraw.Draw(canvas).text((j * (pw + sep) + pw // 2, text_height - 14), label, fill=(0, 0, 0), font=font, anchor="mt")
-        text = (f"id={info['sample_id'][i]}  spk={info['speaker'][i]}  objs={info['n_objects'][i]}  "
+        text = (f"id={info['sample_id'][i]}  out={info['output_id'][i]}  spk={info['speaker'][i]}  objs={info['n_objects'][i]}  "
                 f"com=({info['x_com'][i]:.1f},{info['y_com'][i]:.1f})  mse={mse_vals[i]:.4f}  com_dist={com_dists[i]:.4f}")
         ImageDraw.Draw(canvas).text((pw + sep // 2, 2), text, fill=(80, 80, 80), font=font, anchor="mt")
         return np.array(canvas)
