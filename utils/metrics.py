@@ -73,3 +73,30 @@ def soft_iou(mask_pred, mask_true, epsilon: float = 1e-6):
     except ImportError:
         pass
     return _soft_iou_numpy(np.asarray(mask_pred), np.asarray(mask_true), epsilon)
+
+
+def _soft_dice_numpy(mask_pred: np.ndarray, mask_true: np.ndarray, epsilon: float):
+    intersection = np.minimum(mask_pred, mask_true).sum(axis=(-2, -1))
+    total = mask_pred.sum(axis=(-2, -1)) + mask_true.sum(axis=(-2, -1))
+    return (2 * intersection + epsilon) / (total + epsilon)
+
+
+def _soft_dice_torch(mask_pred, mask_true, epsilon: float):
+    import torch
+    intersection = torch.minimum(mask_pred, mask_true).sum(dim=(-2, -1))
+    total = mask_pred.sum(dim=(-2, -1)) + mask_true.sum(dim=(-2, -1))
+    return (2 * intersection + epsilon) / (total + epsilon)
+
+
+def soft_dice(mask_pred, mask_true, epsilon: float = 1e-6):
+    """Soft Dice, 2*Sum(min(p,g)) / (Sum(p) + Sum(g)), between two [0,1] masks of shape
+    (...,H,W) -> (...) per-mask scores. Accepts numpy arrays or torch tensors -- routed
+    automatically to the matching implementation. Like soft_iou it uses min for the
+    intersection rather than the product, so a perfect prediction of a *soft* mask
+    scores 1.0; the two relate by the exact identity dice = 2*iou / (1 + iou)."""
+    try:
+        import torch
+        if isinstance(mask_pred, torch.Tensor): return _soft_dice_torch(mask_pred, mask_true, epsilon)
+    except ImportError:
+        pass
+    return _soft_dice_numpy(np.asarray(mask_pred), np.asarray(mask_true), epsilon)

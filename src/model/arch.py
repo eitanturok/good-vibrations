@@ -5,7 +5,7 @@ from composer import ComposerModel
 from torchmetrics import MeanSquaredError, Metric
 
 from model.dataset import DATA_INFO
-from utils.metrics import center_of_mass, soft_iou
+from utils.metrics import center_of_mass, soft_iou, soft_dice
 
 #***** 0 helpers *****
 
@@ -63,17 +63,38 @@ class SoftIoU(Metric):
 
     def compute(self): return self.total / self.count
 
-def create_metrics(data_info): return {"mse": MeanSquaredError(), 'com-distance': CenterOfMassDistance(), 'soft-iou': SoftIoU()}
+class SoftDice(Metric):
+    def __init__(self, epsilon:float=1e-6):
+        super().__init__()
+        self.epsilon = epsilon
+        self.add_state("total", default=torch.tensor(0.0), dist_reduce_fx="sum")
+        self.add_state("count", default=torch.tensor(0), dist_reduce_fx="sum")
+
+    def update(self, mask_pred, mask_true):
+        dices = soft_dice(mask_pred, mask_true, self.epsilon)
+        self.total, self.count = self.total + dices.sum(), self.count + dices.numel()
+
+    def compute(self): return self.total / self.count
+
+def create_metrics(data_info): return {
+    "mse": MeanSquaredError(),
+    'com-distance': CenterOfMassDistance(),
+    'soft-iou': SoftIoU(),
+    # 'soft-dice': SoftDice(),
+    }
 
 #***** 2 losses *****
 
 # mse is averaged over (B,H,W) so the error is independent of the out_h out_w we choose
 def mse_loss(mask_pred, mask_true): return F.mse_loss(mask_pred, mask_true)
 def iou_loss(mask_pred, mask_true): return 1 - soft_iou(mask_pred, mask_true).mean()
+def dice_loss(mask_pred, mask_true): return 1 - soft_dice(mask_pred, mask_true).mean()
 def mse_iou_loss(mask_pred, mask_true, theta=0.5):
     return theta * mse_loss(mask_pred, mask_true) + (1 - theta) * iou_loss(mask_pred, mask_true)
+def mse_dice_loss(mask_pred, mask_true, theta=0.5):
+    return theta * mse_loss(mask_pred, mask_true) + (1 - theta) * dice_loss(mask_pred, mask_true)
 
-LOSSES = {'mse': mse_loss, 'iou': iou_loss, 'mse+iou': mse_iou_loss}
+LOSSES = {'mse': mse_loss, 'iou': iou_loss, 'dice': dice_loss, 'mse+iou': mse_iou_loss, 'mse+dice': mse_dice_loss}
 
 #***** 3 decoder *****
 
