@@ -6,7 +6,8 @@ import numpy as np
 from PIL import Image
 from streaming import MDSWriter
 
-from utils.io_utils import load, save, append, symlink, copy, Timing, logger, human_size, dir_size
+from utils.io_utils import load, save, append, symlink, copy
+from utils.helpers import Timing, logger, human_size, dir_size
 from utils.metrics import center_of_mass
 
 #***** 1 post-process image (downsample overhead image) *****
