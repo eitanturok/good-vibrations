@@ -168,17 +168,21 @@ def convert_to_mds(dataset_dir:Path, rows:list, patch_size:int, out_h:int, out_w
 #***** 5 post-process all samples in a base sample directory *****
 
 def resolve_dataset_dir(base_dataset_dir:Path, dataset_name:str|None, key:str) -> Path:
-    # A dataset name may get reused across runs with different params/data -- version it as
-    # "NNN" or "NNN-<name>" under base_dataset_dir so different params never silently
-    # collide/overwrite. Reuse an existing numbered dir if its hash.txt already matches this
-    # exact param/data combination, else allocate the next increasing number.
+    # Datasets are versioned as "NNN" / "NNN-<name>" dirs. If an existing dir's hash.txt
+    # already matches this exact param/data combination, reuse it (cache hit -- no new
+    # number). Otherwise allocate the next number from count.txt, a persistent counter that
+    # only ever increments -- deleting dataset dirs never causes a number to be reused.
     suffix = f"-{dataset_name}" if dataset_name else ""
-    existing = sorted(base_dataset_dir.glob(f"[0-9][0-9][0-9]{suffix}")) if base_dataset_dir.exists() else []
+    existing = sorted(p for p in base_dataset_dir.glob("[0-9][0-9][0-9]*") if p.is_dir()) if base_dataset_dir.exists() else []
     for p in existing:
+        if p.name[3:] != suffix: continue
         hash_path = p / "hash.txt"
         if hash_path.exists() and hash_path.read_text().strip() == key: return p
-    next_n = max((int(p.name[:3]) for p in existing), default=-1) + 1
-    return base_dataset_dir / f"{next_n:03d}{suffix}"
+    base_dataset_dir.mkdir(parents=True, exist_ok=True)
+    count_path = base_dataset_dir / "count.txt"
+    n = int(count_path.read_text().strip()) if count_path.exists() else 0
+    count_path.write_text(str(n + 1))
+    return base_dataset_dir / f"{n:03d}{suffix}"
 
 def post_process(base_sample_dir:Path, base_dataset_dir:Path, dataset_name:str|None, out_h:int, out_w:int, signal_mode:str, normalize_mode:str, patch_size:int, force:bool=False, verbose:int=1, do_save:bool=True, denotch_fn=None):
 
