@@ -156,9 +156,64 @@ def exp23_split(mds_path: str | Path, batch_size: int = 64, eval_batch_size: int
     eval_loaders = [Evaluator(label=label, dataloader=loader(idxs, eval_batch_size)) for label, idxs in evals.items()]
     return train_loader, eval_loaders
 
+def exp24_split(mds_path: str | Path, batch_size: int = 64, eval_batch_size: int = 64, test_size: float = 0.15,
+                  speaker_size: float = 0.05, seed: int = 42, num_workers: int = 8,
+                  speakers=None, n_objects=None, box=None, n_samples: int | None = None,
+                  verbose: int = 1):
+    """Return (train_loader, eval_loaders) using an already-written MDS, split by `layout`.
+
+    Row filters (speakers/n_objects/box/n_samples) are applied via the index sidecar. Every layout
+    (bullet-1, cylinder-1, cylinder-1-bullet-1) gets the same treatment, yielding 2 eval sets each:
+
+    - eval/{bullet,cylinder,cylinder_bullet}: a test_size fraction of that layout's output_ids (whole positions held out; an output_id is a unique object layout/position shared by one sample per speaker).
+    - eval/{bullet,cylinder,cylinder_bullet}_speaker: a speaker_size fraction of that layout's *original* sample count, carved from the remaining sample_ids (not output_ids), so it spans many (position, speaker) combinations. Total eval is ~test_size + speaker_size per layout.
+    - train: everything left.
+    """
+    generator = torch.Generator().manual_seed(seed)
+    dataset = VibrationDataset(local=mds_path)
+
+    # load metadata.jsonl (no dataset-level header line in this format: every line is a sample)
+    lines = (Path(mds_path) / "metadata.jsonl").read_text().strip().splitlines()
+    index = [json.loads(line) for line in lines if line]
+
+    # filter the dataset by speakers, n_objects, box, n_samples
+    keep = [i for i, row in enumerate(index) if _matches(row, speakers, n_objects, box)]
+    if n_samples is not None: keep = keep[:n_samples]
+
+    train_idx, evals = [], {}
+    for layout, name in (("bullet-1", "bullet"), ("cylinder-1", "cylinder"), ("cylinder-1-bullet-1", "cylinder_bullet")):
+        layout_idx = [i for i in keep if index[i]["layout"] == layout]
+
+        # 1. hold out test_size of this layout's output_ids -> eval/{name}
+        output_ids = sorted({index[i]["output_id"] for i in layout_idx}) # sort for deterministic output
+        _, unseen_output_ids = train_test_split(output_ids, test_size=test_size, random_state=seed, shuffle=True)
+        unseen_output_ids = set(unseen_output_ids)
+        evals[f"eval/{name}"] = [i for i in layout_idx if index[i]["output_id"] in unseen_output_ids]
+
+        # 2. carve speaker_size of the layout's original sample count out of the remaining sample_ids
+        # (not output_ids) -> eval/{name}_speaker, so this eval spans many (position, speaker) combinations
+        pool_idx = [i for i in layout_idx if index[i]["output_id"] not in unseen_output_ids]
+        n_speaker = round(speaker_size * len(layout_idx))
+        layout_train_idx, evals[f"eval/{name}_speaker"] = train_test_split(pool_idx, test_size=n_speaker, random_state=seed, shuffle=True)
+        train_idx += layout_train_idx
+
+    if verbose:
+        counts = ", ".join(f"{label}={len(idxs)}" for label, idxs in evals.items())
+        print(f"{len(index)} total samples, {len(keep)} after filtering -> train={len(train_idx)}, {counts}")
+
+    def num_samples(batch): return batch["mask_true"].shape[0]
+    def loader(idxs, bs, shuffle=False, drop_last=False):
+        dl = DataLoader(Subset(dataset, idxs), batch_size=bs, shuffle=shuffle, num_workers=num_workers, generator=generator, pin_memory=True, persistent_workers=num_workers > 0, prefetch_factor=4 if num_workers > 0 else None, drop_last=drop_last)
+        return DataSpec(dataloader=dl, get_num_samples_in_batch=num_samples)
+
+    train_loader = loader(train_idx, batch_size, shuffle=True, drop_last=True)
+    eval_loaders = [Evaluator(label=label, dataloader=loader(idxs, eval_batch_size)) for label, idxs in evals.items()]
+    return train_loader, eval_loaders
+
 SPLIT_METHODS = {
     "exp22": exp22_split,
     "exp23": exp23_split,
+    "exp24": exp24_split,
 }
 
 def build_dataset(mds_path: str | Path, split: str = "exp22", **kwargs):
