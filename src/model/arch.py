@@ -65,7 +65,17 @@ class SoftIoU(Metric):
 
 def create_metrics(data_info): return {"mse": MeanSquaredError(), 'com-distance': CenterOfMassDistance(), 'soft-iou': SoftIoU()}
 
-#***** 2 decoder *****
+#***** 2 losses *****
+
+# mse is averaged over (B,H,W) so the error is independent of the out_h out_w we choose
+def mse_loss(mask_pred, mask_true): return F.mse_loss(mask_pred, mask_true)
+def iou_loss(mask_pred, mask_true): return 1 - soft_iou(mask_pred, mask_true).mean()
+def mse_iou_loss(mask_pred, mask_true, theta=0.5):
+    return theta * mse_loss(mask_pred, mask_true) + (1 - theta) * iou_loss(mask_pred, mask_true)
+
+LOSSES = {'mse': mse_loss, 'iou': iou_loss, 'mse+iou': mse_iou_loss}
+
+#***** 3 decoder *****
 
 class MLPDecoder(nn.Module):
     def __init__(self, d_model, out_h, out_w):
@@ -117,7 +127,7 @@ def build_decoder(decoder, d_model, out_h, out_w, decoder_num_heads:int=2, decod
     if decoder == 'attn-no-rope': return AttnDecoder(d_model, out_h, out_w, num_heads=decoder_num_heads, num_layers=decoder_num_layers, do_rope=False)
     raise ValueError(f"Unknown decoder: {decoder}")
 
-#***** 3 encoder *****
+#***** 4 encoder *****
 
 def dropout(x, mask_shape, p, training):
     if not training or p == 0.0: return x, None
@@ -152,10 +162,10 @@ class FreqEncoder(nn.Module):
         output = self.layers(x, src_key_padding_mask=pad_mask(keep, B_L)) # (B_L,P+1,D) -> (B_L,P+1,D)
         return output[:, 0, :]  # (B_L,P+1,D) -> (B_L,D)
 
-#***** 4 model *****
+#***** 5 model *****
 
 class VibrationTransformer(ComposerModel):
-    def __init__(self, d_model:int=128, pnt_num_heads:int=2, pnt_num_layers:int=2, seq_num_heads:int=2, seq_num_layers:int=2, data_info=DATA_INFO, decoder:str='mlp', decoder_num_heads:int=2, decoder_num_layers:int=2, freq_dropout:float=0.3, laser_dropout:float=0.3):
+    def __init__(self, d_model:int=128, pnt_num_heads:int=2, pnt_num_layers:int=2, seq_num_heads:int=2, seq_num_layers:int=2, data_info=DATA_INFO, decoder:str='mlp', decoder_num_heads:int=2, decoder_num_layers:int=2, freq_dropout:float=0.3, laser_dropout:float=0.3, loss_fn:str='mse'):
         super().__init__()
 
         # encoder
@@ -170,7 +180,8 @@ class VibrationTransformer(ComposerModel):
         # decoder
         self.decoder = build_decoder(decoder, d_model, data_info['out_h'], data_info['out_w'], decoder_num_heads, decoder_num_layers)
 
-        # metrics
+        # loss and metrics
+        self.loss_fn = LOSSES[loss_fn]
         self.train_metrics, self.val_metrics = create_metrics(data_info), create_metrics(data_info)
 
     def forward(self, batch):
@@ -198,8 +209,7 @@ class VibrationTransformer(ComposerModel):
         return dict(mask_pred=mask_pred, mask_logits=mask_logits)
 
     def loss(self, outputs, batch):
-        # mse is averaged over (B,H,W) so the error is independent of the out_h out_w we choose
-        return F.mse_loss(outputs['mask_pred'], batch['mask_true'])
+        return self.loss_fn(outputs['mask_pred'], batch['mask_true'])
 
     def get_metrics(self, is_train=False):
         return self.train_metrics if is_train else self.val_metrics

@@ -42,7 +42,7 @@ import wandb
 
 from model.callbacks import VizSegMask, OutputSaver
 from model.dataset import build_dataset
-from model.arch import VibrationTransformer
+from model.arch import VibrationTransformer, LOSSES
 
 def get_parser():
     parser = argparse.ArgumentParser()
@@ -70,6 +70,7 @@ def get_parser():
     parser.add_argument("--decoder",                     type=str,   default='mlp')
     parser.add_argument("--decoder-num-heads",          type=int,   default=2)
     parser.add_argument("--decoder-num-layers",         type=int,   default=2)
+    parser.add_argument("--loss-fn",                    type=str,   default='mse', choices=list(LOSSES))
     parser.add_argument("--d-model",                    type=int,   default=128)
     parser.add_argument("--pnt-num-heads",              type=int,   default=2)
     parser.add_argument("--seq-num-heads",              type=int,   default=2)
@@ -182,7 +183,7 @@ def run(**kwargs):
 
     # model
     data_info = dict(out_h=args.out_h, out_w=args.out_w, n_laser_rows=args.n_laser_rows, n_laser_cols=args.n_laser_cols, patch_size=args.patch_size, n_freqs=args.n_freqs)
-    model = VibrationTransformer(args.d_model, args.pnt_num_heads, args.pnt_num_layers, args.seq_num_heads, args.seq_num_layers, data_info, args.decoder, args.decoder_num_heads, args.decoder_num_layers, freq_dropout=args.freq_dropout, laser_dropout=args.laser_dropout)
+    model = VibrationTransformer(args.d_model, args.pnt_num_heads, args.pnt_num_layers, args.seq_num_heads, args.seq_num_layers, data_info, args.decoder, args.decoder_num_heads, args.decoder_num_layers, freq_dropout=args.freq_dropout, laser_dropout=args.laser_dropout, loss_fn=args.loss_fn)
     load_path = str(args.checkpoint_path) if args.checkpoint_path else None
 
     # dataset
