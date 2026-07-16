@@ -34,7 +34,6 @@ def _center_of_mass_torch(mask, normalize: bool, epsilon: float):
     if normalize: row, col = row / (H - 1), col / (W - 1)
     return torch.stack([row, col], dim=-1)
 
-
 def center_of_mass(mask, normalize: bool = False, epsilon: float = 1e-6):
     """(row, col) center of mass of a mask. Accepts a numpy array, PIL Image, or a
     (possibly batched, shape (...,H,W)) torch tensor -- routed automatically to the
@@ -47,3 +46,30 @@ def center_of_mass(mask, normalize: bool = False, epsilon: float = 1e-6):
     except ImportError:
         pass
     return _center_of_mass_numpy(np.asarray(mask), normalize)
+
+
+#***** soft IoU *****
+
+def _soft_iou_numpy(mask_pred: np.ndarray, mask_true: np.ndarray, epsilon: float):
+    intersection = np.minimum(mask_pred, mask_true).sum(axis=(-2, -1))
+    union = np.maximum(mask_pred, mask_true).sum(axis=(-2, -1))
+    return (intersection + epsilon) / (union + epsilon)
+
+def _soft_iou_torch(mask_pred, mask_true, epsilon: float):
+    import torch
+    intersection = torch.minimum(mask_pred, mask_true).sum(dim=(-2, -1))
+    union = torch.maximum(mask_pred, mask_true).sum(dim=(-2, -1))
+    return (intersection + epsilon) / (union + epsilon)
+
+def soft_iou(mask_pred, mask_true, epsilon: float = 1e-6):
+    """Soft IoU between two [0,1] masks of shape (...,H,W) -> (...) per-mask scores.
+    Accepts numpy arrays or torch tensors -- routed automatically to the matching
+    implementation. Uses the min/max (Ruzicka) form rather than the product form:
+    both agree on binary masks, but only min/max scores a perfect prediction of a
+    *soft* mask as 1.0."""
+    try:
+        import torch
+        if isinstance(mask_pred, torch.Tensor): return _soft_iou_torch(mask_pred, mask_true, epsilon)
+    except ImportError:
+        pass
+    return _soft_iou_numpy(np.asarray(mask_pred), np.asarray(mask_true), epsilon)

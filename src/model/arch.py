@@ -5,7 +5,7 @@ from composer import ComposerModel
 from torchmetrics import MeanSquaredError, Metric
 
 from model.dataset import DATA_INFO
-from utils.metrics import center_of_mass
+from utils.metrics import center_of_mass, soft_iou
 
 #***** 0 helpers *****
 
@@ -50,7 +50,20 @@ class CenterOfMassDistance(Metric):
 
     def compute(self): return self.total / self.count
 
-def create_metrics(data_info): return {"mse": MeanSquaredError(), 'com-distance': CenterOfMassDistance()}
+class SoftIoU(Metric):
+    def __init__(self, epsilon:float=1e-6):
+        super().__init__()
+        self.epsilon = epsilon
+        self.add_state("total", default=torch.tensor(0.0), dist_reduce_fx="sum")
+        self.add_state("count", default=torch.tensor(0), dist_reduce_fx="sum")
+
+    def update(self, mask_pred, mask_true):
+        ious = soft_iou(mask_pred, mask_true, self.epsilon)
+        self.total, self.count = self.total + ious.sum(), self.count + ious.numel()
+
+    def compute(self): return self.total / self.count
+
+def create_metrics(data_info): return {"mse": MeanSquaredError(), 'com-distance': CenterOfMassDistance(), 'soft-iou': SoftIoU()}
 
 #***** 2 decoder *****
 
