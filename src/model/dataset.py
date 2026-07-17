@@ -163,13 +163,20 @@ def exp24_split(mds_path: str | Path, batch_size: int = 64, eval_batch_size: int
     """Return (train_loader, eval_loaders) using an already-written MDS, split by `layout`.
 
     Row filters (speakers/n_objects/box/n_samples) are applied via the index sidecar. Every layout
-    (bullet-1, cylinder-1, cylinder-1-bullet-1) gets the same treatment, yielding 2 eval sets each:
+    puts ~test_size + speaker_size of its samples in eval, selected by sample_id:
 
-    - eval/{bullet,cylinder,cylinder_bullet}: a test_size fraction of that layout's output_ids (whole positions held out; an output_id is a unique object layout/position shared by one sample per speaker).
-    - eval/{bullet,cylinder,cylinder_bullet}_speaker: a speaker_size fraction of that layout's *original* sample count, carved from the remaining sample_ids (not output_ids), so it spans many (position, speaker) combinations. Total eval is ~test_size + speaker_size per layout.
+    - eval/{bullet,cylinder,cylinder_bullet,stacked}: ~test_size of the layout's samples, held out as
+      whole output_ids (an output_id is one object position; its ~8 samples, one per speaker, stay
+      together) -> unseen positions.
+    - eval/{...}_speaker: ~speaker_size of the layout's samples, one sample from each of that many
+      *distinct* remaining output_ids -> unseen (position, speaker) pairs, no output_id repeated.
+    - eval/empty_box: the empty box has no object, so its output_ids are the same empty scene
+      re-recorded and the position/speaker distinction collapses: one flat sample-level split of
+      test_size + speaker_size.
     - train: everything left.
     """
     generator = torch.Generator().manual_seed(seed)
+    rng = np.random.default_rng(seed)
     dataset = VibrationDataset(local=mds_path)
 
     # load metadata.jsonl (no dataset-level header line in this format: every line is a sample)
@@ -181,21 +188,32 @@ def exp24_split(mds_path: str | Path, batch_size: int = 64, eval_batch_size: int
     if n_samples is not None: keep = keep[:n_samples]
 
     train_idx, evals = [], {}
-    for layout, name in (("bullet-1", "bullet"), ("cylinder-1", "cylinder"), ("cylinder-1-bullet-1", "cylinder_bullet")):
-        layout_idx = [i for i in keep if index[i]["layout"] == layout]
+    for layout in sorted({index[i]["layout"] for i in keep}):
+        name = layout.replace("-1", "").replace("-", "_") # bullet-1 -> bullet, cylinder-1-bullet-1 -> cylinder_bullet, empty-box -> empty_box
+        # sort by sample_id so the split is keyed to sample_ids, not row order in the sidecar
+        layout_idx = sorted((i for i in keep if index[i]["layout"] == layout), key=lambda i: index[i]["sample_id"])
 
-        # 1. hold out test_size of this layout's output_ids -> eval/{name}
+        if layout == "empty-box":
+            # every output_id is the same empty scene re-recorded -> one flat sample-level split
+            layout_train_idx, evals[f"eval/{name}"] = train_test_split(layout_idx, test_size=test_size + speaker_size, random_state=seed, shuffle=True)
+            train_idx += layout_train_idx
+            continue
+
+        # 1. hold out ~test_size of the samples as whole output_ids -> eval/{name}
         output_ids = sorted({index[i]["output_id"] for i in layout_idx}) # sort for deterministic output
         _, unseen_output_ids = train_test_split(output_ids, test_size=test_size, random_state=seed, shuffle=True)
         unseen_output_ids = set(unseen_output_ids)
         evals[f"eval/{name}"] = [i for i in layout_idx if index[i]["output_id"] in unseen_output_ids]
 
-        # 2. carve speaker_size of the layout's original sample count out of the remaining sample_ids
-        # (not output_ids) -> eval/{name}_speaker, so this eval spans many (position, speaker) combinations
-        pool_idx = [i for i in layout_idx if index[i]["output_id"] not in unseen_output_ids]
+        # 2. take ~speaker_size of the samples: one sample from each of that many distinct remaining
+        # output_ids -> eval/{name}_speaker spans many positions with no output_id repeated
+        pool = {}
+        for i in layout_idx:
+            if index[i]["output_id"] not in unseen_output_ids: pool.setdefault(index[i]["output_id"], []).append(i)
         n_speaker = round(speaker_size * len(layout_idx))
-        layout_train_idx, evals[f"eval/{name}_speaker"] = train_test_split(pool_idx, test_size=n_speaker, random_state=seed, shuffle=True)
-        train_idx += layout_train_idx
+        speaker_idx = {int(rng.choice(pool[o])) for o in rng.choice(sorted(pool), size=n_speaker, replace=False)}
+        evals[f"eval/{name}_speaker"] = sorted(speaker_idx)
+        train_idx += [i for idxs in pool.values() for i in idxs if i not in speaker_idx]
 
     if verbose:
         counts = ", ".join(f"{label}={len(idxs)}" for label, idxs in evals.items())
