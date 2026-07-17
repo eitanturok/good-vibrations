@@ -50,7 +50,7 @@ def tokenize(x: np.ndarray, patch_size:int):
 
 #***** 3 post-process a single sample *****
 
-def post_process_sample(sample_dir:Path, out_h:int, out_w:int, signal_mode:str, normalize_mode:str, patch_size:int, verbose:int, do_save:bool, denotch_fn=None):
+def post_process_sample(sample_dir:Path, out_h:int, out_w:int, signal_mode:str, normalize_mode:str, patch_size:int, verbose:int, do_save:bool, denotch_fn=None, empty_mean:np.ndarray|None=None):
     sample_id = sample_dir.name
     is_empty_box = bool({k: v for d in load(sample_dir / "metadata.jsonl") for k, v in d.items()}.get("is_empty_box", False))
 
@@ -86,6 +86,12 @@ def post_process_sample(sample_dir:Path, out_h:int, out_w:int, signal_mode:str, 
         save(fft_signaled, sample_dir / 'vibration/06_signaled_fft.npy', do_save)
         append({"fft_signaled": datetime.now(timezone.utc).isoformat()}, sample_dir / "times.jsonl", do_save)
 
+        # subtract this speaker's empty-box mean (empty_diff); normalize/tokenize run on the diffed signal
+        if empty_mean is not None:
+            fft_signaled = fft_signaled - empty_mean
+            save(fft_signaled, sample_dir / 'vibration/06b_diffed_fft.npy', do_save)
+            append({"fft_diffed": datetime.now(timezone.utc).isoformat()}, sample_dir / "times.jsonl", do_save)
+
         # normalize fft
         fft_normalized = normalize_fft(fft_signaled, normalize_mode, verbose)   # (B,L,F,C) -> (B,L,F,C)
         logger.debug(f'[sample {sample_id}] {fft_normalized.shape=}=(batch, lasers, _freqs, x/y)')
@@ -103,7 +109,7 @@ def post_process_sample(sample_dir:Path, out_h:int, out_w:int, signal_mode:str, 
     symlink(sample_dir / 'image/07_downsampled_smask.npy', sample_dir / 'y.npy', do_save)
 
     n_lasers, n_freqs = fft_raw.shape[1], fft_raw.shape[2]
-    append(dict(out_h=out_h, out_w=out_w, signal_mode=signal_mode, normalize_mode=normalize_mode, patch_size=patch_size, n_lasers=n_lasers, n_freqs=n_freqs), sample_dir / "metadata.jsonl", do_save)
+    append(dict(out_h=out_h, out_w=out_w, signal_mode=signal_mode, normalize_mode=normalize_mode, patch_size=patch_size, n_lasers=n_lasers, n_freqs=n_freqs, empty_diff=empty_mean is not None), sample_dir / "metadata.jsonl", do_save)
     append({"post_process": datetime.now(timezone.utc).isoformat()}, sample_dir / "times.jsonl", do_save)
 
 
@@ -167,6 +173,22 @@ def convert_to_mds(dataset_dir:Path, rows:list, patch_size:int, out_h:int, out_w
 
 #***** 5 post-process all samples in a base sample directory *****
 
+def compute_empty_means(samples_dir:Path, rows:dict, signal_mode:str, denotch_fn, verbose:int) -> dict:
+    # Per-speaker mean of the signaled fft over that speaker's empty-box (n_objects == 0)
+    # samples. Running sum (not stack) so memory stays at one fft per speaker.
+    sums, counts = {}, {}
+    for sample_id, meta in rows.items():
+        if int(meta.get("n_objects", -1)) != 0: continue
+        speaker = int(meta.get("speaker", -1))
+        fft_npz = load(samples_dir / sample_id / 'vibration/03_fft.npz')
+        freqs, fft_raw = fft_npz['freqs'], fft_npz['fft']
+        if denotch_fn is not None: fft_raw = denotch_fn(fft_raw, freqs)
+        fft_signaled = extract_signal(fft_raw, signal_mode).astype(np.float32)  # (B,L,F,C)
+        sums[speaker] = fft_signaled if speaker not in sums else sums[speaker] + fft_signaled
+        counts[speaker] = counts.get(speaker, 0) + 1
+    if verbose: print("empty_diff: empty-box samples per speaker: " + (", ".join(f"speaker {spk}: {n}" for spk, n in sorted(counts.items())) or "none"))
+    return {spk: s / counts[spk] for spk, s in sums.items()}
+
 def resolve_dataset_dir(base_dataset_dir:Path, dataset_name:str|None, key:str) -> Path:
     # Datasets are versioned as "NNN" / "NNN-<name>" dirs. If an existing dir's hash.txt
     # already matches this exact param/data combination, reuse it (cache hit -- no new
@@ -184,7 +206,7 @@ def resolve_dataset_dir(base_dataset_dir:Path, dataset_name:str|None, key:str) -
     count_path.write_text(str(n + 1))
     return base_dataset_dir / f"{n:03d}{suffix}"
 
-def post_process(base_sample_dir:Path, base_dataset_dir:Path, dataset_name:str|None, out_h:int, out_w:int, signal_mode:str, normalize_mode:str, patch_size:int, force:bool=False, verbose:int=1, do_save:bool=True, denotch_fn=None):
+def post_process(base_sample_dir:Path, base_dataset_dir:Path, dataset_name:str|None, out_h:int, out_w:int, signal_mode:str, normalize_mode:str, patch_size:int, empty_diff:bool=False, force:bool=False, verbose:int=1, do_save:bool=True, denotch_fn=None):
 
     # collect complete samples + metadata
     REQUIRED_FILES = ["image/02_smask.png", "vibration/03_fft.npz"]
@@ -205,7 +227,8 @@ def post_process(base_sample_dir:Path, base_dataset_dir:Path, dataset_name:str|N
 
     # hash and check for skip
     with Timing("Hashing: ", enter=f"Hashing metadata of {len(sample_ids)} samples to compute cache key ...", enabled=verbose):
-        key = hashlib.sha1(json.dumps(rows | MDS_COLUMNS, sort_keys=True, default=str).encode()).hexdigest()[:16]
+        # empty_diff only enters the key when on, so existing dataset dirs keep their cached keys
+        key = hashlib.sha1(json.dumps(rows | MDS_COLUMNS | ({"empty_diff": True} if empty_diff else {}), sort_keys=True, default=str).encode()).hexdigest()[:16]
 
     dataset_dir = resolve_dataset_dir(base_dataset_dir, dataset_name, key)
     samples_dir, mds_dir, hash_path = dataset_dir / "samples", dataset_dir / "mds", dataset_dir / "hash.txt"
@@ -224,12 +247,23 @@ def post_process(base_sample_dir:Path, base_dataset_dir:Path, dataset_name:str|N
                 if src_path.name in ("metadata.jsonl", "times.jsonl"): copy(src_path, dst_path, do_save)
                 else: symlink(src_path, dst_path, do_save)
 
+    # compute per-speaker empty-box means for the empty_diff subtraction
+    empty_means = {}
+    if empty_diff:
+        with Timing("Empty-box means: ", enter="Computing per-speaker empty-box fft means ...", enabled=verbose):
+            empty_means = compute_empty_means(samples_dir, rows, signal_mode, denotch_fn, verbose)
+
     # post process each sample
+    speakers_without_empties = set()
     with Timing("Post-processing: ", enter=f"Post-processing {len(sample_ids)} samples ...", enabled=verbose):
         for sample_id in sample_ids:
             sample_dir = samples_dir / sample_id
-            post_process_sample(sample_dir, out_h, out_w, signal_mode, normalize_mode, patch_size, verbose, do_save, denotch_fn)
+            empty_mean = empty_means.get(int(rows[sample_id].get("speaker", -1))) if empty_diff else None
+            if empty_diff and empty_mean is None: speakers_without_empties.add(int(rows[sample_id].get("speaker", -1)))
+            post_process_sample(sample_dir, out_h, out_w, signal_mode, normalize_mode, patch_size, verbose, do_save, denotch_fn, empty_mean)
             rows[sample_id] = {k: v for d in load(sample_dir / "metadata.jsonl") for k, v in d.items()}
+    if speakers_without_empties:
+        logger.warning(f"empty_diff: no empty-box samples for speakers {sorted(speakers_without_empties)} -- their samples were NOT diffed")
 
     # convert to MDS
     sample_rows = [(samples_dir / sample_id, meta) for sample_id, meta in rows.items()]
@@ -273,6 +307,7 @@ def parse_args():
     p.add_argument("--signal-mode",         type=str, default="magnitude", choices=["magnitude", "complex", "mag_phase"])
     p.add_argument("--normalize-mode",      type=str, default="std-sample", choices=["std-sample", "z-sample"])
     p.add_argument("--patch-size",          type=int, default=256)
+    p.add_argument("--empty-diff",          action="store_true", help="Per speaker, average the signaled fft of all empty-box (n_objects=0) samples and subtract that speaker's average from each of its samples before normalization.")
     p.add_argument("--force",               action="store_true")
     p.add_argument("--verbose",             type=int, default=1)
     p.add_argument("--no-save",             dest="do_save", action="store_false")
@@ -283,7 +318,7 @@ def parse_args():
 
 if __name__ == "__main__":
     args = parse_args()
-    mds_path = post_process(args.base_sample_dir, args.base_dataset_dir, args.dataset_name, args.out_h, args.out_w, args.signal_mode, args.normalize_mode, args.patch_size, force=args.force, verbose=args.verbose, do_save=args.do_save)
+    mds_path = post_process(args.base_sample_dir, args.base_dataset_dir, args.dataset_name, args.out_h, args.out_w, args.signal_mode, args.normalize_mode, args.patch_size, empty_diff=args.empty_diff, force=args.force, verbose=args.verbose, do_save=args.do_save)
     n_samples = len((mds_path / "metadata.jsonl").read_text().strip().splitlines())
     print(f"MDS written to {mds_path} ({n_samples} samples)")
 
