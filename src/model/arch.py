@@ -162,9 +162,9 @@ def pad_mask(keep, B_or_BL):
     return ~torch.cat([cls_keep, keep], dim=1)
 
 class FreqEncoder(nn.Module):
-    def __init__(self, patch_size:int, d_model:int, num_heads:int, num_layers:int, signal_length:int, freq_dropout:float):
+    def __init__(self, patch_size:int, d_model:int, num_heads:int, num_layers:int, signal_length:int, freq_dropout:float, n_channels:int=2):
         super().__init__()
-        self.embed = nn.Linear(2 * patch_size, d_model)
+        self.embed = nn.Linear(n_channels * patch_size, d_model)
         self.speakers_embed = nn.Embedding(4, d_model)
         self.layers = nn.TransformerEncoder(nn.TransformerEncoderLayer(d_model=d_model, nhead=num_heads, batch_first=True), num_layers=num_layers)
         self.cls_token = nn.Parameter(torch.zeros(1, 1, d_model))
@@ -190,7 +190,7 @@ class VibrationTransformer(ComposerModel):
         super().__init__()
 
         # encoder
-        self.freq_encoder = FreqEncoder(data_info['patch_size'], d_model, pnt_num_heads, pnt_num_layers, data_info['n_freqs'], freq_dropout)
+        self.freq_encoder = FreqEncoder(data_info['patch_size'], d_model, pnt_num_heads, pnt_num_layers, data_info['n_freqs'], freq_dropout, n_channels=data_info.get('n_channels', 2))
         self.laser_encoder = nn.TransformerEncoder(nn.TransformerEncoderLayer(d_model=d_model, nhead=seq_num_heads, batch_first=True), num_layers=seq_num_layers)
         self.laser_dropout = laser_dropout
 

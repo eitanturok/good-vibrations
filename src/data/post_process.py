@@ -108,8 +108,9 @@ def post_process_sample(sample_dir:Path, out_h:int, out_w:int, signal_mode:str, 
     symlink(sample_dir / 'vibration/08_tokenized_fft.npy', sample_dir / 'X.npy', do_save)
     symlink(sample_dir / 'image/07_downsampled_smask.npy', sample_dir / 'y.npy', do_save)
 
-    n_lasers, n_freqs = fft_raw.shape[1], fft_raw.shape[2]
-    append(dict(out_h=out_h, out_w=out_w, signal_mode=signal_mode, normalize_mode=normalize_mode, patch_size=patch_size, n_lasers=n_lasers, n_freqs=n_freqs, empty_diff=empty_mean is not None), sample_dir / "metadata.jsonl", do_save)
+    # take shapes from the signaled fft, not the raw one: complex/mag_phase modes double the channel dim
+    n_lasers, n_freqs, n_channels = fft_signaled.shape[1], fft_signaled.shape[2], fft_signaled.shape[3]
+    append(dict(out_h=out_h, out_w=out_w, signal_mode=signal_mode, normalize_mode=normalize_mode, patch_size=patch_size, n_lasers=n_lasers, n_freqs=n_freqs, n_channels=n_channels, empty_diff=empty_mean is not None), sample_dir / "metadata.jsonl", do_save)
     append({"post_process": datetime.now(timezone.utc).isoformat()}, sample_dir / "times.jsonl", do_save)
 
 
@@ -128,9 +129,9 @@ def convert_to_mds(dataset_dir:Path, rows:list, patch_size:int, out_h:int, out_w
     if verbose: print(f"Writing MDS to {mds_dir} ...")
     if mds_dir.exists(): shutil.rmtree(mds_dir)
 
-    # read n_lasers, n_freqs from the first sample's metadata
-    n_lasers, n_freqs = rows[0][1]["n_lasers"], rows[0][1]["n_freqs"]
-    x_shape, y_shape = (n_lasers, n_freqs // patch_size, patch_size, 2), (out_h, out_w)
+    # read n_lasers, n_freqs, n_channels from the first sample's metadata (n_channels default 2 for datasets made before it was recorded)
+    n_lasers, n_freqs, n_channels = rows[0][1]["n_lasers"], rows[0][1]["n_freqs"], rows[0][1].get("n_channels", 2)
+    x_shape, y_shape = (n_lasers, n_freqs // patch_size, patch_size, n_channels), (out_h, out_w)
 
     index_rows = []
     dataset_dir.mkdir(parents=True, exist_ok=True)
