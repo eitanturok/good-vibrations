@@ -1,4 +1,4 @@
-We want to generate an image of what is inside of a closed box from it's vibrations. 
+We want to generate an image of what is inside of a closed box from it's vibrations.
 
 We collect our own dataset and train a deep learning model to generate this image.
 
@@ -6,7 +6,7 @@ We collect our own dataset and train a deep learning model to generate this imag
 
 1. We place an object, e.g. a cube, in a box.
 2. We take a photo of the the object in the box from a bird's eye view.
-3. We shine a `l_h x l_w` grid of laser points onto the side of the box. 
+3. We shine a `l_h x l_w` grid of laser points onto the side of the box.
 4. We play an audio file, e.g. a chrip, from one of `S` speakers. This vibrates the box but the vibrations are tiny and not visible to the human eye.
 5. As we play the audio, we record a video of the laser speckles vibrating.
 
