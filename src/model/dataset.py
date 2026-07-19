@@ -12,7 +12,11 @@ from utils.io_utils import load
 
 # ***** 1. turn dataset into MDS format (sharded, streaming) *****
 DATA_INFO = {"out_h": 18, "out_w": 44, "n_samples": 0,
+<<<<<<< Updated upstream
              "n_laser_rows": 10, "n_laser_cols": 10, "patch_size": 256, "n_freqs": 3328, "n_channels": 2}
+=======
+             "n_laser_rows": 10, "n_laser_cols": 10, "patch_size": 256, "n_freqs": 3328, "n_coords": 2}
+>>>>>>> Stashed changes
 
 
 #***** 2 create StreamingDataset (like pytorch Dataset but faster) *****

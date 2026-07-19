@@ -61,7 +61,11 @@ def get_parser():
     parser.add_argument("--n-laser-cols",               type=int,   default=10)
     parser.add_argument("--patch-size",                 type=int,   default=256)
     parser.add_argument("--n-freqs",                    type=int,   default=3328)
+<<<<<<< Updated upstream
     parser.add_argument("--n-channels",                 type=int,   default=2, help="Last dim of X: 2 for magnitude, 4 for complex/mag_phase signal modes.")
+=======
+    parser.add_argument("--n-coords",                   type=int,   default=2) # 2 for magnitude, 4 for complex/mag_phase (real+imag per coord)
+>>>>>>> Stashed changes
     # filter data
     parser.add_argument("--n-samples",                  type=int,   default=None)
     parser.add_argument("--speakers",                   type=int,   default=None)
@@ -183,7 +187,11 @@ def run(**kwargs):
     if not args.no_compile and args.verbose >= 2: torch._logging.set_logs(dynamo=logging.INFO)
 
     # model
+<<<<<<< Updated upstream
     data_info = dict(out_h=args.out_h, out_w=args.out_w, n_laser_rows=args.n_laser_rows, n_laser_cols=args.n_laser_cols, patch_size=args.patch_size, n_freqs=args.n_freqs, n_channels=args.n_channels)
+=======
+    data_info = dict(out_h=args.out_h, out_w=args.out_w, n_laser_rows=args.n_laser_rows, n_laser_cols=args.n_laser_cols, patch_size=args.patch_size, n_freqs=args.n_freqs, n_coords=args.n_coords)
+>>>>>>> Stashed changes
     model = VibrationTransformer(args.d_model, args.pnt_num_heads, args.pnt_num_layers, args.seq_num_heads, args.seq_num_layers, data_info, args.decoder, args.decoder_num_heads, args.decoder_num_layers, freq_dropout=args.freq_dropout, laser_dropout=args.laser_dropout, loss_fn=args.loss_fn)
     load_path = str(args.checkpoint_path) if args.checkpoint_path else None
 
