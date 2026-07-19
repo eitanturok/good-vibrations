@@ -4,13 +4,34 @@ from pathlib import Path
 
 import numpy as np
 from PIL import Image
+from scipy import ndimage
 from streaming import MDSWriter
 
 from utils.io_utils import load, save, append, symlink, copy
 from utils.helpers import Timing, logger, human_size, dir_size
 from utils.metrics import center_of_mass
 
-#***** 1 post-process image (downsample overhead image) *****
+#***** 1 post-process image (blow up + downsample overhead image) *****
+
+def blow_up_mask(mask: Image.Image, object_scale: float) -> Image.Image:
+    # Zooms each connected object about its own center of mass (nearest-neighbor inverse map),
+    # so multi-object masks scale independently instead of drifting toward a shared centroid.
+    # object_scale is linear (area grows ~object_scale**2); 1 is a no-op.
+    if object_scale == 1: return mask
+    arr = np.array(mask) > 127
+    lbl, n = ndimage.label(arr)
+    out = np.zeros_like(arr)
+    rr, cc = np.mgrid[0:arr.shape[0], 0:arr.shape[1]]
+    for i in range(1, n + 1):
+        obj = lbl == i
+        cr, cw = ndimage.center_of_mass(obj)
+        sr = np.round((rr - cr) / object_scale + cr).astype(int)
+        sc = np.round((cc - cw) / object_scale + cw).astype(int)
+        ok = (sr >= 0) & (sr < arr.shape[0]) & (sc >= 0) & (sc < arr.shape[1])
+        hit = np.zeros_like(arr)
+        hit[ok] = obj[sr[ok], sc[ok]]
+        out |= hit
+    return Image.fromarray((out * 255).astype(np.uint8))
 
 def downsample(mask: Image.Image, out_h: int, out_w: int) -> Image.Image:
     # BOX resampling area-averages over the full H x W mask (unlike a floor-division block
@@ -50,16 +71,21 @@ def tokenize(x: np.ndarray, patch_size:int):
 
 #***** 3 post-process a single sample *****
 
-def post_process_sample(sample_dir:Path, out_h:int, out_w:int, signal_mode:str, normalize_mode:str, patch_size:int, verbose:int, do_save:bool, denotch_fn=None, empty_mean:np.ndarray|None=None):
+def post_process_sample(sample_dir:Path, out_h:int, out_w:int, signal_mode:str, normalize_mode:str, patch_size:int, object_scale:float, verbose:int, do_save:bool, denotch_fn=None, empty_mean:np.ndarray|None=None):
     sample_id = sample_dir.name
     is_empty_box = bool({k: v for d in load(sample_dir / "metadata.jsonl") for k, v in d.items()}.get("is_empty_box", False))
 
-    # post process overhead image (downsample segment mask, compute new center of mass)
+    # post process overhead image (blow up + downsample segment mask, compute new center of mass)
     with Timing(f"[sample {sample_id}] post-process overhead image: ", enabled=verbose >= 2):
         segment_mask = load(sample_dir / "image/02_smask.png")
 
+        # blow up objects about their own center of mass before downsampling, so the tiny
+        # objects in this dataset don't collapse to a handful of low-res pixels
+        blownup_segment_mask = blow_up_mask(segment_mask, object_scale)
+        save(blownup_segment_mask, sample_dir / "image/05b_blownup_smask.png", do_save)
+
         # downsample segment mask to out_h x out_w
-        downsampled_segment_mask = downsample(segment_mask, out_h, out_w)
+        downsampled_segment_mask = downsample(blownup_segment_mask, out_h, out_w)
         save(downsampled_segment_mask, sample_dir / "image/06_downsampled_smask.png", do_save)
         save(np.array(downsampled_segment_mask, dtype=np.float32) / 255.0, sample_dir / "image/07_downsampled_smask.npy", do_save)
         append({'downsample': datetime.now(timezone.utc).isoformat()}, sample_dir / 'times.jsonl', do_save)
@@ -110,7 +136,7 @@ def post_process_sample(sample_dir:Path, out_h:int, out_w:int, signal_mode:str, 
 
     # take shapes from the signaled fft, not the raw one: complex/mag_phase modes double the channel dim
     n_lasers, n_freqs, n_channels = fft_signaled.shape[1], fft_signaled.shape[2], fft_signaled.shape[3]
-    append(dict(out_h=out_h, out_w=out_w, signal_mode=signal_mode, normalize_mode=normalize_mode, patch_size=patch_size, n_lasers=n_lasers, n_freqs=n_freqs, n_channels=n_channels, empty_diff=empty_mean is not None), sample_dir / "metadata.jsonl", do_save)
+    append(dict(out_h=out_h, out_w=out_w, signal_mode=signal_mode, normalize_mode=normalize_mode, patch_size=patch_size, object_scale=object_scale, n_lasers=n_lasers, n_freqs=n_freqs, n_channels=n_channels, empty_diff=empty_mean is not None), sample_dir / "metadata.jsonl", do_save)
     append({"post_process": datetime.now(timezone.utc).isoformat()}, sample_dir / "times.jsonl", do_save)
 
 
@@ -207,7 +233,7 @@ def resolve_dataset_dir(base_dataset_dir:Path, dataset_name:str|None, key:str) -
     count_path.write_text(str(n + 1))
     return base_dataset_dir / f"{n:03d}{suffix}"
 
-def post_process(base_sample_dir:Path, base_dataset_dir:Path, dataset_name:str|None, out_h:int, out_w:int, signal_mode:str, normalize_mode:str, patch_size:int, empty_diff:bool=False, force:bool=False, verbose:int=1, do_save:bool=True, denotch_fn=None):
+def post_process(base_sample_dir:Path, base_dataset_dir:Path, dataset_name:str|None, out_h:int, out_w:int, signal_mode:str, normalize_mode:str, patch_size:int, object_scale:float=1, empty_diff:bool=False, force:bool=False, verbose:int=1, do_save:bool=True, denotch_fn=None):
 
     # collect complete samples + metadata
     REQUIRED_FILES = ["image/02_smask.png", "vibration/03_fft.npz"]
@@ -228,8 +254,9 @@ def post_process(base_sample_dir:Path, base_dataset_dir:Path, dataset_name:str|N
 
     # hash and check for skip
     with Timing("Hashing: ", enter=f"Hashing metadata of {len(sample_ids)} samples to compute cache key ...", enabled=verbose):
-        # empty_diff only enters the key when on, so existing dataset dirs keep their cached keys
-        key = hashlib.sha1(json.dumps(rows | MDS_COLUMNS | ({"empty_diff": True} if empty_diff else {}), sort_keys=True, default=str).encode()).hexdigest()[:16]
+        # empty_diff only enters the key when on, so existing dataset dirs keep their cached keys;
+        # object_scale always enters so re-running with a different blow-up factor versions a new dataset
+        key = hashlib.sha1(json.dumps(rows | MDS_COLUMNS | ({"empty_diff": True} if empty_diff else {}) | {"object_scale": object_scale}, sort_keys=True, default=str).encode()).hexdigest()[:16]
 
     dataset_dir = resolve_dataset_dir(base_dataset_dir, dataset_name, key)
     samples_dir, mds_dir, hash_path = dataset_dir / "samples", dataset_dir / "mds", dataset_dir / "hash.txt"
@@ -261,7 +288,7 @@ def post_process(base_sample_dir:Path, base_dataset_dir:Path, dataset_name:str|N
             sample_dir = samples_dir / sample_id
             empty_mean = empty_means.get(int(rows[sample_id].get("speaker", -1))) if empty_diff else None
             if empty_diff and empty_mean is None: speakers_without_empties.add(int(rows[sample_id].get("speaker", -1)))
-            post_process_sample(sample_dir, out_h, out_w, signal_mode, normalize_mode, patch_size, verbose, do_save, denotch_fn, empty_mean)
+            post_process_sample(sample_dir, out_h, out_w, signal_mode, normalize_mode, patch_size, object_scale, verbose, do_save, denotch_fn, empty_mean)
             rows[sample_id] = {k: v for d in load(sample_dir / "metadata.jsonl") for k, v in d.items()}
     if speakers_without_empties:
         logger.warning(f"empty_diff: no empty-box samples for speakers {sorted(speakers_without_empties)} -- their samples were NOT diffed")
@@ -308,6 +335,7 @@ def parse_args():
     p.add_argument("--signal-mode",         type=str, default="magnitude", choices=["magnitude", "complex", "mag_phase"])
     p.add_argument("--normalize-mode",      type=str, default="std-sample", choices=["std-sample", "z-sample"])
     p.add_argument("--patch-size",          type=int, default=256)
+    p.add_argument("--object-scale",        type=float, default=1, help="Linear factor to blow up each mask object about its own center of mass before downsampling (area grows ~object_scale**2). 1 = no-op.")
     p.add_argument("--empty-diff",          action="store_true", help="Per speaker, average the signaled fft of all empty-box (n_objects=0) samples and subtract that speaker's average from each of its samples before normalization.")
     p.add_argument("--force",               action="store_true")
     p.add_argument("--verbose",             type=int, default=1)
@@ -319,7 +347,7 @@ def parse_args():
 
 if __name__ == "__main__":
     args = parse_args()
-    mds_path = post_process(args.base_sample_dir, args.base_dataset_dir, args.dataset_name, args.out_h, args.out_w, args.signal_mode, args.normalize_mode, args.patch_size, empty_diff=args.empty_diff, force=args.force, verbose=args.verbose, do_save=args.do_save)
+    mds_path = post_process(args.base_sample_dir, args.base_dataset_dir, args.dataset_name, args.out_h, args.out_w, args.signal_mode, args.normalize_mode, args.patch_size, object_scale=args.object_scale, empty_diff=args.empty_diff, force=args.force, verbose=args.verbose, do_save=args.do_save)
     n_samples = len((mds_path / "metadata.jsonl").read_text().strip().splitlines())
     print(f"MDS written to {mds_path} ({n_samples} samples)")
 
