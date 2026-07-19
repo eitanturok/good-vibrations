@@ -61,11 +61,7 @@ def get_parser():
     parser.add_argument("--n-laser-cols",               type=int,   default=10)
     parser.add_argument("--patch-size",                 type=int,   default=256)
     parser.add_argument("--n-freqs",                    type=int,   default=3328)
-<<<<<<< Updated upstream
     parser.add_argument("--n-channels",                 type=int,   default=2, help="Last dim of X: 2 for magnitude, 4 for complex/mag_phase signal modes.")
-=======
-    parser.add_argument("--n-coords",                   type=int,   default=2) # 2 for magnitude, 4 for complex/mag_phase (real+imag per coord)
->>>>>>> Stashed changes
     # filter data
     parser.add_argument("--n-samples",                  type=int,   default=None)
     parser.add_argument("--speakers",                   type=int,   default=None)
