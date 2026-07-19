@@ -228,10 +228,122 @@ def exp24_split(mds_path: str | Path, batch_size: int = 64, eval_batch_size: int
     eval_loaders = [Evaluator(label=label, dataloader=loader(idxs, eval_batch_size)) for label, idxs in evals.items()]
     return train_loader, eval_loaders
 
+# each object-type's samples live in two output_id (== image_id) ranges: a "train" range that is
+# always train, and one or more "eval-eligible" ranges we may only draw eval samples from.
+EXP25_GROUPS = {
+    "purple_cube":         {"train_range": (3, 29),   "eval_ranges": [(30, 59)]},
+    "green_cube":          {"train_range": (110, 124), "eval_ranges": [(125, 127)]},
+    "purple_green_cubes":  {"train_range": (60, 88),  "eval_ranges": [(89, 109)]},
+}
+EXP25_ALWAYS_TRAIN_RANGE = (0, 2) # empty-box
+
+def exp25_split(mds_path: str | Path, batch_size: int = 64, eval_batch_size: int = 64, test_size: float = 0.20,
+                  unseen_pos_frac: float = 0.15, unseen_pos_speaker_frac: float = 0.05, seed: int = 42, num_workers: int = 8,
+                  speakers=None, n_objects=None, box=None, n_samples: int | None = None,
+                  verbose: int = 1):
+    """Return (train_loader, eval_loaders) using an already-written MDS, split by object-type.
+
+    Each object-type (purple_cube, green_cube, purple_green_cubes) has an output_id (== image_id)
+    range that is always train (its "grid-1" layout, or the train-side layout for the mixed type)
+    and one or more output_id ranges we may only draw eval samples from (its "grid-2" layout(s)).
+    empty-box is always train, no eval carve-out.
+
+    For each type:
+    - combined pool = train-range samples + eval-range samples.
+    - target_eval = test_size * len(combined pool).
+    - If the eval-range pool is smaller than target_eval, the *whole* eval-range pool becomes eval
+      candidates (we never dip into the train range to make up the difference) -> this type ends up
+      with < test_size eval, and all of its train-range samples stay in train.
+    - Otherwise, target_eval samples (whole output_ids) are drawn from the eval-range pool as eval
+      candidates, and the leftover eval-range output_ids fall back into train.
+    - The eval candidates are then split unseen_pos_frac / unseen_pos_speaker_frac (of the combined
+      pool, not of the eval candidates) into:
+        - eval/{type}: whole held-out output_ids -> positions never seen in train, from any speaker.
+        - eval/{type}_speaker: individual samples from output_ids that DO appear in train -> this
+          exact (position, speaker) pair is new, but the position was seen from other speakers.
+      If the eval-range pool was capped smaller than target_eval, these two eval sets are scaled down
+      proportionally to fit inside what's available.
+    """
+    generator = torch.Generator().manual_seed(seed)
+    dataset = VibrationDataset(local=mds_path)
+
+    # load metadata.jsonl (no dataset-level header line in this format: every line is a sample)
+    lines = (Path(mds_path) / "metadata.jsonl").read_text().strip().splitlines()
+    index = [json.loads(line) for line in lines if line]
+
+    # filter the dataset by speakers, n_objects, box, n_samples
+    keep = [i for i, row in enumerate(index) if _matches(row, speakers, n_objects, box)]
+    if n_samples is not None: keep = keep[:n_samples]
+
+    def in_range(i, lo, hi): return lo <= int(index[i]["output_id"]) <= hi
+
+    train_idx = [i for i in keep if in_range(i, *EXP25_ALWAYS_TRAIN_RANGE)]
+    evals = {}
+    for name, group in EXP25_GROUPS.items():
+        train_range_idx = [i for i in keep if in_range(i, *group["train_range"])]
+        eval_pool_idx = [i for i in keep if any(in_range(i, lo, hi) for lo, hi in group["eval_ranges"])]
+        combined_n = len(train_range_idx) + len(eval_pool_idx)
+
+        target_eval = test_size * combined_n
+        eval_pool_output_ids = sorted({index[i]["output_id"] for i in eval_pool_idx})
+
+        if len(eval_pool_idx) <= target_eval:
+            # worst case: the whole eval-range pool becomes eval candidates, nothing more
+            eval_candidate_idx = eval_pool_idx
+            train_idx += train_range_idx
+            scale = len(eval_pool_idx) / target_eval if target_eval > 0 else 0.0
+        else:
+            n_output_ids = round(target_eval / len(eval_pool_idx) * len(eval_pool_output_ids))
+            n_output_ids = min(max(n_output_ids, 0), len(eval_pool_output_ids))
+            eval_candidate_output_ids, _ = train_test_split(
+                eval_pool_output_ids, train_size=n_output_ids, random_state=seed, shuffle=True)
+            eval_candidate_output_ids = set(eval_candidate_output_ids)
+            eval_candidate_idx = [i for i in eval_pool_idx if index[i]["output_id"] in eval_candidate_output_ids]
+            train_idx += train_range_idx + [i for i in eval_pool_idx if index[i]["output_id"] not in eval_candidate_output_ids]
+            scale = 1.0
+
+        # split eval candidates' output_ids: unseen_pos_frac -> whole new positions, rest -> pool for _speaker
+        pos_frac = min(unseen_pos_frac * scale, unseen_pos_frac + unseen_pos_speaker_frac)
+        eval_candidate_output_ids = sorted({index[i]["output_id"] for i in eval_candidate_idx})
+        n_unseen_pos = round(pos_frac / test_size * len(eval_candidate_output_ids)) if test_size > 0 else 0
+        n_unseen_pos = min(max(n_unseen_pos, 0), len(eval_candidate_output_ids))
+        unseen_pos_output_ids, speaker_pool_output_ids = train_test_split(
+            eval_candidate_output_ids, train_size=n_unseen_pos, random_state=seed, shuffle=True) if 0 < n_unseen_pos < len(eval_candidate_output_ids) \
+            else (eval_candidate_output_ids, []) if n_unseen_pos == len(eval_candidate_output_ids) \
+            else ([], eval_candidate_output_ids)
+        unseen_pos_output_ids = set(unseen_pos_output_ids)
+        evals[f"eval/{name}"] = [i for i in eval_candidate_idx if index[i]["output_id"] in unseen_pos_output_ids]
+
+        # unseen_pos_speaker_frac of the combined pool, taken as individual samples from the
+        # speaker-pool output_ids (these output_ids are NOT held out -> they stay available to train too)
+        speaker_pool_idx = [i for i in eval_candidate_idx if index[i]["output_id"] in set(speaker_pool_output_ids)]
+        n_speaker = round(unseen_pos_speaker_frac * scale / test_size * combined_n) if test_size > 0 else 0
+        n_speaker = min(max(n_speaker, 0), len(speaker_pool_idx))
+        if n_speaker < len(speaker_pool_idx):
+            remainder_idx, speaker_idx = train_test_split(speaker_pool_idx, test_size=n_speaker, random_state=seed, shuffle=True)
+        else:
+            remainder_idx, speaker_idx = [], speaker_pool_idx
+        evals[f"eval/{name}_speaker"] = speaker_idx
+        train_idx += remainder_idx
+
+    if verbose:
+        counts = ", ".join(f"{label}={len(idxs)}" for label, idxs in evals.items())
+        print(f"{len(index)} total samples, {len(keep)} after filtering -> train={len(train_idx)}, {counts}")
+
+    def num_samples(batch): return batch["mask_true"].shape[0]
+    def loader(idxs, bs, shuffle=False, drop_last=False):
+        dl = DataLoader(Subset(dataset, idxs), batch_size=bs, shuffle=shuffle, num_workers=num_workers, generator=generator, pin_memory=True, persistent_workers=num_workers > 0, prefetch_factor=4 if num_workers > 0 else None, drop_last=drop_last)
+        return DataSpec(dataloader=dl, get_num_samples_in_batch=num_samples)
+
+    train_loader = loader(train_idx, batch_size, shuffle=True, drop_last=True)
+    eval_loaders = [Evaluator(label=label, dataloader=loader(idxs, eval_batch_size)) for label, idxs in evals.items()]
+    return train_loader, eval_loaders
+
 SPLIT_METHODS = {
     "exp22": exp22_split,
     "exp23": exp23_split,
     "exp24": exp24_split,
+    "exp25": exp25_split,
 }
 
 def build_dataset(mds_path: str | Path, split: str = "exp22", **kwargs):
