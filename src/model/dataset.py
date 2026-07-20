@@ -1,4 +1,5 @@
 import hashlib, json, os, shutil
+from functools import partial
 from pathlib import Path
 
 import numpy as np
@@ -130,8 +131,8 @@ def noisy_blur(mask: torch.Tensor, generator: torch.Generator, sigma: float = 0.
     out[nonzero] = out[nonzero] + noise[nonzero]
     return out.clamp(0, 1)
 
-def process_image(mask: torch.Tensor, out_h: int, out_w: int, generator: torch.Generator | None = None, augment_fn=noisy_blur) -> torch.Tensor:
-    if generator is not None: mask = augment_fn(mask, generator)
+def process_image(mask: torch.Tensor, out_h: int, out_w: int, augment: bool = True, generator: torch.Generator | None = None, augment_fn=noisy_blur) -> torch.Tensor:
+    if augment: mask = augment_fn(mask, generator)
     return downsample(mask, out_h, out_w)
 
 #***** 2 process vibration *****
@@ -185,20 +186,18 @@ def augment_vibration(fft: torch.Tensor, freqs: torch.Tensor, generator: torch.G
     gain = random_frequency_gain(freqs, generator, n_control, gain_range)
     return fft * gain[None, None, :, None]
 
-def process_vibration(fft: torch.Tensor, freqs: torch.Tensor, signal_mode: str, normalize_mode: str, patch_size: int, generator: torch.Generator | None = None, gain_kwargs: dict | None = None) -> torch.Tensor:
-    """fft: (B,L,F,C) complex, on the target device. Returns tokenized (B,L,P,patch_size,C)
-    float32. generator=None skips frequency augmentation (offline baseline / eval)."""
-    if generator is not None: fft = augment_vibration(fft, freqs, generator, **(gain_kwargs or {}))
+def process_vibration(fft: torch.Tensor, freqs: torch.Tensor, signal_mode: str, normalize_mode: str, patch_size: int, augment: bool = True, generator: torch.Generator | None = None, gain_kwargs: dict | None = None) -> torch.Tensor:
+    """fft: (B,L,F,C) complex, on the target device. Returns tokenized (B,L,P,patch_size,C) float32."""
+    if augment: fft = augment_vibration(fft, freqs, generator, **(gain_kwargs or {}))
     x = extract_signal(fft, signal_mode).float()
     x = normalize_fft(x, normalize_mode)
     return tokenize(x, patch_size)
 
 #***** 3 process batch *****
 
-def process_batch(batch: dict, device: str, signal_mode: str, normalize_mode: str, patch_size: int, out_h: int, out_w: int, freqs: torch.Tensor, generator: torch.Generator | None = None):
-    # generator=None means no augmentations
-    fft_processed = process_vibration(batch["fft"].to(device), freqs, signal_mode, normalize_mode, patch_size, generator=generator)
-    mask_processed = process_image(batch["mask_true"].to(device), out_h, out_w, generator=generator)
+def process_batch(batch: dict, device: str, signal_mode: str, normalize_mode: str, patch_size: int, out_h: int, out_w: int, freqs: torch.Tensor, generator: torch.Generator | None = None, augment_fft: bool = True, augment_mask: bool = True):
+    fft_processed = process_vibration(batch["fft"].to(device), freqs, signal_mode, normalize_mode, patch_size, augment=augment_fft, generator=generator)
+    mask_processed = process_image(batch["mask_true"].to(device), out_h, out_w, augment=augment_mask, generator=generator)
     return dict(fft=fft_processed, mask_true=mask_processed, info=batch["info"])
 
 #***** 4 dataset *****
@@ -330,18 +329,19 @@ SPLIT_METHODS = {"exp25": exp25_split}
 
 def num_samples(batch): return batch["mask_true"].shape[0]
 
-def loader(dataset, idxs, bs, num_workers, generator, shuffle=False, drop_last=False):
+def loader(dataset, idxs, bs, num_workers, generator, process_batch_fn, shuffle=False, drop_last=False):
     dl = DataLoader(Subset(dataset, idxs), batch_size=bs, shuffle=shuffle, num_workers=num_workers, generator=generator, pin_memory=True, persistent_workers=num_workers > 0, prefetch_factor=4 if num_workers > 0 else None, drop_last=drop_last)
-    return DataSpec(dataloader=dl, get_num_samples_in_batch=num_samples)
+    return DataSpec(dataloader=dl, get_num_samples_in_batch=num_samples, microbatch_transforms=process_batch_fn)
 
 def build_dataset(data_dir: str | Path, split: str = "exp25", batch_size: int = 64, eval_batch_size: int = 64,
                    num_workers: int = 8, out_h: int = 20, out_w: int = 40, signal_mode: str = "magnitude",
                    normalize_mode: str = "std", patch_size: int = 256, seed: int = 42,
-                   device: str = "cpu", force_mds: bool = False,
+                   device: str = "cpu", force_mds: bool = False, augment_fft: bool = True, augment_mask: bool = True,
                    verbose: int = 1, **split_kwargs):
 
     if split not in SPLIT_METHODS: raise ValueError(f"Unknown split {split!r}, expected one of {sorted(SPLIT_METHODS)}")
     data_dir = Path(data_dir)
+    if not data_dir.exists(): raise FileNotFoundError(f"{data_dir=} does not exist")
     mds_dir = data_dir / "mds"
     hash_path = mds_dir / "samples_hash.txt"
 
@@ -360,6 +360,11 @@ def build_dataset(data_dir: str | Path, split: str = "exp25", batch_size: int = 
 
     generator = torch.Generator().manual_seed(seed)
     dataset = VibrationDataset(local=mds_dir, out_h=out_h, out_w=out_w, signal_mode=signal_mode, normalize_mode=normalize_mode, patch_size=patch_size, seed=seed, device=device)
-    train_loader = loader(dataset, splits["train"], batch_size, num_workers, generator, shuffle=True, drop_last=True)
-    eval_loaders = [Evaluator(label=label, dataloader=loader(dataset, idxs, eval_batch_size, num_workers, generator)) for label, idxs in splits.items() if label != "train"]
-    return train_loader, eval_loaders, dataset
+    process_kwargs = dict(device=device, signal_mode=signal_mode, normalize_mode=normalize_mode, patch_size=patch_size, out_h=out_h, out_w=out_w, freqs=dataset.freqs, generator=dataset.generator)
+    train_transform = partial(process_batch, **process_kwargs, augment_fft=augment_fft, augment_mask=augment_mask)
+    eval_transform = partial(process_batch, **process_kwargs, augment_fft=False, augment_mask=False)
+
+    train_loader = loader(dataset, splits["train"], batch_size, num_workers, generator, train_transform, shuffle=True, drop_last=True)
+    train_eval_loader = loader(dataset, splits["train"], eval_batch_size, num_workers, generator, eval_transform)
+    eval_loaders = [Evaluator(label=label, dataloader=loader(dataset, idxs, eval_batch_size, num_workers, generator, eval_transform)) for label, idxs in splits.items() if label != "train"]
+    return train_loader, eval_loaders, train_eval_loader, dataset
