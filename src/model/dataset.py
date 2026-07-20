@@ -1,5 +1,6 @@
 import os, json, hashlib, shutil
 from pathlib import Path
+from typing import Literal
 
 import numpy as np
 import torch
@@ -9,6 +10,7 @@ from composer.core import Evaluator, DataSpec
 from streaming import StreamingDataset, MDSWriter
 
 from utils.io_utils import load
+from data.post_process import process_vibration, process_image, make_rng
 
 # ***** 1. turn dataset into MDS format (sharded, streaming) *****
 DATA_INFO = {"out_h": 18, "out_w": 44, "n_samples": 0,
@@ -16,16 +18,56 @@ DATA_INFO = {"out_h": 18, "out_w": 44, "n_samples": 0,
 
 
 #***** 2 create StreamingDataset (like pytorch Dataset but faster) *****
+# MDS now stores X as the clean complex fft (real/imag stacked, shape (L,F,C,2)) and y as the
+# raw downsampled mask -- extract_signal/normalize_fft/tokenize and augmentation happen live,
+# here or in augmenting_collate below, so they can differ every epoch (see notebooks/53).
+
+AugmentSite = Literal["none", "getitem", "collate"]
 
 class VibrationDataset(StreamingDataset):
-    def __init__(self, local: str | Path, shuffle: bool = False, **kwargs):
+    def __init__(self, local: str | Path, shuffle: bool = False, augment_site: AugmentSite = "none",
+                 signal_mode: str = "magnitude", normalize_mode: str = "std-sample", patch_size: int = 256, **kwargs):
         super().__init__(local=str(local), shuffle=shuffle, batch_size=kwargs.pop("batch_size", None), **kwargs)
+        self.augment_site = augment_site
+        self.signal_mode, self.normalize_mode, self.patch_size = signal_mode, normalize_mode, patch_size
+        self.freqs = np.load(Path(local) / "freqs.npy")
+        self._epoch = 0
+
+    def set_epoch(self, epoch: int):
+        # mirrors DistributedSampler.set_epoch -- call once per epoch from the training loop so
+        # augmentation seeds (epoch, sample_id) differ every epoch but stay reproducible.
+        self._epoch = epoch
 
     def __getitem__(self, idx):
         s = super().__getitem__(idx)
-        X, y = s.pop("X"), s.pop("y")
-        info = dict(sample_id=s["sample_id"], output_id=s["output_id"], n_objects=s["n_objects"], speaker=s["speaker"], box=s["box"], is_empty_box=s["is_empty_box"], x_com=s["downsampled_com_x"], y_com=s["downsampled_com_y"])
-        return dict(fft=torch.from_numpy(X.copy()), mask_true=torch.from_numpy(y.copy()), info=info)
+        X, y = s.pop("X"), s.pop("y")  # X: (L,F,C,2) real/imag fft, y: (H,W) raw mask
+        sample_id = s["sample_id"]
+        info = dict(sample_id=sample_id, output_id=s["output_id"], n_objects=s["n_objects"], speaker=s["speaker"], box=s["box"], is_empty_box=s["is_empty_box"], x_com=s["downsampled_com_x"], y_com=s["downsampled_com_y"])
+
+        if self.augment_site == "collate":
+            # defer all processing to augmenting_collate; hand back raw complex fft + raw mask
+            fft_complex = X[..., 0] + 1j * X[..., 1]
+            return dict(fft=fft_complex, mask_true=y, info=info)
+
+        rng = make_rng(self._epoch, sample_id) if self.augment_site == "getitem" else None
+        fft_complex = (X[..., 0] + 1j * X[..., 1])[None]  # (1,L,F,C)
+        fft_processed = process_vibration(fft_complex, self.freqs, self.signal_mode, self.normalize_mode, self.patch_size, rng=rng)[0]
+        mask_processed = process_image(y[None], rng=rng)[0]
+        return dict(fft=torch.from_numpy(fft_processed.copy()), mask_true=torch.from_numpy(mask_processed.copy()), info=info)
+
+
+def augmenting_collate(batch: list[dict], epoch: int, signal_mode: str, normalize_mode: str, patch_size: int, freqs: np.ndarray, augment: bool):
+    """Batched counterpart to VibrationDataset(augment_site='getitem'): stacks raw complex fft +
+    raw mask across the batch, then runs process_vibration/process_image once on the whole
+    batch instead of once per sample. Only meaningful when the dataset was built with
+    augment_site='collate' (otherwise __getitem__ already returned processed tensors)."""
+    fft = np.stack([b["fft"] for b in batch])          # (B,L,F,C) complex
+    mask = np.stack([b["mask_true"] for b in batch])   # (B,H,W)
+    infos = [b["info"] for b in batch]
+    rng = make_rng(epoch, infos[0]["sample_id"]) if augment else None  # one shared draw per batch
+    fft_processed = process_vibration(fft, freqs, signal_mode, normalize_mode, patch_size, rng=rng)
+    mask_processed = process_image(mask, rng=rng)
+    return dict(fft=torch.from_numpy(fft_processed.copy()), mask_true=torch.from_numpy(mask_processed.copy()), info=infos)
 
 #***** 3 build train/eval DataLoaders with filtering + splitting *****
 
@@ -37,7 +79,7 @@ def _matches(row: dict, speakers, n_objects, box) -> bool:
 
 
 def exp22_split(mds_path: str | Path, batch_size: int = 64, eval_batch_size: int = 64, test_size: float = 0.15,
-                  unseen_pos_speaker_frac: float = 0.06, seed: int = 42, num_workers: int = 8,
+                  unseen_pos_speaker_frac: float = 0.06, seed: int = 42, num_workers: int = 8, augment_site: str = "none",
                   speakers=None, n_objects=None, box=None, n_samples: int | None = None,
                   verbose: int = 1):
     """Return (train_loader, eval_loaders) using an already-written MDS.
@@ -52,7 +94,8 @@ def exp22_split(mds_path: str | Path, batch_size: int = 64, eval_batch_size: int
     - train: the remaining sample_ids from train_output_ids.
     """
     generator = torch.Generator().manual_seed(seed)
-    dataset = VibrationDataset(local=mds_path)
+    dataset = VibrationDataset(local=mds_path, augment_site=augment_site)
+    eval_dataset = VibrationDataset(local=mds_path, augment_site="none")  # eval never augments, even when train uses augment_site="getitem"
 
     # load metadata.jsonl (skip line 0: dataset-level info now comes from args, not the sidecar)
     lines = (Path(mds_path) / "metadata.jsonl").read_text().strip().splitlines()
@@ -84,11 +127,17 @@ def exp22_split(mds_path: str | Path, batch_size: int = 64, eval_batch_size: int
               f"eval/unseen_pos={len(unseen_pos_idx)}, eval/unseen_layout={len(unseen_layout_idx)}")
 
     def num_samples(batch): return batch["mask_true"].shape[0]
-    def loader(idxs, bs, shuffle=False, drop_last=False):
-        dl = DataLoader(Subset(dataset, idxs), batch_size=bs, shuffle=shuffle, num_workers=num_workers, generator=generator, pin_memory=True, persistent_workers=num_workers > 0, prefetch_factor=4 if num_workers > 0 else None, drop_last=drop_last)
+    def loader(idxs, bs, shuffle=False, drop_last=False, augment=False):
+        # collate site: __getitem__ always hands back raw data regardless of augment, so both
+        # train and eval can share `dataset` -- augmenting_collate's own `augment` flag gates it.
+        # getitem site (or "none"): augmentation is baked into __getitem__ itself, so eval must
+        # use a separate augment_site="none" instance to guarantee it never augments.
+        ds = dataset if (augment or augment_site == "collate") else eval_dataset
+        collate_fn = (lambda batch: augmenting_collate(batch, dataset._epoch, dataset.signal_mode, dataset.normalize_mode, dataset.patch_size, dataset.freqs, augment)) if augment_site == "collate" else None
+        dl = DataLoader(Subset(ds, idxs), batch_size=bs, shuffle=shuffle, num_workers=num_workers, generator=generator, pin_memory=True, persistent_workers=num_workers > 0, prefetch_factor=4 if num_workers > 0 else None, drop_last=drop_last, collate_fn=collate_fn)
         return DataSpec(dataloader=dl, get_num_samples_in_batch=num_samples)
 
-    train_loader = loader(train_idx, batch_size, shuffle=True, drop_last=True)
+    train_loader = loader(train_idx, batch_size, shuffle=True, drop_last=True, augment=True)
     eval_loaders = [
         Evaluator(label="eval/unseen_pos_speaker", dataloader=loader(unseen_pos_speaker_idx, eval_batch_size)),
         Evaluator(label="eval/unseen_pos", dataloader=loader(unseen_pos_idx, eval_batch_size)),
@@ -97,7 +146,7 @@ def exp22_split(mds_path: str | Path, batch_size: int = 64, eval_batch_size: int
     return train_loader, eval_loaders
 
 def exp23_split(mds_path: str | Path, batch_size: int = 64, eval_batch_size: int = 64, test_size: float = 0.15,
-                  seed: int = 42, num_workers: int = 8,
+                  seed: int = 42, num_workers: int = 8, augment_site: str = "none",
                   speakers=None, n_objects=None, box=None, n_samples: int | None = None,
                   verbose: int = 1):
     """Return (train_loader, eval_loaders) using an already-written MDS, split by `layout`.
@@ -112,7 +161,8 @@ def exp23_split(mds_path: str | Path, batch_size: int = 64, eval_batch_size: int
     - train: everything left in cylinder-1 and cylinder-2.
     """
     generator = torch.Generator().manual_seed(seed)
-    dataset = VibrationDataset(local=mds_path)
+    dataset = VibrationDataset(local=mds_path, augment_site=augment_site)
+    eval_dataset = VibrationDataset(local=mds_path, augment_site="none")  # eval never augments, even when train uses augment_site="getitem"
 
     # load metadata.jsonl (no dataset-level header line in this format: every line is a sample)
     lines = (Path(mds_path) / "metadata.jsonl").read_text().strip().splitlines()
@@ -148,16 +198,22 @@ def exp23_split(mds_path: str | Path, batch_size: int = 64, eval_batch_size: int
         print(f"{len(index)} total samples, {len(keep)} after filtering -> train={len(train_idx)}, {counts}")
 
     def num_samples(batch): return batch["mask_true"].shape[0]
-    def loader(idxs, bs, shuffle=False, drop_last=False):
-        dl = DataLoader(Subset(dataset, idxs), batch_size=bs, shuffle=shuffle, num_workers=num_workers, generator=generator, pin_memory=True, persistent_workers=num_workers > 0, prefetch_factor=4 if num_workers > 0 else None, drop_last=drop_last)
+    def loader(idxs, bs, shuffle=False, drop_last=False, augment=False):
+        # collate site: __getitem__ always hands back raw data regardless of augment, so both
+        # train and eval can share `dataset` -- augmenting_collate's own `augment` flag gates it.
+        # getitem site (or "none"): augmentation is baked into __getitem__ itself, so eval must
+        # use a separate augment_site="none" instance to guarantee it never augments.
+        ds = dataset if (augment or augment_site == "collate") else eval_dataset
+        collate_fn = (lambda batch: augmenting_collate(batch, dataset._epoch, dataset.signal_mode, dataset.normalize_mode, dataset.patch_size, dataset.freqs, augment)) if augment_site == "collate" else None
+        dl = DataLoader(Subset(ds, idxs), batch_size=bs, shuffle=shuffle, num_workers=num_workers, generator=generator, pin_memory=True, persistent_workers=num_workers > 0, prefetch_factor=4 if num_workers > 0 else None, drop_last=drop_last, collate_fn=collate_fn)
         return DataSpec(dataloader=dl, get_num_samples_in_batch=num_samples)
 
-    train_loader = loader(train_idx, batch_size, shuffle=True, drop_last=True)
+    train_loader = loader(train_idx, batch_size, shuffle=True, drop_last=True, augment=True)
     eval_loaders = [Evaluator(label=label, dataloader=loader(idxs, eval_batch_size)) for label, idxs in evals.items()]
     return train_loader, eval_loaders
 
 def exp24_split(mds_path: str | Path, batch_size: int = 64, eval_batch_size: int = 64, test_size: float = 0.15,
-                  speaker_size: float = 0.05, seed: int = 42, num_workers: int = 8,
+                  speaker_size: float = 0.05, seed: int = 42, num_workers: int = 8, augment_site: str = "none",
                   speakers=None, n_objects=None, box=None, n_samples: int | None = None,
                   verbose: int = 1):
     """Return (train_loader, eval_loaders) using an already-written MDS, split by `layout`.
@@ -177,7 +233,8 @@ def exp24_split(mds_path: str | Path, batch_size: int = 64, eval_batch_size: int
     """
     generator = torch.Generator().manual_seed(seed)
     rng = np.random.default_rng(seed)
-    dataset = VibrationDataset(local=mds_path)
+    dataset = VibrationDataset(local=mds_path, augment_site=augment_site)
+    eval_dataset = VibrationDataset(local=mds_path, augment_site="none")  # eval never augments, even when train uses augment_site="getitem"
 
     # load metadata.jsonl (no dataset-level header line in this format: every line is a sample)
     lines = (Path(mds_path) / "metadata.jsonl").read_text().strip().splitlines()
@@ -220,11 +277,17 @@ def exp24_split(mds_path: str | Path, batch_size: int = 64, eval_batch_size: int
         print(f"{len(index)} total samples, {len(keep)} after filtering -> train={len(train_idx)}, {counts}")
 
     def num_samples(batch): return batch["mask_true"].shape[0]
-    def loader(idxs, bs, shuffle=False, drop_last=False):
-        dl = DataLoader(Subset(dataset, idxs), batch_size=bs, shuffle=shuffle, num_workers=num_workers, generator=generator, pin_memory=True, persistent_workers=num_workers > 0, prefetch_factor=4 if num_workers > 0 else None, drop_last=drop_last)
+    def loader(idxs, bs, shuffle=False, drop_last=False, augment=False):
+        # collate site: __getitem__ always hands back raw data regardless of augment, so both
+        # train and eval can share `dataset` -- augmenting_collate's own `augment` flag gates it.
+        # getitem site (or "none"): augmentation is baked into __getitem__ itself, so eval must
+        # use a separate augment_site="none" instance to guarantee it never augments.
+        ds = dataset if (augment or augment_site == "collate") else eval_dataset
+        collate_fn = (lambda batch: augmenting_collate(batch, dataset._epoch, dataset.signal_mode, dataset.normalize_mode, dataset.patch_size, dataset.freqs, augment)) if augment_site == "collate" else None
+        dl = DataLoader(Subset(ds, idxs), batch_size=bs, shuffle=shuffle, num_workers=num_workers, generator=generator, pin_memory=True, persistent_workers=num_workers > 0, prefetch_factor=4 if num_workers > 0 else None, drop_last=drop_last, collate_fn=collate_fn)
         return DataSpec(dataloader=dl, get_num_samples_in_batch=num_samples)
 
-    train_loader = loader(train_idx, batch_size, shuffle=True, drop_last=True)
+    train_loader = loader(train_idx, batch_size, shuffle=True, drop_last=True, augment=True)
     eval_loaders = [Evaluator(label=label, dataloader=loader(idxs, eval_batch_size)) for label, idxs in evals.items()]
     return train_loader, eval_loaders
 
@@ -238,7 +301,7 @@ EXP25_GROUPS = {
 EXP25_ALWAYS_TRAIN_RANGE = (0, 2) # empty-box
 
 def exp25_split(mds_path: str | Path, batch_size: int = 64, eval_batch_size: int = 64, test_size: float = 0.20,
-                  unseen_pos_frac: float = 0.15, unseen_pos_speaker_frac: float = 0.05, seed: int = 42, num_workers: int = 8,
+                  unseen_pos_frac: float = 0.15, unseen_pos_speaker_frac: float = 0.05, seed: int = 42, num_workers: int = 8, augment_site: str = "none",
                   speakers=None, n_objects=None, box=None, n_samples: int | None = None,
                   verbose: int = 1):
     """Return (train_loader, eval_loaders) using an already-written MDS, split by object-type.
@@ -265,7 +328,8 @@ def exp25_split(mds_path: str | Path, batch_size: int = 64, eval_batch_size: int
       proportionally to fit inside what's available.
     """
     generator = torch.Generator().manual_seed(seed)
-    dataset = VibrationDataset(local=mds_path)
+    dataset = VibrationDataset(local=mds_path, augment_site=augment_site)
+    eval_dataset = VibrationDataset(local=mds_path, augment_site="none")  # eval never augments, even when train uses augment_site="getitem"
 
     # load metadata.jsonl (no dataset-level header line in this format: every line is a sample)
     lines = (Path(mds_path) / "metadata.jsonl").read_text().strip().splitlines()
@@ -331,11 +395,17 @@ def exp25_split(mds_path: str | Path, batch_size: int = 64, eval_batch_size: int
         print(f"{len(index)} total samples, {len(keep)} after filtering -> train={len(train_idx)}, {counts}")
 
     def num_samples(batch): return batch["mask_true"].shape[0]
-    def loader(idxs, bs, shuffle=False, drop_last=False):
-        dl = DataLoader(Subset(dataset, idxs), batch_size=bs, shuffle=shuffle, num_workers=num_workers, generator=generator, pin_memory=True, persistent_workers=num_workers > 0, prefetch_factor=4 if num_workers > 0 else None, drop_last=drop_last)
+    def loader(idxs, bs, shuffle=False, drop_last=False, augment=False):
+        # collate site: __getitem__ always hands back raw data regardless of augment, so both
+        # train and eval can share `dataset` -- augmenting_collate's own `augment` flag gates it.
+        # getitem site (or "none"): augmentation is baked into __getitem__ itself, so eval must
+        # use a separate augment_site="none" instance to guarantee it never augments.
+        ds = dataset if (augment or augment_site == "collate") else eval_dataset
+        collate_fn = (lambda batch: augmenting_collate(batch, dataset._epoch, dataset.signal_mode, dataset.normalize_mode, dataset.patch_size, dataset.freqs, augment)) if augment_site == "collate" else None
+        dl = DataLoader(Subset(ds, idxs), batch_size=bs, shuffle=shuffle, num_workers=num_workers, generator=generator, pin_memory=True, persistent_workers=num_workers > 0, prefetch_factor=4 if num_workers > 0 else None, drop_last=drop_last, collate_fn=collate_fn)
         return DataSpec(dataloader=dl, get_num_samples_in_batch=num_samples)
 
-    train_loader = loader(train_idx, batch_size, shuffle=True, drop_last=True)
+    train_loader = loader(train_idx, batch_size, shuffle=True, drop_last=True, augment=True)
     eval_loaders = [Evaluator(label=label, dataloader=loader(idxs, eval_batch_size)) for label, idxs in evals.items()]
     return train_loader, eval_loaders
 

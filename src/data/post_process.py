@@ -5,6 +5,8 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 from scipy import ndimage
+from scipy.ndimage import gaussian_filter
+from scipy.interpolate import PchipInterpolator
 from streaming import MDSWriter
 
 from utils.io_utils import load, save, append, symlink, copy
@@ -69,6 +71,125 @@ def tokenize(x: np.ndarray, patch_size:int):
     P = F // patch_size
     return x[:, :, :P * patch_size, :].reshape(B, L, P, patch_size, C)  # (B,L,P,PS,C)
 
+#***** 2b augmentations (ported from notebooks/53_augmentations.ipynb) *****
+
+def make_rng(epoch:int, sample_id:int) -> np.random.Generator:
+    # Deterministic per-(epoch, sample_id) seed: augmentation differs every epoch but is
+    # reproducible for a given epoch, independent of worker process / draw order.
+    seed = (int(epoch) * 2_147_483_647 + int(sample_id)) & 0xFFFFFFFF
+    return np.random.default_rng(seed)
+
+def random_frequency_gain(freqs: np.ndarray, rng: np.random.Generator, n_control:int=5, gain_range:tuple=(0.8, 1.2)) -> np.ndarray:
+    # Smooth random multiplicative gain curve: random values at a few control frequencies,
+    # connected with a monotonic cubic spline, rescaled into gain_range.
+    control_freqs = np.linspace(freqs.min(), freqs.max(), n_control)
+    control_gains = rng.normal(loc=1.0, scale=1.0, size=n_control)
+    spline = PchipInterpolator(control_freqs, control_gains)
+    gain = spline(freqs)
+    gain = (gain - gain.min()) / (gain.max() - gain.min())  # -> [0, 1]
+    lo, hi = gain_range
+    return (gain * (hi - lo) + lo).astype(np.float32)
+
+def augment_vibration(fft: np.ndarray, freqs: np.ndarray, rng: np.random.Generator, n_control:int=5, gain_range:tuple=(0.8, 1.2)) -> np.ndarray:
+    # fft: (B,L,F,C) complex. One shared gain curve per call (batch); draw a fresh rng per
+    # row upstream (e.g. make_rng(epoch, sample_id)) if per-sample gain curves are wanted.
+    gain = random_frequency_gain(freqs, rng, n_control, gain_range)
+    return fft * gain[None, None, :, None]
+
+def label_smooth(mask: np.ndarray, lo:float=0.05, hi:float=0.9) -> np.ndarray:
+    # Deterministic value remap: [0,1] -> [lo,hi], everywhere. No spatial effect.
+    return mask * (hi - lo) + lo
+
+def edge_blur(mask: np.ndarray, sigma:float=0.8) -> np.ndarray:
+    # Deterministic spatial smoothing (fixed 3x3 kernel); softens boundary transition band,
+    # flat interior/exterior regions unaffected. mask: (B,H,W).
+    return gaussian_filter(mask, sigma=sigma, radius=1, mode='nearest', axes=(1, 2))
+
+def random_boundary_jitter(mask: np.ndarray, rng: np.random.Generator, shift_range:float=1.0, sigma_range:tuple=(0.4, 1.2), lo_range:tuple=(0.0, 0.08), hi_range:tuple=(0.85, 1.0)) -> np.ndarray:
+    # Stochastic: sub-pixel boundary shift + random blur + random label smoothing, meant to
+    # be called fresh per sample per epoch. mask: (B,H,W); one draw per call (shared across B).
+    shift = rng.uniform(-shift_range, shift_range, size=2)
+    jittered = ndimage.shift(mask, (0, *shift), order=1, mode='nearest')
+    sigma = rng.uniform(*sigma_range)
+    blurred = gaussian_filter(jittered, sigma=sigma, radius=1, mode='nearest', axes=(1, 2))
+    lo, hi = rng.uniform(*lo_range), rng.uniform(*hi_range)
+    return np.clip(blurred, 0, 1) * (hi - lo) + lo
+
+def noisy_blur(mask: np.ndarray, rng: np.random.Generator, sigma:float=0.8, noise_std:float=0.05) -> np.ndarray:
+    # Gaussian blur, then add noise back onto originally-nonzero pixels only. mask: (B,H,W).
+    blurred = gaussian_filter(mask, sigma=sigma, radius=1, mode='nearest', axes=(1, 2))
+    noise = rng.normal(0.0, noise_std, size=mask.shape)
+    out = blurred.copy()
+    out[mask != 0] += noise[mask != 0]
+    return np.clip(out, 0, 1)
+
+#***** 2c composed per-sample/per-batch processing (usable standalone or from the live dataloader) *****
+
+def process_vibration(fft: np.ndarray, freqs: np.ndarray, signal_mode:str, normalize_mode:str, patch_size:int, rng: np.random.Generator|None=None, gain_kwargs: dict|None=None) -> np.ndarray:
+    """fft: (B,L,F,C) complex. Returns tokenized (B,L,P,patch_size,C) float32.
+    rng=None skips frequency augmentation (offline baseline / eval)."""
+    if rng is not None:
+        fft = augment_vibration(fft, freqs, rng, **(gain_kwargs or {}))
+    x = extract_signal(fft, signal_mode).astype(np.float32)  # (B,L,F_,C) -> (B,L,F,C)
+    x = normalize_fft(x, normalize_mode)
+    return tokenize(x, patch_size)
+
+def process_image(mask: np.ndarray, rng: np.random.Generator|None=None, augment_fn=None) -> np.ndarray:
+    """mask: (B,H,W) float32 in [0,1]. Returns (B,H,W) float32.
+    rng=None skips mask augmentation (offline baseline / eval)."""
+    if rng is not None:
+        mask = (augment_fn or noisy_blur)(mask, rng)
+    return mask
+
+#***** 2d torch/GPU equivalents of process_vibration (for benchmarking CPU vs GPU) *****
+# The fft (B,L,F,C) arrays here are large enough that GPU may win despite transfer overhead;
+# the mask (B,H,W) arrays in process_image are tiny, so no GPU variant is provided for those --
+# transfer latency alone would dominate any compute saved.
+
+def random_frequency_gain_torch(freqs: "torch.Tensor", rng: np.random.Generator, n_control:int=5, gain_range:tuple=(0.8, 1.2)) -> "torch.Tensor":
+    import torch
+    control_freqs = torch.linspace(freqs.min().item(), freqs.max().item(), n_control, dtype=freqs.dtype, device=freqs.device)
+    control_gains = torch.from_numpy(rng.normal(loc=1.0, scale=1.0, size=n_control)).to(freqs.device, freqs.dtype)
+    # notebook 53's hand-rolled Hermite-spline interp (monotone cubic through control points)
+    idxs = torch.searchsorted(control_freqs[1:], freqs).clamp(max=n_control - 2)
+    m = (control_gains[1:] - control_gains[:-1]) / (control_freqs[1:] - control_freqs[:-1])
+    m = torch.cat([m[[0]], (m[1:] + m[:-1]) / 2, m[[-1]]])
+    dx = control_freqs[idxs + 1] - control_freqs[idxs]
+    t = (freqs - control_freqs[idxs]) / dx
+    tt = t[None, :] ** torch.arange(4, device=t.device, dtype=t.dtype)[:, None]
+    H = torch.tensor([[1, 0, -3, 2], [0, 1, -2, 1], [0, 0, 3, -2], [0, 0, -1, 1]], dtype=t.dtype, device=t.device) @ tt
+    gain = H[0] * control_gains[idxs] + H[1] * m[idxs] * dx + H[2] * control_gains[idxs + 1] + H[3] * m[idxs + 1] * dx
+    gain = (gain - gain.min()) / (gain.max() - gain.min())
+    lo, hi = gain_range
+    return gain * (hi - lo) + lo
+
+def process_vibration_torch(fft: "torch.Tensor", freqs: "torch.Tensor", signal_mode:str, normalize_mode:str, patch_size:int, rng: np.random.Generator|None=None, gain_kwargs: dict|None=None) -> "torch.Tensor":
+    """Same contract as process_vibration but fft/freqs are torch tensors already on the
+    target device (cpu or cuda) -- move them there before calling, once per batch."""
+    import torch
+    if rng is not None:
+        gain = random_frequency_gain_torch(freqs, rng, **(gain_kwargs or {}))
+        fft = fft * gain[None, None, :, None]
+    if signal_mode == "magnitude": x = fft.abs()
+    elif signal_mode == "complex": x = torch.cat([fft.real, fft.imag], dim=-1)
+    elif signal_mode == "mag_phase": x = torch.cat([fft.abs(), fft.angle()], dim=-1)
+    else: raise ValueError(f"Unknown signal mode: {signal_mode}")
+    if normalize_mode is not None:
+        x64 = x.double()
+        if normalize_mode == 'std-sample':
+            std = x64.std(dim=(1, 2, 3), correction=1, keepdim=True).clamp_min(1e-8).float()
+            x = x / std
+        elif normalize_mode == 'z-sample':
+            mean = x64.mean(dim=(1, 2, 3), keepdim=True).float()
+            std = x64.std(dim=(1, 2, 3), correction=1, keepdim=True).clamp_min(1e-8).float()
+            x = (x - mean) / std
+        else: raise ValueError(f"Unknown normalize mode: {normalize_mode}")
+    if patch_size > 0:
+        B, L, F, C = x.shape
+        P = F // patch_size
+        x = x[:, :, :P * patch_size, :].reshape(B, L, P, patch_size, C)
+    return x
+
 #***** 3 post-process a single sample *****
 
 def post_process_sample(sample_dir:Path, out_h:int, out_w:int, signal_mode:str, normalize_mode:str, patch_size:int, object_scale:float, verbose:int, do_save:bool, denotch_fn=None, empty_mean:np.ndarray|None=None):
@@ -96,47 +217,34 @@ def post_process_sample(sample_dir:Path, out_h:int, out_w:int, signal_mode:str, 
         append({'process_overhead/com': datetime.now(timezone.utc).isoformat()}, sample_dir / 'times.jsonl', do_save)
         logger.debug(f"[sample {sample_id}] {downsampled_com=}")
 
-    # post process vibrations (extract signal, normalize signal, tokenize)
+    # post process vibrations: denotch + empty-diff only. extract_signal/normalize_fft/tokenize
+    # (and any frequency-domain augmentation) run live, later, via process_vibration -- they need
+    # to differ every epoch, so they can't be baked in here.
     with Timing(f"[sample {sample_id}] post-process vibrations: ", enabled=verbose >= 2):
         fft_npz = load(sample_dir / 'vibration/03_fft.npz')
-        freqs, fft_raw = fft_npz['freqs'], fft_npz['fft']
+        freqs, fft_clean = fft_npz['freqs'], fft_npz['fft']
         if denotch_fn is not None:
-            fft_raw = denotch_fn(fft_raw, freqs)
-            save({'fft': fft_raw, 'freqs': freqs, 'n_samples': fft_npz['n_samples']}, sample_dir / 'vibration/03_fft.npz', do_save)
+            fft_clean = denotch_fn(fft_clean, freqs)
+            save({'fft': fft_clean, 'freqs': freqs, 'n_samples': fft_npz['n_samples']}, sample_dir / 'vibration/03_fft.npz', do_save)
             append({"fft_denotched": datetime.now(timezone.utc).isoformat()}, sample_dir / "times.jsonl", do_save)
-        logger.debug(f'[sample {sample_id}] {fft_raw.shape=}=(batch, lasers, _freqs, x/y)')
+        logger.debug(f'[sample {sample_id}] {fft_clean.shape=}=(batch, lasers, freqs, x/y)')
 
-        # extract signal from fft
-        fft_signaled = extract_signal(fft_raw, signal_mode).astype(np.float32)  # (B,L,F_,C) -> (B,L,F,C)
-        logger.debug(f'[sample {sample_id}] {fft_signaled.shape=}=(batch, lasers, _freqs, x/y)')
-        save(fft_signaled, sample_dir / 'vibration/06_signaled_fft.npy', do_save)
-        append({"fft_signaled": datetime.now(timezone.utc).isoformat()}, sample_dir / "times.jsonl", do_save)
-
-        # subtract this speaker's empty-box mean (empty_diff); normalize/tokenize run on the diffed signal
+        # subtract this speaker's empty-box mean (empty_diff), still on the clean complex fft
         if empty_mean is not None:
-            fft_signaled = fft_signaled - empty_mean
-            save(fft_signaled, sample_dir / 'vibration/06b_diffed_fft.npy', do_save)
+            fft_clean = fft_clean - empty_mean
             append({"fft_diffed": datetime.now(timezone.utc).isoformat()}, sample_dir / "times.jsonl", do_save)
 
-        # normalize fft
-        fft_normalized = normalize_fft(fft_signaled, normalize_mode, verbose)   # (B,L,F,C) -> (B,L,F,C)
-        logger.debug(f'[sample {sample_id}] {fft_normalized.shape=}=(batch, lasers, _freqs, x/y)')
-        save(fft_normalized, sample_dir / 'vibration/07_normalized_fft.npy', do_save)
-        append({"fft_normalized": datetime.now(timezone.utc).isoformat()}, sample_dir / "times.jsonl", do_save)
+        save(fft_clean, sample_dir / 'vibration/06_clean_fft.npy', do_save)
+        save(freqs, sample_dir / 'vibration/06_freqs.npy', do_save)
+        append({"fft_clean_saved": datetime.now(timezone.utc).isoformat()}, sample_dir / "times.jsonl", do_save)
 
-        # tokenize fft
-        fft_tokenized = tokenize(fft_normalized, patch_size)                    # (B,L,F,C) -> (B,L,P,PS,C)
-        logger.debug(f'[sample {sample_id}] {fft_tokenized.shape=}=(batch, lasers, num_patches, patch_size, x/y)')
-        save(fft_tokenized, sample_dir / 'vibration/08_tokenized_fft.npy', do_save)
-        append({"fft_tokenized": datetime.now(timezone.utc).isoformat()}, sample_dir / "times.jsonl", do_save)
-
-    # symlink X.npy, y.npy for model input, output
-    symlink(sample_dir / 'vibration/08_tokenized_fft.npy', sample_dir / 'X.npy', do_save)
+    # symlink X.npy, y.npy for model input, output. X is the clean complex fft (pre signal
+    # extraction / normalize / tokenize -- those + augmentation run live in the dataloader).
+    symlink(sample_dir / 'vibration/06_clean_fft.npy', sample_dir / 'X.npy', do_save)
     symlink(sample_dir / 'image/07_downsampled_smask.npy', sample_dir / 'y.npy', do_save)
 
-    # take shapes from the signaled fft, not the raw one: complex/mag_phase modes double the channel dim
-    n_lasers, n_freqs, n_channels = fft_signaled.shape[1], fft_signaled.shape[2], fft_signaled.shape[3]
-    append(dict(out_h=out_h, out_w=out_w, signal_mode=signal_mode, normalize_mode=normalize_mode, patch_size=patch_size, object_scale=object_scale, n_lasers=n_lasers, n_freqs=n_freqs, n_channels=n_channels, empty_diff=empty_mean is not None), sample_dir / "metadata.jsonl", do_save)
+    n_lasers, n_freqs = fft_clean.shape[1], fft_clean.shape[2]
+    append(dict(out_h=out_h, out_w=out_w, signal_mode=signal_mode, normalize_mode=normalize_mode, patch_size=patch_size, object_scale=object_scale, n_lasers=n_lasers, n_freqs=n_freqs, empty_diff=empty_mean is not None), sample_dir / "metadata.jsonl", do_save)
     append({"post_process": datetime.now(timezone.utc).isoformat()}, sample_dir / "times.jsonl", do_save)
 
 
@@ -155,9 +263,8 @@ def convert_to_mds(dataset_dir:Path, rows:list, patch_size:int, out_h:int, out_w
     if verbose: print(f"Writing MDS to {mds_dir} ...")
     if mds_dir.exists(): shutil.rmtree(mds_dir)
 
-    # read n_lasers, n_freqs, n_channels from the first sample's metadata (n_channels default 2 for datasets made before it was recorded)
-    n_lasers, n_freqs, n_channels = rows[0][1]["n_lasers"], rows[0][1]["n_freqs"], rows[0][1].get("n_channels", 2)
-    x_shape, y_shape = (n_lasers, n_freqs // patch_size, patch_size, n_channels), (out_h, out_w)
+    n_lasers, n_freqs = rows[0][1]["n_lasers"], rows[0][1]["n_freqs"]
+    x_shape, y_shape = (n_lasers, n_freqs, 2, 2), (out_h, out_w)  # X: (L,F,C,2) real/imag-stacked complex fft
 
     index_rows = []
     dataset_dir.mkdir(parents=True, exist_ok=True)
@@ -168,10 +275,10 @@ def convert_to_mds(dataset_dir:Path, rows:list, patch_size:int, out_h:int, out_w
     try:
       with MDSWriter(out="mds", columns=MDS_COLUMNS, exist_ok=False) as writer:
         for i, (sample_dir, meta) in enumerate(rows):
-            X = np.load(sample_dir / "X.npy").astype(np.float32)   # (1, L, P, PS, C)
-            y = np.load(sample_dir / "y.npy").astype(np.float32)   # (out_h, out_w)
-            # model.py's VibrationTransformer.forward expects (B,L,P,C,PS) per-sample but the leading 1 here is just X.npy's on-disk batch dim from post-processing so we remove it
-            X = np.squeeze(X, axis=0) if X.ndim == 5 and X.shape[0] == 1 else X
+            X = np.load(sample_dir / "X.npy")                          # (1, L, F, C) complex64
+            y = np.load(sample_dir / "y.npy").astype(np.float32)       # (out_h, out_w)
+            X = np.squeeze(X, axis=0) if X.ndim == 4 and X.shape[0] == 1 else X  # -> (L,F,C)
+            X = np.stack([X.real, X.imag], axis=-1).astype(np.float32)  # complex -> (L,F,C,2) real/imag
             assert X.shape == x_shape, f"{sample_dir.name}: X.shape={X.shape} != {x_shape}"
             assert y.shape == y_shape, f"{sample_dir.name}: y.shape={y.shape} != {y_shape}"
 
@@ -191,6 +298,9 @@ def convert_to_mds(dataset_dir:Path, rows:list, patch_size:int, out_h:int, out_w
     finally:
         os.chdir(cwd)
 
+    # freqs is identical across every sample (same fft grid) -- one sidecar, not duplicated per-row
+    shutil.copy(rows[0][0] / "vibration/06_freqs.npy", mds_dir / "freqs.npy")
+
     # dataset-level sidecar for filtering
     lines = "\n".join([json.dumps(r) for r in index_rows])
     (mds_dir / "metadata.jsonl").write_text(lines)
@@ -200,9 +310,10 @@ def convert_to_mds(dataset_dir:Path, rows:list, patch_size:int, out_h:int, out_w
 
 #***** 5 post-process all samples in a base sample directory *****
 
-def compute_empty_means(samples_dir:Path, rows:dict, signal_mode:str, denotch_fn, verbose:int) -> dict:
-    # Per-speaker mean of the signaled fft over that speaker's empty-box (n_objects == 0)
-    # samples. Running sum (not stack) so memory stays at one fft per speaker.
+def compute_empty_means(samples_dir:Path, rows:dict, denotch_fn, verbose:int) -> dict:
+    # Per-speaker mean of the clean complex fft over that speaker's empty-box (n_objects == 0)
+    # samples. Running sum (not stack) so memory stays at one fft per speaker. Averaged in
+    # complex space (pre extract_signal) since extract_signal/normalize/tokenize now run live.
     sums, counts = {}, {}
     for sample_id, meta in rows.items():
         if int(meta.get("n_objects", -1)) != 0: continue
@@ -210,8 +321,7 @@ def compute_empty_means(samples_dir:Path, rows:dict, signal_mode:str, denotch_fn
         fft_npz = load(samples_dir / sample_id / 'vibration/03_fft.npz')
         freqs, fft_raw = fft_npz['freqs'], fft_npz['fft']
         if denotch_fn is not None: fft_raw = denotch_fn(fft_raw, freqs)
-        fft_signaled = extract_signal(fft_raw, signal_mode).astype(np.float32)  # (B,L,F,C)
-        sums[speaker] = fft_signaled if speaker not in sums else sums[speaker] + fft_signaled
+        sums[speaker] = fft_raw if speaker not in sums else sums[speaker] + fft_raw
         counts[speaker] = counts.get(speaker, 0) + 1
     if verbose: print("empty_diff: empty-box samples per speaker: " + (", ".join(f"speaker {spk}: {n}" for spk, n in sorted(counts.items())) or "none"))
     return {spk: s / counts[spk] for spk, s in sums.items()}
@@ -279,7 +389,7 @@ def post_process(base_sample_dir:Path, base_dataset_dir:Path, dataset_name:str|N
     empty_means = {}
     if empty_diff:
         with Timing("Empty-box means: ", enter="Computing per-speaker empty-box fft means ...", enabled=verbose):
-            empty_means = compute_empty_means(samples_dir, rows, signal_mode, denotch_fn, verbose)
+            empty_means = compute_empty_means(samples_dir, rows, denotch_fn, verbose)
 
     # post process each sample
     speakers_without_empties = set()
