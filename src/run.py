@@ -14,7 +14,7 @@ warnings.filterwarnings("ignore", message=r"The pynvml package is deprecated.*",
 # only log errors from this file in order to suppress the warning "Redirects are currently not supported in Windows or MacOs."
 logging.getLogger("torch.distributed.elastic.multiprocessing.redirects").setLevel(logging.ERROR)
 
-import sys, gc, argparse
+import sys, argparse
 from pathlib import Path
 
 # src is a scripts dir (bare imports). On Modal it is mounted at /root/src -> put it on the path
@@ -53,6 +53,7 @@ import wandb
 from model.callbacks import VizSegMask, OutputSaver
 from model.dataset import build_dataset
 from model.arch import VibrationTransformer, LOSSES
+from utils.helpers import cleanup
 
 def get_parser():
     parser = argparse.ArgumentParser()
@@ -96,13 +97,15 @@ def get_parser():
     parser.add_argument("--no-compile",                 action="store_true", default=False, help="Disable torch.compile-ing the model before training/eval.")
     parser.add_argument("--compile-mode",               type=str,   default="default", help="torch.compile mode, e.g. 'default', 'reduce-overhead', 'max-autotune'.")
     # train
-    parser.add_argument("--batch-size",                 type=int,   default=128)
+    parser.add_argument("--batch-size",                 type=int,   default=256)
     parser.add_argument("--lr",                         type=float, default=1e-4)
     parser.add_argument("--max-duration",               type=str,   default="2500ep")
     # eval
     parser.add_argument("--eval-only",                  action="store_true", default=False, help="Skip training, just eval a loaded checkpoint (requires --checkpoint-path).")
     parser.add_argument("--eval-batch-size",            type=int,   default=108) # wandb caps images logged in a single call to 108, so eval batch size should be <= 108 to log all images
     parser.add_argument("--eval-interval",              type=str,   default="50ep")
+    parser.add_argument("--no-eval-before-train",       action="store_true", default=False, help="Skip the boundary eval pass before training starts.")
+    parser.add_argument("--no-eval-after-train",        action="store_true", default=False, help="Skip the boundary eval pass after training ends.")
     parser.add_argument("--outputs-dir",                type=str,   default=None, help="Where to save eval .pt outputs. If not set, defaults to the run's outputs_history dir (same dir the training-time history callback writes to).")
     # run
     parser.add_argument("--run-name",                   type=str,   default=None)
@@ -137,30 +140,6 @@ app = modal.App(
     secrets=[modal.Secret.from_name("huggingface"), modal.Secret.from_name("wandb")],
 )
 
-# **** memory helpers ****
-
-def log_mem(tag):
-    import os, psutil
-    proc = psutil.Process(os.getpid())
-    rss_gb = proc.memory_info().rss / 1e9
-    if torch.cuda.is_available():
-        vram_alloc = torch.cuda.memory_allocated() / 1e9
-        vram_res   = torch.cuda.memory_reserved()  / 1e9
-        print(f'[mem] {tag}: RSS={rss_gb:.2f} GB  VRAM alloc={vram_alloc:.2f} GB  reserved={vram_res:.2f} GB')
-    else:
-        print(f'[mem] {tag}: RSS={rss_gb:.2f} GB')
-
-def cleanup(trainer, *others):
-    log_mem('before close')
-    trainer.close()
-    trainer.state.model.cpu()
-    trainer.state.outputs = None
-    trainer.state.batch   = None
-    del trainer, others
-    gc.collect()
-    if torch.cuda.is_available(): torch.cuda.empty_cache()
-    log_mem('after close')
-
 # **** train / eval ****
 
 def eval_boundary(trainer, boundary_loaders):
@@ -187,7 +166,6 @@ def run(**kwargs):
 
     # device
     device = 'gpu' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu'
-    torch_device = 'cuda' if device == 'gpu' else device
     print(f'Using {device=}')
 
     # set torch compile and cudnn benchmark for speed
@@ -200,7 +178,7 @@ def run(**kwargs):
     train_loader, eval_loaders, train_eval_loader, dataset = build_dataset(
         args.mds_dir, batch_size=args.batch_size, eval_batch_size=args.eval_batch_size, num_workers=args.num_workers,
         split=args.split, test_size=args.test_size, speakers=args.speakers, n_objects=args.n_objects, box=args.box, n_samples=args.n_samples,
-        out_h=args.out_h, out_w=args.out_w, signal_mode=args.signal_mode, normalize_mode=args.normalize_mode, patch_size=args.patch_size, seed=args.seed, device=torch_device,
+        out_h=args.out_h, out_w=args.out_w, signal_mode=args.signal_mode, normalize_mode=args.normalize_mode, patch_size=args.patch_size, seed=args.seed,
         augment_fft=not args.no_fft_augmentation, augment_mask=not args.no_mask_augmentation)
     boundary_loaders = eval_loaders + [Evaluator(label='train', dataloader=train_eval_loader)]
 
@@ -245,10 +223,10 @@ def run(**kwargs):
                     loggers=loggers, callbacks=callbacks, profiler=profiler,
                     compile_config=None if args.no_compile else {"mode": args.compile_mode})
 
-    eval_boundary(trainer, boundary_loaders)  # eval before training starts
+    if not args.no_eval_before_train: eval_boundary(trainer, boundary_loaders)  # eval before training starts
     if not args.eval_only:
         trainer.fit()
-        eval_boundary(trainer, boundary_loaders)  # eval after training ends
+        if not args.no_eval_after_train: eval_boundary(trainer, boundary_loaders)  # eval after training ends
     cleanup(trainer, boundary_loaders, eval_loaders, train_loader)
 
 @app.local_entrypoint()

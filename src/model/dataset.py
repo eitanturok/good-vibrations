@@ -202,6 +202,13 @@ def process_batch(batch: dict, device: str, signal_mode: str, normalize_mode: st
     mask_processed = process_image(batch["mask_true"].to(device), out_h, out_w, augment=augment_mask, generator=generator)
     return dict(fft=fft_processed, mask_true=mask_processed, info=batch["info"])
 
+def collate_and_process(samples: list[dict], process_batch_fn) -> dict:
+    # default-collate then augment here in the DataLoader worker process, so it overlaps with the main process
+    fft = torch.stack([s["fft"] for s in samples])
+    mask_true = torch.stack([s["mask_true"] for s in samples])
+    info = {k: [s["info"][k] for s in samples] for k in samples[0]["info"]}
+    return process_batch_fn(dict(fft=fft, mask_true=mask_true, info=info))
+
 #***** 4 dataset *****
 
 class VibrationDataset(StreamingDataset):
@@ -332,13 +339,14 @@ SPLIT_METHODS = {"exp25": exp25_split}
 def num_samples(batch): return batch["mask_true"].shape[0]
 
 def loader(dataset, idxs, bs, num_workers, generator, process_batch_fn, shuffle=False, drop_last=False):
-    dl = DataLoader(Subset(dataset, idxs), batch_size=bs, shuffle=shuffle, num_workers=num_workers, generator=generator, pin_memory=True, persistent_workers=num_workers > 0, prefetch_factor=4 if num_workers > 0 else None, drop_last=drop_last)
-    return DataSpec(dataloader=dl, get_num_samples_in_batch=num_samples, microbatch_transforms=process_batch_fn)
+    collate_fn = partial(collate_and_process, process_batch_fn=process_batch_fn)
+    dl = DataLoader(Subset(dataset, idxs), batch_size=bs, shuffle=shuffle, num_workers=num_workers, generator=generator, pin_memory=True, persistent_workers=num_workers > 0, prefetch_factor=4 if num_workers > 0 else None, drop_last=drop_last, collate_fn=collate_fn)
+    return DataSpec(dataloader=dl, get_num_samples_in_batch=num_samples)
 
 def build_dataset(data_dir: str | Path, split: str = "exp25", batch_size: int = 64, eval_batch_size: int = 64,
                    num_workers: int = 8, out_h: int = 20, out_w: int = 40, signal_mode: str = "magnitude",
                    normalize_mode: str = "std", patch_size: int = 256, seed: int = 42,
-                   device: str = "cpu", force_mds: bool = False, augment_fft: bool = True, augment_mask: bool = True,
+                   force_mds: bool = False, augment_fft: bool = True, augment_mask: bool = True,
                    verbose: int = 1, **split_kwargs):
 
     if split not in SPLIT_METHODS: raise ValueError(f"Unknown split {split!r}, expected one of {sorted(SPLIT_METHODS)}")
@@ -361,8 +369,9 @@ def build_dataset(data_dir: str | Path, split: str = "exp25", batch_size: int = 
     splits = SPLIT_METHODS[split](mds_dir, seed=seed, verbose=verbose, **split_kwargs)
 
     generator = torch.Generator().manual_seed(seed)
-    dataset = VibrationDataset(local=mds_dir, out_h=out_h, out_w=out_w, signal_mode=signal_mode, normalize_mode=normalize_mode, patch_size=patch_size, seed=seed, device=device)
-    process_kwargs = dict(device=device, signal_mode=signal_mode, normalize_mode=normalize_mode, patch_size=patch_size, out_h=out_h, out_w=out_w, freqs=dataset.freqs, generator=dataset.generator)
+    # device=cpu b/c augmentation runs in DataLoader workers via collate_fn, which are forked subprocesses that can't touch CUDA
+    dataset = VibrationDataset(local=mds_dir, out_h=out_h, out_w=out_w, signal_mode=signal_mode, normalize_mode=normalize_mode, patch_size=patch_size, seed=seed, device="cpu")
+    process_kwargs = dict(device="cpu", signal_mode=signal_mode, normalize_mode=normalize_mode, patch_size=patch_size, out_h=out_h, out_w=out_w, freqs=dataset.freqs, generator=dataset.generator)
     train_transform = partial(process_batch, **process_kwargs, augment_fft=augment_fft, augment_mask=augment_mask)
     eval_transform = partial(process_batch, **process_kwargs, augment_fft=False, augment_mask=False)
 
