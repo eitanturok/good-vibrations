@@ -140,8 +140,11 @@ def process_image(mask: torch.Tensor, out_h: int, out_w: int, augment: bool = Tr
 
 #***** 2 process vibration *****
 
-def extract_signal(x: torch.Tensor, signal_mode: str) -> torch.Tensor:
-    if signal_mode == "magnitude": return x.abs()
+def extract_signal(re: torch.Tensor, im: torch.Tensor, signal_mode: str) -> torch.Tensor:
+    # re, im: separate contiguous tensors (not a (...,2) view) -- slicing re/im off a shared last
+    # axis leaves them non-contiguous, which makes hypot/complex ops much slower.
+    if signal_mode == "magnitude": return torch.hypot(re, im)
+    x = torch.complex(re, im)
     if signal_mode == "complex": return torch.cat([x.real, x.imag], dim=-1)
     if signal_mode == "mag_phase": return torch.cat([x.abs(), x.angle()], dim=-1)
     raise ValueError(f"Unknown signal mode: {signal_mode}")
@@ -185,14 +188,18 @@ def random_frequency_gain(freqs: torch.Tensor, generator: torch.Generator, n_con
     lo, hi = gain_range
     return gain * (hi - lo) + lo
 
-def augment_vibration(fft: torch.Tensor, freqs: torch.Tensor, generator: torch.Generator, n_control: int = 5, gain_range: tuple = (0.8, 1.2)) -> torch.Tensor:
+def augment_vibration(re: torch.Tensor, im: torch.Tensor, freqs: torch.Tensor, generator: torch.Generator, n_control: int = 5, gain_range: tuple = (0.8, 1.2)) -> tuple[torch.Tensor, torch.Tensor]:
+    # re, im: (B,L,F,C) contiguous. gain is real+positive, so scaling re and im separately is
+    # equivalent to (complex fft) * gain -- no need to build a complex tensor to apply it.
     gain = random_frequency_gain(freqs, generator, n_control, gain_range)
-    return fft * gain[None, None, :, None]
+    gain = gain[None, None, :, None]
+    return re * gain, im * gain
 
 def process_vibration(fft: torch.Tensor, freqs: torch.Tensor, signal_mode: str, normalize_mode: str, patch_size: int, augment: bool = True, generator: torch.Generator | None = None, gain_kwargs: dict | None = None) -> torch.Tensor:
-    """fft: (B,L,F,C) complex, on the target device. Returns tokenized (B,L,P,patch_size,C) float32."""
-    if augment: fft = augment_vibration(fft, freqs, generator, **(gain_kwargs or {}))
-    x = extract_signal(fft, signal_mode).float()
+    """fft: (B,L,F,C,2) real/imag, on the target device. Returns tokenized (B,L,P,patch_size,C') float32."""
+    re, im = fft[..., 0].contiguous(), fft[..., 1].contiguous()
+    if augment: re, im = augment_vibration(re, im, freqs, generator, **(gain_kwargs or {}))
+    x = extract_signal(re, im, signal_mode).float()
     x = normalize_fft(x, normalize_mode)
     return tokenize(x, patch_size)
 
@@ -229,7 +236,7 @@ class VibrationDataset(StreamingDataset):
         X, y = s.pop("X"), s.pop("y")  # X: (L,F,C,2) real/imag fft, y: (H,W) raw mask
         info = dict(sample_id=s["sample_id"], output_id=s["output_id"], n_objects=s["n_objects"], speaker=s["speaker"], box=s["box"], is_empty_box=s["is_empty_box"], x_com=s["downsampled_com_x"], y_com=s["downsampled_com_y"])
         X_t, y_t = torch.from_numpy(X.copy()), torch.from_numpy(y.copy())
-        return dict(fft=X_t[..., 0] + 1j * X_t[..., 1], mask_true=y_t, info=info)
+        return dict(fft=X_t, mask_true=y_t, info=info)  # keep fft as real/imag (last dim 2), avoid building a complex tensor until needed
 
 #***** 5 split *****
 
@@ -341,7 +348,8 @@ def num_samples(batch): return batch["mask_true"].shape[0]
 
 def loader(dataset, idxs, bs, num_workers, generator, process_batch_fn, shuffle=False, drop_last=False):
     collate_fn = partial(collate_and_process, process_batch_fn=process_batch_fn)
-    dl = DataLoader(Subset(dataset, idxs), batch_size=bs, shuffle=shuffle, num_workers=num_workers, generator=generator, pin_memory=True, persistent_workers=num_workers > 0, prefetch_factor=4 if num_workers > 0 else None, drop_last=drop_last, collate_fn=collate_fn)
+    dl = DataLoader(Subset(dataset, idxs), batch_size=bs, shuffle=shuffle, num_workers=num_workers, generator=generator, pin_memory=True,
+                    persistent_workers=num_workers > 0, prefetch_factor=4 if num_workers > 0 else None, drop_last=drop_last, collate_fn=collate_fn)
     return DataSpec(dataloader=dl, get_num_samples_in_batch=num_samples)
 
 def build_dataset(data_dir: str | Path, split: str = "exp25", batch_size: int = 64, eval_batch_size: int = 64,
