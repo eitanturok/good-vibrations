@@ -51,13 +51,14 @@ def convert_to_mds(mds_dir: Path, samples: list[tuple[Path, dict]], verbose: int
     first_mask = np.array(Image.open(samples[0][0] / "image/02_smask.png"))
     x_shape, y_shape = (n_lasers, n_freqs, 2, 2), first_mask.shape  # X: (L,F,C,2) real/imag fft; y: raw (H,W) mask
 
+    samples = [(sample_dir.resolve(), meta) for sample_dir, meta in samples]
     index_rows = []
     mds_dir.parent.mkdir(parents=True, exist_ok=True)
     cwd = os.getcwd()
     os.chdir(mds_dir.parent)
 
     try:
-        with MDSWriter(out=mds_dir.name, columns=MDS_COLUMNS, exist_ok=False) as writer:
+        with MDSWriter(out=mds_dir.name, columns=MDS_COLUMNS, exist_ok=False, size_limit="1GB") as writer:
             for i, (sample_dir, meta) in enumerate(samples):
                 fft_npz = np.load(sample_dir / "vibration/03_fft.npz")
                 X = fft_npz["fft"]                                          # (1, L, F, C) complex64
