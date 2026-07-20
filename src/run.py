@@ -1,3 +1,13 @@
+# composer's FileLogger opens its log file with the platform default encoding -- on Windows
+# that's the console codepage (e.g. cp1255), which can't encode wandb's ANSI/emoji status lines
+# and crashes on FileLogger.close(). open()'s default encoding is fixed at interpreter startup,
+# so PYTHONUTF8 has to be set before Python starts -- re-run once with it set if it isn't already
+# (os.execv doesn't reliably replace the process on Windows, so use subprocess instead).
+import os, subprocess, sys
+if os.environ.get("PYTHONUTF8") != "1":
+    env = dict(os.environ, PYTHONUTF8="1")
+    sys.exit(subprocess.run([sys.executable] + sys.argv, env=env).returncode)
+
 # supress warnings
 import warnings, logging
 warnings.filterwarnings("ignore", message=r"The pynvml package is deprecated.*", category=FutureWarning)
@@ -63,6 +73,7 @@ def get_parser():
     parser.add_argument("--n-freqs",                    type=int,   default=3328)
     parser.add_argument("--n-channels",                 type=int,   default=2, help="Last dim of X: 2 for magnitude, 4 for complex/mag_phase signal modes.")
     parser.add_argument("--signal-mode",                type=str,   default="magnitude", choices=["magnitude", "complex", "mag_phase"])
+    parser.add_argument("--normalize-mode",             type=str,   default="std")
     # filter data
     parser.add_argument("--n-samples",                  type=int,   default=None)
     parser.add_argument("--speakers",                   type=int,   default=None)
@@ -93,7 +104,6 @@ def get_parser():
     parser.add_argument("--outputs-dir",                type=str,   default=None, help="Where to save eval .pt outputs. If not set, defaults to the run's outputs_history dir (same dir the training-time history callback writes to).")
     # run
     parser.add_argument("--run-name",                   type=str,   default=None)
-    parser.add_argument("--dry-run",                    action="store_true", default=False)
     # checkpointing
     parser.add_argument("--checkpoint-path",            type=str,   default=None, help="Checkpoint to load for eval. If not set, defaults to the run's latest checkpoint.")
     parser.add_argument("--checkpoint-interval",        type=str,   default="500ep")
@@ -175,6 +185,7 @@ def run(**kwargs):
 
     # device
     device = 'gpu' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu'
+    torch_device = 'cuda' if device == 'gpu' else device
     print(f'Using {device=}')
 
     # set torch compile and cudnn benchmark for speed
@@ -183,18 +194,18 @@ def run(**kwargs):
         torch.backends.cudnn.benchmark = True
     if not args.no_compile and args.verbose >= 2: torch._logging.set_logs(dynamo=logging.INFO)
 
+    # dataset
+    train_loader, eval_loaders, dataset = build_dataset(
+        args.mds_dir, batch_size=args.batch_size, eval_batch_size=args.eval_batch_size, num_workers=args.num_workers,
+        split=args.split, test_size=args.test_size, speakers=args.speakers, n_objects=args.n_objects, box=args.box, n_samples=args.n_samples,
+        out_h=args.out_h, out_w=args.out_w, signal_mode=args.signal_mode, normalize_mode=args.normalize_mode, patch_size=args.patch_size, seed=args.seed, device=torch_device)
+    boundary_loaders = eval_loaders + [Evaluator(label='train', dataloader=train_loader)]
+
     # model
     data_info = dict(out_h=args.out_h, out_w=args.out_w, n_laser_rows=args.n_laser_rows, n_laser_cols=args.n_laser_cols, patch_size=args.patch_size, n_freqs=args.n_freqs, n_channels=args.n_channels)
-    model = VibrationTransformer(args.d_model, args.pnt_num_heads, args.pnt_num_layers, args.seq_num_heads, args.seq_num_layers, data_info, args.decoder, args.decoder_num_heads, args.decoder_num_layers, freq_dropout=args.freq_dropout, laser_dropout=args.laser_dropout, loss_fn=args.loss_fn)
+    model = VibrationTransformer(args.d_model, args.pnt_num_heads, args.pnt_num_layers, args.seq_num_heads, args.seq_num_layers, data_info, args.decoder, args.decoder_num_heads, args.decoder_num_layers, freq_dropout=args.freq_dropout, laser_dropout=args.laser_dropout, loss_fn=args.loss_fn,
+                                  signal_mode=args.signal_mode, normalize_mode=args.normalize_mode, freqs=dataset.freqs, generator=dataset.generator)
     load_path = str(args.checkpoint_path) if args.checkpoint_path else None
-
-    # dataset
-    train_loader, eval_loaders = build_dataset(
-        args.mds_dir, split=args.split, batch_size=args.batch_size, eval_batch_size=args.eval_batch_size,
-        num_workers=args.num_workers, out_h=args.out_h, out_w=args.out_w, signal_mode=args.signal_mode,
-        patch_size=args.patch_size, seed=args.seed, device=device,
-        test_size=args.test_size, speakers=args.speakers, n_objects=args.n_objects, box=args.box, n_samples=args.n_samples)
-    boundary_loaders = eval_loaders + [Evaluator(label='train', dataloader=train_loader)]
 
     # logger
     loggers = []

@@ -1,6 +1,5 @@
-import json, os, shutil
+import hashlib, json, os, shutil
 from pathlib import Path
-from typing import Literal
 
 import numpy as np
 import torch
@@ -11,15 +10,6 @@ from composer.core import Evaluator, DataSpec
 from streaming import StreamingDataset, MDSWriter
 
 #***** 0 convert to MDS *****
-# Self-contained: reads straight from the earliest raw capture files -- X from
-# vibration/03_fft.npz (raw fft, pre-denotch/pre-empty-diff; 'fft' + 'freqs' arrays), y from
-# image/02_smask.png (raw, full-resolution segmentation mask, uint8 {0,255}). No dependency on
-# src/data/post_process.py's intermediate outputs (X.npy/y.npy symlinks, denotch, empty-diff,
-# mask blow-up/downsample) -- all post-processing beyond this point (signal extraction,
-# normalize, tokenize, mask downsample, augmentation) happens live, per process_vibration/
-# process_image below. y is stored at its native (H,W) resolution; downsample() reduces it to
-# (out_h,out_w) at read time in __getitem__/augmenting_collate, not at MDS-write time.
-
 REQUIRED_FILES = ["image/02_smask.png", "vibration/03_fft.npz", "metadata.jsonl"]
 
 MDS_COLUMNS = {"X": "ndarray:float32", "y": "ndarray:float32",
@@ -28,9 +18,7 @@ MDS_COLUMNS = {"X": "ndarray:float32", "y": "ndarray:float32",
                "downsampled_com_x": "float64", "downsampled_com_y": "float64"}
 
 def collect_samples(base_sample_dir: Path, verbose: int = 1) -> list[tuple[Path, dict]]:
-    """Scan base_sample_dir for raw sample dirs (image/02_smask.png, vibration/03_fft.npz,
-    metadata.jsonl present). Returns [(sample_dir, meta_dict), ...], sorted by dir name."""
-    rows, missing_by_file = [], {f: [] for f in REQUIRED_FILES}
+    samples, missing_by_file = [], {f: [] for f in REQUIRED_FILES}
     for sample_dir in sorted(base_sample_dir.glob("*")):
         if not sample_dir.is_dir(): continue
         missing = [f for f in REQUIRED_FILES if not (sample_dir / f).exists()]
@@ -38,25 +26,28 @@ def collect_samples(base_sample_dir: Path, verbose: int = 1) -> list[tuple[Path,
             for f in missing: missing_by_file[f].append(sample_dir.name)
             continue
         meta = {k: v for d in (json.loads(line) for line in (sample_dir / "metadata.jsonl").read_text().splitlines() if line) for k, v in d.items()}
-        rows.append((sample_dir, meta))
+        samples.append((sample_dir, meta))
 
     n_skipped = len({sid for ids in missing_by_file.values() for sid in ids})
     if verbose:
-        print(f"Found {len(rows)} complete samples ({n_skipped} skipped)")
+        print(f"Found {len(samples)} complete samples ({n_skipped} skipped)")
         for f, ids in missing_by_file.items():
             if ids: print(f"missing {f!r}: {ids}")
-    return rows
+    return samples
 
-def convert_to_mds(mds_dir: Path, rows: list[tuple[Path, dict]], force: bool = True, verbose: int = 1) -> Path:
-    if mds_dir.exists():
-        if not force: raise ValueError(f"{mds_dir=} already exists and {force=}")
-        shutil.rmtree(mds_dir)
-        if verbose: print(f"Overwriting {mds_dir=}")
+def hash_samples(samples: list[tuple[Path, dict]]) -> str:
+    h = hashlib.sha256()
+    for sample_dir, meta in sorted(samples, key=lambda s: s[0].name):
+        h.update(sample_dir.name.encode())
+        h.update(json.dumps(meta, sort_keys=True).encode())
+    return h.hexdigest()
+
+def convert_to_mds(mds_dir: Path, samples: list[tuple[Path, dict]], verbose: int = 1) -> Path:
 
     from PIL import Image
-    first_fft = np.load(rows[0][0] / "vibration/03_fft.npz")["fft"]  # (1, L, F, C) complex
+    first_fft = np.load(samples[0][0] / "vibration/03_fft.npz")["fft"]  # (1, L, F, C) complex
     n_lasers, n_freqs = first_fft.shape[1], first_fft.shape[2]
-    first_mask = np.array(Image.open(rows[0][0] / "image/02_smask.png"))
+    first_mask = np.array(Image.open(samples[0][0] / "image/02_smask.png"))
     x_shape, y_shape = (n_lasers, n_freqs, 2, 2), first_mask.shape  # X: (L,F,C,2) real/imag fft; y: raw (H,W) mask
 
     index_rows = []
@@ -66,7 +57,7 @@ def convert_to_mds(mds_dir: Path, rows: list[tuple[Path, dict]], force: bool = T
 
     try:
         with MDSWriter(out=mds_dir.name, columns=MDS_COLUMNS, exist_ok=False) as writer:
-            for i, (sample_dir, meta) in enumerate(rows):
+            for i, (sample_dir, meta) in enumerate(samples):
                 fft_npz = np.load(sample_dir / "vibration/03_fft.npz")
                 X = fft_npz["fft"]                                          # (1, L, F, C) complex64
                 y = (np.array(Image.open(sample_dir / "image/02_smask.png")).astype(np.float32) / 255.0)  # (H,W) in [0,1]
@@ -77,7 +68,8 @@ def convert_to_mds(mds_dir: Path, rows: list[tuple[Path, dict]], force: bool = T
 
                 com = meta.get("downsampled_com", [-1.0, -1.0])
                 sample = {
-                    "X": X, "y": y, "sample_id": int(meta["sample_id"]), "output_id": str(meta.get("output_id", "")),
+                    "X": X, "y": y,
+                    "sample_id": int(meta["sample_id"]), "output_id": str(meta.get("output_id", "")),
                     "n_objects": int(meta.get("n_objects", -1)),
                     "speaker": int(meta.get("speaker", -1)),
                     "box": str(meta.get("box", "")),
@@ -86,18 +78,20 @@ def convert_to_mds(mds_dir: Path, rows: list[tuple[Path, dict]], force: bool = T
                     "downsampled_com_x": float(com[0]), "downsampled_com_y": float(com[1]),
                 }
                 writer.write(sample)
-                index_rows.append(meta)  # full per-sample metadata -> sidecar (used for loader-side filtering)
+                index_rows.append(meta)
                 if verbose >= 2 and (i + 1) % 50 == 0: print(f"  wrote {i + 1}/{len(rows)}")
     finally:
         os.chdir(cwd)
 
     # freqs is identical across every sample (same fft grid) -- one sidecar, not duplicated per-row
-    freqs = np.load(rows[0][0] / "vibration/03_fft.npz")["freqs"]
+    freqs = np.load(samples[0][0] / "vibration/03_fft.npz")["freqs"]
     np.save(mds_dir / "freqs.npy", freqs)
 
+    # save metadata as a sidecar for loader-side filtering
     lines = "\n".join(json.dumps(r) for r in index_rows)
     (mds_dir / "metadata.jsonl").write_text(lines)
-    if verbose: print(f"Wrote {len(rows)} samples to {mds_dir=}")
+    (mds_dir / "samples_hash.txt").write_text(hash_samples(samples))
+    if verbose: print(f"Wrote {len(samples)} samples to {mds_dir=}")
     return mds_dir
 
 #***** 1 process image *****
@@ -129,7 +123,6 @@ def downsample(mask: torch.Tensor, out_h: int, out_w: int) -> torch.Tensor:
 
 def noisy_blur(mask: torch.Tensor, generator: torch.Generator, sigma: float = 0.8, noise_std: float = 0.05) -> torch.Tensor:
     # Gaussian blur, then add noise back onto originally-nonzero pixels only. mask: (B,H,W).
-    # generator always lives on cpu (see VibrationDatasetTorch.__init__); draw there, move after.
     blurred = gaussian_blur(mask, sigma)
     noise = torch.normal(0.0, noise_std, size=mask.shape, generator=generator, device="cpu", dtype=torch.float32).to(mask.device, mask.dtype)
     out = blurred.clone()
@@ -138,8 +131,6 @@ def noisy_blur(mask: torch.Tensor, generator: torch.Generator, sigma: float = 0.
     return out.clamp(0, 1)
 
 def process_image(mask: torch.Tensor, out_h: int, out_w: int, generator: torch.Generator | None = None, augment_fn=noisy_blur) -> torch.Tensor:
-    """mask: (B,H,W) float in [0,1], on the target device. Returns (B,out_h,out_w) float32.
-    generator=None skips mask augmentation (offline baseline / eval)."""
     if generator is not None: mask = augment_fn(mask, generator)
     return downsample(mask, out_h, out_w)
 
@@ -175,11 +166,9 @@ def _hermit_poly(t: torch.Tensor) -> torch.Tensor:
     return A @ tt
 
 def random_frequency_gain(freqs: torch.Tensor, generator: torch.Generator, n_control: int = 5, gain_range: tuple = (0.8, 1.2)) -> torch.Tensor:
-    # Monotone cubic (Hermite spline) interpolant through n_control random control points,
-    # standing in for scipy's PchipInterpolator -- same construction as notebooks/53's
-    # original hermit_poly/interp torch code.
+    # Monotone cubic (Hermite spline) interpolant through n_control random control points
     control_freqs = torch.linspace(freqs.min().item(), freqs.max().item(), n_control, dtype=freqs.dtype, device=freqs.device)
-    # generator always lives on cpu (see VibrationDatasetTorch.__init__); draw there, move after.
+    # generator always lives on cpu (see VibrationDataset.__init__); draw there, move after.
     control_gains = torch.normal(1.0, 1.0, size=(n_control,), generator=generator, device="cpu", dtype=torch.float32).to(freqs.device, freqs.dtype)
     idxs = torch.searchsorted(control_freqs[1:], freqs).clamp(max=n_control - 2)
     m = (control_gains[1:] - control_gains[:-1]) / (control_freqs[1:] - control_freqs[:-1])
@@ -199,39 +188,26 @@ def augment_vibration(fft: torch.Tensor, freqs: torch.Tensor, generator: torch.G
 def process_vibration(fft: torch.Tensor, freqs: torch.Tensor, signal_mode: str, normalize_mode: str, patch_size: int, generator: torch.Generator | None = None, gain_kwargs: dict | None = None) -> torch.Tensor:
     """fft: (B,L,F,C) complex, on the target device. Returns tokenized (B,L,P,patch_size,C)
     float32. generator=None skips frequency augmentation (offline baseline / eval)."""
-    if generator is not None:
-        fft = augment_vibration(fft, freqs, generator, **(gain_kwargs or {}))
+    if generator is not None: fft = augment_vibration(fft, freqs, generator, **(gain_kwargs or {}))
     x = extract_signal(fft, signal_mode).float()
     x = normalize_fft(x, normalize_mode)
     return tokenize(x, patch_size)
 
-#***** 3 dataset *****
-# Augmentation randomness comes from a torch.Generator stored on the dataset (self.generator),
-# not derived from epoch/sample_id. It's checkpointed via state_dict()/load_state_dict()
-# (overridden below), which composer's StreamingDataLoader already calls automatically -- so
-# resuming a run resumes the exact augmentation rng stream too, on top of StreamingDataset's
-# own resume state.
+#***** 3 process batch *****
 
-AugmentSite = Literal["none", "getitem", "collate", "forward"]
-# Three distinct sites for extract_signal/normalize/tokenize/downsample + augmentation, each a
-# real tradeoff, not just an on/off switch:
-#   "getitem"  -- one sample at a time, inside a DataLoader worker process. CPU only: workers
-#                 can't safely hold CUDA state across a fork(). Parallelizes across num_workers.
-#   "collate"  -- whole batch at once, still inside the worker/collate step. Also CPU only for
-#                 the same fork-safety reason -- do NOT .to(cuda) inside collate_fn.
-#   "forward"  -- __getitem__/collate_fn return raw, untouched data (fast, cheap, parallelizable
-#                 across workers); processing happens once, in the main process, via the
-#                 standalone process_batch() below -- call it yourself at the top of your
-#                 training step, right where you'd otherwise do batch = {k: v.to(device) ...}.
-#                 This is the only site that can safely run on GPU with num_workers > 0, since
-#                 it's plain main-process code, not worker/fork code.
+def process_batch(batch: dict, device: str, signal_mode: str, normalize_mode: str, patch_size: int, out_h: int, out_w: int, freqs: torch.Tensor, generator: torch.Generator | None = None):
+    # generator=None means no augmentations
+    fft_processed = process_vibration(batch["fft"].to(device), freqs, signal_mode, normalize_mode, patch_size, generator=generator)
+    mask_processed = process_image(batch["mask_true"].to(device), out_h, out_w, generator=generator)
+    return dict(fft=fft_processed, mask_true=mask_processed, info=batch["info"])
 
-class VibrationDatasetTorch(StreamingDataset):
-    def __init__(self, local: str | Path, shuffle: bool = False, augment_site: AugmentSite = "none",
+#***** 4 dataset *****
+
+class VibrationDataset(StreamingDataset):
+    def __init__(self, local: str | Path, shuffle: bool = False,
                  out_h: int = 20, out_w: int = 40, signal_mode: str = "magnitude", normalize_mode: str = "std",
                  patch_size: int = 256, seed: int = 42, device: str = "cpu", **kwargs):
         super().__init__(local=str(local), shuffle=shuffle, batch_size=kwargs.pop("batch_size", None), **kwargs)
-        self.augment_site = augment_site
         self.out_h, self.out_w = out_h, out_w
         self.signal_mode, self.normalize_mode, self.patch_size = signal_mode, normalize_mode, patch_size
         self.device = device
@@ -239,75 +215,14 @@ class VibrationDatasetTorch(StreamingDataset):
         self.generator = torch.Generator(device=device if device == "cpu" else "cpu")  # cuda generators can't cross process fork boundaries in workers; draw on cpu, move samples after
         self.generator.manual_seed(seed)
 
-    def state_dict(self, num_samples: int, from_beginning: bool) -> dict:
-        state = super().state_dict(num_samples, from_beginning)
-        state["augment_rng_state"] = self.generator.get_state()
-        return state
-
-    def load_state_dict(self, obj: dict) -> None:
-        rng_state = obj.pop("augment_rng_state", None)
-        super().load_state_dict(obj)
-        if rng_state is not None: self.generator.set_state(rng_state)
-
     def __getitem__(self, idx):
         s = super().__getitem__(idx)
         X, y = s.pop("X"), s.pop("y")  # X: (L,F,C,2) real/imag fft, y: (H,W) raw mask
         info = dict(sample_id=s["sample_id"], output_id=s["output_id"], n_objects=s["n_objects"], speaker=s["speaker"], box=s["box"], is_empty_box=s["is_empty_box"], x_com=s["downsampled_com_x"], y_com=s["downsampled_com_y"])
         X_t, y_t = torch.from_numpy(X.copy()), torch.from_numpy(y.copy())
+        return dict(fft=X_t[..., 0] + 1j * X_t[..., 1], mask_true=y_t, info=info)
 
-        if self.augment_site in ("collate", "forward"):
-            # both hand back raw, unprocessed data -- "collate" processes it in augmenting_collate
-            # (CPU, inside the worker/collate step); "forward" leaves it fully raw for the caller
-            # to process themselves via process_batch(), typically on GPU in the main process.
-            return dict(fft=X_t[..., 0] + 1j * X_t[..., 1], mask_true=y_t, info=info)
-
-        generator = self.generator if self.augment_site == "getitem" else None
-        fft_complex = (X_t[..., 0] + 1j * X_t[..., 1])[None].to(self.device)  # (1,L,F,C)
-        fft_processed = process_vibration(fft_complex, self.freqs, self.signal_mode, self.normalize_mode, self.patch_size, generator=generator)[0]
-        mask_processed = process_image(y_t[None].to(self.device), self.out_h, self.out_w, generator=generator)[0]
-        return dict(fft=fft_processed.cpu(), mask_true=mask_processed.cpu(), info=info)
-
-
-def augmenting_collate(batch: list[dict], generator: torch.Generator | None, signal_mode: str, normalize_mode: str, patch_size: int, out_h: int, out_w: int, freqs: torch.Tensor, device: str):
-    """Batched counterpart to VibrationDatasetTorch(augment_site='getitem'): stacks raw complex
-    fft + raw mask across the batch, moves to `device` once, then runs process_vibration/
-    process_image once on the whole batch. generator=None skips augmentation (eval)."""
-    fft = torch.stack([b["fft"] for b in batch]).to(device)          # (B,L,F,C) complex
-    mask = torch.stack([b["mask_true"] for b in batch]).to(device)   # (B,H,W)
-    infos = [b["info"] for b in batch]
-    fft_processed = process_vibration(fft, freqs, signal_mode, normalize_mode, patch_size, generator=generator)
-    mask_processed = process_image(mask, out_h, out_w, generator=generator)
-    return dict(fft=fft_processed.cpu(), mask_true=mask_processed.cpu(), info=infos)
-
-
-class _AugmentingCollate:
-    # Picklable stand-in for a closure over augmenting_collate: DataLoader workers on Windows use
-    # spawn (not fork), which pickles the collate_fn to hand to each worker process -- a lambda
-    # closure can't be pickled, so num_workers > 0 crashes at worker startup on Windows.
-    def __init__(self, generator, signal_mode, normalize_mode, patch_size, out_h, out_w, freqs, device):
-        self.generator, self.signal_mode, self.normalize_mode = generator, signal_mode, normalize_mode
-        self.patch_size, self.out_h, self.out_w, self.freqs, self.device = patch_size, out_h, out_w, freqs, device
-
-    def __call__(self, batch):
-        return augmenting_collate(batch, self.generator, self.signal_mode, self.normalize_mode,
-                                   self.patch_size, self.out_h, self.out_w, self.freqs, self.device)
-
-
-def process_batch(batch: dict, device: str, signal_mode: str, normalize_mode: str, patch_size: int, out_h: int, out_w: int, freqs: torch.Tensor, generator: torch.Generator | None = None):
-    """Counterpart to VibrationDatasetTorch(augment_site='forward'): call this yourself at the
-    top of your training step (in place of the usual `batch = {k: v.to(device) for k, v in
-    batch.items()}`), on a batch whose 'fft'/'mask_true' are still raw (complex fft, full-res
-    mask) -- i.e. the dataset/collate_fn did no processing. Moves to `device` once, then runs
-    process_vibration/process_image on the whole batch, entirely in the main process. Unlike
-    augmenting_collate, does NOT move results back to cpu -- you're about to feed them straight
-    into the model. generator=None skips augmentation (eval)."""
-    fft = batch["fft"].to(device)
-    mask = batch["mask_true"].to(device)
-    fft_processed = process_vibration(fft, freqs, signal_mode, normalize_mode, patch_size, generator=generator)
-    mask_processed = process_image(mask, out_h, out_w, generator=generator)
-    return dict(fft=fft_processed, mask_true=mask_processed, info=batch["info"])
-
-#***** 4 split *****
+#***** 5 split *****
 
 def _matches(row: dict, speakers, n_objects, box) -> bool:
     if speakers is not None and row["speaker"] not in (speakers if isinstance(speakers, list) else [speakers]): return False
@@ -415,59 +330,36 @@ SPLIT_METHODS = {"exp25": exp25_split}
 
 def num_samples(batch): return batch["mask_true"].shape[0]
 
-def loader(dataset, idxs, bs, num_workers, device, augment_site, generator, shuffle=False, drop_last=False, augment=False):
-    # collate site: __getitem__ always hands back raw data regardless of augment, so both
-    # train and eval share the same (augmenting) `dataset` -- augmenting_collate's own
-    # generator arg (None for eval) is what actually gates augmentation.
-    # forward site: __getitem__ also always hands back raw data, but no collate_fn is attached
-    # at all -- default collation just stacks it, and the caller processes it themselves via
-    # process_batch() at the top of their training step (see AugmentSite comment above).
-    # getitem site (or "none"): augmentation is baked into __getitem__ itself, so the caller
-    # must pass eval_dataset (augment_site="none") for eval to guarantee it never augments.
-    collate_fn = _AugmentingCollate(dataset.generator if augment else None, dataset.signal_mode, dataset.normalize_mode, dataset.patch_size, dataset.out_h, dataset.out_w, dataset.freqs, device) \
-        if augment_site == "collate" else None
-    dl = DataLoader(Subset(dataset, idxs), batch_size=bs, shuffle=shuffle, num_workers=num_workers, generator=generator, pin_memory=True, persistent_workers=num_workers > 0, prefetch_factor=4 if num_workers > 0 else None, drop_last=drop_last, collate_fn=collate_fn)
+def loader(dataset, idxs, bs, num_workers, generator, shuffle=False, drop_last=False):
+    dl = DataLoader(Subset(dataset, idxs), batch_size=bs, shuffle=shuffle, num_workers=num_workers, generator=generator, pin_memory=True, persistent_workers=num_workers > 0, prefetch_factor=4 if num_workers > 0 else None, drop_last=drop_last)
     return DataSpec(dataloader=dl, get_num_samples_in_batch=num_samples)
-
 
 def build_dataset(data_dir: str | Path, split: str = "exp25", batch_size: int = 64, eval_batch_size: int = 64,
                    num_workers: int = 8, out_h: int = 20, out_w: int = 40, signal_mode: str = "magnitude",
                    normalize_mode: str = "std", patch_size: int = 256, seed: int = 42,
-                   augment_site: AugmentSite = "none", device: str = "cpu", force_mds: bool = False,
+                   device: str = "cpu", force_mds: bool = False,
                    verbose: int = 1, **split_kwargs):
-    """data_dir/samples holds raw sample dirs (image/02_smask.png, vibration/03_fft.npz,
-    metadata.jsonl); data_dir/mds is written here if missing (or if force_mds). Returns
-    (train_loader, eval_loaders) -- exp25_split itself just returns {"train": [...],
-    "eval/<name>": [...], ...} sample indices; loader-building (Subset/DataLoader/DataSpec/
-    Evaluator) happens here.
-    """
-    if split not in SPLIT_METHODS: raise ValueError(f"Unknown split {split!r}, expected one of {sorted(SPLIT_METHODS)}")
 
+    if split not in SPLIT_METHODS: raise ValueError(f"Unknown split {split!r}, expected one of {sorted(SPLIT_METHODS)}")
     data_dir = Path(data_dir)
     mds_dir = data_dir / "mds"
-    if force_mds or not (mds_dir / "metadata.jsonl").exists():
-        rows = collect_samples(data_dir / "samples", verbose)
-        convert_to_mds(mds_dir, rows, force=True, verbose=verbose)
+    hash_path = mds_dir / "samples_hash.txt"
+
+    samples = collect_samples(data_dir / "samples", verbose)
+    stale = not hash_path.exists() or hash_path.read_text() != hash_samples(samples)
+    if force_mds or stale:
+        if hash_path.exists():
+            if not force_mds: raise ValueError(f"{mds_dir=} already exists and {force_mds=}")
+            shutil.rmtree(mds_dir)
+            if verbose: print(f"Overwriting {mds_dir=}")
+        convert_to_mds(mds_dir, samples, verbose=verbose)
     elif verbose:
         print(f"Reusing existing MDS at {mds_dir}")
 
     splits = SPLIT_METHODS[split](mds_dir, seed=seed, verbose=verbose, **split_kwargs)
 
     generator = torch.Generator().manual_seed(seed)
-    dataset = VibrationDatasetTorch(local=mds_dir, augment_site=augment_site, out_h=out_h, out_w=out_w,
-                                     signal_mode=signal_mode, normalize_mode=normalize_mode, patch_size=patch_size,
-                                     seed=seed, device=device)
-    eval_dataset = VibrationDatasetTorch(local=mds_dir, augment_site="none", out_h=out_h, out_w=out_w,
-                                          signal_mode=signal_mode, normalize_mode=normalize_mode, patch_size=patch_size,
-                                          device=device)
-
-    # collate/forward sites: __getitem__ always hands back raw data regardless of augment_site,
-    # so eval can reuse the same `dataset` -- augmenting_collate's generator=None (collate) or
-    # your own process_batch(..., generator=None) call (forward) is what gates augmentation off.
-    # getitem/none: augmentation is baked into __getitem__ itself, so eval must use
-    # eval_dataset (augment_site="none") to guarantee it never augments.
-    eval_ds = dataset if augment_site in ("collate", "forward") else eval_dataset
-
-    train_loader = loader(dataset, splits["train"], batch_size, num_workers, device, augment_site, generator, shuffle=True, drop_last=True, augment=True)
-    eval_loaders = [Evaluator(label=label, dataloader=loader(eval_ds, idxs, eval_batch_size, num_workers, device, augment_site, generator, augment=False)) for label, idxs in splits.items() if label != "train"]
-    return train_loader, eval_loaders
+    dataset = VibrationDataset(local=mds_dir, out_h=out_h, out_w=out_w, signal_mode=signal_mode, normalize_mode=normalize_mode, patch_size=patch_size, seed=seed, device=device)
+    train_loader = loader(dataset, splits["train"], batch_size, num_workers, generator, shuffle=True, drop_last=True)
+    eval_loaders = [Evaluator(label=label, dataloader=loader(dataset, idxs, eval_batch_size, num_workers, generator)) for label, idxs in splits.items() if label != "train"]
+    return train_loader, eval_loaders, dataset

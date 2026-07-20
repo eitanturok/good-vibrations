@@ -46,10 +46,9 @@ def compute_fft(audio: np.ndarray, fs: int) -> tuple[np.ndarray, np.ndarray]:
 
 #***** 2 spectrogram *****
 
-def compute_spectrogram(audio: np.ndarray, fs: int, nperseg:int = 4096) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+def get_spectrogram(audio: np.ndarray, fs: int, nperseg:int = 4096) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Compute the spectrogram of audio. Returns (freqs, times, Sxx)."""
-    audio = audio.astype(np.float32)
-    freqs, times, Sxx = spectrogram(audio, fs=fs, nperseg=nperseg, noverlap = nperseg // 3, nfft=nperseg*4)
+    freqs, times, Sxx = spectrogram(audio.astype(np.float32), fs=fs, nperseg=nperseg, noverlap = nperseg // 3, nfft=nperseg*4)
     return freqs, times, Sxx
 
 #***** 3 load precomputed artifacts *****
@@ -97,7 +96,7 @@ def main():
     save({'freqs': freqs_fft, 'fft': fft}, out_dir / 'fft.npz')
     plot_fft(freqs_fft, fft, out_dir / 'fft.png', max_freq=args.f_end)
 
-    freqs_spec, times, Sxx = compute_spectrogram(audio, args.fs)
+    freqs_spec, times, Sxx = get_spectrogram(audio, args.fs)
     save({'freqs': freqs_spec, 'times': times, 'Sxx': Sxx.astype(np.float32)}, out_dir / 'spectrogram.npz')
     spec_label = f'Original {out_dir.name} Spectrogram: {{duration}}s'
     plot_spectrogram(freqs_spec, times, Sxx, out_dir / 'spectrogram.png', label=spec_label, max_freq=args.f_end)

@@ -1,10 +1,13 @@
+from functools import partial
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from composer import ComposerModel
 from torchmetrics import MeanSquaredError, Metric
 
-from model.dataset import DATA_INFO
+from model.dataset import process_batch
+
 from utils.metrics import center_of_mass, soft_iou, soft_dice
 
 #***** 0 rope *****
@@ -186,7 +189,8 @@ class FreqEncoder(nn.Module):
 #***** 5 model *****
 
 class VibrationTransformer(ComposerModel):
-    def __init__(self, d_model:int=128, pnt_num_heads:int=2, pnt_num_layers:int=2, seq_num_heads:int=2, seq_num_layers:int=2, data_info=DATA_INFO, decoder:str='mlp', decoder_num_heads:int=2, decoder_num_layers:int=2, freq_dropout:float=0.3, laser_dropout:float=0.3, loss_fn:str='mse'):
+    def __init__(self, d_model:int=128, pnt_num_heads:int=2, pnt_num_layers:int=2, seq_num_heads:int=2, seq_num_layers:int=2, data_info=None, decoder:str='mlp', decoder_num_heads:int=2, decoder_num_layers:int=2, freq_dropout:float=0.3, laser_dropout:float=0.3, loss_fn:str='mse',
+                 signal_mode:str='magnitude', normalize_mode:str='std', freqs:torch.Tensor=None, generator:torch.Generator=None):
         super().__init__()
 
         # encoder
@@ -205,7 +209,14 @@ class VibrationTransformer(ComposerModel):
         self.loss_fn = LOSSES[loss_fn]
         self.train_metrics, self.val_metrics = create_metrics(data_info), create_metrics(data_info)
 
+        self.register_buffer("freqs", freqs, persistent=False)
+        self.generator = generator
+        self.process_batch = partial(process_batch, signal_mode=signal_mode, normalize_mode=normalize_mode, patch_size=data_info['patch_size'], out_h=data_info['out_h'], out_w=data_info['out_w'])
+
     def forward(self, batch):
+        device = self.freqs_laser.device
+        batch = self.process_batch(batch, device=device, freqs=self.freqs.to(device), generator=self.generator if self.training else None)
+
         # B=batch size, L=n_lasers, C=n_coordinates=2, PS=patch_size, D=d_model
         x = batch['fft'] # (B,L,P,2,PS)
         B, L, _, _, _ = x.shape

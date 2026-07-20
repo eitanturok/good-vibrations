@@ -16,7 +16,7 @@ if Path("/src").exists() and str(Path("/src")) not in sys.path:
 from utils.io_utils import save, append, symlink, load, modal_upload, modal_download, fix_symlinks, Bz2Compressor
 from utils.helpers import Timing, logger
 from utils.viz import make_spectrogram_video, plot_spectrogram, plot_fft
-from data.audio import compute_spectrogram
+from data.audio import get_spectrogram
 
 MIN_FREQ, MAX_FREQ = 50, 1000
 
@@ -214,7 +214,7 @@ def _process_vibrations(sample_dir:Path, raw_vibrations:np.ndarray=None, min_fre
 
     # spectrogram of recovered audio
     with Timing(f"[sample {sample_id}] spectrogram: ", enabled=verbose >= 2):
-        spec_freqs, spec_times, Sxx = compute_spectrogram(recovered_audio, audio_sample_rate)
+        spec_freqs, spec_times, Sxx = get_spectrogram(recovered_audio, audio_sample_rate)
         logger.debug(f'[sample {sample_id}] {Sxx.shape=}=(freq bins, time bins)')
         save({'freqs': spec_freqs, 'times': spec_times, 'Sxx': Sxx}, sample_dir / f'vibration/05_spectrogram{file_suffix}.npz', do_save)
 
@@ -321,7 +321,7 @@ def process_vibrations_2(sample_dir:Path, raw_vibrations:np.ndarray=None, use_mo
                          do_save:bool=True, verbose:int=1, cleanup_raw_vibrations:str|None=None, spectrogram_video:bool=True, laser_idx:int|None=None, xy_idx:int=0):
     """Fast single-laser display path for the live loop. Same signature and return dict as
     process_vibrations, same math (get_clean_shifts/get_fft_shifts/get_recovered_audio/
-    compute_spectrogram), but:
+    get_spectrogram), but:
     - pclk runs the optimized batched kernel on just the one ROI crop (no per-frame
       warp_roll sync loop, no other lasers)
     - writes nothing to disk and renders no plots — the background watch_and_run pass
@@ -356,7 +356,7 @@ def process_vibrations_2(sample_dir:Path, raw_vibrations:np.ndarray=None, use_mo
             recovered_audio = get_recovered_audio(fft, n_samples, fps, audio_sample_rate, MIN_FREQ, MAX_FREQ, laser_idx=0, xy_idx=xy_idx)
 
         with Timing(f"[sample {sample_id}] spectrogram: ", enabled=verbose >= 2):
-            spec_freqs, spec_times, Sxx = compute_spectrogram(recovered_audio, audio_sample_rate)
+            spec_freqs, spec_times, Sxx = get_spectrogram(recovered_audio, audio_sample_rate)
 
     return {'fft': fft, 'freqs': freqs, 'n_samples': n_samples, 'recovered_audio': recovered_audio, 'audio_sample_rate': audio_sample_rate,
             'spec_freqs': spec_freqs, 'spec_times': spec_times, 'Sxx': Sxx, 'max_freq': MAX_FREQ, 'laser_idx': recovered_laser, 'xy_idx': xy_idx}
@@ -390,7 +390,7 @@ def get_shifts(raw_vibrations:np.ndarray, rois: list[list[int]], batch_size: int
     else:
         raise ValueError(f'Incorrect value {pclk_mode=}')
 
-def process_vibrations_3(sample_dir, raw_vibrations, pclk_batch_size, pclk_lasers=None, recovery_laser=50, recovery_xy=0, min_freq=MIN_FREQ, max_freq=MAX_FREQ):
+def process_vibrations_3(sample_dir, raw_vibrations, pclk_batch_size, pclk_lasers=None, recovery_laser=50, recovery_xy=0, min_freq=MIN_FREQ, max_freq=MAX_FREQ, do_save:int=2):
     from data.pclk import compute_shifts_for_roi
 
     audio_sample_rate = 22050
@@ -398,16 +398,24 @@ def process_vibrations_3(sample_dir, raw_vibrations, pclk_batch_size, pclk_laser
     fps, rois = int(metadata['fps']), metadata['roi']
     if pclk_lasers is not None: rois = [rois[pclk_point] for pclk_point in pclk_lasers]
 
+    # 1 pclk turns vibrations into shifts
     raw_shifts = np.stack([compute_shifts_for_roi(raw_vibrations[:, y:y+h, x:x+w], pclk_batch_size) for x, y, w, h in tqdm(rois)], axis=0) # (L, T, 2)
+
+    # 2 clean shifts
     clean_shifts = get_clean_shifts(raw_shifts[None], fps, min_freq, max_freq)  # (1, 1, T, 2)
+
+    # 3 get fft
     fft, freqs, n_samples = get_fft_shifts(clean_shifts, fps, min_freq, max_freq)
+
+    # 4 recover audio
     recovered_audio = get_recovered_audio(fft, n_samples, fps, audio_sample_rate, min_freq, max_freq, recovery_points=recovery_laser, xy_idx=recovery_xy)
-    spec_freqs, spec_times, Sxx = compute_spectrogram(recovered_audio, audio_sample_rate)
 
-    return {'clean_shifts':clean_shifts, 'fft': fft, 'freqs': freqs, 'n_samples': n_samples, 'recovered_audio': recovered_audio, 'audio_sample_rate': audio_sample_rate,
+    # 5 compute spectogram
+    spec_freqs, spec_times, Sxx = get_spectrogram(recovered_audio, audio_sample_rate)
+
+    ret = {'clean_shifts':clean_shifts, 'fft': fft, 'freqs': freqs, 'n_samples': n_samples, 'recovered_audio': recovered_audio, 'audio_sample_rate': audio_sample_rate,
             'spec_freqs': spec_freqs, 'spec_times': spec_times, 'Sxx': Sxx, 'min_freq': min_freq, 'max_freq': max_freq, 'recovery_laser': recovery_laser, 'recovery_xy': recovery_xy}
-
-def save_process_vibrations_3(sample_dir, clean_shifts, fft, freqs, n_samples, recovered_audio, audio_sample_rate, spec_freqs, spec_times, Sxx, min_freq, max_freq, recovery_laser, recovery_xy, do_save):
+    if do_save == 0: return ret
 
     axis_label = 'x' if recovery_xy == 0 else 'y'
     file_suffix = f'_laser{recovery_laser}_{axis_label}'
@@ -416,16 +424,19 @@ def save_process_vibrations_3(sample_dir, clean_shifts, fft, freqs, n_samples, r
     save(clean_shifts, sample_dir / 'vibration/02_clean_shifts.npy', do_save)
 
     # fft
-    save({'fft': fft, 'freqs': freqs, 'n_samples': n_samples}, sample_dir / 'vibration/03_fft.npz', do_save)
+    save({'fft': fft, 'freqs': freqs, 'n_samples': n_samples}, sample_dir / f'vibration/03_fft{file_suffix}.npz', do_save)
     plot_fft(freqs, fft[0, recovery_laser, :, recovery_xy], sample_dir / f'vibration/03_fft{file_suffix}.png', title=f'Recovered FFT, Laser {recovery_laser}, {axis_label}-axis', max_freq=max_freq, enabled=do_save)
 
     # recovered audio
+    audio_path = sample_dir / f'vibration/04_recovered_audio{file_suffix}.wav'
     save((recovered_audio, audio_sample_rate), audio_path, do_save)
     symlink(audio_path, sample_dir / 'recovered_audio.wav', do_save)
 
     # spectogram
-    save({'freqs': spec_freqs, 'times': spec_times, 'Sxx': Sxx}, sample_dir / f'vibration/05_spectrogram{file_suffix}.npz', do_save)
-    audio_name = (sample_dir / 'audio.wav').resolve().parent.name  # e.g. chirp_50_1000_3.0sec, via the symlink to audio_dir
+    audio_name = (sample_dir / 'audio.wav').resolve().parent.name
     spec_label = f'Recovered {audio_name} Spectrogram: {{duration}}s, Laser {recovery_laser}, {axis_label}-axis'
+    save({'freqs': spec_freqs, 'times': spec_times, 'Sxx': Sxx}, sample_dir / f'vibration/05_spectrogram{file_suffix}.npz', do_save)
     plot_spectrogram(spec_freqs, spec_times, Sxx, sample_dir / f'vibration/05_spectrogram{file_suffix}.png', label=spec_label, max_freq=max_freq, enabled=do_save)
-    make_spectrogram_video(spec_freqs, spec_times, Sxx, recovered_audio, audio_sample_rate, sample_dir / f'vibration/05_spectrogram{file_suffix}.mp4', label=spec_label, max_freq=max_freq, enabled=do_save)
+    if do_save >= 2: make_spectrogram_video(spec_freqs, spec_times, Sxx, recovered_audio, audio_sample_rate, sample_dir / f'vibration/05_spectrogram{file_suffix}.mp4', label=spec_label, max_freq=max_freq, enabled=do_save)
+
+    return ret
