@@ -212,7 +212,19 @@ def process_vibration(fft: torch.Tensor, freqs: torch.Tensor, signal_mode: str, 
 # resuming a run resumes the exact augmentation rng stream too, on top of StreamingDataset's
 # own resume state.
 
-AugmentSite = Literal["none", "getitem", "collate"]
+AugmentSite = Literal["none", "getitem", "collate", "forward"]
+# Three distinct sites for extract_signal/normalize/tokenize/downsample + augmentation, each a
+# real tradeoff, not just an on/off switch:
+#   "getitem"  -- one sample at a time, inside a DataLoader worker process. CPU only: workers
+#                 can't safely hold CUDA state across a fork(). Parallelizes across num_workers.
+#   "collate"  -- whole batch at once, still inside the worker/collate step. Also CPU only for
+#                 the same fork-safety reason -- do NOT .to(cuda) inside collate_fn.
+#   "forward"  -- __getitem__/collate_fn return raw, untouched data (fast, cheap, parallelizable
+#                 across workers); processing happens once, in the main process, via the
+#                 standalone process_batch() below -- call it yourself at the top of your
+#                 training step, right where you'd otherwise do batch = {k: v.to(device) ...}.
+#                 This is the only site that can safely run on GPU with num_workers > 0, since
+#                 it's plain main-process code, not worker/fork code.
 
 class VibrationDatasetTorch(StreamingDataset):
     def __init__(self, local: str | Path, shuffle: bool = False, augment_site: AugmentSite = "none",
@@ -243,7 +255,10 @@ class VibrationDatasetTorch(StreamingDataset):
         info = dict(sample_id=s["sample_id"], output_id=s["output_id"], n_objects=s["n_objects"], speaker=s["speaker"], box=s["box"], is_empty_box=s["is_empty_box"], x_com=s["downsampled_com_x"], y_com=s["downsampled_com_y"])
         X_t, y_t = torch.from_numpy(X.copy()), torch.from_numpy(y.copy())
 
-        if self.augment_site == "collate":
+        if self.augment_site in ("collate", "forward"):
+            # both hand back raw, unprocessed data -- "collate" processes it in augmenting_collate
+            # (CPU, inside the worker/collate step); "forward" leaves it fully raw for the caller
+            # to process themselves via process_batch(), typically on GPU in the main process.
             return dict(fft=X_t[..., 0] + 1j * X_t[..., 1], mask_true=y_t, info=info)
 
         generator = self.generator if self.augment_site == "getitem" else None
@@ -263,6 +278,21 @@ def augmenting_collate(batch: list[dict], generator: torch.Generator | None, sig
     fft_processed = process_vibration(fft, freqs, signal_mode, normalize_mode, patch_size, generator=generator)
     mask_processed = process_image(mask, out_h, out_w, generator=generator)
     return dict(fft=fft_processed.cpu(), mask_true=mask_processed.cpu(), info=infos)
+
+
+def process_batch(batch: dict, device: str, signal_mode: str, normalize_mode: str, patch_size: int, out_h: int, out_w: int, freqs: torch.Tensor, generator: torch.Generator | None = None):
+    """Counterpart to VibrationDatasetTorch(augment_site='forward'): call this yourself at the
+    top of your training step (in place of the usual `batch = {k: v.to(device) for k, v in
+    batch.items()}`), on a batch whose 'fft'/'mask_true' are still raw (complex fft, full-res
+    mask) -- i.e. the dataset/collate_fn did no processing. Moves to `device` once, then runs
+    process_vibration/process_image on the whole batch, entirely in the main process. Unlike
+    augmenting_collate, does NOT move results back to cpu -- you're about to feed them straight
+    into the model. generator=None skips augmentation (eval)."""
+    fft = batch["fft"].to(device)
+    mask = batch["mask_true"].to(device)
+    fft_processed = process_vibration(fft, freqs, signal_mode, normalize_mode, patch_size, generator=generator)
+    mask_processed = process_image(mask, out_h, out_w, generator=generator)
+    return dict(fft=fft_processed, mask_true=mask_processed, info=batch["info"])
 
 #***** 4 split *****
 
@@ -376,6 +406,9 @@ def loader(dataset, idxs, bs, num_workers, device, augment_site, generator, shuf
     # collate site: __getitem__ always hands back raw data regardless of augment, so both
     # train and eval share the same (augmenting) `dataset` -- augmenting_collate's own
     # generator arg (None for eval) is what actually gates augmentation.
+    # forward site: __getitem__ also always hands back raw data, but no collate_fn is attached
+    # at all -- default collation just stacks it, and the caller processes it themselves via
+    # process_batch() at the top of their training step (see AugmentSite comment above).
     # getitem site (or "none"): augmentation is baked into __getitem__ itself, so the caller
     # must pass eval_dataset (augment_site="none") for eval to guarantee it never augments.
     collate_fn = (lambda batch: augmenting_collate(batch, dataset.generator if augment else None, dataset.signal_mode, dataset.normalize_mode, dataset.patch_size, dataset.out_h, dataset.out_w, dataset.freqs, device)) \
@@ -415,10 +448,12 @@ def build_dataset(data_dir: str | Path, split: str = "exp25", batch_size: int = 
                                           signal_mode=signal_mode, normalize_mode=normalize_mode, patch_size=patch_size,
                                           device=device)
 
-    # collate site: eval reuses the augmenting `dataset` too (augmenting_collate's generator=None
-    # gates augmentation off); getitem/none: eval must use eval_dataset (augment_site="none")
-    # since augmentation there is baked into __getitem__ itself, not gated by a per-call arg.
-    eval_ds = dataset if augment_site == "collate" else eval_dataset
+    # collate/forward sites: __getitem__ always hands back raw data regardless of augment_site,
+    # so eval can reuse the same `dataset` -- augmenting_collate's generator=None (collate) or
+    # your own process_batch(..., generator=None) call (forward) is what gates augmentation off.
+    # getitem/none: augmentation is baked into __getitem__ itself, so eval must use
+    # eval_dataset (augment_site="none") to guarantee it never augments.
+    eval_ds = dataset if augment_site in ("collate", "forward") else eval_dataset
 
     train_loader = loader(dataset, splits["train"], batch_size, num_workers, device, augment_site, generator, shuffle=True, drop_last=True, augment=True)
     eval_loaders = [Evaluator(label=label, dataloader=loader(eval_ds, idxs, eval_batch_size, num_workers, device, augment_site, generator, augment=False)) for label, idxs in splits.items() if label != "train"]

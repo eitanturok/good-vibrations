@@ -15,13 +15,18 @@ import numpy as np
 from torch.utils.data import DataLoader
 
 from model.dataset_np import VibrationDatasetNp, augmenting_collate as augmenting_collate_np
-from model.dataset_torch import VibrationDatasetTorch, augmenting_collate as augmenting_collate_torch
+from model.dataset_torch import VibrationDatasetTorch, augmenting_collate as augmenting_collate_torch, process_batch
 
 
-def time_iterations(dl, n_batches: int, warmup: int = 3) -> dict:
+def time_iterations(dl, n_batches: int, warmup: int = 3, process_fn=None) -> dict:
+    """process_fn, if given, is called on each raw batch (used for augment_site='forward',
+    where processing isn't in __getitem__/collate_fn at all -- it's the caller's job, timed
+    here as part of the per-batch cost since that's what a real training step would pay)."""
     it = iter(dl)
     for _ in range(warmup):
-        try: next(it)
+        try:
+            b = next(it)
+            if process_fn: process_fn(b)
         except StopIteration: it = iter(dl); break
 
     times, n_samples = [], []
@@ -32,6 +37,7 @@ def time_iterations(dl, n_batches: int, warmup: int = 3) -> dict:
         except StopIteration:
             it = iter(dl)
             batch = next(it)
+        if process_fn: batch = process_fn(batch)
         times.append(time.perf_counter() - t0)
         n_samples.append(batch["mask_true"].shape[0])
     total_time = time.perf_counter() - t_start
@@ -53,14 +59,19 @@ def bench_torch(mds_path: Path, batch_size: int, n_batches: int, num_workers: in
     dataset = VibrationDatasetTorch(local=str(mds_path), augment_site=augment_site, batch_size=batch_size, device=device)
     collate_fn = (lambda batch: augmenting_collate_torch(batch, dataset.generator, dataset.signal_mode, dataset.normalize_mode, dataset.patch_size, dataset.out_h, dataset.out_w, dataset.freqs, device)) \
         if augment_site == "collate" else None
-    # num_workers>0 + device="cuda": each worker subprocess would need its own cuda context,
-    # which torch DataLoader workers don't set up automatically -- restrict cuda runs to
-    # num_workers=0 (main-process) here; num_workers>0 is only meaningful for device="cpu".
-    workers = 0 if device == "cuda" else num_workers
+    # "getitem"/"none" (.to(self.device) inside __getitem__) and "collate" (.to(device) inside
+    # collate_fn) both touch CUDA in the worker process -- forked workers can't safely hold a
+    # CUDA context, so restrict those to num_workers=0 (main process) on cuda. "forward" does
+    # NOT touch CUDA in __getitem__/collate_fn at all (that's the whole point -- see AugmentSite
+    # in dataset_torch.py), so it's the only site where num_workers>0 + cuda is actually safe.
+    workers = 0 if (device == "cuda" and augment_site != "forward") else num_workers
     dl = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=workers,
                      pin_memory=(device == "cpu"), persistent_workers=workers > 0,
                      prefetch_factor=prefetch_factor if workers > 0 else None, collate_fn=collate_fn)
-    return time_iterations(dl, n_batches)
+    process_fn = None
+    if augment_site == "forward":
+        process_fn = lambda b: process_batch(b, device, dataset.signal_mode, dataset.normalize_mode, dataset.patch_size, dataset.out_h, dataset.out_w, dataset.freqs, generator=dataset.generator)
+    return time_iterations(dl, n_batches, process_fn=process_fn)
 
 
 def main():
@@ -86,8 +97,8 @@ def main():
         print(f"{'numpy':<14} {'cpu':<6} {augment_site:<10} {args.num_workers:>8} {stats['samples_per_sec']:>12.1f} {stats['mean_batch_s']*1e3:>10.1f}")
 
     for device in devices:
-        for augment_site in ["getitem", "collate"]:
-            workers = 0 if device == "cuda" else args.num_workers
+        for augment_site in ["getitem", "collate", "forward"]:
+            workers = 0 if (device == "cuda" and augment_site != "forward") else args.num_workers
             stats = bench_torch(args.mds_path, args.batch_size, args.n_batches, args.num_workers, args.prefetch_factor, augment_site, device)
             rows.append({"impl": "torch", "device": device, "augment_site": augment_site, "num_workers": workers, **stats})
             print(f"{'torch':<14} {device:<6} {augment_site:<10} {workers:>8} {stats['samples_per_sec']:>12.1f} {stats['mean_batch_s']*1e3:>10.1f}")
