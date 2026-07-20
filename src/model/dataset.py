@@ -132,8 +132,10 @@ def noisy_blur(mask: torch.Tensor, generator: torch.Generator, sigma: float = 0.
     return out.clamp(0, 1)
 
 def process_image(mask: torch.Tensor, out_h: int, out_w: int, augment: bool = True, generator: torch.Generator | None = None, augment_fn=noisy_blur) -> torch.Tensor:
+    mask = downsample(mask, out_h, out_w)
+    # apply augmentation after downsampling so augmentations don't get washed out
     if augment: mask = augment_fn(mask, generator)
-    return downsample(mask, out_h, out_w)
+    return mask
 
 #***** 2 process vibration *****
 
