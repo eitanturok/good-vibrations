@@ -5,6 +5,7 @@ from pathlib import Path
 
 import modal
 import numpy as np
+from tqdm import tqdm
 from scipy.signal import butter, resample, sosfiltfilt
 
 # when running inside a Modal container, src is mounted at /src but this file
@@ -12,13 +13,12 @@ from scipy.signal import butter, resample, sosfiltfilt
 if Path("/src").exists() and str(Path("/src")) not in sys.path:
     sys.path.insert(0, "/src")
 
-from utils.io_utils import save, append, symlink, copy, load, modal_upload, modal_download, fix_symlinks, Bz2Compressor
+from utils.io_utils import save, append, symlink, load, modal_upload, modal_download, fix_symlinks, Bz2Compressor
 from utils.helpers import Timing, logger
 from utils.viz import make_spectrogram_video, plot_spectrogram, plot_fft
 from data.audio import compute_spectrogram
 
 MIN_FREQ, MAX_FREQ = 50, 1000
-DEFAULT_RECOVERY_LASER_IDX = 50
 
 #***** 0 capture vibrations *****
 
@@ -43,9 +43,7 @@ def get_vibrations(cam, speaker, play_audio_fxn, capture_n_frames_fxn, audio_dir
     try:
         raw_vibrations, _ = capture_n_frames_fxn(cam, n_frames, height, width)
     finally:
-        # always wait for the FULL audio file to play out — even if capture throws or the
-        # capture window (n_capture_seconds) is shorter than the audio — so the next
-        # sample's play_audio call never overlaps/cuts this one
+        # always wait for the FULL audio file to play out so the next sample's play_audio call never overlaps/cuts this one
         min_seconds = max(n_capture_seconds, _wav_duration(audio_dir / 'audio.wav') + AUDIO_SETTLE_SECONDS)
         remaining = min_seconds - (time.perf_counter() - t_start)
         if remaining > 0: time.sleep(remaining)
@@ -291,8 +289,7 @@ def process_vibrations(sample_dir:Path, raw_vibrations:np.ndarray=None, use_moda
     axis_label = 'x' if xy_idx == 0 else 'y'
     file_suffix = f'_laser{recovered_laser}_{axis_label}'
     vibration_files = (PROCESSED_FILES
-        + [f'03_fft{file_suffix}.png', f'04_recovered_audio{file_suffix}.wav', f'05_spectrogram{file_suffix}.npz', f'05_spectrogram{file_suffix}.png']
-        + (["00_raw_vibrations.npy.bz2"] if cleanup_raw_vibrations == 'compress' else [])
+        + [f'03_fft{file_suffix}.png', f'04_recovered_audio{file_suffix}.wav', f'05_spectrogram{file_suffix}.npz', f'05_spectrogram{file_suffix}.png'])
         + ([f'05_spectrogram{file_suffix}.mp4'] if spectrogram_video else []))
     with Timing(f'[sample {sample_id}] download processed vibrations modal_volume->DISK::{sample_dir}: ', enabled=verbose >= 1):
         for f in vibration_files: modal_download(volume, f"{sample_dir.name}/vibration/{f}", sample_dir / f"vibration/{f}")
@@ -320,7 +317,8 @@ def warmup_pclk(verbose:int=1):
         dummy = np.zeros((1, 65, 32, 32), dtype=np.uint8)
         compute_shifts_for_all_rois_batched_optimized(dummy, batch_size=64, progress=False)
 
-def process_vibrations_2(sample_dir:Path, raw_vibrations:np.ndarray=None, use_modal:bool=False, pclk_mode:str='batched_optimized', pclk_batch_size:int=3000, do_save:bool=True, verbose:int=1, cleanup_raw_vibrations:str|None=None, spectrogram_video:bool=True, laser_idx:int|None=None, xy_idx:int=0):
+def process_vibrations_2(sample_dir:Path, raw_vibrations:np.ndarray=None, use_modal:bool=False, pclk_mode:str='batched_optimized', pclk_batch_size:int=3000,
+                         do_save:bool=True, verbose:int=1, cleanup_raw_vibrations:str|None=None, spectrogram_video:bool=True, laser_idx:int|None=None, xy_idx:int=0):
     """Fast single-laser display path for the live loop. Same signature and return dict as
     process_vibrations, same math (get_clean_shifts/get_fft_shifts/get_recovered_audio/
     compute_spectrogram), but:
@@ -368,3 +366,66 @@ def save_and_process_vibrations(raw_vibrations:np.ndarray, sample_dir:Path, audi
     # delete vibrations as soon as we finish saving it
     del raw_vibrations
     process_vibrations(sample_dir, use_modal, pclk_mode, pclk_batch_size, do_save, verbose, spectrogram_video=spectrogram_video, laser_idx=laser_idx, xy_idx=xy_idx)
+
+
+
+def get_shifts(raw_vibrations:np.ndarray, rois: list[list[int]], batch_size: int, pclk_mode: str = "sequential", laser_idx: int | None = None) -> np.ndarray:
+    from data.pclk import compute_shifts_for_roi, compute_shifts_for_all_rois_batched, compute_shifts_for_all_rois_batched_optimized
+    if laser_idx is not None:
+        x, y, w, h = rois[laser_idx]
+        shifts = compute_shifts_for_roi(raw_vibrations[:, y:y+h, x:x+w], batch_size)  # (T, 2)
+        return shifts[None]  # (1, T, 2)
+    if pclk_mode == "batched":
+        crops = np.stack([raw_vibrations[:, y:y+h, x:x+w] for x, y, w, h in rois])  # (L, T, H, W)
+        return compute_shifts_for_all_rois_batched(crops, batch_size)                  # (L, T, 2)
+    if pclk_mode == "batched_optimized":
+        crops = np.stack([raw_vibrations[:, y:y+h, x:x+w] for x, y, w, h in rois])  # (L, T, H, W)
+        return compute_shifts_for_all_rois_batched_optimized(crops, batch_size)        # (L, T, 2)
+    elif pclk_mode == 'sequential':
+        from tqdm import tqdm
+        all_shifts = []
+        for x, y, w, h in tqdm(rois):
+            all_shifts.append(compute_shifts_for_roi(raw_vibrations[:, y:y+h, x:x+w], batch_size))
+        return np.stack(all_shifts, axis=0)  # (L, T, 2)
+    else:
+        raise ValueError(f'Incorrect value {pclk_mode=}')
+
+def process_vibrations_3(sample_dir, raw_vibrations, pclk_batch_size, pclk_lasers=None, recovery_laser=50, recovery_xy=0, min_freq=MIN_FREQ, max_freq=MAX_FREQ):
+    from data.pclk import compute_shifts_for_roi
+
+    audio_sample_rate = 22050
+    metadata = {k: v for d in load(sample_dir / 'metadata.jsonl') for k, v in d.items()}
+    fps, rois = int(metadata['fps']), metadata['roi']
+    if pclk_lasers is not None: rois = [rois[pclk_point] for pclk_point in pclk_lasers]
+
+    raw_shifts = np.stack([compute_shifts_for_roi(raw_vibrations[:, y:y+h, x:x+w], pclk_batch_size) for x, y, w, h in tqdm(rois)], axis=0) # (L, T, 2)
+    clean_shifts = get_clean_shifts(raw_shifts[None], fps, min_freq, max_freq)  # (1, 1, T, 2)
+    fft, freqs, n_samples = get_fft_shifts(clean_shifts, fps, min_freq, max_freq)
+    recovered_audio = get_recovered_audio(fft, n_samples, fps, audio_sample_rate, min_freq, max_freq, recovery_points=recovery_laser, xy_idx=recovery_xy)
+    spec_freqs, spec_times, Sxx = compute_spectrogram(recovered_audio, audio_sample_rate)
+
+    return {'clean_shifts':clean_shifts, 'fft': fft, 'freqs': freqs, 'n_samples': n_samples, 'recovered_audio': recovered_audio, 'audio_sample_rate': audio_sample_rate,
+            'spec_freqs': spec_freqs, 'spec_times': spec_times, 'Sxx': Sxx, 'min_freq': min_freq, 'max_freq': max_freq, 'recovery_laser': recovery_laser, 'recovery_xy': recovery_xy}
+
+def save_process_vibrations_3(sample_dir, clean_shifts, fft, freqs, n_samples, recovered_audio, audio_sample_rate, spec_freqs, spec_times, Sxx, min_freq, max_freq, recovery_laser, recovery_xy, do_save):
+
+    axis_label = 'x' if recovery_xy == 0 else 'y'
+    file_suffix = f'_laser{recovery_laser}_{axis_label}'
+
+    # clean shifts
+    save(clean_shifts, sample_dir / 'vibration/02_clean_shifts.npy', do_save)
+
+    # fft
+    save({'fft': fft, 'freqs': freqs, 'n_samples': n_samples}, sample_dir / 'vibration/03_fft.npz', do_save)
+    plot_fft(freqs, fft[0, recovery_laser, :, recovery_xy], sample_dir / f'vibration/03_fft{file_suffix}.png', title=f'Recovered FFT, Laser {recovery_laser}, {axis_label}-axis', max_freq=max_freq, enabled=do_save)
+
+    # recovered audio
+    save((recovered_audio, audio_sample_rate), audio_path, do_save)
+    symlink(audio_path, sample_dir / 'recovered_audio.wav', do_save)
+
+    # spectogram
+    save({'freqs': spec_freqs, 'times': spec_times, 'Sxx': Sxx}, sample_dir / f'vibration/05_spectrogram{file_suffix}.npz', do_save)
+    audio_name = (sample_dir / 'audio.wav').resolve().parent.name  # e.g. chirp_50_1000_3.0sec, via the symlink to audio_dir
+    spec_label = f'Recovered {audio_name} Spectrogram: {{duration}}s, Laser {recovery_laser}, {axis_label}-axis'
+    plot_spectrogram(spec_freqs, spec_times, Sxx, sample_dir / f'vibration/05_spectrogram{file_suffix}.png', label=spec_label, max_freq=max_freq, enabled=do_save)
+    make_spectrogram_video(spec_freqs, spec_times, Sxx, recovered_audio, audio_sample_rate, sample_dir / f'vibration/05_spectrogram{file_suffix}.mp4', label=spec_label, max_freq=max_freq, enabled=do_save)

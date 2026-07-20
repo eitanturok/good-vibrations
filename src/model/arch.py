@@ -7,7 +7,7 @@ from torchmetrics import MeanSquaredError, Metric
 from model.dataset import DATA_INFO
 from utils.metrics import center_of_mass, soft_iou, soft_dice
 
-#***** 0 helpers *****
+#***** 0 rope *****
 
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0) -> torch.Tensor:
     freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)] / dim))
