@@ -181,7 +181,7 @@ def _draw_box_coverage(ax, box_coverage, sample_dir):
     mask = np.array(load(sample_dir / "image/02_smask.png"))
     key = get_box_coverage_key(metadata, mask)
     box, obj, n_objects, shape = key
-    im = ax.imshow(box_coverage[key]['mask'], cmap='Blues')
+    im = ax.imshow(box_coverage[key]['mask'], cmap='Blues', vmin=0)
     plt.colorbar(im, ax=ax)
     ax.set(title=f"Box Coverage\n{n_objects} {obj} in {box} box ({shape[1]}×{shape[0]}, {len(box_coverage[key]['sample_ids'])} samples)", xlabel='x (downsampled pixel space)', ylabel='y (downsampled pixel space)')
 
