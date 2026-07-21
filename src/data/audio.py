@@ -74,16 +74,7 @@ def load_audio_artifacts(audio_dir: Path) -> tuple[np.ndarray, int, np.ndarray, 
 
 #***** 4 cli *****
 
-def main():
-    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument('--T_sec', type=float, default=T_SEC)
-    p.add_argument('--T_start', type=float, default=T_START)
-    p.add_argument('--T_end', type=float, default=T_END)
-    p.add_argument('--fs', type=int, default=FS)
-    p.add_argument('--f_start', type=float, default=F_START)
-    p.add_argument('--f_end', type=float, default=F_END)
-    p.add_argument('--out_dir', type=Path, default=None)
-    args = p.parse_args()
+def main(args):
 
     out_dir = args.out_dir or REPO / 'data' / 'audio' / f'chirp_{int(args.f_start)}_{int(args.f_end)}_{args.T_sec}sec'
 
@@ -103,6 +94,16 @@ def main():
     make_spectrogram_video(freqs_spec, times, Sxx, audio, args.fs, out_dir / 'spectrogram.mp4', label=spec_label, max_freq=args.f_end)
 
     print(f"saved audio.wav, metadata.jsonl, fft.npz, fft.png, spectrogram.npz, spectrogram.png, spectrogram.mp4 to {out_dir}")
+    return audio
 
 if __name__ == "__main__":
-    main()
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument('--T_sec', type=float, default=T_SEC)
+    p.add_argument('--T_start', type=float, default=T_START)
+    p.add_argument('--T_end', type=float, default=T_END)
+    p.add_argument('--fs', type=int, default=FS)
+    p.add_argument('--f_start', type=float, default=F_START)
+    p.add_argument('--f_end', type=float, default=F_END)
+    p.add_argument('--out_dir', type=Path, default=None)
+    args = p.parse_args()
+    main(args)
