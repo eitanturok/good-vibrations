@@ -194,6 +194,27 @@ def preview_audio(samples, sample_rate):
     if isinstance(samples, (str, Path)): return Audio(filename=str(samples), rate=sample_rate)
     return Audio(samples, rate=sample_rate)
 
+def plot_audio_comparison(original:tuple, recovered:tuple, max_freq:float|None=None) -> None:
+    """FFT + spectrogram for an original audio and a recovered/reloaded counterpart (each a
+    (samples, sample_rate) tuple), followed by a playable Audio widget for both."""
+    from data.audio import compute_fft, get_spectrogram
+    (orig_samples, orig_fs), (rec_samples, rec_fs) = original, recovered
+
+    fig, axes = plt.subplots(2, 2, figsize=(24, 8), dpi=80, gridspec_kw={'width_ratios': [3, 1]})
+    for row, (label, samples, fs) in enumerate([('Original', orig_samples, orig_fs), ('Recovered', rec_samples, rec_fs)]):
+        freqs, fft = compute_fft(samples, fs)
+        spec_freqs, spec_times, Sxx = get_spectrogram(samples, fs)
+        _draw_fft(axes[row, 0], freqs, fft, title=f'{label} Audio FFT', max_freq=max_freq)
+        im = _draw_spectrogram(axes[row, 1], spec_freqs, spec_times, Sxx, label=f'{label} Audio Spectrogram: {{duration}}s', max_freq=max_freq)
+        fig.colorbar(im, ax=axes[row, 1], label='Power (dB)')
+    fig.tight_layout()
+    plt.show()
+
+    print('Original audio:')
+    display(Audio(orig_samples, rate=orig_fs))
+    print('Recovered audio:')
+    display(Audio(rec_samples, rate=rec_fs))
+
 def _draw_overhead_full(ax, result:dict, image, objects:list[str]|None=None, alpha:float=0.3):
     """Overhead image with masks + boxes + confidence labels (plot_smask) drawn onto `ax`."""
     from src.data.segment import plot_smask
@@ -281,4 +302,5 @@ def preview(obj, mode):
     if mode == 'plot_live_sample': return plot_live_sample(*obj)
     if mode == 'plot_live_image': return plot_live_image(*obj)
     if mode == 'audio': return preview_audio(*obj)
+    if mode == 'audio_comparison': return plot_audio_comparison(*obj)
     else: raise ValueError(f'{mode=} not recognized')

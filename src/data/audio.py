@@ -77,6 +77,9 @@ def load_audio_artifacts(audio_dir: Path) -> tuple[np.ndarray, int, np.ndarray, 
 def main(args):
 
     out_dir = args.out_dir or REPO / 'data' / 'audio' / f'chirp_{int(args.f_start)}_{int(args.f_end)}_{args.T_sec}sec'
+    if out_dir.exists() and (out_dir / 'audio.wav').exists():
+        print(f'Already computed audio in {out_dir}')
+        return load(out_dir / 'audio.wav')
 
     audio = make_chirp(args.T_sec, args.T_start, args.T_end, args.fs, args.f_start, args.f_end)
     metadata = [{"T_sec": args.T_sec}, {"T_start": args.T_start}, {"T_end": args.T_end}, {"fs": args.fs}, {"f_start": args.f_start}, {"f_end": args.f_end}]
