@@ -5,12 +5,16 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn.functional as F
+from PIL import Image
+from tqdm import tqdm
 from torch.utils.data import Subset, DataLoader
 from sklearn.model_selection import train_test_split
 from composer.core import Evaluator, DataSpec
 from streaming import StreamingDataset, MDSWriter
 
-#***** 0 convert to MDS *****
+
+#***** 0 collect samples *****
+
 REQUIRED_FILES = ["image/02_smask.png", "vibration/03_fft.npz", "metadata.jsonl"]
 
 MDS_COLUMNS = {"X": "ndarray:float32", "y": "ndarray:float32",
@@ -20,7 +24,7 @@ MDS_COLUMNS = {"X": "ndarray:float32", "y": "ndarray:float32",
 
 def collect_samples(base_sample_dir: Path, verbose: int = 1) -> list[tuple[Path, dict]]:
     samples, missing_by_file = [], {f: [] for f in REQUIRED_FILES}
-    for sample_dir in sorted(base_sample_dir.glob("*")):
+    for sample_dir in tqdm(sorted(base_sample_dir.glob("*")), desc="collecting samples", disable=not verbose):
         if not sample_dir.is_dir(): continue
         missing = [f for f in REQUIRED_FILES if not (sample_dir / f).exists()]
         if missing:
@@ -36,20 +40,38 @@ def collect_samples(base_sample_dir: Path, verbose: int = 1) -> list[tuple[Path,
             if ids: print(f"missing {f!r}: {ids}")
     return samples
 
-def hash_samples(samples: list[tuple[Path, dict]]) -> str:
+def hash_samples(samples: list[tuple[Path, dict]], out_h: int | None = None, out_w: int | None = None) -> str:
     h = hashlib.sha256()
+    if out_h is not None: h.update(f"{out_h}x{out_w}".encode())  # resolution is baked into y, so it must invalidate the cache too
     for sample_dir, meta in sorted(samples, key=lambda s: s[0].name):
         h.update(sample_dir.name.encode())
         h.update(json.dumps(meta, sort_keys=True).encode())
     return h.hexdigest()
 
-def convert_to_mds(mds_dir: Path, samples: list[tuple[Path, dict]], verbose: int = 1) -> Path:
+#***** 1 downsample samples *****
 
-    from PIL import Image
+def downsample_mask(mask: Image.Image, out_h: int, out_w: int) -> Image.Image:
+    # BOX resampling area-averages over the full H x W mask (unlike a floor-division block
+    # reshape, which silently truncates to block_h*out_h x block_w*out_w and drops the
+    # bottom/right edge whenever out_h/out_w don't evenly divide H/W).
+    return mask.resize((out_w, out_h), resample=Image.BOX)
+
+def downsample_samples(samples: list[tuple[Path, dict]], out_h: int, out_w: int, verbose: int = 1) -> None:
+    """Downsample every sample's full-resolution mask to (out_h, out_w). Only called when
+    build_dataset's hash_samples check says the MDS is stale, so no per-sample cache check here."""
+    for sample_dir, _ in tqdm(samples, desc="downsampling masks", disable=not verbose):
+        out_path = sample_dir / f"image/05_downsampled_smask_{out_h}h_{out_w}w"
+        mask = downsample_mask(Image.open(sample_dir / "image/02_smask.png"), out_h, out_w)
+        mask.save(out_path.with_suffix(".png"))
+        np.save(out_path.with_suffix(".npy"), np.array(mask, dtype=np.float32) / 255.0)
+
+#***** 2 convert to mds *****
+
+def convert_to_mds(mds_dir: Path, samples: list[tuple[Path, dict]], out_h: int, out_w: int, verbose: int = 1) -> Path:
+
     first_fft = np.load(samples[0][0] / "vibration/03_fft.npz")["fft"]  # (1, L, F, C) complex
     n_lasers, n_freqs = first_fft.shape[1], first_fft.shape[2]
-    first_mask = np.array(Image.open(samples[0][0] / "image/02_smask.png"))
-    x_shape, y_shape = (n_lasers, n_freqs, 2, 2), first_mask.shape  # X: (L,F,C,2) real/imag fft; y: raw (H,W) mask
+    x_shape, y_shape = (n_lasers, n_freqs, 2, 2), (out_h, out_w)  # X: (L,F,C,2) real/imag fft; y: downsampled (out_h,out_w) mask
 
     samples = [(sample_dir.resolve(), meta) for sample_dir, meta in samples]
     index_rows = []
@@ -58,14 +80,16 @@ def convert_to_mds(mds_dir: Path, samples: list[tuple[Path, dict]], verbose: int
     os.chdir(mds_dir.parent)
 
     try:
-        with MDSWriter(out=mds_dir.name, columns=MDS_COLUMNS, exist_ok=False, size_limit="1GB") as writer:
-            for i, (sample_dir, meta) in enumerate(samples):
+        with MDSWriter(out=mds_dir.name, columns=MDS_COLUMNS, exist_ok=False, size_limit="200MB") as writer:
+            for sample_dir, meta in tqdm(samples, desc="writing MDS", disable=not verbose):
                 fft_npz = np.load(sample_dir / "vibration/03_fft.npz")
+
                 X = fft_npz["fft"]                                          # (1, L, F, C) complex64
-                y = (np.array(Image.open(sample_dir / "image/02_smask.png")).astype(np.float32) / 255.0)  # (H,W) in [0,1]
                 X = np.squeeze(X, axis=0) if X.ndim == 4 and X.shape[0] == 1 else X  # -> (L,F,C)
                 X = np.stack([X.real, X.imag], axis=-1).astype(np.float32)  # complex -> (L,F,C,2) real/imag
                 assert X.shape == x_shape, f"{sample_dir.name}: X.shape={X.shape} != {x_shape}"
+
+                y = np.load(sample_dir / f"image/05_downsampled_smask_{out_h}h_{out_w}w.npy")  # precomputed by downsample_samples
                 assert y.shape == y_shape, f"{sample_dir.name}: y.shape={y.shape} != {y_shape}"
 
                 com = meta.get("downsampled_com", [-1.0, -1.0])
@@ -75,13 +99,12 @@ def convert_to_mds(mds_dir: Path, samples: list[tuple[Path, dict]], verbose: int
                     "n_objects": int(meta.get("n_objects", -1)),
                     "speaker": int(meta.get("speaker", -1)),
                     "box": str(meta.get("box", "")),
-                    "is_empty_box": int(bool(meta.get("is_empty_box", False))),
+                    "is_empty_box": bool(meta.get("is_empty_box", False)),
                     "object": str(meta.get("object", "")),
                     "downsampled_com_x": float(com[0]), "downsampled_com_y": float(com[1]),
                 }
                 writer.write(sample)
                 index_rows.append(meta)
-                if verbose >= 2 and (i + 1) % 50 == 0: print(f"  wrote {i + 1}/{len(rows)}")
     finally:
         os.chdir(cwd)
 
@@ -92,11 +115,11 @@ def convert_to_mds(mds_dir: Path, samples: list[tuple[Path, dict]], verbose: int
     # save metadata as a sidecar for loader-side filtering
     lines = "\n".join(json.dumps(r) for r in index_rows)
     (mds_dir / "metadata.jsonl").write_text(lines)
-    (mds_dir / "samples_hash.txt").write_text(hash_samples(samples))
+    (mds_dir / "hash.txt").write_text(hash_samples(samples, out_h, out_w))
     if verbose: print(f"Wrote {len(samples)} samples to {mds_dir=}")
     return mds_dir
 
-#***** 1 process image *****
+#***** 3 process image *****
 
 def _gaussian_kernel1d_radius1(sigma: torch.Tensor) -> torch.Tensor:
     # Matches scipy.ndimage._gaussian_kernel1d(sigma, order=0, radius=1) exactly: truncated
@@ -117,8 +140,8 @@ def gaussian_blur(mask: torch.Tensor, sigma: float) -> torch.Tensor:
     x = F.conv2d(x, k.view(1, 1, 1, 3))
     return x.squeeze(1)
 
-def downsample(mask: torch.Tensor, out_h: int, out_w: int) -> torch.Tensor:
-    # Box/area resampling -- area-averages over the full H x W mask, matching PIL's Image.BOX
+def downsample_batch(mask: torch.Tensor, out_h: int, out_w: int) -> torch.Tensor:
+    # Box/area resampling, matching PIL's Image.BOX. Unused internally (see process_image); kept for notebooks.
     x = mask.unsqueeze(1)  # (B,1,H,W)
     out = F.interpolate(x, size=(out_h, out_w), mode='area')
     return out.squeeze(1)
@@ -132,13 +155,13 @@ def noisy_blur(mask: torch.Tensor, generator: torch.Generator, sigma: float = 0.
     out[nonzero] = out[nonzero] + noise[nonzero]
     return out.clamp(0, 1)
 
-def process_image(mask: torch.Tensor, out_h: int, out_w: int, augment: bool = True, generator: torch.Generator | None = None, augment_fn=noisy_blur) -> torch.Tensor:
-    mask = downsample(mask, out_h, out_w)
+def process_image(mask: torch.Tensor, out_h: int, out_w: int, augment: bool = True, generator: torch.Generator | None = None) -> torch.Tensor:
+    assert mask.shape[-2:] == (out_h, out_w), f"mask {tuple(mask.shape[-2:])} != expected ({out_h},{out_w})"
     # apply augmentation after downsampling so augmentations don't get washed out
-    if augment: mask = augment_fn(mask, generator)
+    if augment: mask = noisy_blur(mask, generator)
     return mask
 
-#***** 2 process vibration *****
+#***** 4 process vibration *****
 
 def extract_signal(re: torch.Tensor, im: torch.Tensor, signal_mode: str) -> torch.Tensor:
     # re, im: separate contiguous tensors (not a (...,2) view) -- slicing re/im off a shared last
@@ -217,7 +240,7 @@ def collate_and_process(samples: list[dict], process_batch_fn) -> dict:
     info = {k: [s["info"][k] for s in samples] for k in samples[0]["info"]}
     return process_batch_fn(dict(fft=fft, mask_true=mask_true, info=info))
 
-#***** 4 dataset *****
+#***** 5 define dataset *****
 
 class VibrationDataset(StreamingDataset):
     def __init__(self, local: str | Path, shuffle: bool = False,
@@ -233,12 +256,12 @@ class VibrationDataset(StreamingDataset):
 
     def __getitem__(self, idx):
         s = super().__getitem__(idx)
-        X, y = s.pop("X"), s.pop("y")  # X: (L,F,C,2) real/imag fft, y: (H,W) raw mask
+        X, y = s.pop("X"), s.pop("y")  # X: (L,F,C,2) real/imag fft, y: (out_h,out_w) mask, already downsampled at MDS-build time
         info = dict(sample_id=s["sample_id"], output_id=s["output_id"], n_objects=s["n_objects"], speaker=s["speaker"], box=s["box"], is_empty_box=s["is_empty_box"], x_com=s["downsampled_com_x"], y_com=s["downsampled_com_y"])
         X_t, y_t = torch.from_numpy(X.copy()), torch.from_numpy(y.copy())
         return dict(fft=X_t, mask_true=y_t, info=info)  # keep fft as real/imag (last dim 2), avoid building a complex tensor until needed
 
-#***** 5 split *****
+#***** 6 define split *****
 
 def _matches(row: dict, speakers, n_objects, box) -> bool:
     if speakers is not None and row["speaker"] not in (speakers if isinstance(speakers, list) else [speakers]): return False
@@ -340,7 +363,7 @@ def exp25_split(mds_path: str | Path, test_size: float = 0.20, unseen_pos_frac: 
 
     return {"train": train_idx, **evals}
 
-#***** 5 build dataloaders *****
+#***** 8 build dataloaders *****
 
 SPLIT_METHODS = {"exp25": exp25_split}
 
@@ -362,16 +385,19 @@ def build_dataset(data_dir: str | Path, split: str = "exp25", batch_size: int = 
     data_dir = Path(data_dir)
     if not data_dir.exists(): raise FileNotFoundError(f"{data_dir=} does not exist")
     mds_dir = data_dir / "mds"
-    hash_path = mds_dir / "samples_hash.txt"
+    hash_path = mds_dir / "hash.txt"
 
     samples = collect_samples(data_dir / "samples", verbose)
-    stale = not hash_path.exists() or hash_path.read_text() != hash_samples(samples)
+    stale = not hash_path.exists() or hash_path.read_text() != hash_samples(samples, out_h, out_w)
     if force_mds or stale:
         if hash_path.exists():
             if not force_mds: raise ValueError(f"{mds_dir=} already exists and {force_mds=}")
             shutil.rmtree(mds_dir)
             if verbose: print(f"Overwriting {mds_dir=}")
-        convert_to_mds(mds_dir, samples, verbose=verbose)
+        
+        # downsample and convert to mds
+        downsample_samples(samples, out_h, out_w, verbose=verbose)
+        convert_to_mds(mds_dir, samples, out_h, out_w, verbose=verbose)
     elif verbose:
         print(f"Reusing existing MDS at {mds_dir}")
 
