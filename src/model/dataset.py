@@ -140,12 +140,6 @@ def gaussian_blur(mask: torch.Tensor, sigma: float) -> torch.Tensor:
     x = F.conv2d(x, k.view(1, 1, 1, 3))
     return x.squeeze(1)
 
-def downsample_batch(mask: torch.Tensor, out_h: int, out_w: int) -> torch.Tensor:
-    # Box/area resampling, matching PIL's Image.BOX. Unused internally (see process_image); kept for notebooks.
-    x = mask.unsqueeze(1)  # (B,1,H,W)
-    out = F.interpolate(x, size=(out_h, out_w), mode='area')
-    return out.squeeze(1)
-
 def noisy_blur(mask: torch.Tensor, generator: torch.Generator, sigma: float = 0.8, noise_std: float = 0.05) -> torch.Tensor:
     # Gaussian blur, then add noise back onto originally-nonzero pixels only. mask: (B,H,W).
     blurred = gaussian_blur(mask, sigma)
