@@ -19,6 +19,7 @@ from utils.viz import make_spectrogram_video, plot_spectrogram, plot_fft
 from data.audio import get_spectrogram
 
 MIN_FREQ, MAX_FREQ = 50, 1000
+DEFAULT_RECOVERY_LASER_IDX = 50
 
 #***** 0 capture vibrations *****
 
@@ -288,9 +289,7 @@ def process_vibrations(sample_dir:Path, raw_vibrations:np.ndarray=None, use_moda
     recovered_laser = laser_idx if laser_idx is not None else DEFAULT_RECOVERY_LASER_IDX
     axis_label = 'x' if xy_idx == 0 else 'y'
     file_suffix = f'_laser{recovered_laser}_{axis_label}'
-    vibration_files = (PROCESSED_FILES
-        + [f'03_fft{file_suffix}.png', f'04_recovered_audio{file_suffix}.wav', f'05_spectrogram{file_suffix}.npz', f'05_spectrogram{file_suffix}.png'])
-        + ([f'05_spectrogram{file_suffix}.mp4'] if spectrogram_video else []))
+    vibration_files = PROCESSED_FILES + [f'03_fft{file_suffix}.png', f'04_recovered_audio{file_suffix}.wav', f'05_spectrogram{file_suffix}.npz', f'05_spectrogram{file_suffix}.png'] + ([f'05_spectrogram{file_suffix}.mp4'] if spectrogram_video else [])
     with Timing(f'[sample {sample_id}] download processed vibrations modal_volume->DISK::{sample_dir}: ', enabled=verbose >= 1):
         for f in vibration_files: modal_download(volume, f"{sample_dir.name}/vibration/{f}", sample_dir / f"vibration/{f}")
         fix_symlinks(sample_dir, [("recovered_audio.wav", f"vibration/04_recovered_audio{file_suffix}.wav")])
