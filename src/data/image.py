@@ -33,17 +33,7 @@ def _organize(object_names, all_detections):
 
 
 def segment(image: Image.Image, objects: dict[str, int], prompts: dict[str, str], is_empty_box: bool = False, segment_scale: float = 1.0) -> dict:
-    """Segment every object in parallel on modal and return the flattened per-instance {names, scores, boxes, masks} dict.
-
-    Objects sharing a prompt (e.g. bullet + cylinder both prompted "Metal circle") are grouped
-    into ONE call with top_k = their combined count, and the distinct top instances are then
-    distributed among them. Calling per-object instead would give every such object the same
-    global top-1 detection — identical masks stacked on top of each other.
-
-    Assignment rule for a shared prompt: the top instances (by score) are ordered LEFT-TO-RIGHT
-    by mask center-of-mass and handed to the sharing objects in `objects` dict order. So
-    objects={'cylinder': 1, 'bullet': 1} guarantees cylinder = leftmost metal circle,
-    bullet = rightmost — arrange the physical objects to match the dict order."""
+    """Segment every object in parallel on modal and return the flattened per-instance {names, scores, boxes, masks} dict."""
     w, h = image.size
     object_names = list(objects.keys())
 
