@@ -14,7 +14,7 @@ warnings.filterwarnings("ignore", message=r"The pynvml package is deprecated.*",
 # only log errors from this file in order to suppress the warning "Redirects are currently not supported in Windows or MacOs."
 logging.getLogger("torch.distributed.elastic.multiprocessing.redirects").setLevel(logging.ERROR)
 
-import sys, gc, argparse
+import sys, argparse
 from pathlib import Path
 
 # src is a scripts dir (bare imports). On Modal it is mounted at /root/src -> put it on the path
@@ -53,6 +53,7 @@ import wandb
 from model.callbacks import VizSegMask, OutputSaver
 from model.dataset import build_dataset
 from model.arch import VibrationTransformer, LOSSES
+from utils.helpers import cleanup
 
 def get_parser():
     parser = argparse.ArgumentParser()
@@ -60,25 +61,32 @@ def get_parser():
     parser.add_argument("--seed",                       type=int,   default=42)
     parser.add_argument("--debug",                      type=int,   default=0)
     parser.add_argument("--verbose",                    type=int,   default=2, help="If >=2, show torch.compile (TorchDynamo) logs.")
+
     # build data
     parser.add_argument("--mds-dir",                    type=str,   default=r"D:/eturok/datasets/000-cylinder-dataset/mds")
-    parser.add_argument("--split",                      type=str,   default="exp23", help="Which split method from SPLIT_METHODS to use (e.g. 'exp22', 'exp23').")
+    parser.add_argument("--split",                      type=str,   default="exp25", help="Which split method from SPLIT_METHODS to use (e.g. 'exp22', 'exp23').")
     parser.add_argument("--num-workers",                type=int,   default=4)
     parser.add_argument("--test-size",                  type=float, default=0.2)
+
     parser.add_argument("--out-h",                      type=int,   default=20)
     parser.add_argument("--out-w",                      type=int,   default=40)
     parser.add_argument("--n-laser-rows",               type=int,   default=10)
     parser.add_argument("--n-laser-cols",               type=int,   default=10)
     parser.add_argument("--patch-size",                 type=int,   default=256)
-    parser.add_argument("--n-freqs",                    type=int,   default=3328)
+    parser.add_argument("--n-freqs",                    type=int,   default=2946)
     parser.add_argument("--n-channels",                 type=int,   default=2, help="Last dim of X: 2 for magnitude, 4 for complex/mag_phase signal modes.")
+
     parser.add_argument("--signal-mode",                type=str,   default="magnitude", choices=["magnitude", "complex", "mag_phase"])
     parser.add_argument("--normalize-mode",             type=str,   default="std")
+    parser.add_argument("--no-mask-augmentation",       action="store_true", default=False, help="Disable mask augmentation (blur+noise).")
+    parser.add_argument("--no-fft-augmentation",        action="store_true", default=False, help="Disable FFT frequency-gain augmentation.")
+
     # filter data
     parser.add_argument("--n-samples",                  type=int,   default=None)
     parser.add_argument("--speakers",                   type=int,   default=None)
     parser.add_argument("--n-objects",                  type=int,   default=None)
     parser.add_argument("--box",                        type=str,   default=None)
+
     # model
     parser.add_argument("--decoder",                     type=str,   default='mlp')
     parser.add_argument("--decoder-num-heads",          type=int,   default=2)
@@ -94,13 +102,15 @@ def get_parser():
     parser.add_argument("--no-compile",                 action="store_true", default=False, help="Disable torch.compile-ing the model before training/eval.")
     parser.add_argument("--compile-mode",               type=str,   default="default", help="torch.compile mode, e.g. 'default', 'reduce-overhead', 'max-autotune'.")
     # train
-    parser.add_argument("--batch-size",                 type=int,   default=128)
+    parser.add_argument("--batch-size",                 type=int,   default=256)
     parser.add_argument("--lr",                         type=float, default=1e-4)
-    parser.add_argument("--max-duration",               type=str,   default="2500ep")
+    parser.add_argument("--max-duration",               type=str,   default="6000ep")
     # eval
     parser.add_argument("--eval-only",                  action="store_true", default=False, help="Skip training, just eval a loaded checkpoint (requires --checkpoint-path).")
     parser.add_argument("--eval-batch-size",            type=int,   default=108) # wandb caps images logged in a single call to 108, so eval batch size should be <= 108 to log all images
     parser.add_argument("--eval-interval",              type=str,   default="50ep")
+    parser.add_argument("--no-eval-before-train",       action="store_true", default=False, help="Skip the boundary eval pass before training starts.")
+    parser.add_argument("--no-eval-after-train",        action="store_true", default=False, help="Skip the boundary eval pass after training ends.")
     parser.add_argument("--outputs-dir",                type=str,   default=None, help="Where to save eval .pt outputs. If not set, defaults to the run's outputs_history dir (same dir the training-time history callback writes to).")
     # run
     parser.add_argument("--run-name",                   type=str,   default=None)
@@ -135,30 +145,6 @@ app = modal.App(
     secrets=[modal.Secret.from_name("huggingface"), modal.Secret.from_name("wandb")],
 )
 
-# **** memory helpers ****
-
-def log_mem(tag):
-    import os, psutil
-    proc = psutil.Process(os.getpid())
-    rss_gb = proc.memory_info().rss / 1e9
-    if torch.cuda.is_available():
-        vram_alloc = torch.cuda.memory_allocated() / 1e9
-        vram_res   = torch.cuda.memory_reserved()  / 1e9
-        print(f'[mem] {tag}: RSS={rss_gb:.2f} GB  VRAM alloc={vram_alloc:.2f} GB  reserved={vram_res:.2f} GB')
-    else:
-        print(f'[mem] {tag}: RSS={rss_gb:.2f} GB')
-
-def cleanup(trainer, *others):
-    log_mem('before close')
-    trainer.close()
-    trainer.state.model.cpu()
-    trainer.state.outputs = None
-    trainer.state.batch   = None
-    del trainer, others
-    gc.collect()
-    if torch.cuda.is_available(): torch.cuda.empty_cache()
-    log_mem('after close')
-
 # **** train / eval ****
 
 def eval_boundary(trainer, boundary_loaders):
@@ -185,7 +171,6 @@ def run(**kwargs):
 
     # device
     device = 'gpu' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu'
-    torch_device = 'cuda' if device == 'gpu' else device
     print(f'Using {device=}')
 
     # set torch compile and cudnn benchmark for speed
@@ -195,16 +180,16 @@ def run(**kwargs):
     if not args.no_compile and args.verbose >= 2: torch._logging.set_logs(dynamo=logging.INFO)
 
     # dataset
-    train_loader, eval_loaders, dataset = build_dataset(
+    train_loader, eval_loaders, train_eval_loader, dataset = build_dataset(
         args.mds_dir, batch_size=args.batch_size, eval_batch_size=args.eval_batch_size, num_workers=args.num_workers,
         split=args.split, test_size=args.test_size, speakers=args.speakers, n_objects=args.n_objects, box=args.box, n_samples=args.n_samples,
-        out_h=args.out_h, out_w=args.out_w, signal_mode=args.signal_mode, normalize_mode=args.normalize_mode, patch_size=args.patch_size, seed=args.seed, device=torch_device)
-    boundary_loaders = eval_loaders + [Evaluator(label='train', dataloader=train_loader)]
+        out_h=args.out_h, out_w=args.out_w, signal_mode=args.signal_mode, normalize_mode=args.normalize_mode, patch_size=args.patch_size, seed=args.seed,
+        augment_fft=not args.no_fft_augmentation, augment_mask=not args.no_mask_augmentation)
+    boundary_loaders = eval_loaders + [Evaluator(label='train', dataloader=train_eval_loader)]
 
     # model
     data_info = dict(out_h=args.out_h, out_w=args.out_w, n_laser_rows=args.n_laser_rows, n_laser_cols=args.n_laser_cols, patch_size=args.patch_size, n_freqs=args.n_freqs, n_channels=args.n_channels)
-    model = VibrationTransformer(args.d_model, args.pnt_num_heads, args.pnt_num_layers, args.seq_num_heads, args.seq_num_layers, data_info, args.decoder, args.decoder_num_heads, args.decoder_num_layers, freq_dropout=args.freq_dropout, laser_dropout=args.laser_dropout, loss_fn=args.loss_fn,
-                                  signal_mode=args.signal_mode, normalize_mode=args.normalize_mode, freqs=dataset.freqs, generator=dataset.generator)
+    model = VibrationTransformer(args.d_model, args.pnt_num_heads, args.pnt_num_layers, args.seq_num_heads, args.seq_num_layers, data_info, args.decoder, args.decoder_num_heads, args.decoder_num_layers, freq_dropout=args.freq_dropout, laser_dropout=args.laser_dropout, loss_fn=args.loss_fn)
     load_path = str(args.checkpoint_path) if args.checkpoint_path else None
 
     # logger
@@ -243,10 +228,10 @@ def run(**kwargs):
                     loggers=loggers, callbacks=callbacks, profiler=profiler,
                     compile_config=None if args.no_compile else {"mode": args.compile_mode})
 
-    eval_boundary(trainer, boundary_loaders)  # eval before training starts
+    if not args.no_eval_before_train: eval_boundary(trainer, boundary_loaders)  # eval before training starts
     if not args.eval_only:
         trainer.fit()
-        eval_boundary(trainer, boundary_loaders)  # eval after training ends
+        if not args.no_eval_after_train: eval_boundary(trainer, boundary_loaders)  # eval after training ends
     cleanup(trainer, boundary_loaders, eval_loaders, train_loader)
 
 @app.local_entrypoint()

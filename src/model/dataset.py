@@ -1,4 +1,5 @@
 import hashlib, json, os, shutil
+from functools import partial
 from pathlib import Path
 
 import numpy as np
@@ -50,13 +51,14 @@ def convert_to_mds(mds_dir: Path, samples: list[tuple[Path, dict]], verbose: int
     first_mask = np.array(Image.open(samples[0][0] / "image/02_smask.png"))
     x_shape, y_shape = (n_lasers, n_freqs, 2, 2), first_mask.shape  # X: (L,F,C,2) real/imag fft; y: raw (H,W) mask
 
+    samples = [(sample_dir.resolve(), meta) for sample_dir, meta in samples]
     index_rows = []
     mds_dir.parent.mkdir(parents=True, exist_ok=True)
     cwd = os.getcwd()
     os.chdir(mds_dir.parent)
 
     try:
-        with MDSWriter(out=mds_dir.name, columns=MDS_COLUMNS, exist_ok=False) as writer:
+        with MDSWriter(out=mds_dir.name, columns=MDS_COLUMNS, exist_ok=False, size_limit="1GB") as writer:
             for i, (sample_dir, meta) in enumerate(samples):
                 fft_npz = np.load(sample_dir / "vibration/03_fft.npz")
                 X = fft_npz["fft"]                                          # (1, L, F, C) complex64
@@ -130,14 +132,19 @@ def noisy_blur(mask: torch.Tensor, generator: torch.Generator, sigma: float = 0.
     out[nonzero] = out[nonzero] + noise[nonzero]
     return out.clamp(0, 1)
 
-def process_image(mask: torch.Tensor, out_h: int, out_w: int, generator: torch.Generator | None = None, augment_fn=noisy_blur) -> torch.Tensor:
-    if generator is not None: mask = augment_fn(mask, generator)
-    return downsample(mask, out_h, out_w)
+def process_image(mask: torch.Tensor, out_h: int, out_w: int, augment: bool = True, generator: torch.Generator | None = None, augment_fn=noisy_blur) -> torch.Tensor:
+    mask = downsample(mask, out_h, out_w)
+    # apply augmentation after downsampling so augmentations don't get washed out
+    if augment: mask = augment_fn(mask, generator)
+    return mask
 
 #***** 2 process vibration *****
 
-def extract_signal(x: torch.Tensor, signal_mode: str) -> torch.Tensor:
-    if signal_mode == "magnitude": return x.abs()
+def extract_signal(re: torch.Tensor, im: torch.Tensor, signal_mode: str) -> torch.Tensor:
+    # re, im: separate contiguous tensors (not a (...,2) view) -- slicing re/im off a shared last
+    # axis leaves them non-contiguous, which makes hypot/complex ops much slower.
+    if signal_mode == "magnitude": return torch.hypot(re, im)
+    x = torch.complex(re, im)
     if signal_mode == "complex": return torch.cat([x.real, x.imag], dim=-1)
     if signal_mode == "mag_phase": return torch.cat([x.abs(), x.angle()], dim=-1)
     raise ValueError(f"Unknown signal mode: {signal_mode}")
@@ -181,25 +188,34 @@ def random_frequency_gain(freqs: torch.Tensor, generator: torch.Generator, n_con
     lo, hi = gain_range
     return gain * (hi - lo) + lo
 
-def augment_vibration(fft: torch.Tensor, freqs: torch.Tensor, generator: torch.Generator, n_control: int = 5, gain_range: tuple = (0.8, 1.2)) -> torch.Tensor:
+def augment_vibration(re: torch.Tensor, im: torch.Tensor, freqs: torch.Tensor, generator: torch.Generator, n_control: int = 5, gain_range: tuple = (0.8, 1.2)) -> tuple[torch.Tensor, torch.Tensor]:
+    # re, im: (B,L,F,C) contiguous. gain is real+positive, so scaling re and im separately is
+    # equivalent to (complex fft) * gain -- no need to build a complex tensor to apply it.
     gain = random_frequency_gain(freqs, generator, n_control, gain_range)
-    return fft * gain[None, None, :, None]
+    gain = gain[None, None, :, None]
+    return re * gain, im * gain
 
-def process_vibration(fft: torch.Tensor, freqs: torch.Tensor, signal_mode: str, normalize_mode: str, patch_size: int, generator: torch.Generator | None = None, gain_kwargs: dict | None = None) -> torch.Tensor:
-    """fft: (B,L,F,C) complex, on the target device. Returns tokenized (B,L,P,patch_size,C)
-    float32. generator=None skips frequency augmentation (offline baseline / eval)."""
-    if generator is not None: fft = augment_vibration(fft, freqs, generator, **(gain_kwargs or {}))
-    x = extract_signal(fft, signal_mode).float()
+def process_vibration(fft: torch.Tensor, freqs: torch.Tensor, signal_mode: str, normalize_mode: str, patch_size: int, augment: bool = True, generator: torch.Generator | None = None, gain_kwargs: dict | None = None) -> torch.Tensor:
+    """fft: (B,L,F,C,2) real/imag, on the target device. Returns tokenized (B,L,P,patch_size,C') float32."""
+    re, im = fft[..., 0].contiguous(), fft[..., 1].contiguous()
+    if augment: re, im = augment_vibration(re, im, freqs, generator, **(gain_kwargs or {}))
+    x = extract_signal(re, im, signal_mode).float()
     x = normalize_fft(x, normalize_mode)
     return tokenize(x, patch_size)
 
 #***** 3 process batch *****
 
-def process_batch(batch: dict, device: str, signal_mode: str, normalize_mode: str, patch_size: int, out_h: int, out_w: int, freqs: torch.Tensor, generator: torch.Generator | None = None):
-    # generator=None means no augmentations
-    fft_processed = process_vibration(batch["fft"].to(device), freqs, signal_mode, normalize_mode, patch_size, generator=generator)
-    mask_processed = process_image(batch["mask_true"].to(device), out_h, out_w, generator=generator)
+def process_batch(batch: dict, device: str, signal_mode: str, normalize_mode: str, patch_size: int, out_h: int, out_w: int, freqs: torch.Tensor, generator: torch.Generator | None = None, augment_fft: bool = True, augment_mask: bool = True):
+    fft_processed = process_vibration(batch["fft"].to(device), freqs, signal_mode, normalize_mode, patch_size, augment=augment_fft, generator=generator)
+    mask_processed = process_image(batch["mask_true"].to(device), out_h, out_w, augment=augment_mask, generator=generator)
     return dict(fft=fft_processed, mask_true=mask_processed, info=batch["info"])
+
+def collate_and_process(samples: list[dict], process_batch_fn) -> dict:
+    # default-collate then augment here in the DataLoader worker process, so it overlaps with the main process
+    fft = torch.stack([s["fft"] for s in samples])
+    mask_true = torch.stack([s["mask_true"] for s in samples])
+    info = {k: [s["info"][k] for s in samples] for k in samples[0]["info"]}
+    return process_batch_fn(dict(fft=fft, mask_true=mask_true, info=info))
 
 #***** 4 dataset *****
 
@@ -220,7 +236,7 @@ class VibrationDataset(StreamingDataset):
         X, y = s.pop("X"), s.pop("y")  # X: (L,F,C,2) real/imag fft, y: (H,W) raw mask
         info = dict(sample_id=s["sample_id"], output_id=s["output_id"], n_objects=s["n_objects"], speaker=s["speaker"], box=s["box"], is_empty_box=s["is_empty_box"], x_com=s["downsampled_com_x"], y_com=s["downsampled_com_y"])
         X_t, y_t = torch.from_numpy(X.copy()), torch.from_numpy(y.copy())
-        return dict(fft=X_t[..., 0] + 1j * X_t[..., 1], mask_true=y_t, info=info)
+        return dict(fft=X_t, mask_true=y_t, info=info)  # keep fft as real/imag (last dim 2), avoid building a complex tensor until needed
 
 #***** 5 split *****
 
@@ -330,18 +346,21 @@ SPLIT_METHODS = {"exp25": exp25_split}
 
 def num_samples(batch): return batch["mask_true"].shape[0]
 
-def loader(dataset, idxs, bs, num_workers, generator, shuffle=False, drop_last=False):
-    dl = DataLoader(Subset(dataset, idxs), batch_size=bs, shuffle=shuffle, num_workers=num_workers, generator=generator, pin_memory=True, persistent_workers=num_workers > 0, prefetch_factor=4 if num_workers > 0 else None, drop_last=drop_last)
+def loader(dataset, idxs, bs, num_workers, generator, process_batch_fn, shuffle=False, drop_last=False):
+    collate_fn = partial(collate_and_process, process_batch_fn=process_batch_fn)
+    dl = DataLoader(Subset(dataset, idxs), batch_size=bs, shuffle=shuffle, num_workers=num_workers, generator=generator, pin_memory=True,
+                    persistent_workers=num_workers > 0, prefetch_factor=4 if num_workers > 0 else None, drop_last=drop_last, collate_fn=collate_fn)
     return DataSpec(dataloader=dl, get_num_samples_in_batch=num_samples)
 
 def build_dataset(data_dir: str | Path, split: str = "exp25", batch_size: int = 64, eval_batch_size: int = 64,
                    num_workers: int = 8, out_h: int = 20, out_w: int = 40, signal_mode: str = "magnitude",
                    normalize_mode: str = "std", patch_size: int = 256, seed: int = 42,
-                   device: str = "cpu", force_mds: bool = False,
+                   force_mds: bool = False, augment_fft: bool = True, augment_mask: bool = True,
                    verbose: int = 1, **split_kwargs):
 
     if split not in SPLIT_METHODS: raise ValueError(f"Unknown split {split!r}, expected one of {sorted(SPLIT_METHODS)}")
     data_dir = Path(data_dir)
+    if not data_dir.exists(): raise FileNotFoundError(f"{data_dir=} does not exist")
     mds_dir = data_dir / "mds"
     hash_path = mds_dir / "samples_hash.txt"
 
@@ -359,7 +378,13 @@ def build_dataset(data_dir: str | Path, split: str = "exp25", batch_size: int = 
     splits = SPLIT_METHODS[split](mds_dir, seed=seed, verbose=verbose, **split_kwargs)
 
     generator = torch.Generator().manual_seed(seed)
-    dataset = VibrationDataset(local=mds_dir, out_h=out_h, out_w=out_w, signal_mode=signal_mode, normalize_mode=normalize_mode, patch_size=patch_size, seed=seed, device=device)
-    train_loader = loader(dataset, splits["train"], batch_size, num_workers, generator, shuffle=True, drop_last=True)
-    eval_loaders = [Evaluator(label=label, dataloader=loader(dataset, idxs, eval_batch_size, num_workers, generator)) for label, idxs in splits.items() if label != "train"]
-    return train_loader, eval_loaders, dataset
+    # device=cpu b/c augmentation runs in DataLoader workers via collate_fn, which are forked subprocesses that can't touch CUDA
+    dataset = VibrationDataset(local=mds_dir, out_h=out_h, out_w=out_w, signal_mode=signal_mode, normalize_mode=normalize_mode, patch_size=patch_size, seed=seed, device="cpu")
+    process_kwargs = dict(device="cpu", signal_mode=signal_mode, normalize_mode=normalize_mode, patch_size=patch_size, out_h=out_h, out_w=out_w, freqs=dataset.freqs, generator=dataset.generator)
+    train_transform = partial(process_batch, **process_kwargs, augment_fft=augment_fft, augment_mask=augment_mask)
+    eval_transform = partial(process_batch, **process_kwargs, augment_fft=False, augment_mask=False)
+
+    train_loader = loader(dataset, splits["train"], batch_size, num_workers, generator, train_transform, shuffle=True, drop_last=True)
+    train_eval_loader = loader(dataset, splits["train"], eval_batch_size, num_workers, generator, eval_transform)
+    eval_loaders = [Evaluator(label=label, dataloader=loader(dataset, idxs, eval_batch_size, num_workers, generator, eval_transform)) for label, idxs in splits.items() if label != "train"]
+    return train_loader, eval_loaders, train_eval_loader, dataset

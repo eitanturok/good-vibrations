@@ -1,14 +1,8 @@
 
-import bz2, contextlib, functools, logging, os, sys, threading, time, json, shutil
+import contextlib, gc, logging, sys, threading, time, shutil, psutil
 from pathlib import Path
-from datetime import datetime, timezone
 
-import numpy as np
-import psutil
-import matplotlib.pyplot as plt
-from PIL import Image
-from IPython.display import Audio
-from scipy.io.wavfile import write as wav_write, read as wav_read
+import torch
 
 
 #***** logging *****
@@ -73,3 +67,25 @@ def dir_size(path:Path, follow_symlinks:bool=False) -> int:
     if follow_symlinks:
         return sum(p.stat().st_size for p in path.rglob("*") if p.is_file())
     return sum(p.lstat().st_size for p in path.rglob("*") if p.is_file() or p.is_symlink())
+
+def log_mem(tag):
+    import os, psutil
+    proc = psutil.Process(os.getpid())
+    rss_gb = proc.memory_info().rss / 1e9
+    if torch.cuda.is_available():
+        vram_alloc = torch.cuda.memory_allocated() / 1e9
+        vram_res   = torch.cuda.memory_reserved()  / 1e9
+        print(f'[mem] {tag}: RSS={rss_gb:.2f} GB  VRAM alloc={vram_alloc:.2f} GB  reserved={vram_res:.2f} GB')
+    else:
+        print(f'[mem] {tag}: RSS={rss_gb:.2f} GB')
+
+def cleanup(trainer, *others):
+    log_mem('before close')
+    trainer.close()
+    trainer.state.model.cpu()
+    trainer.state.outputs = None
+    trainer.state.batch   = None
+    del trainer, others
+    gc.collect()
+    if torch.cuda.is_available(): torch.cuda.empty_cache()
+    log_mem('after close')

@@ -62,7 +62,6 @@ class OutputSaver(Callback):
         # during training land on the real epoch (ep0050, ep0100, ...) instead of ep0000
         epoch = state.timestamp.get(self.save_interval.unit).value
         if self.force_save or epoch % self.save_interval.value == 0:
-            # state.output['fft'] is not saved because we've already saved it elsewhere
             outputs = dict(mask_pred=_to_cpu(state.outputs['mask_pred']), mask_logits=_to_cpu(state.outputs['mask_logits']),
                            fft=_to_cpu(state.batch['fft']), mask_true=_to_cpu(state.batch['mask_true']), info=state.batch['info'])
 
