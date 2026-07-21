@@ -62,8 +62,12 @@ class videoPlayer():
                 frame_show = self.correct_gamma_show(frame_show)
                 
                 color = (255,255,255) if frame_show.dtype=='uint8' else (1,1,1)
+                bg_color = (0,0,0) if frame_show.dtype=='uint8' else (0,0,0)
                 if show_frame_number:
-                    cv2.putText(frame_show,'frame {}'.format(self.data_counter),
+                    label = 'frame {}'.format(self.data_counter)
+                    (text_w,text_h), baseline = cv2.getTextSize(label, FONT, 0.75, 2)
+                    cv2.rectangle(frame_show,(5,20-text_h-baseline),(15+text_w,25+baseline),bg_color,-1)
+                    cv2.putText(frame_show,label,
                             (10,20), FONT, 0.75,color,2,cv2.LINE_AA)
                 
                 cv2.imshow("frame",frame_show)

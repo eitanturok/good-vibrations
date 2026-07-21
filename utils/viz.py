@@ -1,6 +1,7 @@
 
 from pathlib import Path
 
+import cv2
 import numpy as np
 import matplotlib.pyplot as plt
 from IPython.display import Audio, display
@@ -146,6 +147,7 @@ def _stretch_contrast(image,minmax=None):
     return stretched
 
 def preview_vibration_video(frame_recording):
+    # to scroll through the frames of the vidoe, hold down the / button, next ti the right shift key
     import cv2, sys, importlib.util, pathlib
     _repo_root = str(pathlib.Path(__file__).parent.parent)
     if _repo_root not in sys.path:
@@ -188,7 +190,9 @@ def preview_box_coverage(box_coverage, sample_dir):
     _draw_box_coverage(ax, box_coverage, sample_dir)
     plt.show()
 
-def preview_audio(samples, sample_rate): return Audio(samples, rate=sample_rate)
+def preview_audio(samples, sample_rate):
+    if isinstance(samples, (str, Path)): return Audio(filename=str(samples), rate=sample_rate)
+    return Audio(samples, rate=sample_rate)
 
 def _draw_overhead_full(ax, result:dict, image, objects:list[str]|None=None, alpha:float=0.3):
     """Overhead image with masks + boxes + confidence labels (plot_smask) drawn onto `ax`."""
