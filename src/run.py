@@ -204,11 +204,10 @@ def run(**kwargs):
     profiler = None
     if not args.eval_only and args.debug > 0:
         profiler = Profiler(
-            trace_handlers=[JSONTraceHandler(folder=f"runs/{{run_name}}/composer_profiler", merged_trace_filename=f"runs/{{run_name}}/merged_trace_node{{node_rank}}.json",
-                                            overwrite=True)],
-            schedule=cyclic_schedule(wait=0, warmup=0, active=1, repeat=1),
+            trace_handlers=[JSONTraceHandler(folder=f"runs/{{run_name}}/composer_profiler", merged_trace_filename=f"runs/{{run_name}}/merged_trace_node{{node_rank}}.json", overwrite=True)],
+            schedule=cyclic_schedule(wait=1, warmup=1, active=3, repeat=1),
             torch_prof_folder=f"runs/{{run_name}}/torch_profiler", torch_prof_remote_file_name=f"runs/{{run_name}}/torch_profiler",
-            torch_prof_overwrite=True, torch_prof_memory_filename=None,
+            torch_prof_overwrite=True, torch_prof_memory_filename=None, torch_prof_with_stack=True,
             )
 
     # callbacks
