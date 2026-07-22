@@ -95,7 +95,7 @@ def convert_to_mds(mds_dir: Path, samples: list[tuple[Path, dict]], out_h: int, 
                 com = meta.get("downsampled_com", [-1.0, -1.0])
                 sample = {
                     "X": X, "y": y,
-                    "sample_id": int(meta["sample_id"]), "output_id": str(meta.get("output_id", "")),
+                    "sample_id": int(meta.get("sample_id", -1)), "output_id": int(meta.get("output_id", -1)),
                     "n_objects": int(meta.get("n_objects", -1)),
                     "speaker": int(meta.get("speaker", -1)),
                     "box": str(meta.get("box", "")),
@@ -223,6 +223,11 @@ def process_vibration(fft: torch.Tensor, freqs: torch.Tensor, signal_mode: str, 
 #***** 3 process batch *****
 
 def process_batch(batch: dict, device: str, signal_mode: str, normalize_mode: str, patch_size: int, out_h: int, out_w: int, freqs: torch.Tensor, generator: torch.Generator | None = None, augment_fft: bool = True, augment_mask: bool = True):
+    fft_processed = process_vibration(batch["fft"].to(device), freqs, signal_mode, normalize_mode, patch_size, augment=augment_fft, generator=generator)
+    mask_processed = process_image(batch["mask_true"].to(device), out_h, out_w, augment=augment_mask, generator=generator)
+    return dict(fft=fft_processed, mask_true=mask_processed, info=batch["info"])
+
+def _process_batch_impl(batch, device, signal_mode, normalize_mode, patch_size, out_h, out_w, freqs, generator, augment_fft, augment_mask):
     fft_processed = process_vibration(batch["fft"].to(device), freqs, signal_mode, normalize_mode, patch_size, augment=augment_fft, generator=generator)
     mask_processed = process_image(batch["mask_true"].to(device), out_h, out_w, augment=augment_mask, generator=generator)
     return dict(fft=fft_processed, mask_true=mask_processed, info=batch["info"])
@@ -388,7 +393,7 @@ def build_dataset(data_dir: str | Path, split: str = "exp25", batch_size: int = 
             if not force_mds: raise ValueError(f"{mds_dir=} already exists and {force_mds=}")
             shutil.rmtree(mds_dir)
             if verbose: print(f"Overwriting {mds_dir=}")
-        
+
         # downsample and convert to mds
         downsample_samples(samples, out_h, out_w, verbose=verbose)
         convert_to_mds(mds_dir, samples, out_h, out_w, verbose=verbose)
