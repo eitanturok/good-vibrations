@@ -23,8 +23,8 @@ experiment_dir/
             01_cropped.png
             02_smask.png
             02_smask.npy
-            03_overhead_masked.png     (mask overlay + avg COM crosshair, no boxes/confidence)
-            04_overhead_scored.png     (mask + boxes + confidence labels)
+            03_overhead_masked.png
+            04_overhead_scored.png
             samples.jsonl
             smasks/
                 cube1.png
@@ -108,7 +108,7 @@ dataset_dir/
                 times.jsonl
                 X.npy
                 Y.npy
-        mds/ 			
+        mds/
             metadata.jsonl
             index.jsonl
             shards_00.jsonl
