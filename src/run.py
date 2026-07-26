@@ -78,8 +78,8 @@ def get_parser():
 
     parser.add_argument("--signal-mode",                type=str,   default="magnitude", choices=["magnitude", "complex", "mag_phase"])
     parser.add_argument("--normalize-mode",             type=str,   default="std")
-    parser.add_argument("--mask-augmentation",          type=int,   default=1, choices=(0, 1), help="Mask augmentation (blur+noise).")
-    parser.add_argument("--fft-augmentation",           type=int,   default=1, choices=(0, 1), help="FFT frequency-gain augmentation.")
+    parser.add_argument("--augment-mask",               type=int,   default=1, choices=(0, 1), help="Mask augmentation (blur+noise).")
+    parser.add_argument("--augment-fft",                type=int,   default=1, choices=(0, 1), help="FFT frequency-gain augmentation.")
 
     # filter data
     parser.add_argument("--n-samples",                  type=int,   default=None)
@@ -180,11 +180,11 @@ def run(**kwargs):
     if args.compile and args.verbose >= 2: torch._logging.set_logs(dynamo=logging.INFO)
 
     # dataset
-    train_loader, eval_loaders, train_eval_loader, dataset = build_dataset(
+    train_loader, eval_loaders, train_eval_loader = build_dataset(
         args.mds_dir, batch_size=args.batch_size, eval_batch_size=args.eval_batch_size, num_workers=args.num_workers,
         split=args.split, test_size=args.test_size, speakers=args.speakers, n_objects=args.n_objects, box=args.box, n_samples=args.n_samples,
         out_h=args.out_h, out_w=args.out_w, signal_mode=args.signal_mode, normalize_mode=args.normalize_mode, patch_size=args.patch_size, seed=args.seed,
-        augment_fft=bool(args.fft_augmentation), augment_mask=bool(args.mask_augmentation))
+        augment_fft=bool(args.augment_fft), augment_mask=bool(args.augment_mask))
     boundary_loaders = eval_loaders + [Evaluator(label='train', dataloader=train_eval_loader)]
 
     # model

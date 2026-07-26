@@ -11,16 +11,24 @@ from torch.utils.data import Subset, DataLoader
 from sklearn.model_selection import train_test_split
 from composer.core import Evaluator, DataSpec
 from streaming import StreamingDataset, MDSWriter
+from streaming.base.format.mds.encodings import _encodings
+
+# patch streaming to support complex ndarray
+_NDArray = _encodings["ndarray"]
+_NDArray._int2value_dtype |= {100: "complex64", 101: "complex128"}
+_NDArray._value_dtype2int |= {"complex64": 100, "complex128": 101}
 
 
 #***** 0 collect samples *****
 
 REQUIRED_FILES = ["image/02_smask.png", "vibration/03_fft.npz", "metadata.jsonl"]
 
-MDS_COLUMNS = {"X": "ndarray:float32", "y": "ndarray:float32",
-               "sample_id": "int", "output_id": "str",
-               "n_objects": "int", "speaker": "int", "box": "str", "is_empty_box": "int", "object": "str",
-               "downsampled_com_x": "float64", "downsampled_com_y": "float64"}
+def mds_columns(augment_fft: bool) -> dict[str, str]:
+    x_dtype = "complex64" if augment_fft else "float32"  # raw fft is complex; precomputed signal is real
+    return {"X": f"ndarray:{x_dtype}", "y": "ndarray:float32",
+            "sample_id": "int", "output_id": "int",
+            "n_objects": "int", "speaker": "int", "box": "str", "is_empty_box": "int", "object": "str",
+            "downsampled_com_x": "float64", "downsampled_com_y": "float64"}
 
 def collect_samples(base_sample_dir: Path, verbose: int = 1) -> list[tuple[Path, dict]]:
     samples, missing_by_file = [], {f: [] for f in REQUIRED_FILES}
@@ -40,9 +48,11 @@ def collect_samples(base_sample_dir: Path, verbose: int = 1) -> list[tuple[Path,
             if ids: print(f"missing {f!r}: {ids}")
     return samples
 
-def hash_samples(samples: list[tuple[Path, dict]], out_h: int | None = None, out_w: int | None = None) -> str:
+def hash_samples(samples: list[tuple[Path, dict]], out_h: int | None = None, out_w: int | None = None,
+                  augment_fft: bool = True, signal_mode: str = "magnitude", normalize_mode: str = "std", patch_size: int = 256) -> str:
     h = hashlib.sha256()
     if out_h is not None: h.update(f"{out_h}x{out_w}".encode())  # resolution is baked into y, so it must invalidate the cache too
+    if not augment_fft: h.update(f"{augment_fft}{signal_mode}{normalize_mode}{patch_size}".encode())  # baked into X when not augmenting, so it must invalidate the cache too
     for sample_dir, meta in sorted(samples, key=lambda s: s[0].name):
         h.update(sample_dir.name.encode())
         h.update(json.dumps(meta, sort_keys=True).encode())
@@ -58,20 +68,35 @@ def downsample_mask(mask: Image.Image, out_h: int, out_w: int) -> Image.Image:
 
 def downsample_samples(samples: list[tuple[Path, dict]], out_h: int, out_w: int, verbose: int = 1) -> None:
     """Downsample every sample's full-resolution mask to (out_h, out_w). Only called when
-    build_dataset's hash_samples check says the MDS is stale, so no per-sample cache check here."""
+    build_dataset's hashed mds_dir doesn't already exist, so no per-sample cache check here."""
     for sample_dir, _ in tqdm(samples, desc="downsampling masks", disable=not verbose):
         out_path = sample_dir / f"image/05_downsampled_smask_{out_h}h_{out_w}w"
         mask = downsample_mask(Image.open(sample_dir / "image/02_smask.png"), out_h, out_w)
         mask.save(out_path.with_suffix(".png"))
         np.save(out_path.with_suffix(".npy"), np.array(mask, dtype=np.float32) / 255.0)
 
+def precompute_vibration_samples(samples: list[tuple[Path, dict]], signal_mode: str, normalize_mode: str, patch_size: int, verbose: int = 1) -> None:
+    freqs = torch.from_numpy(np.load(samples[0][0] / "vibration/03_fft.npz")["freqs"])
+    for sample_dir, _ in tqdm(samples, desc="precomputing fft", disable=not verbose):
+        X = np.load(sample_dir / "vibration/03_fft.npz")["fft"]  # (1, L, F, C) complex64
+        X = np.squeeze(X, axis=0) if X.ndim == 4 and X.shape[0] == 1 else X
+        X = torch.from_numpy(X).unsqueeze(0)
+        X = process_vibration(X, freqs, signal_mode, normalize_mode, patch_size, augment=False).squeeze(0).numpy()
+        out_path = sample_dir / f"vibration/04_precomputed_fft_{signal_mode}_{normalize_mode}_{patch_size}.npy"
+        np.save(out_path, X)
+
 #***** 2 convert to mds *****
 
-def convert_to_mds(mds_dir: Path, samples: list[tuple[Path, dict]], out_h: int, out_w: int, verbose: int = 1) -> Path:
+def convert_to_mds(mds_dir: Path, samples: list[tuple[Path, dict]], out_h: int, out_w: int, verbose: int = 1,
+                    augment_fft: bool = True, signal_mode: str = "magnitude", normalize_mode: str = "std", patch_size: int = 256) -> Path:
 
-    first_fft = np.load(samples[0][0] / "vibration/03_fft.npz")["fft"]  # (1, L, F, C) complex
-    n_lasers, n_freqs = first_fft.shape[1], first_fft.shape[2]
-    x_shape, y_shape = (n_lasers, n_freqs, 2, 2), (out_h, out_w)  # X: (L,F,C,2) real/imag fft; y: downsampled (out_h,out_w) mask
+    def load_X(sample_dir: Path) -> np.ndarray:
+        if not augment_fft:
+            return np.load(sample_dir / f"vibration/04_precomputed_fft_{signal_mode}_{normalize_mode}_{patch_size}.npy")
+        X = np.load(sample_dir / "vibration/03_fft.npz")["fft"]  # (1, L, F, C) complex64
+        return np.squeeze(X, axis=0) if X.ndim == 4 and X.shape[0] == 1 else X
+
+    x_shape, y_shape = load_X(samples[0][0]).shape, (out_h, out_w)  # y: downsampled (out_h,out_w) mask
 
     samples = [(sample_dir.resolve(), meta) for sample_dir, meta in samples]
     index_rows = []
@@ -80,13 +105,9 @@ def convert_to_mds(mds_dir: Path, samples: list[tuple[Path, dict]], out_h: int, 
     os.chdir(mds_dir.parent)
 
     try:
-        with MDSWriter(out=mds_dir.name, columns=MDS_COLUMNS, exist_ok=False, size_limit="200MB") as writer:
+        with MDSWriter(out=mds_dir.name, columns=mds_columns(augment_fft), exist_ok=False, size_limit="200MB") as writer:
             for sample_dir, meta in tqdm(samples, desc="writing MDS", disable=not verbose):
-                fft_npz = np.load(sample_dir / "vibration/03_fft.npz")
-
-                X = fft_npz["fft"]                                          # (1, L, F, C) complex64
-                X = np.squeeze(X, axis=0) if X.ndim == 4 and X.shape[0] == 1 else X  # -> (L,F,C)
-                X = np.stack([X.real, X.imag], axis=-1).astype(np.float32)  # complex -> (L,F,C,2) real/imag
+                X = load_X(sample_dir)
                 assert X.shape == x_shape, f"{sample_dir.name}: X.shape={X.shape} != {x_shape}"
 
                 y = np.load(sample_dir / f"image/05_downsampled_smask_{out_h}h_{out_w}w.npy")  # precomputed by downsample_samples
@@ -115,7 +136,6 @@ def convert_to_mds(mds_dir: Path, samples: list[tuple[Path, dict]], out_h: int, 
     # save metadata as a sidecar for loader-side filtering
     lines = "\n".join(json.dumps(r) for r in index_rows)
     (mds_dir / "metadata.jsonl").write_text(lines)
-    (mds_dir / "hash.txt").write_text(hash_samples(samples, out_h, out_w))
     if verbose: print(f"Wrote {len(samples)} samples to {mds_dir=}")
     return mds_dir
 
@@ -131,7 +151,7 @@ def _gaussian_kernel1d_radius1(sigma: torch.Tensor) -> torch.Tensor:
 def gaussian_blur(mask: torch.Tensor, sigma: float, generator:torch.Generator) -> torch.Tensor:
     # mask: (B,H,W). Separable 3x3 blur via two 1D convs, replicate-padded (matches scipy's mode='nearest', i.e. edge replication).
     sigma_t = torch.as_tensor(sigma, dtype=torch.float32, device="cpu")
-    sampled_sigma = torch.normal(sigma_t, sigma_t, generator=generator).clamp_min(1e-3).to(mask.device, mask.dtype)
+    sampled_sigma = torch.normal(sigma_t, 0.3, generator=generator).clamp_min(1e-3).to(mask.device, mask.dtype)
     k = _gaussian_kernel1d_radius1(sampled_sigma)
     x = mask.unsqueeze(1)  # (B,1,H,W)
     x = F.pad(x, (0, 0, 1, 1), mode='replicate')
@@ -157,11 +177,8 @@ def process_image(mask: torch.Tensor, out_h: int, out_w: int, augment: bool = Tr
 
 #***** 4 process vibration *****
 
-def extract_signal(re: torch.Tensor, im: torch.Tensor, signal_mode: str) -> torch.Tensor:
-    # re, im: separate contiguous tensors (not a (...,2) view) -- slicing re/im off a shared last
-    # axis leaves them non-contiguous, which makes hypot/complex ops much slower.
-    if signal_mode == "magnitude": return torch.hypot(re, im)
-    x = torch.complex(re, im)
+def extract_signal(x: torch.Tensor, signal_mode: str) -> torch.Tensor:
+    if signal_mode == "magnitude": return x.abs()
     if signal_mode == "complex": return torch.cat([x.real, x.imag], dim=-1)
     if signal_mode == "mag_phase": return torch.cat([x.abs(), x.angle()], dim=-1)
     raise ValueError(f"Unknown signal mode: {signal_mode}")
@@ -205,30 +222,21 @@ def random_frequency_gain(freqs: torch.Tensor, generator: torch.Generator, n_con
     lo, hi = gain_range
     return gain * (hi - lo) + lo
 
-def augment_vibration(re: torch.Tensor, im: torch.Tensor, freqs: torch.Tensor, generator: torch.Generator, n_control: int = 5, gain_range: tuple = (0.8, 1.2)) -> tuple[torch.Tensor, torch.Tensor]:
-    # re, im: (B,L,F,C) contiguous. gain is real+positive, so scaling re and im separately is
-    # equivalent to (complex fft) * gain -- no need to build a complex tensor to apply it.
+def augment_vibration(x: torch.Tensor, freqs: torch.Tensor, generator: torch.Generator, n_control: int = 5, gain_range: tuple = (0.8, 1.2)) -> torch.Tensor:
     gain = random_frequency_gain(freqs, generator, n_control, gain_range)
     gain = gain[None, None, :, None]
-    return re * gain, im * gain
+    return x * gain
 
 def process_vibration(fft: torch.Tensor, freqs: torch.Tensor, signal_mode: str, normalize_mode: str, patch_size: int, augment: bool = True, generator: torch.Generator | None = None, gain_kwargs: dict | None = None) -> torch.Tensor:
-    """fft: (B,L,F,C,2) real/imag, on the target device. Returns tokenized (B,L,P,patch_size,C') float32."""
-    re, im = fft[..., 0].contiguous(), fft[..., 1].contiguous()
-    if augment: re, im = augment_vibration(re, im, freqs, generator, **(gain_kwargs or {}))
-    x = extract_signal(re, im, signal_mode).float()
+    if augment: fft = augment_vibration(fft, freqs, generator, **(gain_kwargs or {}))
+    x = extract_signal(fft, signal_mode).float()
     x = normalize_fft(x, normalize_mode)
     return tokenize(x, patch_size)
 
 #***** 3 process batch *****
 
-def process_batch(batch: dict, device: str, signal_mode: str, normalize_mode: str, patch_size: int, out_h: int, out_w: int, freqs: torch.Tensor, generator: torch.Generator | None = None, augment_fft: bool = True, augment_mask: bool = True):
-    fft_processed = process_vibration(batch["fft"].to(device), freqs, signal_mode, normalize_mode, patch_size, augment=augment_fft, generator=generator)
-    mask_processed = process_image(batch["mask_true"].to(device), out_h, out_w, augment=augment_mask, generator=generator)
-    return dict(fft=fft_processed, mask_true=mask_processed, info=batch["info"])
-
-def _process_batch_impl(batch, device, signal_mode, normalize_mode, patch_size, out_h, out_w, freqs, generator, augment_fft, augment_mask):
-    fft_processed = process_vibration(batch["fft"].to(device), freqs, signal_mode, normalize_mode, patch_size, augment=augment_fft, generator=generator)
+def process_batch(batch: dict, device: str, signal_mode: str, normalize_mode: str, patch_size: int, out_h: int, out_w: int, freqs: torch.Tensor, generator: torch.Generator | None = None, augment_fft: bool = True, augment_mask: bool = True, mds_precomputed_fft: bool = False):
+    fft_processed = batch["fft"].to(device) if mds_precomputed_fft else process_vibration(batch["fft"].to(device), freqs, signal_mode, normalize_mode, patch_size, augment=augment_fft, generator=generator)
     mask_processed = process_image(batch["mask_true"].to(device), out_h, out_w, augment=augment_mask, generator=generator)
     return dict(fft=fft_processed, mask_true=mask_processed, info=batch["info"])
 
@@ -242,23 +250,18 @@ def collate_and_process(samples: list[dict], process_batch_fn) -> dict:
 #***** 5 define dataset *****
 
 class VibrationDataset(StreamingDataset):
-    def __init__(self, local: str | Path, shuffle: bool = False,
-                 out_h: int = 20, out_w: int = 40, signal_mode: str = "magnitude", normalize_mode: str = "std",
-                 patch_size: int = 256, seed: int = 42, device: str = "cpu", **kwargs):
+    def __init__(self, local: str | Path, shuffle: bool = False, seed: int = 42, **kwargs):
         super().__init__(local=str(local), shuffle=shuffle, batch_size=kwargs.pop("batch_size", None), **kwargs)
-        self.out_h, self.out_w = out_h, out_w
-        self.signal_mode, self.normalize_mode, self.patch_size = signal_mode, normalize_mode, patch_size
-        self.device = device
-        self.freqs = torch.from_numpy(np.load(Path(local) / "freqs.npy")).to(device)
-        self.generator = torch.Generator(device=device if device == "cpu" else "cpu")  # cuda generators can't cross process fork boundaries in workers; draw on cpu, move samples after
+        self.freqs = torch.from_numpy(np.load(Path(local) / "freqs.npy"))
+        self.generator = torch.Generator(device="cpu")  # cuda generators can't cross process fork boundaries in workers; draw on cpu, move samples after
         self.generator.manual_seed(seed)
 
     def __getitem__(self, idx):
         s = super().__getitem__(idx)
-        X, y = s.pop("X"), s.pop("y")  # X: (L,F,C,2) real/imag fft, y: (out_h,out_w) mask, already downsampled at MDS-build time
+        X, y = s.pop("X"), s.pop("y")
         info = dict(sample_id=s["sample_id"], output_id=s["output_id"], n_objects=s["n_objects"], speaker=s["speaker"], box=s["box"], is_empty_box=s["is_empty_box"], x_com=s["downsampled_com_x"], y_com=s["downsampled_com_y"])
         X_t, y_t = torch.from_numpy(X.copy()), torch.from_numpy(y.copy())
-        return dict(fft=X_t, mask_true=y_t, info=info)  # keep fft as real/imag (last dim 2), avoid building a complex tensor until needed
+        return dict(fft=X_t, mask_true=y_t, info=info)
 
 #***** 6 define split *****
 
@@ -383,33 +386,34 @@ def build_dataset(data_dir: str | Path, split: str = "exp25", batch_size: int = 
     if split not in SPLIT_METHODS: raise ValueError(f"Unknown split {split!r}, expected one of {sorted(SPLIT_METHODS)}")
     data_dir = Path(data_dir)
     if not data_dir.exists(): raise FileNotFoundError(f"{data_dir=} does not exist")
-    mds_dir = data_dir / "mds"
-    hash_path = mds_dir / "hash.txt"
 
     samples = collect_samples(data_dir / "samples", verbose)
-    stale = not hash_path.exists() or hash_path.read_text() != hash_samples(samples, out_h, out_w)
-    if force_mds or stale:
-        if hash_path.exists():
-            if not force_mds: raise ValueError(f"{mds_dir=} already exists and {force_mds=}")
-            shutil.rmtree(mds_dir)
-            if verbose: print(f"Overwriting {mds_dir=}")
+    mds_dir = data_dir / "mds" / hash_samples(samples, out_h, out_w, augment_fft, signal_mode, normalize_mode, patch_size)[:16]
+    done = mds_dir / "metadata.jsonl"  # last file convert_to_mds writes -- its presence means the build completed
 
-        # downsample and convert to mds
+    if force_mds and mds_dir.exists():
+        shutil.rmtree(mds_dir)
+        if verbose: print(f"Overwriting {mds_dir=}")
+
+    if not done.exists():
+        if mds_dir.exists(): shutil.rmtree(mds_dir)  # clear out a partial/crashed build
+        # downsample image, precompute fft, and convert to mds
         downsample_samples(samples, out_h, out_w, verbose=verbose)
-        convert_to_mds(mds_dir, samples, out_h, out_w, verbose=verbose)
+        if not augment_fft: precompute_vibration_samples(samples, signal_mode, normalize_mode, patch_size, verbose=verbose)
+        convert_to_mds(mds_dir, samples, out_h, out_w, verbose=verbose, augment_fft=augment_fft, signal_mode=signal_mode, normalize_mode=normalize_mode, patch_size=patch_size)
     elif verbose:
         print(f"Reusing existing MDS at {mds_dir}")
 
     splits = SPLIT_METHODS[split](mds_dir, seed=seed, verbose=verbose, **split_kwargs)
 
     generator = torch.Generator().manual_seed(seed)
-    # device=cpu b/c augmentation runs in DataLoader workers via collate_fn, which are forked subprocesses that can't touch CUDA
-    dataset = VibrationDataset(local=mds_dir, out_h=out_h, out_w=out_w, signal_mode=signal_mode, normalize_mode=normalize_mode, patch_size=patch_size, seed=seed, device="cpu")
-    process_kwargs = dict(device="cpu", signal_mode=signal_mode, normalize_mode=normalize_mode, patch_size=patch_size, out_h=out_h, out_w=out_w, freqs=dataset.freqs, generator=dataset.generator)
+    dataset = VibrationDataset(local=mds_dir, seed=seed)
+    process_kwargs = dict(device="cpu", signal_mode=signal_mode, normalize_mode=normalize_mode, patch_size=patch_size, out_h=out_h, out_w=out_w, freqs=dataset.freqs, generator=dataset.generator, mds_precomputed_fft=not augment_fft)
     train_transform = partial(process_batch, **process_kwargs, augment_fft=augment_fft, augment_mask=augment_mask)
     eval_transform = partial(process_batch, **process_kwargs, augment_fft=False, augment_mask=False)
 
     train_loader = loader(dataset, splits["train"], batch_size, num_workers, generator, train_transform, shuffle=True, drop_last=True)
     train_eval_loader = loader(dataset, splits["train"], eval_batch_size, num_workers, generator, eval_transform)
     eval_loaders = [Evaluator(label=label, dataloader=loader(dataset, idxs, eval_batch_size, num_workers, generator, eval_transform)) for label, idxs in splits.items() if label != "train"]
-    return train_loader, eval_loaders, train_eval_loader, dataset
+
+    return train_loader, eval_loaders, train_eval_loader
