@@ -128,11 +128,11 @@ def _gaussian_kernel1d_radius1(sigma: torch.Tensor) -> torch.Tensor:
     w = torch.exp(-0.5 * (x / sigma) ** 2)
     return w / w.sum()
 
-def gaussian_blur(mask: torch.Tensor, sigma: float) -> torch.Tensor:
-    # mask: (B,H,W). Separable 3x3 blur via two 1D convs, replicate-padded (matches scipy's
-    # mode='nearest', i.e. edge replication).
-    sigma_t = torch.as_tensor(sigma, dtype=mask.dtype, device=mask.device)
-    k = _gaussian_kernel1d_radius1(sigma_t)
+def gaussian_blur(mask: torch.Tensor, sigma: float, generator:torch.Generator) -> torch.Tensor:
+    # mask: (B,H,W). Separable 3x3 blur via two 1D convs, replicate-padded (matches scipy's mode='nearest', i.e. edge replication).
+    sigma_t = torch.as_tensor(sigma, dtype=torch.float32, device="cpu")
+    sampled_sigma = torch.normal(sigma_t, sigma_t, generator=generator).clamp_min(1e-3).to(mask.device, mask.dtype)
+    k = _gaussian_kernel1d_radius1(sampled_sigma)
     x = mask.unsqueeze(1)  # (B,1,H,W)
     x = F.pad(x, (0, 0, 1, 1), mode='replicate')
     x = F.conv2d(x, k.view(1, 1, 3, 1))
@@ -140,9 +140,9 @@ def gaussian_blur(mask: torch.Tensor, sigma: float) -> torch.Tensor:
     x = F.conv2d(x, k.view(1, 1, 1, 3))
     return x.squeeze(1)
 
-def noisy_blur(mask: torch.Tensor, generator: torch.Generator, sigma: float = 0.8, noise_std: float = 0.05) -> torch.Tensor:
+def noiys_blur(mask: torch.Tensor, generator: torch.Generator, sigma: float = 0.8, noise_std: float = 0.05) -> torch.Tensor:
     # Gaussian blur, then add noise back onto originally-nonzero pixels only. mask: (B,H,W).
-    blurred = gaussian_blur(mask, sigma)
+    blurred = gaussian_blur(mask, sigma, generator)
     noise = torch.normal(0.0, noise_std, size=mask.shape, generator=generator, device="cpu", dtype=torch.float32).to(mask.device, mask.dtype)
     out = blurred.clone()
     nonzero = mask != 0
