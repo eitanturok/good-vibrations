@@ -78,8 +78,8 @@ def get_parser():
 
     parser.add_argument("--signal-mode",                type=str,   default="magnitude", choices=["magnitude", "complex", "mag_phase"])
     parser.add_argument("--normalize-mode",             type=str,   default="std")
-    parser.add_argument("--no-mask-augmentation",       action="store_true", default=False, help="Disable mask augmentation (blur+noise).")
-    parser.add_argument("--no-fft-augmentation",        action="store_true", default=False, help="Disable FFT frequency-gain augmentation.")
+    parser.add_argument("--mask-augmentation",          type=int,   default=1, choices=(0, 1), help="Mask augmentation (blur+noise).")
+    parser.add_argument("--fft-augmentation",           type=int,   default=1, choices=(0, 1), help="FFT frequency-gain augmentation.")
 
     # filter data
     parser.add_argument("--n-samples",                  type=int,   default=None)
@@ -99,18 +99,18 @@ def get_parser():
     parser.add_argument("--seq-num-layers",             type=int,   default=2)
     parser.add_argument("--freq-dropout",               type=float, default=0.3)
     parser.add_argument("--laser-dropout",              type=float, default=0.3)
-    parser.add_argument("--no-compile",                 action="store_true", default=False, help="Disable torch.compile-ing the model before training/eval.")
+    parser.add_argument("--compile",                    type=int,   default=1, choices=(0, 1), help="torch.compile-ing the model before training/eval.")
     parser.add_argument("--compile-mode",               type=str,   default="default", help="torch.compile mode, e.g. 'default', 'reduce-overhead', 'max-autotune'.")
     # train
     parser.add_argument("--batch-size",                 type=int,   default=256)
     parser.add_argument("--lr",                         type=float, default=1e-4)
     parser.add_argument("--max-duration",               type=str,   default="6000ep")
     # eval
-    parser.add_argument("--eval-only",                  action="store_true", default=False, help="Skip training, just eval a loaded checkpoint (requires --checkpoint-path).")
+    parser.add_argument("--eval-only",                  type=int,   default=0, choices=(0, 1), help="Skip training, just eval a loaded checkpoint (requires --checkpoint-path).")
     parser.add_argument("--eval-batch-size",            type=int,   default=108) # wandb caps images logged in a single call to 108, so eval batch size should be <= 108 to log all images
     parser.add_argument("--eval-interval",              type=str,   default="50ep")
-    parser.add_argument("--no-eval-before-train",       action="store_true", default=False, help="Skip the boundary eval pass before training starts.")
-    parser.add_argument("--no-eval-after-train",        action="store_true", default=False, help="Skip the boundary eval pass after training ends.")
+    parser.add_argument("--eval-before-train",          type=int,   default=1, choices=(0, 1), help="Run the boundary eval pass before training starts.")
+    parser.add_argument("--eval-after-train",           type=int,   default=1, choices=(0, 1), help="Run the boundary eval pass after training ends.")
     parser.add_argument("--outputs-dir",                type=str,   default=None, help="Where to save eval .pt outputs. If not set, defaults to the run's outputs_history dir (same dir the training-time history callback writes to).")
     # run
     parser.add_argument("--run-name",                   type=str,   default=None)
@@ -177,14 +177,14 @@ def run(**kwargs):
     if torch.cuda.is_available():
         torch.set_float32_matmul_precision("high")
         torch.backends.cudnn.benchmark = True
-    if not args.no_compile and args.verbose >= 2: torch._logging.set_logs(dynamo=logging.INFO)
+    if args.compile and args.verbose >= 2: torch._logging.set_logs(dynamo=logging.INFO)
 
     # dataset
     train_loader, eval_loaders, train_eval_loader, dataset = build_dataset(
         args.mds_dir, batch_size=args.batch_size, eval_batch_size=args.eval_batch_size, num_workers=args.num_workers,
         split=args.split, test_size=args.test_size, speakers=args.speakers, n_objects=args.n_objects, box=args.box, n_samples=args.n_samples,
         out_h=args.out_h, out_w=args.out_w, signal_mode=args.signal_mode, normalize_mode=args.normalize_mode, patch_size=args.patch_size, seed=args.seed,
-        augment_fft=not args.no_fft_augmentation, augment_mask=not args.no_mask_augmentation)
+        augment_fft=bool(args.fft_augmentation), augment_mask=bool(args.mask_augmentation))
     boundary_loaders = eval_loaders + [Evaluator(label='train', dataloader=train_eval_loader)]
 
     # model
@@ -225,12 +225,12 @@ def run(**kwargs):
                     device=device, save_metrics=True, log_to_console=True, progress_bar=False, load_path=load_path,
                     autoresume=True if not args.eval_only and args.run_name else None, save_folder=f"runs/{{run_name}}/checkpoints" if not args.eval_only else None, save_interval=args.checkpoint_interval,
                     loggers=loggers, callbacks=callbacks, profiler=profiler,
-                    compile_config=None if args.no_compile else {"mode": args.compile_mode})
+                    compile_config={"mode": args.compile_mode} if args.compile else None)
 
-    if not args.no_eval_before_train: eval_boundary(trainer, boundary_loaders)  # eval before training starts
+    if args.eval_before_train: eval_boundary(trainer, boundary_loaders)  # eval before training starts
     if not args.eval_only:
         trainer.fit()
-        if not args.no_eval_after_train: eval_boundary(trainer, boundary_loaders)  # eval after training ends
+        if args.eval_after_train: eval_boundary(trainer, boundary_loaders)  # eval after training ends
     cleanup(trainer, boundary_loaders, eval_loaders, train_loader)
 
 @app.local_entrypoint()
