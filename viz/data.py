@@ -1,11 +1,14 @@
 """Data layer for the vibrations dashboard.
 
-Scans data/samples for metadata, reduces FFTs on demand, and extracts
-per-sample predictions + metrics from runs/<name>/outputs_history/*.pt files.
-All conventions follow what is actually on disk (notebook 46's naming),
-not the newer constants in src3.
+Reads sample metadata + X/y from an MDS dataset (datasets/<name>/mds), reduces
+FFTs on demand, and extracts per-sample predictions + metrics from
+runs/<name>/outputs_history/*.pt files.
+
+The dataset a run trained on isn't recorded in the run, so it's resolved by
+matching the run's sample_ids against each dataset's metadata sidecar.
 """
 import json
+import os
 import re
 import hashlib
 from functools import lru_cache
@@ -16,12 +19,16 @@ import numpy as np
 from utils.metrics import center_of_mass
 
 ROOT = Path(__file__).resolve().parent.parent
-SAMPLES_DIR = ROOT / "data" / "samples"
+DATASETS_DIR = ROOT / "datasets"
 RUNS_DIR = ROOT / "runs"
 CACHE_DIR = Path(__file__).resolve().parent / "cache"
 
-FFT_NAME = "inputs/03_fft_shifts.npz"
-THUMB_NAME = "outputs/01_resized_overhead.png"
+# Which dataset a run was trained on. Runs don't record this, so it's resolved by
+# matching the run's sample_ids against each dataset's metadata sidecar (see dataset_for_run).
+DEFAULT_DATASET = "016"
+
+# Raw capture dirs (overhead images + audio), which the MDS datasets don't carry.
+RAW_SAMPLE_ROOTS = [ROOT / "experiments" / "experiment-25" / "samples"]
 
 # description -> short layout label (there is no explicit layout field)
 LAYOUTS = [
@@ -45,22 +52,27 @@ def _audio_label(meta: dict) -> str:
     return "chirp_50_1000_3.0sec"
 
 
-def load_metadata(sample_dir: Path) -> dict:
-    meta = {}
-    for line in (sample_dir / "metadata.jsonl").read_text().splitlines():
-        if line.strip():
-            meta.update(json.loads(line))
-    return meta
+def _object_label(meta: dict) -> str:
+    """Object name(s) for a sample. Newer datasets store an `objects` dict ({name: count},
+    empty for an empty box); older ones stored a single `object` string. Support both."""
+    objs = meta.get("objects")
+    if isinstance(objs, dict):
+        return "+".join(sorted(objs)) if objs else "none"
+    return meta.get("object") or "none"
+
+
+@lru_cache(maxsize=8)
+def load_metadata(dataset: str) -> list[dict]:
+    """All per-sample metadata rows from a dataset's MDS sidecar, in shard order."""
+    path = DATASETS_DIR / dataset / "mds" / "metadata.jsonl"
+    return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
 
 
 # ***** manifest *****
 
-def build_manifest() -> dict:
-    samples, out_h, out_w = [], 18, 44
-    for d in sorted(SAMPLES_DIR.iterdir()):
-        if not (d / "metadata.jsonl").exists() or not (d / FFT_NAME).exists():
-            continue
-        m = load_metadata(d)
+def build_manifest(dataset: str = DEFAULT_DATASET) -> dict:
+    samples, out_h, out_w = [], 20, 40
+    for m in load_metadata(dataset):
         out_h, out_w = int(m["out_h"]), int(m["out_w"])
         com = m.get("downsampled_com", [-1.0, -1.0])  # (row, col)
         samples.append({
@@ -68,14 +80,14 @@ def build_manifest() -> dict:
             "output_id": m["output_id"],
             "speaker": int(m["speaker"]),
             "box": m["box"],
-            "object": m["object"] or "none",
-            "layout": _layout(m.get("description", "")),
+            "object": _object_label(m),
+            # newer datasets carry an explicit `layout`; older ones only implied it via description
+            "layout": m.get("layout") or _layout(m.get("description", "")),
             "n_objects": int(m["n_objects"]),
             "is_empty_box": bool(m["is_empty_box"]),
             "audio": _audio_label(m),
             "com_row": round(float(com[0]), 3),
             "com_col": round(float(com[1]), 3),
-            "sample_dir": str(d),
         })
     facets = {
         k: sorted({s[k] for s in samples}, key=str)
@@ -86,18 +98,35 @@ def build_manifest() -> dict:
         "out_w": out_w,
         "samples": samples,
         "facets": facets,
+        "dataset": dataset,
+        "datasets": list_datasets(),
         "runs": list_runs(),
-        "empty_box_groups": empty_box_groups(),
+        "empty_box_groups": empty_box_groups(dataset),
     }
 
 
-def empty_box_groups() -> list[dict]:
+def list_datasets() -> list[str]:
+    return sorted(d.name for d in DATASETS_DIR.iterdir() if (d / "mds" / "metadata.jsonl").exists())
+
+
+@lru_cache(maxsize=32)
+def dataset_for_run(run: str) -> str:
+    """Which dataset a run trained on: the smallest one whose sample_ids cover the run's.
+    Runs don't record this, so it's inferred; falls back to DEFAULT_DATASET on no match."""
+    z = extract_run(run)
+    run_ids = {int(s) for s in np.unique(z["sample_id"])}
+    matches = []
+    for name in list_datasets():
+        ids = {int(m["sample_id"]) for m in load_metadata(name)}
+        if run_ids <= ids:
+            matches.append((len(ids), name))
+    return min(matches)[1] if matches else DEFAULT_DATASET
+
+
+def empty_box_groups(dataset: str = DEFAULT_DATASET) -> list[dict]:
     """The distinct empty-box output_id groups (no object, no meaningful com)."""
     groups: dict[str, list[int]] = {}
-    for d in sorted(SAMPLES_DIR.iterdir()):
-        if not (d / "metadata.jsonl").exists() or not (d / FFT_NAME).exists():
-            continue
-        m = load_metadata(d)
+    for m in load_metadata(dataset):
         if m.get("is_empty_box"):
             groups.setdefault(m["output_id"], []).append(int(m["sample_id"]))
     return [{"output_id": oid, "sample_ids": sorted(ids)} for oid, ids in sorted(groups.items())]
@@ -114,8 +143,8 @@ def list_runs() -> list[str]:
 
 
 def data_version() -> str:
-    """Cheap change stamp: sample count + run names + outputs_history mtimes."""
-    parts = [str(sum(1 for _ in SAMPLES_DIR.iterdir()))]
+    """Cheap change stamp: dataset names + run names + outputs_history mtimes."""
+    parts = ["|".join(list_datasets())]
     for name in list_runs():
         out = RUNS_DIR / name / "outputs_history"
         parts.append(f"{name}:{max((p.stat().st_mtime for p in out.rglob('*.pt')), default=0):.0f}")
@@ -124,26 +153,55 @@ def data_version() -> str:
 
 # ***** fft *****
 
-@lru_cache(maxsize=64)
-def _magnitude(sample_id: int) -> tuple[np.ndarray, np.ndarray]:
-    """Returns (|fft| as float32 (100, F, 2), freqs (F,))."""
-    z = np.load(SAMPLES_DIR / f"{sample_id:06d}" / FFT_NAME)
-    return np.abs(z["fft"][0]).astype(np.float32), z["freqs"]
+@lru_cache(maxsize=4)
+def _mds(dataset: str):
+    """Read-only handle on a dataset's MDS shards, plus sample_id -> row index."""
+    from streaming.base.local import LocalDataset  # local import: heavy, only needed for fft/gt
+    ds = LocalDataset(str(DATASETS_DIR / dataset / "mds"))
+    index = {int(m["sample_id"]): i for i, m in enumerate(load_metadata(dataset))}
+    return ds, index
+
+
+@lru_cache(maxsize=8)
+def _freqs(dataset: str, n_freqs: int) -> np.ndarray:
+    """The frequency axis for a dataset's X. Newer datasets ship a freqs.npy sidecar; older
+    ones only record the [min_freq, max_freq] band the fft was cropped to, so rebuild it.
+    Tokenized X drops the tail freqs that don't fill a patch, hence n_freqs (not metadata's)."""
+    path = DATASETS_DIR / dataset / "mds" / "freqs.npy"
+    if path.exists():
+        return np.load(path)[:n_freqs]
+    m = load_metadata(dataset)[0]
+    return np.linspace(float(m["min_freq"]), float(m["max_freq"]), int(m["n_freqs"]))[:n_freqs]
 
 
 @lru_cache(maxsize=64)
-def _magnitude_normalized(sample_id: int) -> tuple[np.ndarray, np.ndarray]:
-    """Per-sample std-normalized |fft|: matches src3/post_process.py normalize_fft('std-sample'),
+def _magnitude(sample_id: int, dataset: str = DEFAULT_DATASET) -> tuple[np.ndarray, np.ndarray]:
+    """Returns (|fft| as float32 (n_lasers, F, 2), freqs (F,)).
+
+    X is stored either as the raw complex fft (n_lasers, F, C) or — when the dataset was built
+    with augment_fft=False — as a real, already-magnitude, patch-tokenized signal
+    (n_lasers, P, patch_size, C). Flatten the patch axes back to a plain frequency axis."""
+    ds, index = _mds(dataset)
+    X = ds[index[sample_id]]["X"]
+    if X.ndim == 4:  # (L, P, patch_size, C) -> (L, P*patch_size, C)
+        X = X.reshape(X.shape[0], -1, X.shape[-1])
+    return np.abs(X).astype(np.float32), _freqs(dataset, X.shape[1])
+
+
+@lru_cache(maxsize=64)
+def _magnitude_normalized(sample_id: int, dataset: str = DEFAULT_DATASET) -> tuple[np.ndarray, np.ndarray]:
+    """Per-sample std-normalized |fft|: matches src/model/dataset.py normalize_fft('std-sample'),
     computed over the whole (laser, freq, dir) tensor before any laser/dir subsetting, so the
     scale factor doesn't change as the user toggles which lasers/dirs are selected."""
-    mag, freqs = _magnitude(sample_id)
+    mag, freqs = _magnitude(sample_id, dataset)
     std = max(float(mag.astype(np.float64).std(ddof=1)), 1e-8)
     return (mag / std).astype(np.float32), freqs
 
 
-def fft_curve(sample_id: int, lasers: list[int] | None, dirs: str, norm: bool = False) -> tuple[np.ndarray, np.ndarray]:
+def fft_curve(sample_id: int, lasers: list[int] | None, dirs: str, norm: bool = False,
+              dataset: str = DEFAULT_DATASET) -> tuple[np.ndarray, np.ndarray]:
     """Mean |fft| over the given lasers (None = all 100) and dirs ('x'|'y'|'xy')."""
-    mag, freqs = _magnitude_normalized(sample_id) if norm else _magnitude(sample_id)
+    mag, freqs = _magnitude_normalized(sample_id, dataset) if norm else _magnitude(sample_id, dataset)
     if lasers is not None:
         mag = mag[lasers]
     d = {"x": [0], "y": [1], "xy": [0, 1]}[dirs]
@@ -174,7 +232,10 @@ def extract_run(run: str) -> dict:
         rel = p.relative_to(RUNS_DIR / run / "outputs_history")
         split = rel.parts[0] if rel.parts[0] != "eval" else rel.parts[1]
         epoch = int(re.match(r"ep(\d+)-ba(\d+)", p.stem).group(1))
-        d = torch.load(p, map_location="cpu", weights_only=False)
+        try:
+            d = torch.load(p, map_location="cpu", weights_only=False)
+        except (RuntimeError, EOFError):
+            continue  # partial/corrupt dump (e.g. a run still writing) — skip, don't kill the run
         pred = d["mask_pred"].float().numpy()
         true = d["mask_true"].float().numpy()
         h, w = pred.shape[-2:]
@@ -243,6 +304,20 @@ def run_masks(run: str, sample_ids: list[int], epoch: int | None = None) -> dict
     }
 
 
-def gt_mask(sample_id: int) -> list:
-    y = np.load(SAMPLES_DIR / f"{sample_id:06d}" / "y.npy")
+def raw_sample_dir(sample_id: int, dataset: str = DEFAULT_DATASET) -> Path | None:
+    """Local dir holding a sample's raw capture assets (overhead images, audio), or None.
+    The MDS dataset carries only X/y, and metadata's own `sample_dir` is the Windows path
+    from the recording rig, so these come from the local experiment tree instead.
+    $VIZ_RAW_SAMPLES overrides the default for datasets captured under a different experiment."""
+    roots = [os.environ["VIZ_RAW_SAMPLES"]] if os.environ.get("VIZ_RAW_SAMPLES") else RAW_SAMPLE_ROOTS
+    for root in roots:
+        d = Path(root) / f"{sample_id:06d}"
+        if d.is_dir():
+            return d
+    return None
+
+
+def gt_mask(sample_id: int, dataset: str = DEFAULT_DATASET) -> list:
+    ds, index = _mds(dataset)
+    y = ds[index[sample_id]]["y"]
     return np.round(y.astype(np.float64), 4).tolist()

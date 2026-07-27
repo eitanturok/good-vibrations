@@ -137,9 +137,13 @@ const emptyLayout = msg => LAYOUT({
 });
 
 // ===== boot =====
+// sample-scoped endpoints resolve their dataset from the loaded run; no run = server default
+const runQ = () => (S.runs[0] ? `&run=${encodeURIComponent(S.runs[0])}` : "");
+
 let _bootedOnce = false;
 async function boot() {
-  S.man = await jget("/api/manifest");
+  // the loaded run picks the dataset (samples/fft/gt must come from what it trained on)
+  S.man = await jget("/api/manifest" + (S.runs[0] ? `?run=${encodeURIComponent(S.runs[0])}` : ""));
   S.version = S.man.version;
   GROUPS = new Map();
   for (const s of S.man.samples) { if (!GROUPS.has(s.output_id)) GROUPS.set(s.output_id, []); GROUPS.get(s.output_id).push(s); }
@@ -547,7 +551,7 @@ async function fetchCurves(ids) {
   const missing = ids.filter(id => !S.fftCache.has(key + "|" + id));
   if (missing.length) {
     const lasers = S.lasers.size === 100 ? "all" : [...S.lasers].sort((a, b) => a - b).join(",");
-    const r = await jget(`/api/fft?ids=${missing.join(",")}&lasers=${lasers}&dirs=${S.dirs}&norm=${S.norm}`);
+    const r = await jget(`/api/fft?ids=${missing.join(",")}&lasers=${lasers}&dirs=${S.dirs}&norm=${S.norm}${runQ()}`);
     S.freqs = r.freqs;
     for (const [id, c] of Object.entries(r.curves)) S.fftCache.set(key + "|" + id, c);
   }
@@ -647,10 +651,27 @@ $("#run-add").onchange = e => { if (e.target.value) addRun(e.target.value); e.ta
 
 async function addRun(name, silent = false) {
   if (S.runs.includes(name)) return;
+  const isFirst = S.runs.length === 0;
   S.runs.push(name);
   if (!silent) renderRunChips();
   try {
     S.runData[name] = await jget(`/api/run/${name}`);
+    // the first run decides the dataset, so reload the manifest before mapping its sample ids
+    if (isFirst) {
+      const man = await jget(`/api/manifest?run=${encodeURIComponent(name)}`);
+      if (man.dataset !== S.man.dataset) {
+        S.man = man;
+        SAMPLE.clear();
+        for (const s of man.samples) SAMPLE.set(s.sample_id, s);
+        GROUPS = new Map();
+        for (const s of man.samples) { if (!GROUPS.has(s.output_id)) GROUPS.set(s.output_id, []); GROUPS.get(s.output_id).push(s); }
+        EMPTY_GROUPS = man.empty_box_groups || [];
+        S.fftCache.clear(); S.gtMasks = {};
+        for (const s of [...S.pool.keys()]) if (!SAMPLE.has(s)) S.pool.delete(s);
+        for (const f of Object.keys(man.facets)) S.filters[f] = new Set(man.facets[f]);
+        buildLaserGrid(); buildEmptySelect();
+      }
+    }
     // bulk-populate the pool with every sample in this run (all splits, including train)
     const samples = Object.keys(S.runData[name].samples).map(id => SAMPLE.get(+id)).filter(Boolean);
     for (const s of samples) S.pool.set(s.sample_id, s);
@@ -687,7 +708,7 @@ function renderRunChips() {
 async function ensureGtMasks(ids) {
   const missing = ids.filter(id => !(id in S.gtMasks));
   if (!missing.length) return;
-  Object.entries(await jget(`/api/gt_masks?ids=${missing.join(",")}`)).forEach(([id, m]) => S.gtMasks[+id] = m);
+  Object.entries(await jget(`/api/gt_masks?ids=${missing.join(",")}${runQ()}`)).forEach(([id, m]) => S.gtMasks[+id] = m);
 }
 async function ensureRunMasks(run, ids) {
   S.runMasks[run] = S.runMasks[run] || {};
