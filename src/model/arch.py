@@ -13,10 +13,35 @@ def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0) -> torch.Te
     freqs = torch.arange(end).unsqueeze(dim=1) * freqs.unsqueeze(dim=0)
     return torch.cat([freqs.cos(), freqs.sin()], dim=-1)
 
+# v1 (original). Not a rotation: precompute_freqs_cis returns [cos | sin], so concatenating the h
+# and w tables gives [cos_h, sin_h, cos_w, sin_w] and apply_rope's chunk(2, -1) reads that as
+# cos=[cos_h, sin_h], sin=[cos_w, sin_w] -- sines land in the cosine slot, so cos^2+sin^2 != 1.
+# It still assigns a distinct (non-orthogonal, magnitude-varying) vector per position, which is why
+# it trains fine and even beat v2 at 1000ep. Kept for reference / loading old checkpoints.
+# def precompute_freqs_cis_2d(dim: int, h: int, w: int, theta: float = 10000.0) -> torch.Tensor:
+#     freqs_h, freqs_w = precompute_freqs_cis(dim // 2, h, theta), precompute_freqs_cis(dim // 2, w, theta),
+#     freqs_h, freqs_w = freqs_h.reshape(h, 1, -1).repeat(1, w, 1), freqs_w.reshape(1, w, -1).repeat(h, 1, 1)
+#     return torch.cat([freqs_h, freqs_w], dim=-1).reshape(h * w, dim)
+
+# v2. Correct rotation, but both axes reuse the same frequency ladder, so a position's row angles and
+# col angles are proportional (row*f vs col*f) and channels alias across the grid. Superseded by v3.
+# def precompute_freqs_cis_2d(dim: int, h: int, w: int, theta: float = 10000.0) -> torch.Tensor:
+#     freqs_h, freqs_w = precompute_freqs_cis(dim // 2, h, theta), precompute_freqs_cis(dim // 2, w, theta)
+#     cos_h, sin_h = (t.reshape(h, 1, -1).repeat(1, w, 1) for t in freqs_h.chunk(2, dim=-1))  # (h,w,dim//4)
+#     cos_w, sin_w = (t.reshape(1, w, -1).repeat(h, 1, 1) for t in freqs_w.chunk(2, dim=-1))  # (h,w,dim//4)
+#     return torch.cat([cos_h, cos_w, sin_h, sin_w], dim=-1).reshape(h * w, dim)
+
 def precompute_freqs_cis_2d(dim: int, h: int, w: int, theta: float = 10000.0) -> torch.Tensor:
-    freqs_h, freqs_w = precompute_freqs_cis(dim // 2, h, theta), precompute_freqs_cis(dim // 2, w, theta),
-    freqs_h, freqs_w = freqs_h.reshape(h, 1, -1).repeat(1, w, 1), freqs_w.reshape(1, w, -1).repeat(h, 1, 1)
-    return torch.cat([freqs_h, freqs_w], dim=-1).reshape(h * w, dim)
+    """2D RoPE table matching the Pixtral/HF reference. One frequency ladder is split across the two
+    axes -- rows take freqs[::2], cols take freqs[1::2] -- so every channel gets a distinct angular
+    rate and no two channels encode the same position the same way. Returns [cos | sin] to match
+    apply_rope's chunk(2, -1) half-split, so channel i pairs with channel i + dim/2."""
+    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2).float() / dim))                # (dim//2,)
+    angles_h = torch.outer(torch.arange(h).float(), freqs[::2])                     # (h,dim//4) rows
+    angles_w = torch.outer(torch.arange(w).float(), freqs[1::2])                    # (w,dim//4) cols
+    angles = torch.cat([angles_h[:, None, :].repeat(1, w, 1),
+                        angles_w[None, :, :].repeat(h, 1, 1)], dim=-1).reshape(h * w, dim // 2)
+    return torch.cat([angles.cos(), angles.sin()], dim=-1)                          # (h*w,dim)
 
 def apply_rope(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
     assert x.shape[-1] % 2 == 0

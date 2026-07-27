@@ -43,7 +43,7 @@ GPU_AVAILABLE_FLOPS['nvidia geforce rtx 5080'] = {
 from icecream import install; install()
 import wandb
 
-from model.callbacks import VizSegMask, OutputSaver
+from model.callbacks import VisualizeSMask, OutputSaver, OUTPUT_EXTRACTORS, DEFAULT_OUTPUT_KEYS
 from model.dataset import build_dataset
 from model.arch import VibrationTransformer, LOSSES
 from utils.helpers import cleanup
@@ -102,9 +102,10 @@ def get_parser():
     parser.add_argument("--eval-only",                  type=int,   default=0, choices=(0, 1), help="Skip training, just eval a loaded checkpoint (requires --checkpoint-path).")
     parser.add_argument("--eval-batch-size",            type=int,   default=108) # wandb caps images logged in a single call to 108, so eval batch size should be <= 108 to log all images
     parser.add_argument("--eval-interval",              type=str,   default="50ep")
+    parser.add_argument("--viz-interval",               type=str,   default="50ep", help="How often VisualizeSMask logs predicted-vs-true mask images to wandb.")
     parser.add_argument("--eval-before-train",          type=int,   default=1, choices=(0, 1), help="Run the boundary eval pass before training starts.")
     parser.add_argument("--eval-after-train",           type=int,   default=1, choices=(0, 1), help="Run the boundary eval pass after training ends.")
-    parser.add_argument("--outputs-dir",                type=str,   default=None, help="Where to save eval .pt outputs. If not set, defaults to the run's outputs_history dir (same dir the training-time history callback writes to).")
+    parser.add_argument("--output-keys",                type=str,   default=list(DEFAULT_OUTPUT_KEYS), nargs="*", choices=list(OUTPUT_EXTRACTORS), help="Payloads to dump per-batch as .pt in runs/<run>/outputs_history. Pass with no values to skip saving outputs entirely; 'fft' and 'mask_logits' are very large.")
     # run
     parser.add_argument("--run-name",                   type=str,   default=None)
     # checkpointing
@@ -141,10 +142,12 @@ app = modal.App(
 # **** train / eval ****
 
 def eval_boundary(trainer, boundary_loaders):
-    saver = next(cb for cb in trainer.state.callbacks if isinstance(cb, OutputSaver))
-    saver.force_save = True
+    # OutputSaver is opt-in, so force-save whichever interval callbacks are actually installed
+    cbs = [cb for cb in trainer.state.callbacks if isinstance(cb, (OutputSaver, VisualizeSMask))]
+    for cb in cbs: cb.force_save = True
     try: trainer.eval(boundary_loaders)
-    finally: saver.force_save = False
+    finally:
+        for cb in cbs: cb.force_save = False
 
 @app.function(
     gpu="A10",
@@ -204,10 +207,11 @@ def run(**kwargs):
             )
 
     # callbacks
-    callbacks = [OutputSaver(args.eval_interval, f"runs/{{run_name}}/outputs_history", overwrite=True, visualizer=VizSegMask()),
+    callbacks = [VisualizeSMask(args.viz_interval),
                  SpeedMonitor(1), OOMObserver(folder=f"runs/{{run_name}}/torch_traces", remote_file_name=None), NaNMonitor(),
                 RuntimeEstimator(skip_batches=64, time_unit="minutes"), SystemMetricsMonitor(),
                 OptimizerMonitor(log_optimizer_metrics=True, batch_log_interval=10)]
+    if args.output_keys: callbacks.append(OutputSaver(args.eval_interval, f"runs/{{run_name}}/outputs_history", overwrite=True, output_keys=args.output_keys))
 
     # optimizer
     optimizer = torch.optim.Adam(model.parameters(), args.lr, fused=True) if not args.eval_only else None
