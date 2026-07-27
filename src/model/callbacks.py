@@ -13,7 +13,21 @@ from model.arch import com_distances, mses
 
 MAX_WANDB_IMAGES = 108  # wandb.Image caps any single log_images call at this many items
 
-class VizSegMask:
+def _to_cpu(x: torch.Tensor): return x.detach().to('cpu', copy=True)
+
+def _is_due(interval: Time, state: State, force: bool) -> bool:
+    """True when the trainer timestamp lands on an interval boundary, or `force` overrides it."""
+    return force or state.timestamp.get(interval.unit).value % interval.value == 0
+
+
+class VisualizeSMask(Callback):
+    def __init__(self, viz_interval, force_save: bool = False):
+        self.viz_interval = Time.from_input(viz_interval, TimeUnit.EPOCH)
+        # when True, bypasses the viz_interval due-check entirely: set this around a manual
+        # trainer.eval() call made outside the normal training loop (e.g. epoch 0 before any weight
+        # update, or the final epoch after fit() ends) that wouldn't otherwise land on a due epoch
+        self.force_save = force_save
+
     def _render(self, pred_np, true_np, info, mse_vals, com_dists, i, scale=8, text_height=40, sep=4, font=ImageFont.load_default(size=14)):
         h, w = pred_np[i].shape
         ph, pw = h * scale, w * scale  # panel size after upscale
@@ -33,20 +47,35 @@ class VizSegMask:
         pred_np, true_np = mask_pred.numpy(), mask_true.numpy()
         return [self._render(pred_np, true_np, info, mse_vals, com_dists, i) for i in range(len(pred_np))]
 
-    def upload(self, path: str, data_name: str, logger: Logger):
-        """Load a .pt file OutputSaver just wrote and log its first MAX_WANDB_IMAGES samples as images."""
-        outputs = torch.load(path, map_location='cpu', weights_only=False)
-        mask_pred, mask_true, info = outputs['mask_pred'][:MAX_WANDB_IMAGES], outputs['mask_true'][:MAX_WANDB_IMAGES], outputs['info']
-        info = {k: v[:MAX_WANDB_IMAGES] for k, v in info.items()}
+    def visualize(self, state: State, logger: Logger, data_name: str):
+        """Render the batch's first MAX_WANDB_IMAGES samples straight from in-memory state, so viz
+        needs no OutputSaver and no .pt on disk."""
+        if not _is_due(self.viz_interval, state, self.force_save): return
+        mask_pred, mask_true = _to_cpu(state.outputs['mask_pred'][:MAX_WANDB_IMAGES]), _to_cpu(state.batch['mask_true'][:MAX_WANDB_IMAGES])
+        info = {k: v[:MAX_WANDB_IMAGES] for k, v in state.batch['info'].items()}
         logger.log_images(self._render_batch(mask_pred, mask_true, info), name=f'SMask/{data_name}', channels_last=True, use_table=False)
+
+    def after_forward(self, state, logger): self.visualize(state, logger, state.dataloader_label)
+    def eval_after_forward(self, state, logger): self.visualize(state, logger, state.dataloader_label or "eval")
 
 # ***** OutputSaver *****
 
-def _to_cpu(x:torch.Tensor): return x.detach().to('cpu', copy=True)
+OUTPUT_EXTRACTORS = {
+    'mask_pred':   lambda state: _to_cpu(state.outputs['mask_pred']),
+    'mask_logits': lambda state: _to_cpu(state.outputs['mask_logits']),
+    'mask_true':   lambda state: _to_cpu(state.batch['mask_true']),
+    'fft':         lambda state: _to_cpu(state.batch['fft']),
+    'info':        lambda state: state.batch['info'],
+}
+DEFAULT_OUTPUT_KEYS = ('mask_pred', 'info')
+
 
 class OutputSaver(Callback):
-    def __init__(self, save_interval, folder, filename='ep{epoch:04d}-ba{batch:06d}.pt', overwrite:bool=False, visualizer: VizSegMask | None = None):
-        self.save_interval, self.folder, self.filename, self.overwrite, self.visualizer = Time.from_input(save_interval, TimeUnit.EPOCH), folder, filename, overwrite, visualizer
+    def __init__(self, save_interval, folder, filename='ep{epoch:04d}-ba{batch:06d}.pt', overwrite:bool=False, output_keys=DEFAULT_OUTPUT_KEYS):
+        self.save_interval, self.folder, self.filename, self.overwrite = Time.from_input(save_interval, TimeUnit.EPOCH), folder, filename, overwrite
+        if unknown := set(output_keys) - set(OUTPUT_EXTRACTORS):
+            raise ValueError(f'OutputSaver: unknown output_keys {sorted(unknown)}; valid keys are {sorted(OUTPUT_EXTRACTORS)}')
+        self.output_keys = tuple(output_keys)
         # when True, bypasses the save_interval due-check entirely: set this around a manual
         # trainer.eval() call made outside the normal training loop (e.g. epoch 0 before any weight
         # update, or the final epoch after fit() ends) that wouldn't otherwise land on a due epoch
@@ -60,10 +89,8 @@ class OutputSaver(Callback):
     def save_outputs(self, state: State, logger: Logger, data_name: str, batch: int):
         # due-check and filename epoch both use the *trainer* timestamp, so eval dumps taken
         # during training land on the real epoch (ep0050, ep0100, ...) instead of ep0000
-        epoch = state.timestamp.get(self.save_interval.unit).value
-        if self.force_save or epoch % self.save_interval.value == 0:
-            outputs = dict(mask_pred=_to_cpu(state.outputs['mask_pred']), mask_logits=_to_cpu(state.outputs['mask_logits']),
-                           fft=_to_cpu(state.batch['fft']), mask_true=_to_cpu(state.batch['mask_true']), info=state.batch['info'])
+        if _is_due(self.save_interval, state, self.force_save):
+            outputs = {k: OUTPUT_EXTRACTORS[k](state) for k in self.output_keys}
 
             # local disk is the ground truth: write it first and let it raise before any logger is touched,
             # so a logger destination never ends up with data that wasn't also saved locally
@@ -78,9 +105,6 @@ class OutputSaver(Callback):
             for destination in logger.destinations:
                 if isinstance(destination, WandBLogger): continue # wandb JSON serialization fails on raw tensor payloads
                 destination.log_metrics({f'{data_name}/{k}': v for k, v in outputs.items()})
-
-            # upload to wandb viz only after the file is safely on disk, reading back from that same file
-            if self.visualizer is not None: self.visualizer.upload(path, data_name, logger)
 
     def after_forward(self, state, logger): self.save_outputs(state, logger, state.dataloader_label, state.timestamp.batch.value)
     def eval_after_forward(self, state, logger): self.save_outputs(state, logger, f'{state.dataloader_label or "eval"}', state.eval_timestamp.batch.value)
