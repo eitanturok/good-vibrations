@@ -232,36 +232,22 @@ def process_vibration(fft: torch.Tensor, freqs: torch.Tensor, signal_mode: str, 
     x = normalize_fft(x, normalize_mode)
     return tokenize(x, patch_size)
 
-#***** 3 process batch *****
-
-def process_batch(batch: dict, device: str, signal_mode: str, normalize_mode: str, patch_size: int, out_h: int, out_w: int, freqs: torch.Tensor, generator: torch.Generator | None = None, augment_fft: bool = True, augment_mask: bool = True, mds_precomputed_fft: bool = False):
-    fft_processed = batch["fft"].to(device) if mds_precomputed_fft else process_vibration(batch["fft"].to(device), freqs, signal_mode, normalize_mode, patch_size, augment=augment_fft, generator=generator)
-    mask_processed = process_image(batch["mask_true"].to(device), out_h, out_w, augment=augment_mask, generator=generator)
-    return dict(fft=fft_processed, mask_true=mask_processed, info=batch["info"])
-
-def collate_and_process(samples: list[dict]) -> dict:
-    fft = torch.stack([s["fft"] for s in samples])
-    mask_true = torch.stack([s["mask_true"] for s in samples])
-    info = {k: [s["info"][k] for s in samples] for k in samples[0]["info"]}
-    return dict(fft=fft, mask_true=mask_true, info=info)
-
 #***** 5 define dataset *****
 
 class VibrationDataset(StreamingDataset):
     def __init__(self, local: str | Path, process_kwargs: dict, shuffle: bool = False, seed: int = 42, **kwargs):
         super().__init__(local=str(local), shuffle=shuffle, batch_size=kwargs.pop("batch_size", None), **kwargs)
-        self.freqs = torch.from_numpy(np.load(Path(local) / "freqs.npy"))
-        self.generator = torch.Generator(device="cpu")  # cuda generators can't cross process fork boundaries in workers; draw on cpu, move samples after
-        self.generator.manual_seed(seed)
-        self.process_kwargs = dict(process_kwargs, freqs=self.freqs, generator=self.generator)
+        self.pk = dict(process_kwargs, freqs=torch.from_numpy(np.load(Path(local) / "freqs.npy")), generator=torch.Generator(device="cpu").manual_seed(seed))
 
     def __getitem__(self, idx):
         s = super().__getitem__(idx)
-        X, y = s.pop("X"), s.pop("y")
+        X = torch.from_numpy(s.pop("X").copy()).unsqueeze(0).to(self.pk["device"])
+        y = torch.from_numpy(s.pop("y").copy()).unsqueeze(0).to(self.pk["device"])
         info = dict(sample_id=s["sample_id"], output_id=s["output_id"], n_objects=s["n_objects"], speaker=s["speaker"], box=s["box"], is_empty_box=s["is_empty_box"], x_com=s["downsampled_com_x"], y_com=s["downsampled_com_y"])
-        X_t, y_t = torch.from_numpy(X.copy()), torch.from_numpy(y.copy())
-        processed = process_batch(dict(fft=X_t.unsqueeze(0), mask_true=y_t.unsqueeze(0), info=info), **self.process_kwargs)
-        return dict(fft=processed["fft"].squeeze(0), mask_true=processed["mask_true"].squeeze(0), info=info)
+
+        fft = X if self.pk["mds_precomputed_fft"] else process_vibration(X, self.pk["freqs"], self.pk["signal_mode"], self.pk["normalize_mode"], self.pk["patch_size"], augment=self.pk["augment_fft"], generator=self.pk["generator"])
+        mask_true = process_image(y, self.pk["out_h"], self.pk["out_w"], augment=self.pk["augment_mask"], generator=self.pk["generator"])
+        return dict(fft=fft.squeeze(0), mask_true=mask_true.squeeze(0), info=info)
 
 #***** 6 define split *****
 
@@ -373,7 +359,7 @@ def num_samples(batch): return batch["mask_true"].shape[0]
 
 def loader(dataset, idxs, bs, num_workers, generator, shuffle=False, drop_last=False):
     dl = DataLoader(Subset(dataset, idxs), batch_size=bs, shuffle=shuffle, num_workers=num_workers, generator=generator, pin_memory=True,
-                    persistent_workers=num_workers > 0, prefetch_factor=4 if num_workers > 0 else None, drop_last=drop_last, collate_fn=collate_and_process)
+                    persistent_workers=num_workers > 0, prefetch_factor=4 if num_workers > 0 else None, drop_last=drop_last)
     return DataSpec(dataloader=dl, get_num_samples_in_batch=num_samples)
 
 def build_dataset(data_dir: str | Path, split: str = "exp25", batch_size: int = 64, eval_batch_size: int = 64,

@@ -1,8 +1,4 @@
-# composer's FileLogger opens its log file with the platform default encoding -- on Windows
-# that's the console codepage (e.g. cp1255), which can't encode wandb's ANSI/emoji status lines
-# and crashes on FileLogger.close(). open()'s default encoding is fixed at interpreter startup,
-# so PYTHONUTF8 has to be set before Python starts -- re-run once with it set if it isn't already
-# (os.execv doesn't reliably replace the process on Windows, so use subprocess instead).
+# patch windows to not log emojis
 import os, subprocess, sys
 if os.environ.get("PYTHONUTF8") != "1":
     env = dict(os.environ, PYTHONUTF8="1")
@@ -11,14 +7,11 @@ if os.environ.get("PYTHONUTF8") != "1":
 # supress warnings
 import warnings, logging
 warnings.filterwarnings("ignore", message=r"The pynvml package is deprecated.*", category=FutureWarning)
-# only log errors from this file in order to suppress the warning "Redirects are currently not supported in Windows or MacOs."
 logging.getLogger("torch.distributed.elastic.multiprocessing.redirects").setLevel(logging.ERROR)
 
 import sys, argparse
 from pathlib import Path
 
-# src is a scripts dir (bare imports). On Modal it is mounted at /root/src -> put it on the path
-# so `from model import ...` resolves both locally (run from src/) and remotely.
 try:
     if Path("/root/src").exists() and "/root/src" not in sys.path: sys.path.insert(0, "/root/src")
 except PermissionError:
@@ -104,7 +97,7 @@ def get_parser():
     # train
     parser.add_argument("--batch-size",                 type=int,   default=256)
     parser.add_argument("--lr",                         type=float, default=1e-4)
-    parser.add_argument("--max-duration",               type=str,   default="6000ep")
+    parser.add_argument("--max-duration",               type=str,   default="2000ep")
     # eval
     parser.add_argument("--eval-only",                  type=int,   default=0, choices=(0, 1), help="Skip training, just eval a loaded checkpoint (requires --checkpoint-path).")
     parser.add_argument("--eval-batch-size",            type=int,   default=108) # wandb caps images logged in a single call to 108, so eval batch size should be <= 108 to log all images
