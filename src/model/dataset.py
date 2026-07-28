@@ -28,6 +28,11 @@ def should_augment(p: float) -> bool:
 
 REQUIRED_FILES = ["image/02_smask.png", "vibration/03_fft.npz", "metadata.jsonl"]
 
+def precomputed_fft_name(signal_mode: str, normalize_mode: str, patch_size: int, subtract_speaker_mean: bool) -> str:
+    # the speaker mean is baked into the precomputed array, so it has to be part of the filename
+    suffix = "_spkmean" if subtract_speaker_mean else ""
+    return f"vibration/04_precomputed_fft_{signal_mode}_{normalize_mode}_{patch_size}{suffix}.npy"
+
 def mds_columns(augment_fft: bool) -> dict[str, str]:
     x_dtype = "complex64" if augment_fft else "float32"  # raw fft is complex; precomputed signal is real
     return {"X": f"ndarray:{x_dtype}", "y": "ndarray:float32",
@@ -54,10 +59,12 @@ def collect_samples(base_sample_dir: Path, verbose: int = 1) -> list[tuple[Path,
     return samples
 
 def hash_samples(samples: list[tuple[Path, dict]], out_h: int | None = None, out_w: int | None = None,
-                  augment_fft: bool = True, signal_mode: str = "magnitude", normalize_mode: str = "std", patch_size: int = 256) -> str:
+                  augment_fft: bool = True, signal_mode: str = "magnitude", normalize_mode: str = "std", patch_size: int = 256,
+                  subtract_speaker_mean: bool = False) -> str:
     h = hashlib.sha256()
     if out_h is not None: h.update(f"{out_h}x{out_w}".encode())  # resolution is baked into y, so it must invalidate the cache too
     if not augment_fft: h.update(f"{augment_fft}{signal_mode}{normalize_mode}{patch_size}".encode())  # baked into X when not augmenting, so it must invalidate the cache too
+    if subtract_speaker_mean: h.update(b"spkmean")  # hashed in both paths, unlike the above
     for sample_dir, meta in sorted(samples, key=lambda s: s[0].name):
         h.update(sample_dir.name.encode())
         h.update(json.dumps(meta, sort_keys=True).encode())
@@ -66,11 +73,12 @@ def hash_samples(samples: list[tuple[Path, dict]], out_h: int | None = None, out
 #***** 1 convert to mds *****
 
 def convert_to_mds(mds_dir: Path, samples: list[tuple[Path, dict]], out_h: int, out_w: int, verbose: int = 1,
-                    augment_fft: bool = True, signal_mode: str = "magnitude", normalize_mode: str = "std", patch_size: int = 256) -> Path:
+                    augment_fft: bool = True, signal_mode: str = "magnitude", normalize_mode: str = "std", patch_size: int = 256,
+                    subtract_speaker_mean: bool = False) -> Path:
 
     def load_X(sample_dir: Path) -> np.ndarray:
         if not augment_fft:
-            return np.load(sample_dir / f"vibration/04_precomputed_fft_{signal_mode}_{normalize_mode}_{patch_size}.npy")
+            return np.load(sample_dir / precomputed_fft_name(signal_mode, normalize_mode, patch_size, subtract_speaker_mean))
         X = np.load(sample_dir / "vibration/03_fft.npz")["fft"]  # (1, L, F, C) complex64
         return np.squeeze(X, axis=0) if X.ndim == 4 and X.shape[0] == 1 else X
 
@@ -187,6 +195,12 @@ def extract_signal(x: torch.Tensor, signal_mode: str) -> torch.Tensor:
     if signal_mode == "mag_phase": return torch.cat([x.abs(), x.angle()], dim=-1)
     raise ValueError(f"Unknown signal mode: {signal_mode}")
 
+def subtract_speaker_mean(x: torch.Tensor, speaker_mean: torch.Tensor | None) -> torch.Tensor:
+    # after the magnitude (per-sample trigger jitter randomizes phase, so complex means cancel toward
+    # zero) and before the std (otherwise the std is inflated by the term we're about to remove)
+    if speaker_mean is None: return x
+    return x - speaker_mean
+
 def normalize_fft(x: torch.Tensor, normalize_mode: str) -> torch.Tensor:
     if normalize_mode is None: return x
     x64 = x.double()
@@ -231,21 +245,50 @@ def augment_vibration(x: torch.Tensor, freqs: torch.Tensor, n_control: int = 5, 
     gain = gain[None, None, :, None]
     return x * gain
 
-def process_vibration(fft: torch.Tensor, freqs: torch.Tensor, signal_mode: str, normalize_mode: str, patch_size: int, augment: float = 0.5, gain_kwargs: dict | None = None) -> torch.Tensor:
+def process_vibration(fft: torch.Tensor, freqs: torch.Tensor, signal_mode: str, normalize_mode: str, patch_size: int, augment: float = 0.5, gain_kwargs: dict | None = None, speaker_mean: torch.Tensor | None = None) -> torch.Tensor:
     if should_augment(augment): fft = augment_vibration(fft, freqs, **(gain_kwargs or {}))
     x = extract_signal(fft, signal_mode).float()
+    x = subtract_speaker_mean(x, speaker_mean)
     x = normalize_fft(x, normalize_mode)
     return tokenize(x, patch_size)
 
-def precompute_vibration_samples(samples: list[tuple[Path, dict]], signal_mode: str, normalize_mode: str, patch_size: int, verbose: int = 1) -> None:
+SPEAKER_MEANS_FILE = "speaker_means.npz"
+
+def compute_speaker_means(samples: list[tuple[Path, dict]], keep_idxs: list[int] | None = None, verbose: int = 1) -> dict[int, torch.Tensor]:
+    """{speaker: mean magnitude spectrum (1,L,F,C)}, averaged over that speaker's samples.
+    keep_idxs restricts the average to a subset (pass the train split to avoid eval leakage)."""
+    if keep_idxs is not None:
+        keep = set(keep_idxs)
+        samples = [s for i, s in enumerate(samples) if i in keep]
+
+    sums, counts = {}, {}
+    for sample_dir, meta in tqdm(samples, desc="computing speaker means", disable=not verbose):
+        speaker = int(meta.get("speaker", -1))
+        X = np.load(sample_dir / "vibration/03_fft.npz")["fft"]  # (1, L, F, C) complex64
+        X = np.squeeze(X, axis=0) if X.ndim == 4 and X.shape[0] == 1 else X
+        mag = np.abs(X).astype(np.float64)  # float32 sums drift over many samples
+        sums[speaker] = sums.get(speaker, 0) + mag
+        counts[speaker] = counts.get(speaker, 0) + 1
+
+    if verbose: print("speaker means: " + ", ".join(f"speaker {s}={counts[s]} samples" for s in sorted(counts)))
+    return {s: torch.from_numpy((sums[s] / counts[s]).astype(np.float32)).unsqueeze(0) for s in sums}
+
+def save_speaker_means(means: dict[int, torch.Tensor], path: Path) -> None:
+    np.savez(path, **{str(s): m.squeeze(0).numpy() for s, m in means.items()})
+
+def load_speaker_means(path: Path) -> dict[int, torch.Tensor]:
+    d = np.load(path)
+    return {int(s): torch.from_numpy(d[s]).unsqueeze(0) for s in d.files}
+
+def precompute_vibration_samples(samples: list[tuple[Path, dict]], signal_mode: str, normalize_mode: str, patch_size: int, verbose: int = 1, speaker_means: dict[int, torch.Tensor] | None = None) -> None:
     freqs = torch.from_numpy(np.load(samples[0][0] / "vibration/03_fft.npz")["freqs"])
-    for sample_dir, _ in tqdm(samples, desc="precomputing fft", disable=not verbose):
+    for sample_dir, meta in tqdm(samples, desc="precomputing fft", disable=not verbose):
         X = np.load(sample_dir / "vibration/03_fft.npz")["fft"]  # (1, L, F, C) complex64
         X = np.squeeze(X, axis=0) if X.ndim == 4 and X.shape[0] == 1 else X
         X = torch.from_numpy(X).unsqueeze(0)
-        X = process_vibration(X, freqs, signal_mode, normalize_mode, patch_size, augment=0.0).squeeze(0).numpy()
-        out_path = sample_dir / f"vibration/04_precomputed_fft_{signal_mode}_{normalize_mode}_{patch_size}.npy"
-        np.save(out_path, X)
+        speaker_mean = speaker_means[int(meta.get("speaker", -1))] if speaker_means is not None else None
+        X = process_vibration(X, freqs, signal_mode, normalize_mode, patch_size, augment=0.0, speaker_mean=speaker_mean).squeeze(0).numpy()
+        np.save(sample_dir / precomputed_fft_name(signal_mode, normalize_mode, patch_size, speaker_means is not None), X)
 
 #***** 5 define dataset *****
 
@@ -253,13 +296,17 @@ class VibrationDataset(StreamingDataset):
     def __init__(self, local: str | Path, process_kwargs: dict, shuffle: bool = False, seed: int = 42, **kwargs):
         super().__init__(local=str(local), shuffle=shuffle, batch_size=kwargs.pop("batch_size", None), **kwargs)
         self.pk = dict(process_kwargs, freqs=torch.from_numpy(np.load(Path(local) / "freqs.npy")))
+        # only needed on the raw-fft path; the precomputed path already had the mean subtracted offline
+        means_path = Path(local) / SPEAKER_MEANS_FILE
+        self.speaker_means = load_speaker_means(means_path) if means_path.exists() and not self.pk["mds_precomputed_fft"] else None
 
     def __getitem__(self, idx):
         s = super().__getitem__(idx)
         X = torch.from_numpy(s.pop("X").copy()).unsqueeze(0).to(self.pk["device"])
         y = torch.from_numpy(s.pop("y").copy()).unsqueeze(0).to(self.pk["device"])
         info = dict(sample_id=s["sample_id"], output_id=s["output_id"], n_objects=s["n_objects"], speaker=s["speaker"], box=s["box"], is_empty_box=s["is_empty_box"], x_com=s["downsampled_com_x"], y_com=s["downsampled_com_y"])
-        fft = X if self.pk["mds_precomputed_fft"] else process_vibration(X, self.pk["freqs"], self.pk["signal_mode"], self.pk["normalize_mode"], self.pk["patch_size"], augment=self.pk["augment_fft"])
+        speaker_mean = self.speaker_means[int(s["speaker"])].to(self.pk["device"]) if self.speaker_means is not None else None
+        fft = X if self.pk["mds_precomputed_fft"] else process_vibration(X, self.pk["freqs"], self.pk["signal_mode"], self.pk["normalize_mode"], self.pk["patch_size"], augment=self.pk["augment_fft"], speaker_mean=speaker_mean)
         mask_true = process_image(y, self.pk["out_h"], self.pk["out_w"], augment=self.pk["augment_mask"])
         return dict(fft=fft.squeeze(0), mask_true=mask_true.squeeze(0), info=info)
 
@@ -281,7 +328,7 @@ EXP25_ALWAYS_TRAIN_RANGE = (0, 2)  # empty-box
 def exp25_split(mds_path: str | Path, test_size: float = 0.20, unseen_pos_frac: float = 0.15,
                  unseen_pos_speaker_frac: float = 0.05, seed: int = 42,
                  speakers=None, n_objects=None, box=None, n_samples: int | None = None,
-                 verbose: int = 1) -> dict[str, list[int]]:
+                 verbose: int = 1, index: list[dict] | None = None) -> dict[str, list[int]]:
     """Return {"train": [...], "eval/<name>": [...], "eval/<name>_speaker": [...], ...}: sample
     indices (into the mds_path metadata.jsonl / dataset) for each split, by object-type.
 
@@ -306,8 +353,9 @@ def exp25_split(mds_path: str | Path, test_size: float = 0.20, unseen_pos_frac: 
       If the eval-range pool was capped smaller than target_eval, these two eval sets are scaled down
       proportionally to fit inside what's available.
     """
-    lines = (Path(mds_path) / "metadata.jsonl").read_text().strip().splitlines()
-    index = [json.loads(line) for line in lines if line]
+    if index is None:
+        lines = (Path(mds_path) / "metadata.jsonl").read_text().strip().splitlines()
+        index = [json.loads(line) for line in lines if line]
 
     keep = [i for i, row in enumerate(index) if _matches(row, speakers, n_objects, box)]
     if n_samples is not None: keep = keep[:n_samples]
@@ -380,18 +428,20 @@ def build_dataset(data_dir: str | Path, split: str = "exp25", batch_size: int = 
                    num_workers: int = 8, out_h: int = 20, out_w: int = 40, signal_mode: str = "magnitude",
                    normalize_mode: str = "std", patch_size: int = 256, seed: int = 42,
                    force_mds: bool = False, augment_fft: float = 0.5, augment_mask: float = 0.5,
-                   verbose: int = 1, **split_kwargs):
+                   subtract_speaker_mean: bool = False, verbose: int = 1, **split_kwargs):
 
     if split not in SPLIT_METHODS: raise ValueError(f"Unknown split {split!r}, expected one of {sorted(SPLIT_METHODS)}")
     if not 0 <= augment_fft <= 1: raise ValueError(f"{augment_fft=} must be a probability in [0, 1]")
     if not 0 <= augment_mask <= 1: raise ValueError(f"{augment_mask=} must be a probability in [0, 1]")
+    if subtract_speaker_mean and signal_mode != "magnitude":
+        raise ValueError(f"{subtract_speaker_mean=} requires signal_mode='magnitude', got {signal_mode!r}")
     data_dir = Path(data_dir)
     if not data_dir.exists(): raise FileNotFoundError(f"{data_dir=} does not exist")
 
     # the fft gain augmentation needs the raw complex fft, so any nonzero probability means we store it raw
     raw_fft = augment_fft > 0
     samples = collect_samples(data_dir / "samples", verbose)
-    mds_dir = data_dir / "mds" / hash_samples(samples, out_h, out_w, raw_fft, signal_mode, normalize_mode, patch_size)[:16]
+    mds_dir = data_dir / "mds" / hash_samples(samples, out_h, out_w, raw_fft, signal_mode, normalize_mode, patch_size, subtract_speaker_mean)[:16]
     done = mds_dir / "metadata.jsonl"  # last file convert_to_mds writes -- its presence means the build completed
 
     if force_mds and mds_dir.exists():
@@ -400,10 +450,17 @@ def build_dataset(data_dir: str | Path, split: str = "exp25", batch_size: int = 
 
     if not done.exists():
         if mds_dir.exists(): shutil.rmtree(mds_dir)  # clear out a partial/crashed build
+
+        speaker_means = None
+        if subtract_speaker_mean:
+            # train-only, so eval spectra don't leak in.
+            speaker_means = compute_speaker_means(samples, keep_idxs=SPLIT_METHODS[split](mds_dir, seed=seed, verbose=0, index=[m for _, m in samples], **split_kwargs)["train"], verbose=verbose)
+
         # downsample image, precompute fft, and convert to mds
         downsample_samples(samples, out_h, out_w, verbose=verbose)
-        if not raw_fft: precompute_vibration_samples(samples, signal_mode, normalize_mode, patch_size, verbose=verbose)
-        convert_to_mds(mds_dir, samples, out_h, out_w, verbose=verbose, augment_fft=raw_fft, signal_mode=signal_mode, normalize_mode=normalize_mode, patch_size=patch_size)
+        if not raw_fft: precompute_vibration_samples(samples, signal_mode, normalize_mode, patch_size, verbose=verbose, speaker_means=speaker_means)
+        convert_to_mds(mds_dir, samples, out_h, out_w, verbose=verbose, augment_fft=raw_fft, signal_mode=signal_mode, normalize_mode=normalize_mode, patch_size=patch_size, subtract_speaker_mean=subtract_speaker_mean)
+        if speaker_means is not None: save_speaker_means(speaker_means, mds_dir / SPEAKER_MEANS_FILE)
     elif verbose:
         print(f"Reusing existing MDS at {mds_dir}")
 
