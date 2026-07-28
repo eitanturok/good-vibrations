@@ -26,6 +26,7 @@ from composer.profiler import JSONTraceHandler, cyclic_schedule
 from composer.profiler.profiler import Profiler
 from composer.loggers import WandBLogger, FileLogger
 from composer.callbacks import RuntimeEstimator, SpeedMonitor, OOMObserver, NaNMonitor, SystemMetricsMonitor, OptimizerMonitor
+from composer.optim import ConstantScheduler, CosineAnnealingScheduler, CosineAnnealingWithWarmupScheduler, LinearWithWarmupScheduler
 from composer.callbacks.speed_monitor import GPU_AVAILABLE_FLOPS
 
 # RTX 5080 isn't in composer's GPU_AVAILABLE_FLOPS table yet, so MFU can't be computed. Patch it in here
@@ -47,6 +48,15 @@ from model.callbacks import VisualizeSMask, OutputSaver, OUTPUT_EXTRACTORS, DEFA
 from model.dataset import build_dataset
 from model.arch import VibrationTransformer, LOSSES
 from utils.helpers import cleanup
+
+SCHEDULERS = {
+    "constant": lambda t_warmup: ConstantScheduler(),
+    "cosine": lambda t_warmup: CosineAnnealingScheduler(),
+    "cosine-warmup": lambda t_warmup: CosineAnnealingWithWarmupScheduler(t_warmup=t_warmup),
+    "linear-warmup": lambda t_warmup: LinearWithWarmupScheduler(t_warmup=t_warmup),
+    }
+def build_scheduler(scheduler: str, t_warmup: str): return SCHEDULERS[scheduler](t_warmup)
+
 
 def get_parser():
     parser = argparse.ArgumentParser()
@@ -97,6 +107,9 @@ def get_parser():
     # train
     parser.add_argument("--batch-size",                 type=int,   default=256)
     parser.add_argument("--lr",                         type=float, default=1e-4)
+    parser.add_argument("--weight-decay",               type=float, default=1e-2)
+    parser.add_argument("--scheduler",                  type=str,   default="cosine-warmup", choices=tuple(SCHEDULERS), help="LR schedule. 'constant' reproduces the old no-scheduler behavior.")
+    parser.add_argument("--t-warmup",                   type=str,   default="100ep", help="Warmup length for the *-warmup schedulers; ignored by 'constant'.")
     parser.add_argument("--max-duration",               type=str,   default="2000ep")
     # eval
     parser.add_argument("--eval-only",                  type=int,   default=0, choices=(0, 1), help="Skip training, just eval a loaded checkpoint (requires --checkpoint-path).")
@@ -108,6 +121,7 @@ def get_parser():
     parser.add_argument("--output-keys",                type=str,   default=list(DEFAULT_OUTPUT_KEYS), nargs="*", choices=list(OUTPUT_EXTRACTORS), help="Payloads to dump per-batch as .pt in runs/<run>/outputs_history. Pass with no values to skip saving outputs entirely; 'fft' and 'mask_logits' are very large.")
     # run
     parser.add_argument("--run-name",                   type=str,   default=None)
+    parser.add_argument("--wandb-group",                type=str,   default="attn-lr-sweep", help="wandb group, for keeping sweep runs together.")
     # checkpointing
     parser.add_argument("--checkpoint-path",            type=str,   default=None, help="Checkpoint to load for eval. If not set, defaults to the run's latest checkpoint.")
     parser.add_argument("--checkpoint-interval",        type=str,   default="500ep")
@@ -192,7 +206,7 @@ def run(**kwargs):
     loggers = []
     if not args.eval_only:
         config = data_info | args.__dict__ | dict(gpu_name=torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu", num_parameters=sum([p_.numel() for p_ in model.parameters()]))
-        wandb_logger = WandBLogger("better-tsa", group="metal", name=args.run_name, init_kwargs={"settings": wandb.Settings(x_disable_stats=False), "config": config, "save_code": True, "id": args.run_name, "resume": "allow"})
+        wandb_logger = WandBLogger("better-tsa", group=args.wandb_group, name=args.run_name, init_kwargs={"settings": wandb.Settings(x_disable_stats=False), "config": config, "save_code": True, "id": args.run_name, "resume": "allow"})
         file_logger = FileLogger(f"runs/{{run_name}}/logs-rank{{rank}}.txt")
         loggers = [wandb_logger, file_logger]
 
@@ -213,15 +227,16 @@ def run(**kwargs):
                 OptimizerMonitor(log_optimizer_metrics=True, batch_log_interval=10)]
     if args.output_keys: callbacks.append(OutputSaver(args.eval_interval, f"runs/{{run_name}}/outputs_history", overwrite=True, output_keys=args.output_keys))
 
-    # optimizer
-    optimizer = torch.optim.Adam(model.parameters(), args.lr, fused=True) if not args.eval_only else None
+    # optimizer + lr schedule
+    optimizer = torch.optim.AdamW(model.parameters(), args.lr, weight_decay=args.weight_decay, fused=True) if not args.eval_only else None
+    schedulers = build_scheduler(args.scheduler, args.t_warmup) if not args.eval_only else None
 
     # trainer
     trainer = Trainer(run_name=args.run_name, model=model, optimizers=optimizer, train_dataloader=train_loader, auto_log_hparams=False,
                     eval_dataloader=eval_loaders, max_duration=args.max_duration if not args.eval_only else None, seed=args.seed, eval_interval=args.eval_interval,
                     device=device, save_metrics=True, log_to_console=True, progress_bar=False, load_path=load_path,
                     autoresume=True if not args.eval_only and args.run_name else None, save_folder=f"runs/{{run_name}}/checkpoints" if not args.eval_only else None, save_interval=args.checkpoint_interval,
-                    loggers=loggers, callbacks=callbacks, profiler=profiler,
+                    schedulers=schedulers, loggers=loggers, callbacks=callbacks, profiler=profiler,
                     compile_config={"mode": args.compile_mode} if args.compile else None)
 
     if args.eval_before_train: eval_boundary(trainer, boundary_loaders)  # eval before training starts

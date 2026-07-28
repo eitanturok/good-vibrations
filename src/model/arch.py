@@ -13,18 +13,14 @@ def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0) -> torch.Te
     freqs = torch.arange(end).unsqueeze(dim=1) * freqs.unsqueeze(dim=0)
     return torch.cat([freqs.cos(), freqs.sin()], dim=-1)
 
-# v1 (original). Not a rotation: precompute_freqs_cis returns [cos | sin], so concatenating the h
-# and w tables gives [cos_h, sin_h, cos_w, sin_w] and apply_rope's chunk(2, -1) reads that as
-# cos=[cos_h, sin_h], sin=[cos_w, sin_w] -- sines land in the cosine slot, so cos^2+sin^2 != 1.
-# It still assigns a distinct (non-orthogonal, magnitude-varying) vector per position, which is why
-# it trains fine and even beat v2 at 1000ep. Kept for reference / loading old checkpoints.
+# v1: not a rotation -- the h/w concat puts sines in the cosine slot, so cos^2+sin^2 != 1.
+# Still gives every position a distinct vector, so it trains (and beat v2 at 1000ep).
 # def precompute_freqs_cis_2d(dim: int, h: int, w: int, theta: float = 10000.0) -> torch.Tensor:
 #     freqs_h, freqs_w = precompute_freqs_cis(dim // 2, h, theta), precompute_freqs_cis(dim // 2, w, theta),
 #     freqs_h, freqs_w = freqs_h.reshape(h, 1, -1).repeat(1, w, 1), freqs_w.reshape(1, w, -1).repeat(h, 1, 1)
 #     return torch.cat([freqs_h, freqs_w], dim=-1).reshape(h * w, dim)
 
-# v2. Correct rotation, but both axes reuse the same frequency ladder, so a position's row angles and
-# col angles are proportional (row*f vs col*f) and channels alias across the grid. Superseded by v3.
+# v2: a real rotation, but both axes reuse one frequency ladder so row/col angles stay proportional.
 # def precompute_freqs_cis_2d(dim: int, h: int, w: int, theta: float = 10000.0) -> torch.Tensor:
 #     freqs_h, freqs_w = precompute_freqs_cis(dim // 2, h, theta), precompute_freqs_cis(dim // 2, w, theta)
 #     cos_h, sin_h = (t.reshape(h, 1, -1).repeat(1, w, 1) for t in freqs_h.chunk(2, dim=-1))  # (h,w,dim//4)
@@ -32,10 +28,8 @@ def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0) -> torch.Te
 #     return torch.cat([cos_h, cos_w, sin_h, sin_w], dim=-1).reshape(h * w, dim)
 
 def precompute_freqs_cis_2d(dim: int, h: int, w: int, theta: float = 10000.0) -> torch.Tensor:
-    """2D RoPE table matching the Pixtral/HF reference. One frequency ladder is split across the two
-    axes -- rows take freqs[::2], cols take freqs[1::2] -- so every channel gets a distinct angular
-    rate and no two channels encode the same position the same way. Returns [cos | sin] to match
-    apply_rope's chunk(2, -1) half-split, so channel i pairs with channel i + dim/2."""
+    """2D RoPE (matches Pixtral/HF): rows take freqs[::2], cols freqs[1::2], so every channel gets a
+    distinct rate. Returns [cos | sin] for apply_rope's half-split pairing of channel i with i+dim/2."""
     freqs = 1.0 / (theta ** (torch.arange(0, dim, 2).float() / dim))                # (dim//2,)
     angles_h = torch.outer(torch.arange(h).float(), freqs[::2])                     # (h,dim//4) rows
     angles_w = torch.outer(torch.arange(w).float(), freqs[1::2])                    # (w,dim//4) cols
@@ -149,10 +143,13 @@ class AttnDecoder(nn.Module):
     def __init__(self, d_model, out_h, out_w, num_heads:int=2, num_layers:int=2, do_rope:bool=True):
         super().__init__()
         self.out_h, self.out_w = out_h, out_w
-        self.query_seed = nn.Parameter(torch.zeros(1, 1, d_model))
+        # v1: one seed shared by every position, so RoPE alone distinguished the queries
+        # self.query_seed = nn.Parameter(torch.zeros(1, 1, d_model))
+        # v2: one learned query per output position (DETR-style); ties the ckpt to this resolution
+        self.query_seed = nn.Parameter(torch.zeros(1, out_h * out_w, d_model))
         nn.init.trunc_normal_(self.query_seed, std=0.02)
         self.register_buffer("freqs_query", precompute_freqs_cis_2d(d_model, out_h, out_w))  # 2D RoPE over the output grid
-        layer = nn.TransformerDecoderLayer(d_model=d_model, nhead=num_heads, batch_first=True)
+        layer = nn.TransformerDecoderLayer(d_model=d_model, nhead=num_heads, dim_feedforward=4 * d_model, batch_first=True)
         self.layers = nn.TransformerDecoder(layer, num_layers=num_layers)
         self.head = nn.Linear(d_model, 1)
         self.do_rope = do_rope
@@ -160,7 +157,7 @@ class AttnDecoder(nn.Module):
     def forward(self, memory, memory_key_padding_mask=None):
         # memory: (B,S,D) per-laser token sequence to cross-attend into (S = L+1, includes cls token)
         B = memory.shape[0]
-        queries = self.query_seed.expand(B, self.out_h * self.out_w, -1)  # (B,out_h*out_w,D)
+        queries = self.query_seed.expand(B, -1, -1)  # (1,out_h*out_w,D) -> (B,out_h*out_w,D)
         if self.do_rope: queries = apply_rope(queries, self.freqs_query)                    # give each query its 2D grid position
         out = self.layers(queries, memory, memory_key_padding_mask=memory_key_padding_mask)  # (B,out_h*out_w,D)
         return self.head(out).view(B, self.out_h, self.out_w)
