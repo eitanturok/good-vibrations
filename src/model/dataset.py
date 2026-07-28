@@ -18,6 +18,12 @@ _NDArray._int2value_dtype |= {100: "complex64", 101: "complex128"}
 _NDArray._value_dtype2int |= {"complex64": 100, "complex128": 101}
 
 
+def should_augment(p: float) -> bool:
+    # per-sample coin flip, so each sample is independently augmented with probability p
+    if p <= 0: return False
+    if p >= 1: return True
+    return torch.rand((), device="cpu").item() < p
+
 #***** 0 collect samples *****
 
 REQUIRED_FILES = ["image/02_smask.png", "vibration/03_fft.npz", "metadata.jsonl"]
@@ -57,34 +63,7 @@ def hash_samples(samples: list[tuple[Path, dict]], out_h: int | None = None, out
         h.update(json.dumps(meta, sort_keys=True).encode())
     return h.hexdigest()
 
-#***** 1 downsample samples *****
-
-def downsample_mask(mask: Image.Image, out_h: int, out_w: int) -> Image.Image:
-    # BOX resampling area-averages over the full H x W mask (unlike a floor-division block
-    # reshape, which silently truncates to block_h*out_h x block_w*out_w and drops the
-    # bottom/right edge whenever out_h/out_w don't evenly divide H/W).
-    return mask.resize((out_w, out_h), resample=Image.BOX)
-
-def downsample_samples(samples: list[tuple[Path, dict]], out_h: int, out_w: int, verbose: int = 1) -> None:
-    """Downsample every sample's full-resolution mask to (out_h, out_w). Only called when
-    build_dataset's hashed mds_dir doesn't already exist, so no per-sample cache check here."""
-    for sample_dir, _ in tqdm(samples, desc="downsampling masks", disable=not verbose):
-        out_path = sample_dir / f"image/05_downsampled_smask_{out_h}h_{out_w}w"
-        mask = downsample_mask(Image.open(sample_dir / "image/02_smask.png"), out_h, out_w)
-        mask.save(out_path.with_suffix(".png"))
-        np.save(out_path.with_suffix(".npy"), np.array(mask, dtype=np.float32) / 255.0)
-
-def precompute_vibration_samples(samples: list[tuple[Path, dict]], signal_mode: str, normalize_mode: str, patch_size: int, verbose: int = 1) -> None:
-    freqs = torch.from_numpy(np.load(samples[0][0] / "vibration/03_fft.npz")["freqs"])
-    for sample_dir, _ in tqdm(samples, desc="precomputing fft", disable=not verbose):
-        X = np.load(sample_dir / "vibration/03_fft.npz")["fft"]  # (1, L, F, C) complex64
-        X = np.squeeze(X, axis=0) if X.ndim == 4 and X.shape[0] == 1 else X
-        X = torch.from_numpy(X).unsqueeze(0)
-        X = process_vibration(X, freqs, signal_mode, normalize_mode, patch_size, augment=False).squeeze(0).numpy()
-        out_path = sample_dir / f"vibration/04_precomputed_fft_{signal_mode}_{normalize_mode}_{patch_size}.npy"
-        np.save(out_path, X)
-
-#***** 2 convert to mds *****
+#***** 1 convert to mds *****
 
 def convert_to_mds(mds_dir: Path, samples: list[tuple[Path, dict]], out_h: int, out_w: int, verbose: int = 1,
                     augment_fft: bool = True, signal_mode: str = "magnitude", normalize_mode: str = "std", patch_size: int = 256) -> Path:
@@ -138,6 +117,23 @@ def convert_to_mds(mds_dir: Path, samples: list[tuple[Path, dict]], out_h: int, 
     if verbose: print(f"Wrote {len(samples)} samples to {mds_dir=}")
     return mds_dir
 
+#***** 2 downsample image *****
+
+def downsample_mask(mask: Image.Image, out_h: int, out_w: int) -> Image.Image:
+    # BOX resampling area-averages over the full H x W mask (unlike a floor-division block
+    # reshape, which silently truncates to block_h*out_h x block_w*out_w and drops the
+    # bottom/right edge whenever out_h/out_w don't evenly divide H/W).
+    return mask.resize((out_w, out_h), resample=Image.BOX)
+
+def downsample_samples(samples: list[tuple[Path, dict]], out_h: int, out_w: int, verbose: int = 1) -> None:
+    """Downsample every sample's full-resolution mask to (out_h, out_w). Only called when
+    build_dataset's hashed mds_dir doesn't already exist, so no per-sample cache check here."""
+    for sample_dir, _ in tqdm(samples, desc="downsampling masks", disable=not verbose):
+        out_path = sample_dir / f"image/05_downsampled_smask_{out_h}h_{out_w}w"
+        mask = downsample_mask(Image.open(sample_dir / "image/02_smask.png"), out_h, out_w)
+        mask.save(out_path.with_suffix(".png"))
+        np.save(out_path.with_suffix(".npy"), np.array(mask, dtype=np.float32) / 255.0)
+
 #***** 3 process image *****
 
 def _gaussian_kernel1d_radius1(sigma: torch.Tensor) -> torch.Tensor:
@@ -147,11 +143,9 @@ def _gaussian_kernel1d_radius1(sigma: torch.Tensor) -> torch.Tensor:
     w = torch.exp(-0.5 * (x / sigma) ** 2)
     return w / w.sum()
 
-def gaussian_blur(mask: torch.Tensor, sigma: float, generator:torch.Generator) -> torch.Tensor:
+def gaussian_blur(mask: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
     # mask: (B,H,W). Separable 3x3 blur via two 1D convs, replicate-padded (matches scipy's mode='nearest', i.e. edge replication).
-    sigma_t = torch.as_tensor(sigma, dtype=torch.float32, device="cpu")
-    sampled_sigma = torch.normal(sigma_t, 0.3, generator=generator).clamp_min(1e-3).to(mask.device, mask.dtype)
-    k = _gaussian_kernel1d_radius1(sampled_sigma)
+    k = _gaussian_kernel1d_radius1(sigma)
     x = mask.unsqueeze(1)  # (B,1,H,W)
     x = F.pad(x, (0, 0, 1, 1), mode='replicate')
     x = F.conv2d(x, k.view(1, 1, 3, 1))
@@ -159,19 +153,30 @@ def gaussian_blur(mask: torch.Tensor, sigma: float, generator:torch.Generator) -
     x = F.conv2d(x, k.view(1, 1, 1, 3))
     return x.squeeze(1)
 
-def noisy_blur(mask: torch.Tensor, generator: torch.Generator, sigma: float = 0.8, noise_std: float = 0.05) -> torch.Tensor:
-    # Gaussian blur, then add noise back onto originally-nonzero pixels only. mask: (B,H,W).
-    blurred = gaussian_blur(mask, sigma, generator)
-    noise = torch.normal(0.0, noise_std, size=mask.shape, generator=generator, device="cpu", dtype=torch.float32).to(mask.device, mask.dtype)
-    out = blurred.clone()
+def _sample_scale(lo: float, hi: float) -> torch.Tensor:
+    # drawn on cpu, where the worker's global RNG lives
+    return torch.empty(()).uniform_(lo, hi)
+
+def noisy_blur(mask: torch.Tensor, blur_noise: tuple = (0.5, 1.0), object_noise: tuple = (0.05, 0.1), background_noise: tuple = (0.05, 0.1)) -> torch.Tensor:
     nonzero = mask != 0
+
+    # blur the segmentation mask so we don't have such sharp edges
+    out = gaussian_blur(mask, _sample_scale(*blur_noise).to(mask.device, mask.dtype))
+
+    # add noise to the object
+    noise = torch.normal(0.0, _sample_scale(*object_noise).item(), size=mask.shape, device="cpu", dtype=torch.float32).to(mask.device, mask.dtype)
     out[nonzero] = out[nonzero] + noise[nonzero]
+
+    # add noise to the background
+    noise = torch.normal(0.0, _sample_scale(*background_noise).item(), size=mask.shape, device="cpu", dtype=torch.float32).to(mask.device, mask.dtype)
+    out[~nonzero] = out[~nonzero] + noise[~nonzero]
+
     return out.clamp(0, 1)
 
-def process_image(mask: torch.Tensor, out_h: int, out_w: int, augment: bool = True, generator: torch.Generator | None = None) -> torch.Tensor:
+def process_image(mask: torch.Tensor, out_h: int, out_w: int, augment: float = 0.5) -> torch.Tensor:
     assert mask.shape[-2:] == (out_h, out_w), f"mask {tuple(mask.shape[-2:])} != expected ({out_h},{out_w})"
     # apply augmentation after downsampling so augmentations don't get washed out
-    if augment: mask = noisy_blur(mask, generator)
+    if should_augment(augment): mask = noisy_blur(mask)
     return mask
 
 #***** 4 process vibration *****
@@ -205,11 +210,11 @@ def _hermit_poly(t: torch.Tensor) -> torch.Tensor:
     A = torch.tensor([[1, 0, -3, 2], [0, 1, -2, 1], [0, 0, 3, -2], [0, 0, -1, 1]], dtype=t.dtype, device=t.device)
     return A @ tt
 
-def random_frequency_gain(freqs: torch.Tensor, generator: torch.Generator, n_control: int = 5, gain_range: tuple = (0.8, 1.2)) -> torch.Tensor:
+def random_frequency_gain(freqs: torch.Tensor, n_control: int = 5, gain_range: tuple = (0.8, 1.2)) -> torch.Tensor:
     # Monotone cubic (Hermite spline) interpolant through n_control random control points
     control_freqs = torch.linspace(freqs.min().item(), freqs.max().item(), n_control, dtype=freqs.dtype, device=freqs.device)
-    # generator always lives on cpu (see VibrationDataset.__init__); draw there, move after.
-    control_gains = torch.normal(1.0, 1.0, size=(n_control,), generator=generator, device="cpu", dtype=torch.float32).to(freqs.device, freqs.dtype)
+    # draw on cpu (the worker's global RNG lives there), then move.
+    control_gains = torch.normal(1.0, 1.0, size=(n_control,), device="cpu", dtype=torch.float32).to(freqs.device, freqs.dtype)
     idxs = torch.searchsorted(control_freqs[1:], freqs).clamp(max=n_control - 2)
     m = (control_gains[1:] - control_gains[:-1]) / (control_freqs[1:] - control_freqs[:-1])
     m = torch.cat([m[[0]], (m[1:] + m[:-1]) / 2, m[[-1]]])
@@ -221,32 +226,41 @@ def random_frequency_gain(freqs: torch.Tensor, generator: torch.Generator, n_con
     lo, hi = gain_range
     return gain * (hi - lo) + lo
 
-def augment_vibration(x: torch.Tensor, freqs: torch.Tensor, generator: torch.Generator, n_control: int = 5, gain_range: tuple = (0.8, 1.2)) -> torch.Tensor:
-    gain = random_frequency_gain(freqs, generator, n_control, gain_range)
+def augment_vibration(x: torch.Tensor, freqs: torch.Tensor, n_control: int = 5, gain_range: tuple = (0.8, 1.2)) -> torch.Tensor:
+    gain = random_frequency_gain(freqs, n_control, gain_range)
     gain = gain[None, None, :, None]
     return x * gain
 
-def process_vibration(fft: torch.Tensor, freqs: torch.Tensor, signal_mode: str, normalize_mode: str, patch_size: int, augment: bool = True, generator: torch.Generator | None = None, gain_kwargs: dict | None = None) -> torch.Tensor:
-    if augment: fft = augment_vibration(fft, freqs, generator, **(gain_kwargs or {}))
+def process_vibration(fft: torch.Tensor, freqs: torch.Tensor, signal_mode: str, normalize_mode: str, patch_size: int, augment: float = 0.5, gain_kwargs: dict | None = None) -> torch.Tensor:
+    if should_augment(augment): fft = augment_vibration(fft, freqs, **(gain_kwargs or {}))
     x = extract_signal(fft, signal_mode).float()
     x = normalize_fft(x, normalize_mode)
     return tokenize(x, patch_size)
+
+def precompute_vibration_samples(samples: list[tuple[Path, dict]], signal_mode: str, normalize_mode: str, patch_size: int, verbose: int = 1) -> None:
+    freqs = torch.from_numpy(np.load(samples[0][0] / "vibration/03_fft.npz")["freqs"])
+    for sample_dir, _ in tqdm(samples, desc="precomputing fft", disable=not verbose):
+        X = np.load(sample_dir / "vibration/03_fft.npz")["fft"]  # (1, L, F, C) complex64
+        X = np.squeeze(X, axis=0) if X.ndim == 4 and X.shape[0] == 1 else X
+        X = torch.from_numpy(X).unsqueeze(0)
+        X = process_vibration(X, freqs, signal_mode, normalize_mode, patch_size, augment=0.0).squeeze(0).numpy()
+        out_path = sample_dir / f"vibration/04_precomputed_fft_{signal_mode}_{normalize_mode}_{patch_size}.npy"
+        np.save(out_path, X)
 
 #***** 5 define dataset *****
 
 class VibrationDataset(StreamingDataset):
     def __init__(self, local: str | Path, process_kwargs: dict, shuffle: bool = False, seed: int = 42, **kwargs):
         super().__init__(local=str(local), shuffle=shuffle, batch_size=kwargs.pop("batch_size", None), **kwargs)
-        self.pk = dict(process_kwargs, freqs=torch.from_numpy(np.load(Path(local) / "freqs.npy")), generator=torch.Generator(device="cpu").manual_seed(seed))
+        self.pk = dict(process_kwargs, freqs=torch.from_numpy(np.load(Path(local) / "freqs.npy")))
 
     def __getitem__(self, idx):
         s = super().__getitem__(idx)
         X = torch.from_numpy(s.pop("X").copy()).unsqueeze(0).to(self.pk["device"])
         y = torch.from_numpy(s.pop("y").copy()).unsqueeze(0).to(self.pk["device"])
         info = dict(sample_id=s["sample_id"], output_id=s["output_id"], n_objects=s["n_objects"], speaker=s["speaker"], box=s["box"], is_empty_box=s["is_empty_box"], x_com=s["downsampled_com_x"], y_com=s["downsampled_com_y"])
-
-        fft = X if self.pk["mds_precomputed_fft"] else process_vibration(X, self.pk["freqs"], self.pk["signal_mode"], self.pk["normalize_mode"], self.pk["patch_size"], augment=self.pk["augment_fft"], generator=self.pk["generator"])
-        mask_true = process_image(y, self.pk["out_h"], self.pk["out_w"], augment=self.pk["augment_mask"], generator=self.pk["generator"])
+        fft = X if self.pk["mds_precomputed_fft"] else process_vibration(X, self.pk["freqs"], self.pk["signal_mode"], self.pk["normalize_mode"], self.pk["patch_size"], augment=self.pk["augment_fft"])
+        mask_true = process_image(y, self.pk["out_h"], self.pk["out_w"], augment=self.pk["augment_mask"])
         return dict(fft=fft.squeeze(0), mask_true=mask_true.squeeze(0), info=info)
 
 #***** 6 define split *****
@@ -365,15 +379,19 @@ def loader(dataset, idxs, bs, num_workers, generator, shuffle=False, drop_last=F
 def build_dataset(data_dir: str | Path, split: str = "exp25", batch_size: int = 64, eval_batch_size: int = 64,
                    num_workers: int = 8, out_h: int = 20, out_w: int = 40, signal_mode: str = "magnitude",
                    normalize_mode: str = "std", patch_size: int = 256, seed: int = 42,
-                   force_mds: bool = False, augment_fft: bool = True, augment_mask: bool = True,
+                   force_mds: bool = False, augment_fft: float = 0.5, augment_mask: float = 0.5,
                    verbose: int = 1, **split_kwargs):
 
     if split not in SPLIT_METHODS: raise ValueError(f"Unknown split {split!r}, expected one of {sorted(SPLIT_METHODS)}")
+    if not 0 <= augment_fft <= 1: raise ValueError(f"{augment_fft=} must be a probability in [0, 1]")
+    if not 0 <= augment_mask <= 1: raise ValueError(f"{augment_mask=} must be a probability in [0, 1]")
     data_dir = Path(data_dir)
     if not data_dir.exists(): raise FileNotFoundError(f"{data_dir=} does not exist")
 
+    # the fft gain augmentation needs the raw complex fft, so any nonzero probability means we store it raw
+    raw_fft = augment_fft > 0
     samples = collect_samples(data_dir / "samples", verbose)
-    mds_dir = data_dir / "mds" / hash_samples(samples, out_h, out_w, augment_fft, signal_mode, normalize_mode, patch_size)[:16]
+    mds_dir = data_dir / "mds" / hash_samples(samples, out_h, out_w, raw_fft, signal_mode, normalize_mode, patch_size)[:16]
     done = mds_dir / "metadata.jsonl"  # last file convert_to_mds writes -- its presence means the build completed
 
     if force_mds and mds_dir.exists():
@@ -384,17 +402,17 @@ def build_dataset(data_dir: str | Path, split: str = "exp25", batch_size: int = 
         if mds_dir.exists(): shutil.rmtree(mds_dir)  # clear out a partial/crashed build
         # downsample image, precompute fft, and convert to mds
         downsample_samples(samples, out_h, out_w, verbose=verbose)
-        if not augment_fft: precompute_vibration_samples(samples, signal_mode, normalize_mode, patch_size, verbose=verbose)
-        convert_to_mds(mds_dir, samples, out_h, out_w, verbose=verbose, augment_fft=augment_fft, signal_mode=signal_mode, normalize_mode=normalize_mode, patch_size=patch_size)
+        if not raw_fft: precompute_vibration_samples(samples, signal_mode, normalize_mode, patch_size, verbose=verbose)
+        convert_to_mds(mds_dir, samples, out_h, out_w, verbose=verbose, augment_fft=raw_fft, signal_mode=signal_mode, normalize_mode=normalize_mode, patch_size=patch_size)
     elif verbose:
         print(f"Reusing existing MDS at {mds_dir}")
 
     splits = SPLIT_METHODS[split](mds_dir, seed=seed, verbose=verbose, **split_kwargs)
 
     generator = torch.Generator().manual_seed(seed)
-    process_kwargs = dict(device="cpu", signal_mode=signal_mode, normalize_mode=normalize_mode, patch_size=patch_size, out_h=out_h, out_w=out_w, mds_precomputed_fft=not augment_fft)
+    process_kwargs = dict(device="cpu", signal_mode=signal_mode, normalize_mode=normalize_mode, patch_size=patch_size, out_h=out_h, out_w=out_w, mds_precomputed_fft=not raw_fft)
     train_dataset = VibrationDataset(local=mds_dir, seed=seed, process_kwargs=dict(process_kwargs, augment_fft=augment_fft, augment_mask=augment_mask))
-    eval_dataset = VibrationDataset(local=mds_dir, seed=seed, process_kwargs=dict(process_kwargs, augment_fft=False, augment_mask=False))
+    eval_dataset = VibrationDataset(local=mds_dir, seed=seed, process_kwargs=dict(process_kwargs, augment_fft=0.0, augment_mask=0.0))
 
     train_loader = loader(train_dataset, splits["train"], batch_size, num_workers, generator, shuffle=True, drop_last=True)
     train_eval_loader = loader(eval_dataset, splits["train"], eval_batch_size, num_workers, generator)

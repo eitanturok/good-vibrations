@@ -25,7 +25,7 @@ from composer.core import Evaluator
 from composer.profiler import JSONTraceHandler, cyclic_schedule
 from composer.profiler.profiler import Profiler
 from composer.loggers import WandBLogger, FileLogger
-from composer.callbacks import RuntimeEstimator, SpeedMonitor, OOMObserver, NaNMonitor, SystemMetricsMonitor, OptimizerMonitor
+from composer.callbacks import RuntimeEstimator, SpeedMonitor, OOMObserver, NaNMonitor, SystemMetricsMonitor, OptimizerMonitor, LRMonitor
 from composer.optim import ConstantScheduler, CosineAnnealingScheduler, CosineAnnealingWithWarmupScheduler, LinearWithWarmupScheduler
 from composer.callbacks.speed_monitor import GPU_AVAILABLE_FLOPS
 
@@ -81,8 +81,8 @@ def get_parser():
 
     parser.add_argument("--signal-mode",                type=str,   default="magnitude", choices=["magnitude", "complex", "mag_phase"])
     parser.add_argument("--normalize-mode",             type=str,   default="std")
-    parser.add_argument("--augment-mask",               type=int,   default=1, choices=(0, 1), help="Mask augmentation (blur+noise).")
-    parser.add_argument("--augment-fft",                type=int,   default=1, choices=(0, 1), help="FFT frequency-gain augmentation.")
+    parser.add_argument("--augment-mask",               type=float, default=0.5, help="Probability a sample gets mask augmentation (blur+noise). 0 disables.")
+    parser.add_argument("--augment-fft",                type=float, default=0.5, help="Probability a sample gets FFT frequency-gain augmentation. 0 disables.")
 
     # filter data
     parser.add_argument("--n-samples",                  type=int,   default=None)
@@ -106,7 +106,7 @@ def get_parser():
     parser.add_argument("--compile-mode",               type=str,   default="default", help="torch.compile mode, e.g. 'default', 'reduce-overhead', 'max-autotune'.")
     # train
     parser.add_argument("--batch-size",                 type=int,   default=256)
-    parser.add_argument("--lr",                         type=float, default=1e-4)
+    parser.add_argument("--lr",                         type=float, default=1e-3)
     parser.add_argument("--weight-decay",               type=float, default=1e-2)
     parser.add_argument("--scheduler",                  type=str,   default="cosine-warmup", choices=tuple(SCHEDULERS), help="LR schedule. 'constant' reproduces the old no-scheduler behavior.")
     parser.add_argument("--t-warmup",                   type=str,   default="100ep", help="Warmup length for the *-warmup schedulers; ignored by 'constant'.")
@@ -194,7 +194,7 @@ def run(**kwargs):
         args.mds_dir, batch_size=args.batch_size, eval_batch_size=args.eval_batch_size, num_workers=args.num_workers,
         split=args.split, test_size=args.test_size, speakers=args.speakers, n_objects=args.n_objects, box=args.box, n_samples=args.n_samples,
         out_h=args.out_h, out_w=args.out_w, signal_mode=args.signal_mode, normalize_mode=args.normalize_mode, patch_size=args.patch_size, seed=args.seed,
-        augment_fft=bool(args.augment_fft), augment_mask=bool(args.augment_mask))
+        augment_fft=args.augment_fft, augment_mask=args.augment_mask)
     boundary_loaders = eval_loaders + [Evaluator(label='train', dataloader=train_eval_loader)]
 
     # model
@@ -221,9 +221,8 @@ def run(**kwargs):
             )
 
     # callbacks
-    callbacks = [VisualizeSMask(args.viz_interval),
-                 SpeedMonitor(1), OOMObserver(folder=f"runs/{{run_name}}/torch_traces", remote_file_name=None), NaNMonitor(),
-                RuntimeEstimator(skip_batches=64, time_unit="minutes"), SystemMetricsMonitor(),
+    callbacks = [VisualizeSMask(args.viz_interval), NaNMonitor(), LRMonitor(), SystemMetricsMonitor(), SpeedMonitor(1),
+                 OOMObserver(folder=f"runs/{{run_name}}/torch_traces", remote_file_name=None), RuntimeEstimator(skip_batches=64, time_unit="minutes"),
                 OptimizerMonitor(log_optimizer_metrics=True, batch_log_interval=10)]
     if args.output_keys: callbacks.append(OutputSaver(args.eval_interval, f"runs/{{run_name}}/outputs_history", overwrite=True, output_keys=args.output_keys))
 
