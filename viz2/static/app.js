@@ -9,7 +9,10 @@
  * the DOM at any time, which is what keeps 1024 rows x N runs smooth. */
 
 const $ = (s) => document.querySelector(s);
-const ROW_H = 182;   // must equal --row-h in style.css; the virtualizer assumes it
+/* Row height. Stacked mode adds a second mask box per cell, so rows grow by one mask
+   plus its gap; the virtualizer, the spacer and the scroll anchoring all read this. */
+const ROW_H_BASE = 182, MASK_BOX = 114;   // must match --row-h / --mask-h in style.css
+const rowH = () => (S.view.mode === "stacked" ? ROW_H_BASE + MASK_BOX : ROW_H_BASE);
 const METRICS = [
   { key: "mse",     label: "MSE",      short: "mse", worst: "high" },
   { key: "iou",     label: "Soft IoU", short: "iou", worst: "low"  },
@@ -20,12 +23,22 @@ const S = {
   samples: [], runs: {}, order: [], runOrder: [], meta: null,
   filters: {
     splits: new Set(), speakers: new Set(), layouts: new Set(), nObjects: new Set(),
+    objects: new Set(),          // object TYPES present, independent of layout
+    boxes: new Set(),            // enclosure the scene sits in
     positions: null, ranges: {},
+    // Explicit lookups. Empty means "no restriction"; any entry narrows the table to
+    // exactly those samples/positions, unioned so both searches can be used at once.
+    findSamples: new Set(), findPositions: new Set(),
   },
   sort: { run: null, metric: "comdist", dir: "worst" },
   view: { mode: "pred", background: true },
   domain: {}, positions: [], activePos: -1, modalRow: -1,
   renderVersion: 0,   // from /api/runs; part of image URLs to defeat immutable caching
+  lut: null,          // colormaps from the server, so client and server agree on colour
+  epochIdx: null,     // null = each run's latest; otherwise an index into the epoch list
+  playing: false,
+  frameData: {},      // run -> fp16 masks for the visible rows, all epochs
+  truthCache: {},     // sid -> ground-truth values, for client-side diff
 };
 
 const fmt = (v, n = 4) => (v == null || !isFinite(v) ? "–" : v.toFixed(n));
@@ -69,12 +82,15 @@ const api = (u) => fetch(u).then((r) => { if (!r.ok) throw new Error(u); return 
 /* ***** boot ***** */
 
 async function boot() {
-  const [runs, samples] = await Promise.all([api("/api/runs"), api("/api/samples")]);
+  const [runs, samples, lut] = await Promise.all([
+    api("/api/runs"), api("/api/samples"), api("/api/lut")]);
+  S.lut = lut;
   S.meta = runs;
   S.renderVersion = runs.render_version ?? 0;
   S.samples = samples.samples;
   buildPositions();
   initFilters();
+  bindFind();
   buildSpeakerDiagram();
   buildScatter();
   buildSliders();
@@ -114,12 +130,16 @@ async function addRun(name, reload = false) {
     for (const sp of d.splits) {
       if (!prev || !prev.splits.has(sp)) S.filters.splits.add(sp);   // genuinely new only
     }
+    d.metricsEpoch = null;      // /api/run without ?epoch scores the latest
     S.runs[name] = d;
+    invalidateEpochs();
     recomputeDomains({ preserve: true });
     return;
   }
+  d.metricsEpoch = null;
   S.runs[name] = d;
   S.runOrder.push(name);
+  invalidateEpochs();
   d.splits = new Set(Object.values(d.samples).map((x) => x.split));
   for (const sp of d.splits) S.filters.splits.add(sp);
   recomputeDomains();
@@ -129,6 +149,7 @@ async function addRun(name, reload = false) {
 function removeRun(name) {
   delete S.runs[name];
   S.runOrder = S.runOrder.filter((n) => n !== name);
+  invalidateEpochs();
   if (S.sort.run === name) S.sort.run = null;
   recomputeDomains();
   refresh();
@@ -172,6 +193,8 @@ function initFilters() {
     if (s.speaker != null) f.speakers.add(s.speaker);
     if (s.layout) f.layouts.add(s.layout);
     if (s.n_objects != null) f.nObjects.add(s.n_objects);
+    if (s.box) f.boxes.add(s.box);
+    (s.objects && s.objects.length ? s.objects : ["(none)"]).forEach((o) => f.objects.add(o));
   });
 }
 
@@ -192,14 +215,28 @@ function predictedSplit(sampleIdx) {
 
 function passes(s) {
   const f = S.filters;
+  // An explicit ID search overrides the browsing filters: when you ask for a sample by
+  // number you want to see it, not have it hidden by a speaker chip you set earlier.
+  if (f.findSamples.size || f.findPositions.size) {
+    return f.findSamples.has(+s.sample_id) || f.findPositions.has(+s.output_id);
+  }
   if (!f.speakers.has(s.speaker)) return false;
   if (!f.layouts.has(s.layout)) return false;
   if (!f.nObjects.has(s.n_objects)) return false;
+  if (!f.boxes.has(s.box)) return false;
+  // Contains-any: a scene passes if any object in it is selected. Empty boxes have no
+  // objects, so they ride on the "empty" pseudo-entry rather than never matching.
+  const objs = s.objects && s.objects.length ? s.objects : ["(none)"];
+  if (!objs.some((o) => f.objects.has(o))) return false;
   if (f.positions && !(s.pos >= 0 && f.positions.has(s.pos))) return false;
 
-  const sp = predictedSplit(s.i);
-  if (sp == null) return false;                 // no run predicted this sample
-  if (!f.splits.has(sp)) return false;
+  // With no runs loaded the table is a ground-truth browser, so every sample qualifies;
+  // the split filter only applies once some run has assigned splits.
+  if (S.runOrder.length) {
+    const sp = predictedSplit(s.i);
+    if (sp == null) return false;               // no loaded run predicted this sample
+    if (!f.splits.has(sp)) return false;
+  }
 
   // Metric ranges read the sorted run when one is chosen, else any loaded run may
   // satisfy them (union) — the intuitive reading of "show me samples where MSE is high".
@@ -269,6 +306,18 @@ function statsFor(name) {
   return out;
 }
 
+/* "which epoch am I looking at, out of how many the run trained for" -- the two are
+   easy to confuse once the slider exists, so the header always shows both and calls out
+   when you are looking at anything other than the newest predictions. */
+function epochLabel(run) {
+  const r = S.runs[run];
+  const eps = r.epochs || [];
+  const last = eps.length ? eps[eps.length - 1] : r.epoch;
+  const shown = epochFor(run);
+  if (shown == null || shown === last) return `ep <b>${last}</b> <span class="k">(latest)</span>`;
+  return `ep <b class="scrub">${shown}</b> <span class="k">of ${last}</span>`;
+}
+
 function renderHeader() {
   const h = document.createElement("div");
   h.className = "hrow";
@@ -295,7 +344,7 @@ function renderHeader() {
         <div class="hname" title="${name} — click to cycle sort">${name}${warn}</div>
         <button class="hclose" title="Remove this run">&times;</button>
       </div>
-      <div class="hmeta">${statusChip(status)} ep ${r.epoch} · ${r.n}/${S.samples.length}${skipped}</div>
+      <div class="hmeta">${statusChip(status)} ${epochLabel(name)} · ${r.n}/${S.samples.length}${skipped}</div>
       <div class="hstats">${METRICS.map((m) => {
         const s = st[m.key];
         return `<span><span class="k">${m.short}</span> <b>${s ? fmt(s.mean, 3) : "–"}</b>${
@@ -331,18 +380,10 @@ function renderHeader() {
   return h;
 }
 
-/* Mask images are cached `immutable`, so the render version is part of the URL: bumping
+/* Images are cached `immutable`, so the render version is part of the URL: bumping
    config.RENDER_VERSION is what lets a changed rendering reach browsers that already
-   cached the old one. */
-function maskURL(run, sid) {
-  const { mode, background } = S.view;
-  // The run's epoch is part of the URL: a still-training run writes new predictions, and
-  // without it the browser would keep serving the epoch it first cached.
-  const ep = S.runs[run] ? S.runs[run].epoch : 0;
-  return `/api/mask.png?run=${encodeURIComponent(run)}&sid=${sid}&mode=${mode}` +
-    `&bg=${background ? 1 : 0}&v=${S.renderVersion}&ep=${ep}`;
-}
-
+   cached the old one. Table prediction cells no longer use images -- they are canvases
+   drawn from /api/frames -- so this covers the ground-truth column and the modals. */
 function gtMaskURL(sid) {
   return `/api/gt_mask.png?sid=${sid}&bg=${S.view.background ? 1 : 0}&v=${S.renderVersion}`;
 }
@@ -365,7 +406,14 @@ function syncRowCells(el) {
   while (el._runCells.length < S.runOrder.length) {
     const c = document.createElement("div");
     c.className = "cell run";
-    c.innerHTML = `<div class="tags mstats"></div><img class="mask" loading="lazy" decoding="async" alt=""><div class="tags subtags"></div>`;
+    // One rendering path: every prediction cell is a canvas drawn from local mask values
+    // over a CSS backdrop. Keeping a parallel server-PNG path meant two renderers that
+    // had to agree on gamma, alpha and backdrop geometry -- and they drifted.
+    // A second canvas for the ground-truth half, shown only in stacked mode.
+    c.innerHTML = `<div class="tags mstats"></div>` +
+      `<canvas class="mask predmask" width="40" height="20"></canvas>` +
+      `<canvas class="mask truthmask" width="40" height="20" hidden></canvas>` +
+      `<div class="tags subtags"></div>`;
     el.appendChild(c);
     el._runCells.push(c);
   }
@@ -373,7 +421,7 @@ function syncRowCells(el) {
 
 function paintRow(el, rank) {
   const s = S.order[rank];
-  el.style.transform = `translateY(${rank * ROW_H}px)`;
+  el.style.transform = `translateY(${rank * rowH()}px)`;
   el.querySelector(".idxn").textContent = rank + 1;
   // Identity line: which sample, where it was captured, which speaker played. The 8
   // samples sharing a position differ only by speaker, so all three belong together.
@@ -396,10 +444,14 @@ function paintRow(el, rank) {
   // run column rather than here.
   const com = s.com_gt && s.com_gt[0] != null && s.com_gt[0] >= 0
     ? `${fmt(s.com_gt[0], 1)}, ${fmt(s.com_gt[1], 1)}` : "–";
+  // Four chips have to share 224px without wrapping -- a second line would overflow the
+  // fixed row height the virtualizer depends on. "com" is dropped from the label (the
+  // value reads as a coordinate pair, and the modal spells it out) to buy that room.
   el.querySelector(".gt-foot").innerHTML =
-    `<span class="tag">com ${com}</span>` +
+    `<span class="tag" title="center of mass (row, col) in grid coords">${com}</span>` +
     `<span class="tag" title="${s.layout}">${shortLayout(s.layout)}</span>` +
-    `<span class="tag">${s.n_objects} obj</span>`;
+    `<span class="tag">${s.n_objects} obj</span>` +
+    (s.box ? `<span class="tag" title="box: ${s.box}">${s.box}</span>` : "");
   el.querySelector(".gtcell").onclick = () => openModal(rank);
 
   syncRowCells(el);
@@ -413,6 +465,7 @@ function paintRow(el, rank) {
       stats.innerHTML = "";
       com.innerHTML = "";
       m.hidden = true;
+      m.style.backgroundImage = "";
       if (!c._np) { c._np = document.createElement("div"); c._np.className = "nopred"; c._np.textContent = "no prediction"; c.appendChild(c._np); }
       c._np.hidden = false;
       return;
@@ -426,26 +479,56 @@ function paintRow(el, rank) {
     }).join("");
     // The split lives here because each run's dataloaders decide it independently -- the
     // same sample can be train in one run and an eval split in another.
+    // The epoch is per cell because runs save on different cadences: at one slider
+    // position two columns can legitimately be showing different epochs.
+    const cellEp = epochFor(name);
+    const shownEp = cellEp == null ? (S.runs[name].epochs || []).slice(-1)[0] : cellEp;
+    const latest = cellEp == null;
     com.innerHTML = `<span class="tag">com ${fmt(e.com[0], 1)}, ${fmt(e.com[1], 1)}</span>` +
-      `<span class="tag split" title="${e.split}">${shortSplit(e.split)}</span>`;
-    m.className = "mask predmask" + (S.view.background ? "" : " nobg");
-    const u = maskURL(name, s.i);
-    if (m.getAttribute("src") !== u) m.setAttribute("src", u);
+      `<span class="tag split" title="${e.split}">${shortSplit(e.split)}</span>` +
+      `<span class="tag ep${latest ? "" : " scrub"}" title="${
+        latest ? "Latest saved epoch" : "Viewing an earlier epoch"}">ep ${shownEp ?? "–"}</span>`;
+    m.hidden = false;
     m.dataset.run = name; m.dataset.sid = s.i;
     m.onclick = () => openNeighbors(name, s.i);
+    m.className = "mask predmask" + (S.view.background ? " bg" : " nobg");
+    // The backdrop is a CSS background behind the canvas rather than baked into the
+    // pixels: it is fetched once per sample and reused for every run and every epoch,
+    // which is most of why scrubbing costs no bandwidth.
+    const want = S.view.background ? `url(/api/backdrop/${s.i}.jpg)` : "";
+    if (m.style.backgroundImage !== want) m.style.backgroundImage = want;
+    paintCanvas(m, name, s.i, epochFor(name));
+
+    // Stacked: the target gets its own box directly below the prediction, so the two are
+    // adjacent instead of the ground truth being columns away in the leftmost cell.
+    const tm = c.querySelector(".truthmask");
+    tm.hidden = S.view.mode !== "stacked";
+    if (!tm.hidden) {
+      tm.className = "mask truthmask" + (S.view.background ? " bg" : " nobg");
+      if (tm.style.backgroundImage !== want) tm.style.backgroundImage = want;
+      const truth = S.truthCache[s.i];
+      if (truth) drawMask(tm, truth, "truth", null);
+      else ensureTruth(s.i);
+    }
   });
+}
+
+/* Which rows are on screen. Row k occupies [hh + k*rowH(), hh + (k+1)*rowH()) in scroll
+   space, so the sticky header's height comes off before dividing. Shared with the frame
+   prefetch: if the two disagreed, it would fetch data for rows it never paints. */
+function visibleRange(pad = 3) {
+  const sc = $("#scroller");
+  const hdr = sc.querySelector(".hrow");
+  const top = Math.max(0, sc.scrollTop - (hdr ? hdr.offsetHeight : 0));
+  return {
+    first: Math.max(0, Math.floor(top / rowH()) - pad),
+    last: Math.min(S.order.length, Math.ceil((top + sc.clientHeight) / rowH()) + pad),
+  };
 }
 
 const pool = [];
 function renderVisible() {
-  const sc = $("#scroller");
-  const hdr = sc.querySelector(".hrow");
-  const hh = hdr ? hdr.offsetHeight : 0;
-  // Row k occupies [hh + k*ROW_H, hh + (k+1)*ROW_H) in scroll space; the visible band
-  // starts under the sticky header, so subtract its height before dividing.
-  const top = Math.max(0, sc.scrollTop - hh);
-  const first = Math.max(0, Math.floor(top / ROW_H) - 3);
-  const last = Math.min(S.order.length, Math.ceil((top + sc.clientHeight) / ROW_H) + 3);
+  const { first, last } = visibleRange();
   const need = Math.max(0, last - first);
   const rowsEl = $("#rows");
   while (pool.length < need) { const r = buildRow(); pool.push(r); rowsEl.appendChild(r); }
@@ -477,7 +560,7 @@ function refresh(toTop = false) {
   // grows with the number of run columns, so measure it rather than assume a height.
   const hh = hdr.offsetHeight;
   $("#rows").style.top = `${hh}px`;
-  $("#spacer").style.height = `${hh + S.order.length * ROW_H}px`;
+  $("#spacer").style.height = `${hh + S.order.length * rowH()}px`;
   const nRuns = S.runOrder.length;
   $("#rowcount").innerHTML =
     `<b>${S.order.length}</b> of ${S.samples.length} samples` +
@@ -486,6 +569,7 @@ function refresh(toTop = false) {
   renderChips();
   renderScatter();
   renderSpeakers();
+  renderEpochPanel();
   renderVisible();
 }
 
@@ -502,8 +586,61 @@ function chipRow(host, values, set, labelFn) {
   });
 }
 
+/* ***** explicit id search *****
+   Each accepted id becomes its own removable chip, so a list can be built up and pruned
+   one entry at a time rather than re-typing the whole query. */
+
+function renderFindChips() {
+  const f = S.filters;
+  const host = $("#find-chips");
+  host.innerHTML = "";
+  const add = (kind, set, val) => {
+    const b = document.createElement("button");
+    b.className = "chip find";
+    // Terse prefixes: these chips stack up, so "s871" beats "sample 871" for width.
+    b.innerHTML = `${kind === "sample" ? "s" : "p"}${val}<span class="x">&times;</span>`;
+    b.title = "Remove";
+    b.onclick = () => { set.delete(val); renderFindChips(); refresh(); };
+    host.appendChild(b);
+  };
+  [...f.findSamples].sort((a, b) => a - b).forEach((v) => add("sample", f.findSamples, v));
+  [...f.findPositions].sort((a, b) => a - b).forEach((v) => add("pos", f.findPositions, v));
+
+  const n = f.findSamples.size + f.findPositions.size;
+  $("#find-count").textContent = n ? `${n} active` : "";
+  // The browsing filters are bypassed while a search is active; say so rather than
+  // leaving the sidebar looking like it is lying.
+  $("#sidebar").classList.toggle("searching", n > 0);
+}
+
+function bindFind() {
+  const commit = (input, set, valid) => {
+    // Accept a list, so pasting "871, 502 33" works as well as typing one at a time.
+    const ids = input.value.split(/[^0-9]+/).filter(Boolean).map(Number);
+    let added = 0;
+    for (const id of ids) if (valid(id)) { set.add(id); added++; }
+    if (added) { input.value = ""; renderFindChips(); refresh(true); }
+    else if (ids.length) { input.classList.add("bad"); setTimeout(() => input.classList.remove("bad"), 600); }
+  };
+  const sampleIds = new Set(S.samples.map((s) => +s.sample_id));
+  const posIds = new Set(S.samples.map((s) => +s.output_id));
+  $("#find-sample").onkeydown = (e) => {
+    if (e.key === "Enter") commit($("#find-sample"), S.filters.findSamples, (i) => sampleIds.has(i));
+  };
+  $("#find-pos").onkeydown = (e) => {
+    if (e.key === "Enter") commit($("#find-pos"), S.filters.findPositions, (i) => posIds.has(i));
+  };
+  $("#find-clear").onclick = () => {
+    S.filters.findSamples.clear();
+    S.filters.findPositions.clear();
+    renderFindChips();
+    refresh();
+  };
+}
+
 function renderChips() {
   const f = S.filters;
+  renderFindChips();
   const splits = new Set();
   S.runOrder.forEach((n) => S.runs[n].splits.forEach((s) => splits.add(s)));
   const counts = new Map();
@@ -511,9 +648,21 @@ function renderChips() {
   chipRow($("#split-chips"), [...splits].sort().map((s) => [s, counts.get(s) || 0]), f.splits, (v) => v);
   chipRow($("#layout-chips"), uniq((s) => s.layout), f.layouts, (v) => v);
   chipRow($("#nobj-chips"), uniq((s) => s.n_objects), f.nObjects, (v) => `${v}`);
+  chipRow($("#box-chips"), uniq((s) => s.box), f.boxes, (v) => v);
+  // Contains-object: one chip per object TYPE, counted across every layout it appears
+  // in, so "purple-cube" covers both the solo and the two-object scenes.
+  const objCounts = new Map();
+  S.samples.forEach((s) => {
+    (s.objects && s.objects.length ? s.objects : ["(none)"])
+      .forEach((o) => objCounts.set(o, (objCounts.get(o) || 0) + 1));
+  });
+  const objVals = [...objCounts.entries()].sort((a, b) => (a[0] > b[0] ? 1 : -1));
+  chipRow($("#obj-chips"), objVals, f.objects, (v) => (v === "(none)" ? "empty" : shortLayout(v)));
+  $("#obj-count").textContent = `${f.objects.size}/${objVals.length}`;
   $("#split-count").textContent = `${f.splits.size}/${splits.size}`;
   $("#layout-count").textContent = `${f.layouts.size}/${uniq((s) => s.layout).length}`;
   $("#nobj-count").textContent = `${f.nObjects.size}/${uniq((s) => s.n_objects).length}`;
+  $("#box-count").textContent = `${f.boxes.size}/${uniq((s) => s.box).length}`;
   $("#spk-count").textContent = `${f.speakers.size}/8`;
   $("#metric-scope").textContent = S.sort.run ? `range applies to ${S.sort.run}` : "any loaded run in range";
 }
@@ -528,7 +677,7 @@ function buildSpeakerDiagram() {
   const svg = $("#speakers");
   // Speakers sit OUTSIDE the box, so the margin has to clear the push-out distance plus
   // the circle radius (OFF + R), or every edge speaker is clipped by the viewport.
-  const W = 236, H = 148, OFF = 16, R = 11, M = OFF + R + 1;
+  const W = 236, H = 116, OFF = 14, R = 10, M = OFF + R + 1;
   svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
   const bw = W - 2 * M, bh = H - 2 * M;
   let out = `<rect class="box-outline" x="${M}" y="${M}" width="${bw}" height="${bh}" rx="4"/>
@@ -794,6 +943,251 @@ function syncSliders() {
   });
 }
 
+/* ***** epoch frames *****
+   Mask values are fetched as one fp16 blob per run (1600 bytes per cell per epoch --
+   usually smaller than a PNG of the same cell) and drawn to <canvas> on the client. That
+   makes scrubbing the epoch slider and playing the animation pure local work: no network
+   round-trip and no server render per frame. */
+
+async function fetchFrames(run, sids) {
+  const r = await fetch(`/api/frames?run=${encodeURIComponent(run)}&sids=${sids.join(",")}`);
+  if (!r.ok) throw new Error("frames");
+  const raw = new Uint16Array(await r.arrayBuffer());
+  return {
+    epochs: S.runs[run] ? S.runs[run].epochs || [] : [],
+    sids: new Map(sids.map((s, i) => [s, i])),
+    raw,
+  };
+}
+
+/* Minimal IEEE half -> float. Only needed because DataView has no float16 reader. */
+function half(u) {
+  const s = (u & 0x8000) ? -1 : 1, e = (u >> 10) & 0x1f, m = u & 0x3ff;
+  if (e === 0) return s * m * 5.9604644775390625e-8;
+  if (e === 31) return m ? NaN : s * Infinity;
+  return s * Math.pow(2, e - 15) * (1 + m / 1024);
+}
+
+/* Draws a (20,40) mask into a canvas using the server's own LUT, so a cell looks
+   identical whether the client painted it or the server rendered a PNG. */
+function drawMask(canvas, values, mode, truth) {
+  const { h, w, gamma, gain } = S.lut;
+  const n = w * h;
+  const ctx = canvas.getContext("2d");
+
+  // Reused buffers: at ~36 cells x 5 fps a fresh ImageData per cell is pure GC churn.
+  const off = drawMask._off || (drawMask._off = document.createElement("canvas"));
+  if (off.width !== w || off.height !== h) { off.width = w; off.height = h; }
+  const octx = off.getContext("2d");
+  const img = drawMask._img && drawMask._img.width === w
+    ? drawMask._img : (drawMask._img = octx.createImageData(w, h));
+  const px = img.data;
+
+  // Overlay draws the target underneath and the prediction over it, in one box; stacked
+  // draws them as two boxes (handled by the caller, which paints each half).
+  const soloLut = mode === "diff" ? S.lut.diff : mode === "truth" ? S.lut.truth : S.lut.pred;
+  const layers = mode === "overlay"
+    ? [{ v: truth, lut: S.lut.truth, k: 0.72 }, { v: values, lut: S.lut.pred, k: 0.82 }]
+    : [{ v: values, lut: soloLut, k: gain }];
+
+  ctx.clearRect(0, 0, w, h);
+  for (const { v, lut, k } of layers) {
+    for (let i = 0; i < n; i++) {
+      let t, a;
+      if (mode === "diff") {
+        const d = Math.max(-1, Math.min(1, v[i] - truth[i]));
+        const mag = Math.pow(Math.abs(d), gamma);
+        t = 0.5 + 0.5 * Math.sign(d) * mag;
+        a = mag;
+      } else {
+        t = Math.pow(Math.max(0, Math.min(1, v[i])), gamma);
+        a = t;
+      }
+      const c = lut[Math.round(t * (lut.length - 1))] || [0, 0, 0];
+      px[i * 4] = c[0]; px[i * 4 + 1] = c[1]; px[i * 4 + 2] = c[2];
+      // Alpha-weighted so the backdrop photo shows through faint cells; k matches the
+      // server's gain constants so a canvas cell composites identically to a server PNG.
+      px[i * 4 + 3] = Math.round(a * k * 255);
+    }
+    // putImageData ignores compositing and would overwrite the layer beneath, so stage
+    // on the offscreen canvas and drawImage, which composites.
+    octx.putImageData(img, 0, 0);
+    ctx.drawImage(off, 0, 0);
+  }
+}
+
+/* Paints one cell from locally-held frame data, fetching the run's frames for the
+   visible rows the first time they are needed. */
+/* Modes that draw the target as well as the prediction: overlay composites them in one
+   box, stacked puts them in two. */
+const needsTruth = (m) => m === "overlay" || m === "stacked";
+
+const scratch = new Float32Array(20 * 40);   // reused across cells; avoids per-frame GC
+
+function paintCanvas(cv, run, sid, epoch) {
+  if (!S.lut) return;
+  const store = S.frameData[run];
+  const cells = S.lut.h * S.lut.w;
+  if (!store || !store.sids.has(sid)) { ensureFrames(run); return; }
+  const eps = store.epochs;
+  const ei = epoch == null ? eps.length - 1 : eps.indexOf(epoch);
+  const si = store.sids.get(sid);
+  if (ei < 0) return;
+  const off = (ei * store.sids.size + si) * cells;
+  for (let i = 0; i < cells; i++) scratch[i] = half(store.raw[off + i]);
+  if (Number.isNaN(scratch[0])) {                   // run has no prediction here
+    cv.getContext("2d").clearRect(0, 0, S.lut.w, S.lut.h);
+    return;
+  }
+  // In stacked mode this canvas is the prediction half only -- the target is drawn into
+  // its own canvas below, so it needs no truth here.
+  const mode = S.view.mode === "stacked" ? "pred" : S.view.mode;
+  const wantTruth = mode === "diff" || needsTruth(mode);
+  const truth = wantTruth ? S.truthCache[sid] : null;
+  if (wantTruth && !truth) { ensureTruth(sid); return; }
+  drawMask(cv, scratch, mode, truth);
+}
+
+/* Fetch frames for whatever rows are on screen, once per run. */
+let framesPending = new Set();
+async function ensureFrames(run) {
+  if (framesPending.has(run)) return;
+  framesPending.add(run);
+  const first = Math.max(0, Math.floor(Math.max(0, $("#scroller").scrollTop) / rowH()) - 4);
+  const sids = S.order.slice(first, first + 24).map((s) => s.i);
+  try {
+    const d = await fetchFrames(run, sids);
+    S.frameData[run] = d;
+    renderVisible();
+  } finally {
+    framesPending.delete(run);
+  }
+}
+
+const truthPending = new Set();
+async function ensureTruth(sid) {
+  if (truthPending.has(sid)) return;
+  truthPending.add(sid);
+  try {
+    const d = await api(`/api/values?sid=${sid}`);
+    S.truthCache[sid] = d.v.flat();
+    renderVisible();
+  } finally {
+    truthPending.delete(sid);
+  }
+}
+
+/* ***** epoch slider + playback *****
+   The union of every loaded run's epochs, so one slider drives all columns. A run
+   without that exact epoch falls back to its nearest earlier one. */
+
+/* Memoized: epochFor() calls this once per run per cell, so during playback an
+   un-cached version rebuilt and sorted the union ~36 times a frame. */
+let epochsCache = null;
+function allEpochs() {
+  if (epochsCache) return epochsCache;
+  const set = new Set();
+  S.runOrder.forEach((n) => (S.runs[n].epochs || []).forEach((e) => set.add(e)));
+  return (epochsCache = [...set].sort((a, b) => a - b));
+}
+const invalidateEpochs = () => { epochsCache = null; };
+
+function epochFor(run) {
+  const eps = allEpochs();
+  if (S.epochIdx == null || !eps.length) return null;      // null = the run's latest
+  const want = eps[Math.min(S.epochIdx, eps.length - 1)];
+  const mine = S.runs[run].epochs || [];
+  let best = null;
+  for (const e of mine) if (e <= want) best = e;
+  return best == null ? (mine[0] ?? null) : best;
+}
+
+function renderEpochPanel() {
+  const eps = allEpochs();
+  $("#epoch-panel").hidden = eps.length < 2;
+  if (eps.length < 2) return;
+  const sl = $("#epoch-slider");
+  sl.max = eps.length - 1;
+  if (S.epochIdx != null) sl.value = Math.min(S.epochIdx, eps.length - 1);
+  else sl.value = eps.length - 1;
+  const i = S.epochIdx == null ? eps.length - 1 : +sl.value;
+  const latest = S.epochIdx == null || i === eps.length - 1;
+  $("#epoch-label").innerHTML =
+    `<b>ep ${eps[i]}</b>` + (latest ? ` <span class="k">latest</span>` : "");
+  // The slider's right end is the furthest epoch any loaded run reached, which is what
+  // the track is scaled to.
+  $("#epoch-max").textContent = eps[eps.length - 1];
+  $("#epoch-play").textContent = S.playing ? "❚❚" : "▶";
+  $("#epoch-play").title = S.playing ? "Pause" : "Play through all epochs";
+  // Greyed at the ends so the control says where you are without you having to test it.
+  $("#epoch-prev").disabled = i <= 0;
+  $("#epoch-next").disabled = i >= eps.length - 1;
+}
+
+/* One epoch at a time, because the slider is far too coarse to land on a specific epoch
+   when a run has dozens of them. Stepping stops playback: the two controls both drive
+   epochIdx, and letting the timer keep firing would yank the frame back. */
+function stepEpoch(delta) {
+  const eps = allEpochs();
+  if (eps.length < 2) return;
+  S.playing = false;
+  clearInterval(playTimer);
+  // null means "pinned to latest", which is the last index for stepping purposes.
+  const cur = S.epochIdx == null ? eps.length - 1 : S.epochIdx;
+  setEpochIdx(cur + delta);
+}
+
+function setEpochIdx(i) {
+  const eps = allEpochs();
+  S.epochIdx = i == null ? null : Math.max(0, Math.min(i, eps.length - 1));
+  renderEpochPanel();
+  renderVisible();          // masks repaint immediately from local frame data
+  fetchEpochMetrics();      // metrics/sort catch up when the server answers
+}
+
+/* Metrics belong to an epoch as much as the masks do. Without this the table would show
+   early-training masks captioned with final-epoch mse/iou and sorted by them -- the most
+   misleading state the scrubber can produce. Debounced so dragging the slider or playing
+   does not fire a request per frame. */
+let metricsTimer = 0;
+function fetchEpochMetrics() {
+  clearTimeout(metricsTimer);
+  metricsTimer = setTimeout(async () => {
+    const jobs = S.runOrder.map(async (name) => {
+      const ep = epochFor(name);
+      const cur = S.runs[name];
+      if (cur.metricsEpoch === ep) return false;
+      const q = ep == null ? "" : `?epoch=${ep}`;
+      try {
+        const d = await api(`/api/run/${encodeURIComponent(name)}${q}`);
+        cur.samples = d.samples;
+        cur.metricsEpoch = ep;
+        return true;
+      } catch {
+        return false;
+      }
+    });
+    if ((await Promise.all(jobs)).some(Boolean)) refresh();
+  }, 250);
+}
+
+let playTimer = 0;
+function togglePlay() {
+  S.playing = !S.playing;
+  clearInterval(playTimer);
+  if (S.playing) {
+    const eps = allEpochs();
+    if (S.epochIdx == null || S.epochIdx >= eps.length - 1) S.epochIdx = 0;
+    // Frames are already local, so this is just an index advance -- no fetch per step.
+    playTimer = setInterval(() => {
+      const n = allEpochs().length;
+      if (S.epochIdx >= n - 1) { S.playing = false; clearInterval(playTimer); renderEpochPanel(); return; }
+      setEpochIdx(S.epochIdx + 1);
+    }, 220);
+  }
+  renderEpochPanel();
+}
+
 /* ***** live updates *****
    Runs keep training while viz2 is open. Poll the (cheap, server-throttled) run list;
    when a loaded run's epoch advances, refetch its metrics and re-render its masks. */
@@ -826,19 +1220,20 @@ async function poll() {
   for (const name of advanced) await addRun(name, true);
 
   if (advanced.length) {
+    S.frameData = {};   // new epochs exist; refetch mask values
     // Mask URLs are cached immutable, so a new epoch needs a new URL to be fetched.
     S.epochTag = (S.epochTag || 0) + 1;
     // New metrics can reorder a sorted table. Keep whichever sample is at the top of the
     // viewport in view, so rows don't slide out from under the user mid-read.
     const sc = $("#scroller");
     const hdr = sc.querySelector(".hrow");
-    const anchorRank = Math.floor(Math.max(0, sc.scrollTop - (hdr ? hdr.offsetHeight : 0)) / ROW_H);
+    const anchorRank = Math.floor(Math.max(0, sc.scrollTop - (hdr ? hdr.offsetHeight : 0)) / rowH());
     const anchor = S.order[anchorRank];
     refresh();
     if (anchor) {
       const next = S.order.indexOf(anchor);
       if (next >= 0 && next !== anchorRank) {
-        sc.scrollTop += (next - anchorRank) * ROW_H;
+        sc.scrollTop += (next - anchorRank) * rowH();
         renderVisible();
       }
     }
@@ -883,8 +1278,8 @@ const valueCache = new Map();
 async function valuesFor(run, sid, mode) {
   const k = `${run}|${sid}|${mode}`;
   if (!valueCache.has(k))
-    valueCache.set(k, api(`/api/values?sid=${sid}&run=${encodeURIComponent(run)}&mode=${mode}`).then((d) => d.v));
-  return valueCache.get(k);
+    valueCache.set(k, api(`/api/values?sid=${sid}&run=${encodeURIComponent(run)}&mode=${mode}`));
+  return valueCache.get(k);   // {v} or, in overlay/stacked mode, {v, t}
 }
 
 function bindTooltip() {
@@ -892,7 +1287,7 @@ function bindTooltip() {
   let cur = null;
   $("#scroller").addEventListener("mousemove", async (ev) => {
     // dataset.run is "" on the ground-truth cell, which still has values to show.
-    const img = ev.target.closest?.("img.mask");
+    const img = ev.target.closest?.(".mask");
     if (!img || img.dataset.sid === undefined) { tip.hidden = true; cur = null; return; }
     const b = img.getBoundingClientRect();
     const col = Math.floor(((ev.clientX - b.left) / b.width) * 40);
@@ -902,9 +1297,11 @@ function bindTooltip() {
     const mode = img.dataset.run ? S.view.mode : "pred";
     const key = `${img.dataset.run}|${img.dataset.sid}|${mode}`;
     if (cur !== key) { cur = key; tip._v = await valuesFor(img.dataset.run, img.dataset.sid, mode); }
-    const v = tip._v?.[row]?.[col];
+    const v = tip._v?.v?.[row]?.[col];
+    const t = tip._v?.t?.[row]?.[col];
     tip.hidden = false;
-    tip.textContent = `[${row},${col}] ${v == null ? "–" : v.toFixed(3)}`;
+    tip.textContent = `[${row},${col}] ` + (v == null ? "–" : v.toFixed(3)) +
+      (t == null ? "" : ` pred · ${t.toFixed(3)} true`);
     tip.style.left = `${ev.clientX + 12}px`;
     tip.style.top = `${ev.clientY + 14}px`;
   });
@@ -1044,15 +1441,40 @@ function bindUI() {
   $("#scroller").addEventListener("scroll", onScroll, { passive: true });
   window.addEventListener("resize", renderVisible);
 
+  /* Collapsing the sidebar hands its 268px to the table, which matters when comparing
+     several runs side by side. Purely a CSS width change: the virtualizer keys off
+     viewport HEIGHT, so no rows need recomputing. */
+  const setSidebar = (open) => {
+    document.body.classList.toggle("nosidebar", !open);
+    $("#sidebar-show").hidden = open;
+    try { localStorage.setItem("viz2.sidebar", open ? "1" : "0"); } catch (_) {}
+  };
+  $("#sidebar-hide").onclick = () => setSidebar(false);
+  $("#sidebar-show").onclick = () => setSidebar(true);
+  try { if (localStorage.getItem("viz2.sidebar") === "0") setSidebar(false); } catch (_) {}
+
   $("#mode-seg").querySelectorAll("button").forEach((b) => {
     b.onclick = () => {
       S.view.mode = b.dataset.mode;
       $("#mode-seg").querySelectorAll("button").forEach((x) => x.classList.toggle("on", x === b));
+      document.body.classList.toggle("stacked", S.view.mode === "stacked");
       renderLegend();
-      renderVisible();
+      // Stacked changes the row height, so the spacer and row offsets must be rebuilt --
+      // a repaint alone would leave rows overlapping.
+      refresh();
     };
   });
   $("#bg-toggle").onchange = (e) => { S.view.background = e.target.checked; renderVisible(); };
+
+  $("#epoch-slider").oninput = (e) => setEpochIdx(+e.target.value);
+  $("#epoch-play").onclick = togglePlay;
+  $("#epoch-prev").onclick = () => stepEpoch(-1);
+  $("#epoch-next").onclick = () => stepEpoch(1);
+  $("#epoch-latest").onclick = () => {
+    S.playing = false; clearInterval(playTimer);
+    S.frameData = {};                 // drop frames so the latest epoch refetches cleanly
+    setEpochIdx(null);
+  };
 
   document.querySelectorAll("[data-all]").forEach((b) => {
     b.onclick = () => {
@@ -1060,6 +1482,12 @@ function bindUI() {
       if (k === "speakers") S.filters.speakers = new Set([1, 2, 3, 4, 5, 6, 7, 8]);
       if (k === "layouts") S.filters.layouts = new Set(uniq((s) => s.layout).map((x) => x[0]));
       if (k === "nObjects") S.filters.nObjects = new Set(uniq((s) => s.n_objects).map((x) => x[0]));
+      if (k === "boxes") S.filters.boxes = new Set(uniq((s) => s.box).map((x) => x[0]));
+      if (k === "objects") {
+        const all = new Set();
+        S.samples.forEach((s) => (s.objects && s.objects.length ? s.objects : ["(none)"]).forEach((o) => all.add(o)));
+        S.filters.objects = all;
+      }
       if (k === "splits") { const a = new Set(); S.runOrder.forEach((n) => S.runs[n].splits.forEach((x) => a.add(x))); S.filters.splits = a; }
       refresh();
     };
@@ -1083,6 +1511,14 @@ function bindUI() {
     if (!$("#modal").hidden) {
       if (e.key === "ArrowLeft") { e.preventDefault(); stepModal(-1); }
       if (e.key === "ArrowRight") { e.preventDefault(); stepModal(1); }
+      return;
+    }
+    // Bare "f" toggles the filter panel -- but not while typing in the id searches, and
+    // not when it is a browser/OS chord.
+    const typing = /^(INPUT|TEXTAREA|SELECT)$/.test(e.target.tagName);
+    if (e.key === "f" && !typing && !e.ctrlKey && !e.metaKey && !e.altKey) {
+      e.preventDefault();
+      setSidebar(document.body.classList.contains("nosidebar"));
     }
   });
 
@@ -1091,12 +1527,29 @@ function bindUI() {
   setInterval(poll, POLL_MS);   // pick up new runs and new epochs of training ones
 }
 
+/* Blue is always the prediction and green always the ground truth, in every view, so the
+   overlay and difference explain each other rather than needing separate keys.
+   Colorbars are served `immutable`, so they carry the render version too -- without it a
+   palette change never reaches a browser that cached the old ramp. */
+const colorbarURL = (mode) => `/api/colorbar/${mode}.png?v=${S.renderVersion}`;
+
 function renderLegend() {
-  const diff = S.view.mode === "diff";
+  const m = S.view.mode;
+  if (m === "overlay" || m === "stacked") {
+    // Two ramps rather than flat swatches: both layers carry magnitude, so the key has
+    // to show the light-to-dark range each one spans.
+    $("#legend").innerHTML =
+      `<div class="dualbar">
+         <div><img src="${colorbarURL("pred")}" alt=""><span>prediction</span></div>
+         <div><img src="${colorbarURL("truth")}" alt=""><span>ground truth</span></div>
+       </div>`;
+    return;
+  }
+  const diff = m === "diff";
   $("#legend").innerHTML =
-    `<img src="/api/colorbar/${diff ? "diff" : "pred"}.png" alt="">
+    `<img src="${colorbarURL(diff ? "diff" : "pred")}" alt="">
      <div class="lbl">${diff
-       ? `<span>−1 missed</span><span>0</span><span>+1 excess</span>`
+       ? `<span>missed truth</span><span>0</span><span>excess pred</span>`
        : `<span>0</span><span>mask value</span><span>1</span>`}</div>`;
 }
 

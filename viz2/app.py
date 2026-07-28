@@ -14,7 +14,7 @@ from fastapi import FastAPI, HTTPException, Query, Response
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from viz2 import config, render
+from viz2 import config, data, render
 from viz2.data import Registry
 
 app = FastAPI(title="viz2")
@@ -86,6 +86,12 @@ def api_samples():
             "output_id": m.get("output_id"),
             "layout": m.get("layout"),
             "n_objects": m.get("n_objects"),
+            # Object types present, independent of layout: lets the UI ask "contains a
+            # cylinder?" once the dataset holds more than cubes.
+            "objects": sorted(m.get("objects") or {}),
+            # The enclosure the scene sits in. Experiment-25 is entirely "metal", so the
+            # filter shows a single chip today; it populates itself if other boxes appear.
+            "box": m.get("box"),
             "speaker": m.get("speaker"),
             "is_empty_box": bool(m.get("is_empty_box")),
             # full-resolution image coords, for the position scatter; [-1,-1] sentinel
@@ -97,13 +103,15 @@ def api_samples():
 
 
 @app.get("/api/run/{name}")
-def api_run(name: str, reload: int = 0):
+def api_run(name: str, reload: int = 0, epoch: int | None = None):
+    """Per-sample metrics for one run. `epoch` scores that saved epoch instead of the
+    latest, so the numbers and sorting match the masks on screen while scrubbing."""
     # reload=1 re-reads the run's prediction files, picking up epochs written since it
     # was first loaded (a run still training keeps producing them).
     if reload:
         registry.rescan()
     try:
-        rd = registry.run(name, reload=bool(reload))
+        rd = registry.run(name, reload=bool(reload), epoch=epoch)
     except KeyError:
         raise HTTPException(404, "unknown or incompatible run")
     samples = {}
@@ -117,6 +125,7 @@ def api_run(name: str, reload: int = 0):
         }
     return {"name": rd.name, "epoch": rd.epoch, "family": rd.family,
             "skipped_files": rd.skipped_files, "n": len(rd.sample_ids),
+            "epochs": registry.epochs(name),   # drives the epoch slider
             "samples": samples}
 
 
@@ -129,7 +138,7 @@ def api_mask(run: str, sid: int, mode: str = "pred", bg: int = 1):
     rd = _run(run)
     if i not in rd.row_of:
         raise HTTPException(404, "no prediction for this sample")
-    mode = "diff" if mode == "diff" else "pred"
+    mode = mode if mode in ("diff", "overlay", "stacked") else "pred"
     img = render.cached_mask("run", run, i, mode, bool(bg))
     return Response(img, media_type=render.media_type(img), headers=IMMUTABLE)
 
@@ -140,9 +149,19 @@ def api_gt_mask(sid: int, bg: int = 1):
     return Response(img, media_type=render.media_type(img), headers=IMMUTABLE)
 
 
+@app.get("/api/backdrop/{sid}.jpg")
+def api_backdrop(sid: int):
+    """The overhead frame at cell size, shown behind canvas-drawn masks. Fetched once per
+    sample and reused across every epoch, so scrubbing never re-downloads it."""
+    img = render.cached_backdrop(_sid(sid))
+    if img is None:
+        raise HTTPException(404, "no backdrop")
+    return Response(img, media_type="image/jpeg", headers=IMMUTABLE)
+
+
 @app.get("/api/colorbar/{mode}.png")
 def api_colorbar(mode: str):
-    mode = "diff" if mode == "diff" else "pred"
+    mode = mode if mode in ("diff", "truth") else "pred"
     return Response(render.cached_colorbar(mode), media_type="image/png", headers=IMMUTABLE)
 
 
@@ -160,6 +179,13 @@ def api_values(sid: int, run: str = "", mode: str = "pred"):
         values = rd.masks[rd.row_of[i]]
         if mode == "diff":
             values = values - registry.gt.masks[i]
+        elif mode in ("overlay", "stacked"):
+            # Two masks are on screen, so report both rather than leaving the reader to
+            # guess which one a single number belongs to.
+            return JSONResponse(
+                {"v": np.round(values.astype(np.float64), 4).tolist(),
+                 "t": np.round(registry.gt.masks[i].astype(np.float64), 4).tolist()},
+                headers=IMMUTABLE)
     return JSONResponse({"v": np.round(values.astype(np.float64), 4).tolist()},
                         headers=IMMUTABLE)
 
@@ -196,6 +222,48 @@ def api_audio(sid: int, which: str):
         raise HTTPException(404, "not generated for this sample")
     # FileResponse handles Range requests, which <audio> needs in order to seek.
     return FileResponse(p, media_type="audio/wav")
+
+
+@app.get("/api/lut")
+def api_lut():
+    """The colormaps, so the client draws cells with exactly the colours the server uses
+    for the modal and ground-truth images. One source of truth for colour."""
+    return {"pred": render.SEQ_LUT.tolist(), "truth": render.TRUE_SEQ_LUT.tolist(),
+            "diff": render.DIV_LUT.tolist(), "gamma": render.GAMMA,
+            "gain": render.OVERLAY_GAIN,   # alpha scale when drawn over the backdrop
+            "h": config.MASK_H, "w": config.MASK_W}
+
+
+@app.get("/api/frames")
+def api_frames(run: str, sids: str, epochs: str = ""):
+    """Raw mask values for a set of samples across a set of epochs, as one fp16 blob.
+
+    A 20x40 mask is 1600 bytes -- usually smaller than a PNG of it -- so shipping values
+    and drawing them on the client is both lighter than per-frame images and fast enough
+    to scrub and animate without touching the network again.
+
+    Layout: float16[n_epochs][n_sids][H*W], C-order. Samples the run never predicted are
+    filled with NaN so the client can show its "no prediction" state.
+    """
+    ids = [registry.sample_index(s) for s in sids.split(",") if s.strip()]
+    if not ids:
+        raise HTTPException(400, "no sids")
+    eps = [int(e) for e in epochs.split(",") if e.strip()] or registry.epochs(run)
+    if not eps:
+        raise HTTPException(404, "run has no saved epochs")
+
+    if run not in registry.by_name or not registry.by_name[run].compatible:
+        raise HTTPException(404, "unknown or incompatible run")
+
+    want = set(ids)
+    out = np.full((len(eps), len(ids), config.MASK_H * config.MASK_W), np.nan, dtype=np.float16)
+    for ei, ep in enumerate(eps):
+        masks = data.load_epoch_masks(run, registry.runs_dir, ep, want)
+        for si, i in enumerate(ids):
+            m = masks.get(i)
+            if m is not None:
+                out[ei, si] = m.reshape(-1)
+    return Response(out.tobytes(), media_type="application/octet-stream", headers=IMMUTABLE)
 
 
 @app.get("/api/neighbors")

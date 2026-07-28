@@ -12,6 +12,7 @@
   <header class="brand">
     <h1>viz2</h1>
     <p id="subtitle">loading…</p>
+    <button id="sidebar-hide" title="Hide filters (F)" aria-label="Hide filters">‹</button>
   </header>
 
   <section class="panel">
@@ -22,23 +23,51 @@
   <section class="panel">
     <h2>Display</h2>
     <div class="seg" id="mode-seg">
-      <button data-mode="pred" class="on">Prediction</button>
-      <button data-mode="diff">Difference</button>
+      <button data-mode="pred" class="on" title="Prediction only">Pred</button>
+      <button data-mode="overlay" title="Prediction and ground truth composited in one box">Overlay</button>
+      <button data-mode="diff" title="Signed difference, prediction minus ground truth">Diff</button>
+      <button data-mode="stacked" title="Prediction above, ground truth below, in separate boxes">Stacked</button>
     </div>
     <div id="legend"></div>
     <label class="check"><input type="checkbox" id="bg-toggle" checked><span>Show background</span></label>
   </section>
 
-  <section class="panel">
-    <div class="phead"><h2>Position</h2><span class="count"></span>
-      <span class="links"><button class="link" id="pos-clear">clear</button></span>
+  <section class="panel" id="epoch-panel" hidden>
+    <div class="phead"><h2>Epoch</h2><span class="count" id="epoch-label"></span>
+      <span class="links"><button class="link" id="epoch-latest">latest</button></span>
     </div>
-    <p class="hint">Drag to lasso · click a point · arrow keys to walk</p>
-    <svg id="scatter" tabindex="0"></svg>
-    <p class="hint" id="pos-status">all positions</p>
+    <div class="epochrow">
+      <button id="epoch-play" class="playbtn" title="Play through epochs">▶</button>
+      <button id="epoch-prev" class="stepbtn" title="Previous epoch">‹</button>
+      <button id="epoch-next" class="stepbtn" title="Next epoch">›</button>
+      <input id="epoch-slider" type="range" min="0" max="0" value="0" step="1"
+             title="Drag to scrub; focus it and use arrow keys to step">
+      <span id="epoch-max" class="count" title="Highest epoch across the loaded runs"></span>
+    </div>
   </section>
 
   <section class="panel">
+    <div class="phead"><h2>Find</h2><span class="count" id="find-count"></span>
+      <span class="links"><button class="link" id="find-clear">clear</button></span>
+    </div>
+    <div class="finds">
+      <input id="find-sample" class="find" type="search" inputmode="numeric"
+             placeholder="sample id" title="Sample id, e.g. 871. Enter to add; paste a list to add several." autocomplete="off">
+      <input id="find-pos" class="find" type="search" inputmode="numeric"
+             placeholder="position id" title="Position id, e.g. 108 — adds all 8 speakers at that position." autocomplete="off">
+    </div>
+    <div class="chips" id="find-chips"></div>
+  </section>
+
+  <section class="panel browse">
+    <div class="phead"><h2>Position</h2><span class="count"></span>
+      <span class="links"><button class="link" id="pos-clear">clear</button></span>
+    </div>
+    <svg id="scatter" tabindex="0" title="Drag to lasso · click a point · arrow keys to walk"></svg>
+    <p class="hint" id="pos-status">all positions</p>
+  </section>
+
+  <section class="panel browse">
     <div class="phead"><h2>Speaker</h2>
       <span class="count" id="spk-count"></span>
       <span class="links"><button class="link" data-all="speakers">all</button><button class="link" data-none="speakers">none</button></span>
@@ -46,7 +75,7 @@
     <svg id="speakers"></svg>
   </section>
 
-  <section class="panel">
+  <section class="panel browse">
     <div class="phead"><h2>Split</h2>
       <span class="count" id="split-count"></span>
       <span class="links"><button class="link" data-all="splits">all</button><button class="link" data-none="splits">none</button></span>
@@ -54,7 +83,31 @@
     <div class="chips" id="split-chips"></div>
   </section>
 
-  <section class="panel">
+  <section class="panel browse">
+    <div class="phead"><h2>Objects</h2>
+      <span class="count" id="obj-count"></span>
+      <span class="links"><button class="link" data-all="objects">all</button><button class="link" data-none="objects">none</button></span>
+    </div>
+    <div class="chips" id="obj-chips"></div>
+  </section>
+
+  <section class="panel browse">
+    <div class="phead"><h2># Objects</h2>
+      <span class="count" id="nobj-count"></span>
+      <span class="links"><button class="link" data-all="nObjects">all</button><button class="link" data-none="nObjects">none</button></span>
+    </div>
+    <div class="chips" id="nobj-chips"></div>
+  </section>
+
+  <section class="panel browse">
+    <div class="phead"><h2>Box</h2>
+      <span class="count" id="box-count"></span>
+      <span class="links"><button class="link" data-all="boxes">all</button><button class="link" data-none="boxes">none</button></span>
+    </div>
+    <div class="chips" id="box-chips"></div>
+  </section>
+
+  <section class="panel browse">
     <div class="phead"><h2>Layout</h2>
       <span class="count" id="layout-count"></span>
       <span class="links"><button class="link" data-all="layouts">all</button><button class="link" data-none="layouts">none</button></span>
@@ -62,15 +115,7 @@
     <div class="chips" id="layout-chips"></div>
   </section>
 
-  <section class="panel">
-    <div class="phead"><h2>Objects</h2>
-      <span class="count" id="nobj-count"></span>
-      <span class="links"><button class="link" data-all="nObjects">all</button><button class="link" data-none="nObjects">none</button></span>
-    </div>
-    <div class="chips" id="nobj-chips"></div>
-  </section>
-
-  <section class="panel">
+  <section class="panel browse">
     <div class="phead"><h2>Metrics</h2><span class="count"></span>
       <span class="links"><button class="link" id="metric-reset">reset</button></span>
     </div>
@@ -78,6 +123,9 @@
     <div id="sliders"></div>
   </section>
 </aside>
+
+<!-- Lives outside #sidebar so it stays reachable once the sidebar has slid away. -->
+<button id="sidebar-show" title="Show filters (F)" aria-label="Show filters" hidden>›</button>
 
 <main>
   <div id="scroller"><div id="spacer"></div><div id="rows"></div></div>

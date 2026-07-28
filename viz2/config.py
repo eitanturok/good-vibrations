@@ -66,6 +66,10 @@ N_DEFAULT_RUNS = 3  # auto-loaded on first open, most recently modified first
 # training while viz2 is open show up without a restart. A scan is ~0.15s.
 RESCAN_SECONDS = 10.0
 
+# How many scrubbed-epoch RunData objects to keep. Each is ~5MB, so this bounds the
+# epoch slider's memory; the latest-epoch entry per run is never evicted.
+MAX_EPOCH_CACHE = 24
+
 # Run status is inferred from logs-rank0.txt: a clean shutdown prints the memory line,
 # a crash leaves a traceback, and anything else still being written is training.
 RUN_LOG = "logs-rank0.txt"

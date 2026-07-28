@@ -18,18 +18,39 @@ from PIL import Image
 
 from viz2 import config
 
-# Sequential blue ramp, 100->700 (magnitude). The lightest step is allowed to recede
-# toward the surface -- that is the intended reading of "near zero".
-SEQ_HEX = ["#eaf2fd", "#cde2fb", "#b7d3f6", "#9ec5f4", "#86b6ef", "#6da7ec",
+# Sequential ramps, light->dark, one hue each (never a rainbow). The lightest step is
+# allowed to recede toward the surface -- that is the intended reading of "near zero".
+# A prediction is drawn on the blue ramp and a ground-truth mask on the green one, so a
+# mask carries the same identity whether it is shown alone or overlaid.
+# Both ramps start at white so an empty cell reads as nothing at all, and darken to the
+# hue that identifies the layer.
+SEQ_HEX = ["#ffffff", "#eaf2fd", "#cde2fb", "#b7d3f6", "#9ec5f4", "#86b6ef", "#6da7ec",
            "#5598e7", "#3987e5", "#2a78d6", "#256abf", "#1c5cab", "#184f95",
            "#104281", "#0d366b"]
 
-# Diverging: blue (under-prediction) <-> gray midpoint <-> red (over-prediction).
+TRUE_SEQ_HEX = ["#ffffff", "#e7f4ec", "#c9e8d6", "#a9dbc0", "#86cda8", "#63bf90", "#45ad79",
+                "#2f9a66", "#1f8757", "#17744a", "#0f6640", "#0d5c33", "#0a4d2b",
+                "#083f23", "#06311b"]
+
+# Diverging: green (missed truth) <-> gray midpoint <-> blue (excess prediction).
 # Gray, not white, at the midpoint so zero-diff cells still read as data rather than
-# dropping out to the page. blue<->aqua was rejected upstream: both cool.
-DIV_NEG_HEX = "#256abf"   # truth > pred  (model missed mass)
+# dropping out to the page.
+# One identity everywhere: BLUE is the prediction, GREEN is the ground truth.
+#
+# Prediction takes blue because it is what you look at all day -- the default view over
+# a 1024-row table -- and a wall of red would read as alarm and clash with the red used
+# for crashed runs and remove buttons. Ground truth is the rarer reference layer.
+#
+# The green is deliberately deeper than the "running" status badge (#1f7a4d, OKLab
+# deltaE 9.7 away) so a ground-truth mask is never mistaken for a run-state indicator.
+PRED_HEX = "#256abf"
+TRUE_HEX = "#0d5c33"
+
+# Diff arms inherit the same identity, so the views explain each other: blue means the
+# prediction put mass here, green means ground-truth mass the model missed.
+DIV_NEG_HEX = TRUE_HEX    # truth > pred  (model missed mass)
 DIV_MID_HEX = "#f0efec"
-DIV_POS_HEX = "#e34948"   # pred > truth  (model hallucinated mass)
+DIV_POS_HEX = PRED_HEX    # pred > truth  (model hallucinated mass)
 
 
 def _hex(h: str) -> np.ndarray:
@@ -46,23 +67,39 @@ def _ramp(hexes: list[str], n: int = 256) -> np.ndarray:
 
 
 SEQ_LUT = _ramp(SEQ_HEX)
+TRUE_SEQ_LUT = _ramp(TRUE_SEQ_HEX)
 DIV_LUT = _ramp([DIV_NEG_HEX, DIV_MID_HEX, DIV_POS_HEX])
 
 
-def colorize(values: np.ndarray, mode: str) -> tuple[np.ndarray, np.ndarray]:
+# Display gamma. Predictions from an undertrained run can top out around 0.4-0.7 while a
+# converged run reaches 1.0, so on a linear [0,1] ramp the weak run renders almost
+# entirely in the palest steps and its structure is invisible. Raising values to a power
+# < 1 expands the low end where the data actually lives. This is a DISPLAY transform
+# only: the domain stays fixed at [0,1] so cells remain comparable across runs, and
+# hover tooltips and all metrics continue to report the true values.
+GAMMA = 0.6
+
+
+def colorize(values: np.ndarray, mode: str, gamma: float = GAMMA) -> tuple[np.ndarray, np.ndarray]:
     """(H,W) values -> (rgb (H,W,3) uint8, alpha (H,W) float in [0,1]).
 
     Alpha encodes "how much signal is here", used by the no-background view so the
     mask silhouette floats free of a filled rectangle.
     """
     if mode == "diff":
-        t = np.clip((values + 1.0) / 2.0, 0.0, 1.0)      # [-1,1] -> [0,1], fixed domain
-        alpha = np.abs(np.clip(values, -1.0, 1.0))
+        # Gamma applied symmetrically about the neutral midpoint, so over- and
+        # under-prediction brighten at the same rate. Domain stays fixed at [-1,+1].
+        signed = np.clip(values, -1.0, 1.0)
+        mag = np.abs(signed) ** gamma
+        t = 0.5 + 0.5 * np.sign(signed) * mag
+        alpha = mag
         lut = DIV_LUT
     else:
-        t = np.clip(values, 0.0, 1.0)
+        t = np.clip(values, 0.0, 1.0) ** gamma
         alpha = t
-        lut = SEQ_LUT
+        # "truth" draws the ground-truth ramp so a GT mask is green whether it is shown
+        # on its own or as the underlay in the overlay view.
+        lut = TRUE_SEQ_LUT if mode == "truth" else SEQ_LUT
     rgb = lut[(t * (len(lut) - 1)).round().astype(np.int32)]
     return rgb, alpha
 
@@ -84,6 +121,37 @@ def _png(rgb: np.ndarray, alpha: np.ndarray | None, upscale: int) -> bytes:
 # Floor on the mask overlay so a confident prediction still reads as solid colour over a
 # photo, while near-zero cells stay transparent enough to see the scene through.
 OVERLAY_GAIN = 0.85
+
+
+def render_both(pred: np.ndarray, truth: np.ndarray, background: bool,
+                backdrop: Image.Image | None = None) -> bytes:
+    """Ground truth and prediction in one panel: green truth underneath, blue prediction
+    over it, so agreement reads as overlap and each error type stays identifiable.
+
+    Drawn as two successive alpha composites rather than by mixing colours, because a
+    blend would put purple where the two agree -- a third hue that means neither.
+    """
+    up = config.UPSCALE
+    h, w = pred.shape
+    size = (w * up, h * up)
+
+    if backdrop is not None:
+        base = backdrop.convert("RGB").resize(size, Image.LANCZOS)
+    else:
+        base = Image.new("RGB", size, (255, 255, 255))
+
+    for values, hexcolor, gain in ((truth, TRUE_HEX, 0.72), (pred, PRED_HEX, 0.82)):
+        a = np.clip(values, 0.0, 1.0) ** GAMMA
+        alpha = Image.fromarray((a * gain * 255).round().astype(np.uint8), mode="L").resize(size, Image.NEAREST)
+        layer = Image.new("RGB", size, tuple(int(x) for x in _hex(hexcolor)))
+        base = Image.composite(layer, base, alpha)
+
+    buf = io.BytesIO()
+    if backdrop is not None:
+        base.save(buf, format="JPEG", quality=82, optimize=True)
+    else:
+        base.save(buf, format="PNG", optimize=True)
+    return buf.getvalue()
 
 
 def render_mask(values: np.ndarray, mode: str, background: bool,
@@ -113,7 +181,7 @@ def render_mask(values: np.ndarray, mode: str, background: bool,
 
 
 def colorbar(mode: str, width: int = 256, height: int = 14) -> bytes:
-    """Legend strip. Diff spans the full [-1,+1] domain; pred spans [0,1]."""
+    """Legend strip. Diff spans the full [-1,+1] domain; pred/truth span [0,1]."""
     t = np.linspace(0.0, 1.0, width)
     values = (t * 2 - 1) if mode == "diff" else t
     rgb, _ = colorize(values[None, :], mode)
@@ -144,10 +212,12 @@ def _cached(kind: str, run: str, sid: int, mode: str, background: bool, epoch: i
     from viz2.app import registry  # set at startup
     bd = _backdrop(sid) if background else None
     if kind == "gt":
-        return render_mask(registry.gt.masks[sid], "pred", background, bd)
+        return render_mask(registry.gt.masks[sid], "truth", background, bd)
     rd = registry.run(run)
     row = rd.row_of[sid]
     values = rd.masks[row]
+    if mode in ("overlay", "stacked"):
+        return render_both(values, registry.gt.masks[sid], background, bd)
     if mode == "diff":
         values = values - registry.gt.masks[sid]
     return render_mask(values, mode, background, bd)
@@ -170,3 +240,15 @@ def media_type(data: bytes) -> str:
 @lru_cache(maxsize=8)
 def cached_colorbar(mode: str) -> bytes:
     return colorbar(mode)
+
+
+@lru_cache(maxsize=2048)
+def cached_backdrop(sid: int) -> bytes | None:
+    """The overhead frame encoded once at cell size, for use behind canvas cells."""
+    im = _backdrop(sid)
+    if im is None:
+        return None
+    im = im.resize((config.MASK_W * config.UPSCALE, config.MASK_H * config.UPSCALE), Image.LANCZOS)
+    buf = io.BytesIO()
+    im.save(buf, format="JPEG", quality=82, optimize=True)
+    return buf.getvalue()

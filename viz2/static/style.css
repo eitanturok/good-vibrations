@@ -69,15 +69,44 @@ body { display: flex; overflow: hidden; }
   background: var(--surface-1);
   border-right: 1px solid var(--line);
   padding-bottom: 32px;
+  visibility: visible;
+  transition: margin-left .18s ease, visibility 0s;
 }
 
-.brand { padding: 16px 16px 12px; border-bottom: 1px solid var(--line); }
+/* Collapse by pulling the sidebar off to the left with a negative margin rather than
+   removing it: the panel keeps its width and scroll position, so reopening restores the
+   exact state you left, and the table simply reflows into the freed space.
+   visibility flips only after the slide finishes, so the panel stays painted on the way
+   out but nothing inside it is tabbable or screen-reader-visible once hidden. */
+body.nosidebar #sidebar {
+  margin-left: -269px;
+  visibility: hidden;
+  transition: margin-left .18s ease, visibility 0s linear .18s;
+}
+
+.brand { position: relative; padding: 16px 16px 12px; border-bottom: 1px solid var(--line); }
+
+/* Collapse/expand affordances: quiet by default, accent on hover. */
+#sidebar-hide, #sidebar-show {
+  cursor: pointer; padding: 0; line-height: 1;
+  border: 1px solid var(--line-firm); background: var(--surface-1); color: var(--ink-3);
+  border-radius: var(--r); font-size: 15px;
+}
+#sidebar-hide:hover, #sidebar-show:hover { border-color: var(--accent); color: var(--accent); }
+#sidebar-hide { position: absolute; top: 14px; right: 12px; width: 22px; height: 22px; }
+/* A slim tab against the left edge -- the only way back once the panel is hidden. */
+#sidebar-show {
+  position: fixed; top: 14px; left: 0; z-index: 60;
+  width: 18px; height: 30px;
+  border-left: 0; border-top-left-radius: 0; border-bottom-left-radius: 0;
+}
 .brand h1 { margin: 0; font-size: 15px; letter-spacing: .04em; text-transform: uppercase; }
 .brand p { margin: 3px 0 0; font-size: 11px; color: var(--ink-3); }
 
-.panel { padding: 14px 16px; border-bottom: 1px solid var(--line); }
+/* Compact enough that the whole filter column fits without scrolling. */
+.panel { padding: 9px 14px; border-bottom: 1px solid var(--line); }
 .panel h2 {
-  margin: 0 0 9px; font-size: 10px; font-weight: 600;
+  margin: 0 0 7px; font-size: 10px; font-weight: 600;
   letter-spacing: .09em; text-transform: uppercase; color: var(--ink-3);
 }
 /* Panel heading row: title, then its count, with the all/none/clear actions pinned to
@@ -118,12 +147,62 @@ body { display: flex; overflow: hidden; }
 .chip:hover { opacity: 1; filter: none; }
 .chip.off:hover { border-color: var(--line-firm); color: var(--ink-2); }
 
+/* ***** id search ***** */
+
+.finds { display: flex; gap: 6px; margin-bottom: 7px; }
+.find {
+  font: inherit; font-size: 11px; min-width: 0; flex: 1;
+  padding: 5px 7px; border-radius: var(--r);
+  border: 1px solid var(--line-firm); background: var(--surface-0); color: var(--ink);
+}
+.find::placeholder { color: var(--ink-3); }
+.find:focus { outline: 2px solid var(--accent); outline-offset: -1px; border-color: var(--accent); }
+.find.bad { border-color: var(--pos); animation: shake .3s; }
+@keyframes shake { 25% { transform: translateX(-3px); } 75% { transform: translateX(3px); } }
+
+/* Narrow: these accumulate, so they must pack many per line. */
+.chip.find { padding: 3px 4px 3px 7px; gap: 3px; font-family: var(--mono); font-size: 10px; }
+.chip.find .x { font-size: 11px; line-height: 1; opacity: .75; }
+.chip.find:hover .x { opacity: 1; }
+
+/* While an explicit id search is active the browsing filters are bypassed, so dim them
+   rather than letting the sidebar imply they still apply. */
+#sidebar.searching .panel.browse { opacity: .4; }
+
 .seg { display: flex; border: 1px solid var(--line-firm); border-radius: var(--r); overflow: hidden; }
 .seg button {
   flex: 1; font: inherit; font-size: 11px; padding: 6px 8px; cursor: pointer;
   border: 0; background: var(--surface-2); color: var(--ink-3);
 }
 .seg button.on { background: var(--accent); color: #fff; }
+
+/* Epoch scrubber: frames are held locally, so dragging and playback never hit the net. */
+.epochrow { display: flex; align-items: center; gap: 8px; }
+.playbtn {
+  flex: none; width: 26px; height: 26px; padding: 0; cursor: pointer;
+  border: 1px solid var(--accent); background: var(--accent); color: #fff;
+  border-radius: var(--r); font-size: 11px; line-height: 1;
+}
+.playbtn:hover { filter: brightness(1.08); }
+/* Secondary to play: outlined rather than filled, so the row has one clear primary
+   action and the steppers read as fine adjustment. */
+.stepbtn {
+  flex: none; width: 22px; height: 26px; padding: 0; cursor: pointer;
+  border: 1px solid var(--line-firm); background: var(--surface-1); color: var(--ink-2);
+  border-radius: var(--r); font-size: 15px; line-height: 1;
+}
+.stepbtn:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+.stepbtn:disabled { opacity: 0.3; cursor: default; }
+/* The two steppers read as one paired control, so they sit tighter to each other than
+   to the play button and the slider on either side. */
+#epoch-prev { margin-right: -4px; border-top-right-radius: 0; border-bottom-right-radius: 0; }
+#epoch-next { border-top-left-radius: 0; border-bottom-left-radius: 0; border-left-color: transparent; }
+#epoch-slider { flex: 1; accent-color: var(--accent); min-width: 0; }
+#epoch-max { flex: none; }
+
+/* Canvas cells render the mask client-side while scrubbing epochs. */
+canvas.mask { image-rendering: pixelated; }
+canvas.mask.bg { background-size: 100% 100%; background-repeat: no-repeat; background-color: var(--surface-2); }
 
 .check { display: flex; align-items: center; gap: 7px; margin-top: 10px; font-size: 11.5px; cursor: pointer; }
 .check input { accent-color: var(--accent); }
@@ -132,9 +211,15 @@ body { display: flex; overflow: hidden; }
 #legend img { width: 100%; height: 12px; display: block; border-radius: 2px; image-rendering: auto; }
 #legend .lbl { display: flex; justify-content: space-between; font-size: 10px; color: var(--ink-3); margin-top: 3px; font-variant-numeric: tabular-nums; }
 
+/* Overlay key: one ramp per layer, each labelled -- identity is never colour alone. */
+.dualbar { display: flex; flex-direction: column; gap: 5px; }
+.dualbar > div { display: flex; align-items: center; gap: 7px; }
+.dualbar img { flex: 1; height: 10px; border-radius: 2px; display: block; border: 1px solid var(--line); }
+.dualbar span { font-size: 10px; color: var(--ink-3); white-space: nowrap; width: 66px; }
+
 /* ***** speaker + position diagrams ***** */
 
-#speakers { width: 100%; height: 148px; display: block; }   /* matches the viewBox */
+#speakers { width: 100%; height: 116px; display: block; }   /* matches the viewBox */
 .spk { cursor: pointer; }
 .spk circle { fill: var(--accent); stroke: var(--accent); stroke-width: 1.5; }
 .spk text { fill: #fff; font-size: 9px; text-anchor: middle; dominant-baseline: central; font-weight: 600; }
@@ -176,9 +261,9 @@ body { display: flex; overflow: hidden; }
 
 /* ***** sliders ***** */
 
-.slider { margin-bottom: 13px; }
+.slider { margin-bottom: 9px; }
 .slider:last-child { margin-bottom: 0; }
-.slider .top { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 3px; }
+.slider .top { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 2px; }
 .slider .nm { font-size: 11px; font-weight: 500; }
 .slider .val { font-size: 10px; color: var(--ink-3); font-family: var(--mono); }
 .slider .pair { position: relative; height: 18px; }
@@ -235,6 +320,13 @@ main { flex: 1; min-width: 0; display: flex; flex-direction: column; height: 100
   position: absolute; left: 0; display: flex; height: var(--row-h);
   border-bottom: 1px solid var(--line);
 }
+/* Stacked mode gives every prediction cell a second mask box, so rows grow by one box
+   plus its gap. Must stay in sync with ROW_H_BASE + MASK_BOX in app.js. */
+body.stacked .row { height: calc(var(--row-h) + 114px); }
+.truthmask { margin-top: 4px; }
+/* The run cells put the target in their LOWER box, so the ground-truth column drops by
+   exactly one box + gap to sit on the same line rather than floating above it. */
+body.stacked .gtimg { margin-top: 114px; }
 .row:hover { background: var(--surface-1); }
 
 .cell { flex: none; padding: 8px 10px; border-right: 1px solid var(--line); }
@@ -277,6 +369,12 @@ main { flex: 1; min-width: 0; display: flex; flex-direction: column; height: 100
 .hclose:focus-visible { opacity: 1; outline: 2px solid var(--accent); }
 .hclose:hover { color: var(--pos); background: var(--surface-2); }
 .hmeta { font-size: 10px; color: var(--ink-3); margin-top: 2px; font-variant-numeric: tabular-nums; }
+.hmeta b { font-weight: 600; color: var(--ink-2); }
+/* Viewing a historical epoch rather than the newest predictions. */
+.hmeta b.scrub { color: var(--accent); }
+.hmeta .k { color: var(--ink-3); font-weight: 400; }
+#epoch-label b { font-weight: 600; color: var(--ink-2); }
+#epoch-label .k { color: var(--accent); }
 .hstats { display: flex; gap: 9px; margin-top: 5px; font-size: 10px; font-family: var(--mono); color: var(--ink-2); }
 .hstats b { font-weight: 600; color: var(--ink); }
 .hstats .k { color: var(--ink-3); }
@@ -343,6 +441,12 @@ main { flex: 1; min-width: 0; display: flex; flex-direction: column; height: 100
    metrics, COM and split below it -- so the columns read as one system. */
 .tags { display: flex; gap: 4px; flex-wrap: wrap; margin-top: 4px; }
 .tags.gt-head, .tags.mstats { margin: 0 0 4px; }
+/* The ground-truth footer carries four chips (com, layout, count, box) in 224px. They
+   must stay on ONE line: the row height is fixed for the virtualizer, and a wrapped
+   line would overflow it. Tighter padding and a 3px gap keep the worst case (two-object
+   layout) on a single row. */
+.gt-foot { gap: 3px; }
+.gt-foot .tag { padding: 1px 4px; }
 .tag {
   font-size: 9.5px; padding: 1px 5px; border-radius: 3px;
   background: var(--surface-2); color: var(--ink-2); border: 1px solid var(--line);
@@ -353,6 +457,8 @@ main { flex: 1; min-width: 0; display: flex; flex-direction: column; height: 100
 .mstats .k { color: var(--ink-3); }
 .mstats b { font-weight: 600; color: var(--ink); }
 .subtags .tag { font-family: var(--mono); }
+/* Epoch chip: accented while scrubbing so a cell showing older predictions is obvious. */
+.tag.ep.scrub { border-color: var(--accent); color: var(--accent); background: var(--accent-sf); }
 
 .nopred {
   width: var(--mask-w); height: var(--mask-h);

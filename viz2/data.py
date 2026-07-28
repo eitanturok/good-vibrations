@@ -9,6 +9,7 @@ import json
 import os
 import time
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
 
 import numpy as np
@@ -241,8 +242,80 @@ def _split_dirs(outputs: Path) -> list[tuple[str, Path]]:
     return out + [(p.name, p) for p in _eval_dirs(outputs)]
 
 
-def load_run(name: str, runs_dir: Path, gt: GtIndex, family: str = "unknown") -> RunData:
-    """Load one run's final-epoch predictions and score every sample against the target.
+def load_epoch_masks(name: str, runs_dir: Path, epoch: int, want: set[int]) -> dict[int, np.ndarray]:
+    """Just the masks for `want` at one epoch, as {sample_id: (H,W)}.
+
+    load_run() would decode every sample of every split and score them all -- ~126MB of
+    tensors and a full metric pass -- to serve the couple of dozen cells on screen. The
+    epoch scrubber only needs pixels, so this skips the metrics entirely and keeps only
+    the requested rows.
+    """
+    outputs = runs_dir / name / config.OUTPUTS_SUBDIR
+    out: dict[int, np.ndarray] = {}
+    for _, d in _split_dirs(outputs):
+        for p in d.glob(f"ep{epoch:04d}-*.pt"):
+            try:
+                obj = torch.load(p, map_location="cpu", weights_only=False)
+            except Exception:
+                continue
+            sid = _as_int_array(obj["info"]["sample_id"])
+            hit = [i for i, s in enumerate(sid) if int(s) in want]
+            if not hit:
+                continue
+            m = obj["mask_pred"]
+            for i in hit:
+                out[int(sid[i])] = m[i].float().numpy()
+    return out
+
+
+# Epochs whose every file failed to load, keyed by (run, epoch). A truncated .pt (a run
+# killed mid-save) otherwise defines an epoch that exists in the filename listing but
+# yields no samples at all -- the slider would offer it and the whole column would read
+# "no prediction". Filled in by load_run, which is the only place that finds out.
+_DEAD_EPOCHS: set[tuple[str, int]] = set()
+
+
+def run_epochs(name: str, runs_dir: Path) -> list[int]:
+    """Every epoch this run has usable predictions for, ascending.
+
+    Epochs proven unreadable are excluded, so the epoch slider never offers a frame that
+    would render as an empty column -- and, because the slider's maximum is the highest
+    epoch across the loaded runs, never overstates how far a run actually got.
+    """
+    outputs = runs_dir / name / config.OUTPUTS_SUBDIR
+    files = _pred_files(outputs)
+    eps = sorted({_epoch_of(p) for p in files})
+
+    # The newest epoch is the one at risk: a run killed mid-write leaves a truncated .pt
+    # that still names a valid epoch. Verify only that one -- the cost is a single load,
+    # and older epochs were completed before the next began.
+    while eps and (name, eps[-1]) not in _DEAD_EPOCHS:
+        newest = eps[-1]
+        if any(_loadable(p) for p in files if _epoch_of(p) == newest):
+            break
+        _DEAD_EPOCHS.add((name, newest))
+        eps.pop()
+
+    return [e for e in eps if (name, e) not in _DEAD_EPOCHS]
+
+
+@lru_cache(maxsize=4096)
+def _loadable(path: Path) -> bool:
+    """Whether a prediction file can actually be read. Cached: a file that parsed once
+    will not stop parsing, and a truncated one will not start."""
+    try:
+        torch.load(path, map_location="cpu", weights_only=False)
+        return True
+    except Exception:
+        return False
+
+
+def load_run(name: str, runs_dir: Path, gt: GtIndex, family: str = "unknown",
+             epoch: int | None = None) -> RunData:
+    """Load one run's predictions and score every sample against the target.
+
+    `epoch` selects which saved epoch to read; the default (None) uses each split's
+    latest, which is what the table shows.
 
     Metrics mirror the training loop exactly (see src/model/arch.py mses/com_distances
     and utils/metrics.soft_iou), which is what lets the column headers be cross-checked
@@ -250,26 +323,46 @@ def load_run(name: str, runs_dir: Path, gt: GtIndex, family: str = "unknown") ->
     """
     outputs = runs_dir / name / config.OUTPUTS_SUBDIR
     ids, masks, splits, skipped = [], [], [], []
-    epoch = 0
+    want, epoch = epoch, 0
 
     for split, d in _split_dirs(outputs):
         files = sorted(d.glob("ep*.pt"), key=_epoch_of)
+        if want is not None:
+            files = [f for f in files if _epoch_of(f) == want]
         if not files:
             continue
-        last = _epoch_of(files[-1])
-        epoch = max(epoch, last)
-        for p in [f for f in files if _epoch_of(f) == last]:  # train has one file per batch
-            try:
-                obj = torch.load(p, map_location="cpu", weights_only=False)
-            except Exception:
-                skipped.append(str(p.relative_to(outputs)))
-                continue
-            sid = _as_int_array(obj["info"]["sample_id"])
-            ids.append(sid)
-            masks.append(obj["mask_pred"].float().numpy())
-            splits += [split] * len(sid)
+        # Walk this split's epochs newest-first until one actually loads. Without this a
+        # single truncated final save (a run killed mid-write) would drop the split from
+        # the table entirely, even though every earlier epoch is intact. When a specific
+        # epoch was requested there is only one candidate, so this is a no-op.
+        for last in sorted({_epoch_of(f) for f in files}, reverse=True):
+            got = False
+            for p in [f for f in files if _epoch_of(f) == last]:  # train: one file per batch
+                try:
+                    obj = torch.load(p, map_location="cpu", weights_only=False)
+                except Exception:
+                    skipped.append(str(p.relative_to(outputs)))
+                    continue
+                sid = _as_int_array(obj["info"]["sample_id"])
+                ids.append(sid)
+                masks.append(obj["mask_pred"].float().numpy())
+                splits += [split] * len(sid)
+                got = True
+            if got:
+                epoch = max(epoch, last)
+                break
 
     if not ids:
+        # Every file for this epoch was unreadable. Remember that, so the epoch stops
+        # being offered, then retry on the next-newest epoch rather than handing back a
+        # column of "no prediction" -- a corrupt final save should not hide a run.
+        if skipped:
+            _DEAD_EPOCHS.add((name, want if want is not None else epoch))
+            # Newest surviving epoch at or below the one asked for.
+            usable = [e for e in run_epochs(name, runs_dir)
+                      if want is None or e <= want]
+            if usable:
+                return load_run(name, runs_dir, gt, family, epoch=max(usable))
         empty_f = np.zeros(0, dtype=np.float64)
         return RunData(name, epoch, np.zeros(0, dtype=np.int64), np.zeros((0, config.MASK_H, config.MASK_W),
                        dtype=np.float32), [], empty_f, empty_f, empty_f,
@@ -312,7 +405,7 @@ class Registry:
         self.gt = load_gt(experiment_dir)
         self._scanned_at = 0.0
         self.rescan()
-        self._runs: dict[str, RunData] = {}
+        self._runs: dict[tuple[str, int | None], RunData] = {}
         n_ok = sum(e.compatible for e in self.entries)
         self.startup_s = time.perf_counter() - t0
         print(f"[viz2] {len(self.gt)} samples | {n_ok} compatible / "
@@ -332,7 +425,7 @@ class Registry:
     def defaults(self) -> list[str]:
         return [e.name for e in self.entries if e.compatible][: config.N_DEFAULT_RUNS]
 
-    def run(self, name: str, reload: bool = False) -> RunData:
+    def run(self, name: str, reload: bool = False, epoch: int | None = None) -> RunData:
         entry = self.by_name.get(name)
         if entry is None:
             # A run requested but not in the cached scan may have just appeared.
@@ -340,11 +433,21 @@ class Registry:
             entry = self.by_name.get(name)
         if entry is None or not entry.compatible:
             raise KeyError(name)
+        key = (name, epoch)
         if reload:
-            self._runs.pop(name, None)
-        if name not in self._runs:
-            self._runs[name] = load_run(name, self.runs_dir, self.gt, entry.family)
-        return self._runs[name]
+            self._runs.pop(key, None)
+        if key not in self._runs:
+            self._runs[key] = load_run(name, self.runs_dir, self.gt, entry.family, epoch)
+            # Each RunData is ~5MB, and scrubbing a 200-epoch run would otherwise pin a
+            # gigabyte. Latest-epoch entries (epoch=None) are what the table always needs,
+            # so evict scrubbed ones first, oldest first.
+            scrubbed = [k for k in self._runs if k[1] is not None]
+            for old in scrubbed[:-config.MAX_EPOCH_CACHE]:
+                self._runs.pop(old, None)
+        return self._runs[key]
+
+    def epochs(self, name: str) -> list[int]:
+        return run_epochs(name, self.runs_dir)
 
     def sample_index(self, sid) -> int:
         """Validate an untrusted sample id: coerced to int and range-checked so no
