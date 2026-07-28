@@ -23,8 +23,11 @@
 
         <div class="facet-label">runs</div>
         <div id="run-chips"></div>
-        <select id="run-add" style="width:100%;margin-top:6px"><option value="">+ add run…</option></select>
-        <div class="hint">adding a run loads all its samples into the pool</div>
+        <div id="run-picker">
+          <input id="run-search" placeholder="+ add run… (type to search)" spellcheck="false" autocomplete="off">
+          <div id="run-options" hidden></div>
+        </div>
+        <div class="hint">adding a run loads all its samples into the pool, and adds a column to the table</div>
 
         <div class="facet-label">audio</div>
         <div class="chips" data-facet="audio"></div>

@@ -139,6 +139,28 @@ select, input, .seg {
 }
 input { outline: none; }
 input:focus { border-color: var(--accent); }
+/* searchable run picker (replaces a native <select>, whose typeahead only matches the
+   first letter -- useless for timestamp-prefixed run slugs) */
+#run-picker { position: relative; margin-top: 6px; }
+#run-search { width: 100%; }
+#run-options {
+  position: absolute; z-index: 40; left: 0; right: 0; top: calc(100% + 3px);
+  max-height: 260px; overflow-y: auto;
+  background: var(--surface-2); border: 1px solid var(--grid); border-radius: 6px;
+  box-shadow: 0 8px 22px rgba(0, 0, 0, 0.55);
+}
+.run-opt {
+  display: flex; align-items: center; gap: 6px; padding: 4px 7px;
+  font-size: 11px; color: var(--ink-2); cursor: pointer; white-space: nowrap;
+}
+.run-opt.hi { background: rgba(57, 135, 229, 0.18); color: var(--ink); }
+.run-opt:hover { background: rgba(255, 255, 255, 0.06); color: var(--ink); }
+.run-opt.selected .run-opt-name { color: var(--ink); }
+.run-opt.empty { color: var(--muted); cursor: default; }
+.run-opt.empty:hover { background: none; }
+.run-opt-mark { width: 10px; flex: none; }
+.run-opt-name { overflow: hidden; text-overflow: ellipsis; }
+
 .seg { display: inline-flex; padding: 0; overflow: hidden; }
 .seg button {
   background: none; border: 0; color: var(--muted); padding: 3px 9px; cursor: pointer; font: inherit;

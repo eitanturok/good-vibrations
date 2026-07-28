@@ -110,11 +110,29 @@ def list_datasets() -> list[str]:
 
 
 @lru_cache(maxsize=32)
+def _run_sample_ids(run: str) -> frozenset[int]:
+    """Every sample_id a run dumped, read from the .pt `info` dicts alone.
+
+    Deliberately does NOT go through extract_run: extraction now needs the run's dataset
+    (to fetch ground-truth masks), and the dataset is resolved from these ids — so this has
+    to stay the cheap, dependency-free half of that cycle."""
+    import torch  # local import: heavy, and only run-backed views need it
+
+    ids: set[int] = set()
+    for p in sorted((RUNS_DIR / run / "outputs_history").rglob("*.pt")):
+        try:
+            d = torch.load(p, map_location="cpu", weights_only=False)
+        except (RuntimeError, EOFError):
+            continue  # partial/corrupt dump — same tolerance as extract_run
+        ids.update(int(s) for s in d["info"]["sample_id"])
+    return frozenset(ids)
+
+
+@lru_cache(maxsize=32)
 def dataset_for_run(run: str) -> str:
     """Which dataset a run trained on: the smallest one whose sample_ids cover the run's.
     Runs don't record this, so it's inferred; falls back to DEFAULT_DATASET on no match."""
-    z = extract_run(run)
-    run_ids = {int(s) for s in np.unique(z["sample_id"])}
+    run_ids = set(_run_sample_ids(run))
     matches = []
     for name in list_datasets():
         ids = {int(m["sample_id"]) for m in load_metadata(name)}
@@ -216,6 +234,16 @@ def _run_key(run: str) -> str:
     return hashlib.md5(sig.encode()).hexdigest()[:12]
 
 
+@lru_cache(maxsize=4)
+def _gt_masks_by_id(dataset: str) -> dict[int, np.ndarray]:
+    """sample_id -> ground-truth mask, read once per dataset from the MDS `y` field.
+
+    The dumps only carry `mask_pred` + `info`, so ground truth is looked up here by the
+    sample_id recorded in `info` rather than read out of the run."""
+    ds, index = _mds(dataset)
+    return {sid: np.asarray(ds[i]["y"], dtype=np.float32) for sid, i in index.items()}
+
+
 def extract_run(run: str) -> dict:
     """Strip a run's .pt batches to per-sample metrics + masks. Cached as npz."""
     CACHE_DIR.mkdir(exist_ok=True)
@@ -225,6 +253,8 @@ def extract_run(run: str) -> dict:
         return {k: z[k] for k in z.files}
 
     import torch  # local import: only needed on cache miss
+
+    gt = _gt_masks_by_id(dataset_for_run(run))
 
     recs = {k: [] for k in ["sample_id", "epoch", "split", "mse", "com_dist",
                             "pred_row", "pred_col", "masks"]}
@@ -237,7 +267,23 @@ def extract_run(run: str) -> dict:
         except (RuntimeError, EOFError):
             continue  # partial/corrupt dump (e.g. a run still writing) — skip, don't kill the run
         pred = d["mask_pred"].float().numpy()
-        true = d["mask_true"].float().numpy()
+        sample_ids = np.asarray(d["info"]["sample_id"], dtype=np.int64)
+        if "mask_true" in d:
+            true = d["mask_true"].float().numpy()   # older dumps carried it inline
+        else:
+            # current dumps store only mask_pred + info, so ground truth is looked up in the
+            # run's dataset by the sample_id in info. That `y` is already downsampled to the
+            # run's out_h/out_w, so it lines up with mask_pred without any resampling.
+            keep = np.array([int(s) in gt for s in sample_ids], dtype=bool)
+            if not keep.any():
+                continue  # nothing in this batch maps to the dataset — skip it
+            if not keep.all():
+                pred, sample_ids = pred[keep], sample_ids[keep]
+            true = np.stack([gt[int(s)] for s in sample_ids])
+        if true.shape != pred.shape:
+            raise ValueError(
+                f"{run}: ground-truth mask {true.shape} does not match mask_pred {pred.shape} "
+                f"in {p.name} — wrong dataset resolved for this run?")
         h, w = pred.shape[-2:]
         mse = ((pred - true) ** 2).mean(axis=(-2, -1))
         com_p, com_t = center_of_mass(pred), center_of_mass(true)
@@ -245,7 +291,7 @@ def extract_run(run: str) -> dict:
         com_dist = np.linalg.norm((com_p - com_t) / norm, axis=-1)
         com_dist[true.sum(axis=(-2, -1)) <= 0] = np.nan  # metric skips empty GT
         n = len(pred)
-        recs["sample_id"].append(np.asarray(d["info"]["sample_id"], dtype=np.int64))
+        recs["sample_id"].append(sample_ids)
         recs["epoch"].append(np.full(n, epoch, dtype=np.int64))
         recs["split"].append(np.full(n, split, dtype="U32"))
         recs["mse"].append(mse)

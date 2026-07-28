@@ -157,7 +157,7 @@ async function boot() {
   buildLaserGrid(); buildRunSelect(); buildEmptySelect(); renderRunChips();
 
   // first load only: default to the whole dataset, so there's something useful on screen
-  // without manual setup. Runs are still opt-in via the run-add dropdown. Later re-boots
+  // without manual setup. Runs are still opt-in via the run search box. Later re-boots
   // (triggered by the live-update poll picking up a data change) must not repopulate on top
   // of the user's own pool.
   if (!_bootedOnce) {
@@ -641,13 +641,61 @@ const updateFFT = debounce(async () => {
 }, 120);
 
 // ===== runs =====
-function buildRunSelect() {
-  const sel = $("#run-add");
-  sel.innerHTML = `<option value="">+ add run…</option>`;
-  for (const r of S.man.runs.filter(r => !S.runs.includes(r)))
-    sel.appendChild(Object.assign(document.createElement("option"), { value: r, textContent: r }));
+// A native <select> only typeahead-matches the *first* letter, which is useless for run names
+// that are long timestamp-prefixed slugs (1785245258-gleaming-kagu). This is a small combobox
+// instead: substring match anywhere in the name, already-selected runs stay listed and marked
+// so the dropdown always shows what's loaded rather than hiding it.
+let _runHi = 0;   // index of the keyboard-highlighted option
+
+function runMatches() {
+  const q = $("#run-search").value.trim().toLowerCase();
+  const all = S.man ? S.man.runs : [];
+  return q ? all.filter(r => r.toLowerCase().includes(q)) : all;
 }
-$("#run-add").onchange = e => { if (e.target.value) addRun(e.target.value); e.target.value = ""; };
+function renderRunOptions(open = true) {
+  const box = $("#run-options"), matches = runMatches();
+  if (!open) { box.hidden = true; return; }
+  _runHi = Math.max(0, Math.min(_runHi, matches.length - 1));
+  box.innerHTML = matches.length
+    ? matches.map((r, i) => {
+        const on = S.runs.includes(r);
+        return `<div class="run-opt${on ? " selected" : ""}${i === _runHi ? " hi" : ""}" data-run="${r}">
+          <span class="run-opt-mark" style="color:${on ? runColor(r) : "transparent"}">✓</span>
+          <span class="run-opt-name">${r}</span>
+        </div>`;
+      }).join("")
+    : `<div class="run-opt empty">no run matches</div>`;
+  box.hidden = false;
+  box.querySelectorAll(".run-opt[data-run]").forEach(el => el.onmousedown = e => {
+    e.preventDefault();            // keep focus in the input so the list stays open
+    toggleRun(el.dataset.run);
+  });
+  const hi = box.querySelector(".run-opt.hi");
+  if (hi) hi.scrollIntoView({ block: "nearest" });
+}
+// clicking an already-loaded run removes it, so the list is a single toggle surface
+function toggleRun(name) {
+  S.runs.includes(name) ? dropRun(name) : addRun(name);
+  renderRunOptions(true);
+}
+function buildRunSelect() { if (!$("#run-options").hidden) renderRunOptions(true); }
+
+$("#run-search").oninput = () => { _runHi = 0; renderRunOptions(true); };
+$("#run-search").onfocus = () => renderRunOptions(true);
+$("#run-search").onblur = () => setTimeout(() => renderRunOptions(false), 120);
+$("#run-search").onkeydown = e => {
+  const matches = runMatches();
+  if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+    e.preventDefault();
+    _runHi = (_runHi + (e.key === "ArrowDown" ? 1 : -1) + matches.length) % Math.max(matches.length, 1);
+    renderRunOptions(true);
+  } else if (e.key === "Enter") {
+    e.preventDefault();
+    if (matches[_runHi]) toggleRun(matches[_runHi]);
+  } else if (e.key === "Escape") {
+    $("#run-search").value = ""; renderRunOptions(false); $("#run-search").blur();
+  }
+};
 
 async function addRun(name, silent = false) {
   if (S.runs.includes(name)) return;

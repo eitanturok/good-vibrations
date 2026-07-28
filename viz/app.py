@@ -1,6 +1,11 @@
 """Vibrations dashboard server.
 
-    python viz/app.py            # http://localhost:8501
+    python -m viz                # http://localhost:8501
+    python viz                   # same thing
+    python viz/app.py            # same thing
+
+Run from the repo root, or with PYTHONPATH=. so data.py can import utils.metrics.
+The launcher itself lives in viz/__main__.py.
 
 Everything is read live from data/ and runs/ — new samples or runs appear
 without a restart (the frontend polls /api/version).
@@ -117,37 +122,13 @@ app.mount("/static", StaticFiles(directory=STATIC), name="static")
 
 
 if __name__ == "__main__":
-    import argparse
-    import errno
-    import socket
-    import sys
+    # The launcher lives in __main__.py so `python -m viz` and `python viz` share it.
+    # It can't be imported as `__main__` (that name is this file, right now), so load it
+    # from its path.
+    import importlib.util
 
-    import uvicorn
-
-    ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--host", default="127.0.0.1")
-    ap.add_argument("--port", type=int, default=8501)
-    args = ap.parse_args()
-
-    url = f"http://{args.host}:{args.port}"
-
-    # Check the port up front: with reload=True uvicorn binds inside its reloader supervisor,
-    # which reports a bare "[Errno 98] Address already in use" naming neither the address nor
-    # the holder, and then hangs instead of exiting.
-    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    try:
-        probe.bind((args.host, args.port))
-    except OSError as e:
-        if e.errno != errno.EADDRINUSE:
-            raise
-        sys.exit(f"[viz] cannot start: {url} is already in use.\n"
-                 f"      find the holder:  ss -lptn 'sport = :{args.port}'\n"
-                 f"      then stop it:     kill <pid>\n"
-                 f"      or pick another:  python viz/app.py --port {args.port + 1}")
-    finally:
-        probe.close()
-
-    print(f"[viz] serving on {url}")
-    uvicorn.run("app:app", host=args.host, port=args.port,
-                app_dir=str(Path(__file__).parent), reload=True)
+    spec = importlib.util.spec_from_file_location(
+        "viz_launcher", Path(__file__).resolve().parent / "__main__.py")
+    launcher = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(launcher)
+    launcher.main()
