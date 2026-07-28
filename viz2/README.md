@@ -1,0 +1,76 @@
+# viz2
+
+Compare predicted segmentation masks across training runs, sample by sample.
+
+```bash
+python -m viz2                 # http://127.0.0.1:8503
+python -m viz2 --port 9000 --experiment experiments/experiment-25 --runs runs
+```
+
+Startup is ~0.5 s. No inference runs: ground-truth masks are read from
+`samples/<id>/image/05_downsampled_smask_20h_40w.npy` and predictions from the
+`.pt` files the `OutputSaver` callback already wrote during training.
+
+## Layout
+
+One row per sample. Column 1 is the row number, column 2 the ground truth (sample id,
+overhead photo with mask/COM/speaker), and every column after that is one training run's
+prediction, with per-sample mse / soft-IoU / COM-distance above each mask and
+mean ± std for the filtered set in the header.
+
+## Finding bad predictions
+
+Click a run column header to sort the whole table by that run, cycling
+worst → best → unsorted; pick the metric from the dropdown. Direction is labelled
+**worst/best** rather than asc/desc, because "worst" means *high* MSE but *low* IoU.
+Sorting is global, so a run's worst samples stay aligned with every other run's
+prediction for the same sample.
+
+## Filters (left)
+
+- **Position** — scatter of `avg_com`, one point per physical position (~125 of them,
+  8 samples each — one per speaker). Drag to lasso, shift-drag to add, click to select,
+  ctrl/cmd-click to toggle, and arrow keys to walk to the neighbouring position.
+- **Speaker** — diagram drawn from the same `SPEAKER_POSITION` constants that place the
+  speaker into `05_overhead_speaker.png`, so it matches the photos.
+- **Split / layout / objects** — chips with live counts.
+- **Metrics** — dual-handle range sliders. They read the sorted run when one is
+  selected, otherwise a sample passes if any loaded run is in range.
+
+Selected is a filled accent; deselected is muted, desaturated and dashed — the same
+rule for chips, speakers and scatter points.
+
+## Display
+
+`Prediction` shows the mask on a single-hue blue ramp (values are soft probabilities,
+so the ramp is continuous). `Difference` shows `pred − truth` on a fixed [−1,+1]
+diverging scale: **red = predicted mass that isn't there, blue = real mass the model
+missed**, gray = agreement. Domains are fixed, never per-cell autoscaled, so cells stay
+comparable across the whole table. "Show background" toggles the opaque fill off so the
+mask silhouette floats. Hovering a mask reads out the value at that grid cell.
+
+Clicking a ground-truth cell opens the sample: large overhead image, object/COM details,
+and original + recovered audio with the precomputed spectrogram and FFT. ←/→ step
+through the current sort order.
+
+## Which runs appear
+
+Only runs that can be validly compared against this experiment. A run is rejected if it
+has no `outputs_history/`, has a different mask shape, uses the legacy `info` schema, or
+was trained on a **different dataset** — sample ids collide across experiments, so a
+cylinder/bullet run would otherwise join cleanly and report silently wrong numbers.
+Rejected runs stay visible in the picker with the reason. Truncated `.pt` files are
+skipped per-file and reported in the column header rather than failing the run.
+
+## Correctness
+
+Metrics mirror the training loop (`utils/metrics.py`, `src/model/arch.py`), so column
+headers reproduce the run's own logs exactly. To check:
+
+```bash
+grep -E "batch=<epoch*3>\]: metrics/eval/purple_cube/" runs/<run>/logs-rank0.txt
+```
+
+COM distance is undefined (`–`) on empty-box samples: with no object there is no center
+of mass. This matches the training metric, which skips them, and keeps degenerate
+samples from dominating a "worst COM distance" sort.
