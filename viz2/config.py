@@ -62,6 +62,20 @@ EXP25_EVAL_SPLITS = {
 
 N_DEFAULT_RUNS = 3  # auto-loaded on first open, most recently modified first
 
+# The runs directory is re-scanned at most this often, so runs that appear or keep
+# training while viz2 is open show up without a restart. A scan is ~0.15s.
+RESCAN_SECONDS = 10.0
+
+# Run status is inferred from logs-rank0.txt: a clean shutdown prints the memory line,
+# a crash leaves a traceback, and anything else still being written is training.
+RUN_LOG = "logs-rank0.txt"
+LOG_TAIL_BYTES = 4096
+RUNNING_MAX_AGE = 600.0          # log silent longer than this is no longer "running"
+CLEAN_EXIT_MARKER = "before close"
+# Only a real traceback counts. Bare "Error:"/"Exception" appear in ordinary log lines
+# (warnings, retried steps) and would label healthy runs as crashed.
+CRASH_MARKERS = ("Traceback (most recent call last)",)
+
 # ***** speaker positions *****
 
 # Copied verbatim from SPEAKER_POSITION in src/data/image.py (inside draw_speaker).

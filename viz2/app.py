@@ -63,9 +63,12 @@ def _clean(v):
 
 @app.get("/api/runs")
 def api_runs():
+    # Picks up runs that appeared since startup, so a model that finishes training while
+    # viz2 is open shows up in the picker on its own.
+    registry.maybe_rescan()
     runs = [{"name": e.name, "compatible": e.compatible, "reason": e.reason,
              "mtime": e.mtime, "epoch": e.epoch, "eval_splits": e.eval_splits,
-             "family": e.family} for e in registry.entries]
+             "family": e.family, "status": e.status} for e in registry.entries]
     return {"runs": runs, "default_selected": registry.defaults(),
             "n_samples": len(registry.gt), "render_version": config.RENDER_VERSION}
 
@@ -94,8 +97,15 @@ def api_samples():
 
 
 @app.get("/api/run/{name}")
-def api_run(name: str):
-    rd = _run(name)
+def api_run(name: str, reload: int = 0):
+    # reload=1 re-reads the run's prediction files, picking up epochs written since it
+    # was first loaded (a run still training keeps producing them).
+    if reload:
+        registry.rescan()
+    try:
+        rd = registry.run(name, reload=bool(reload))
+    except KeyError:
+        raise HTTPException(404, "unknown or incompatible run")
     samples = {}
     for i, sid in enumerate(rd.sample_ids):
         samples[int(sid)] = {
@@ -186,6 +196,69 @@ def api_audio(sid: int, which: str):
         raise HTTPException(404, "not generated for this sample")
     # FileResponse handles Range requests, which <audio> needs in order to seek.
     return FileResponse(p, media_type="audio/wav")
+
+
+@app.get("/api/neighbors")
+def api_neighbors(run: str, sid: int, k: int = 5):
+    """Ground-truth samples whose center of mass is closest to / furthest from what this
+    run predicted for `sid`.
+
+    Answers "the model put the mass here -- which real scenes actually look like that?",
+    so a prediction that resembles a different sample than its own target is visible.
+    """
+    i = _sid(sid)
+    rd = _run(run)
+    if i not in rd.row_of:
+        raise HTTPException(404, "no prediction for this sample")
+    pred = np.asarray(rd.com_pred[rd.row_of[i]], dtype=np.float64)
+
+    gt = registry.gt
+    # Grid cells are not square (20 rows x 40 cols over the same scene), so normalise to
+    # [0,1] on each axis before measuring -- otherwise a column offset counts double.
+    scale = np.array([config.MASK_H - 1, config.MASK_W - 1], dtype=np.float64)
+    target = pred / scale
+    coms = gt.com_gt / scale
+
+    # Empty boxes carry a (-1,-1) sentinel rather than a position; ranking them would
+    # fill the "least similar" list with samples that have no center of mass at all.
+    valid = np.array([not m.get("is_empty_box") and gt.com_gt[j][0] >= 0
+                      for j, m in enumerate(gt.meta)])
+    d = np.linalg.norm(coms - target, axis=-1)
+    d[~valid] = np.nan
+
+    order = np.argsort(np.where(np.isnan(d), np.inf, d))
+    order = [j for j in order if not np.isnan(d[j])]
+    k = max(1, min(int(k), 25))
+
+    def distinct(seq):
+        """One entry per physical position: 8 samples share each output_id (one per
+        speaker) with identical ground-truth COM, so without this every slot in the list
+        would be the same scene repeated."""
+        seen, out = set(), []
+        for j in seq:
+            key = gt.meta[j].get("output_id")
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(j)
+            if len(out) == k:
+                break
+        return out
+
+    def pack(idx):
+        m = gt.meta[idx]
+        return {"i": int(idx), "sample_id": gt.sample_ids[idx],
+                "output_id": m.get("output_id"), "speaker": m.get("speaker"),
+                "layout": m.get("layout"), "n_objects": m.get("n_objects"),
+                "com": [_clean(gt.com_gt[idx][0]), _clean(gt.com_gt[idx][1])],
+                "distance": _clean(d[idx])}
+
+    return {"run": run, "sample_id": gt.sample_ids[i],
+            "pred_com": [_clean(pred[0]), _clean(pred[1])],
+            "gt_com": [_clean(gt.com_gt[i][0]), _clean(gt.com_gt[i][1])],
+            "n_candidates": len(order),
+            "most_similar": [pack(j) for j in distinct(order)],
+            "least_similar": [pack(j) for j in distinct(order[::-1])]}
 
 
 @app.get("/api/detail/{sid}")

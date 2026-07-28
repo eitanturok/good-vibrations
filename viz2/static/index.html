@@ -15,6 +15,11 @@
   </header>
 
   <section class="panel">
+    <button id="add-run" class="btn wide">+ Add run</button>
+    <p id="rowcount" class="rowcount"></p>
+  </section>
+
+  <section class="panel">
     <h2>Display</h2>
     <div class="seg" id="mode-seg">
       <button data-mode="pred" class="on">Prediction</button>
@@ -25,50 +30,56 @@
   </section>
 
   <section class="panel">
-    <div class="phead"><h2>Position</h2><button class="link" id="pos-clear">clear</button></div>
+    <div class="phead"><h2>Position</h2><span class="count"></span>
+      <span class="links"><button class="link" id="pos-clear">clear</button></span>
+    </div>
     <p class="hint">Drag to lasso · click a point · arrow keys to walk</p>
     <svg id="scatter" tabindex="0"></svg>
     <p class="hint" id="pos-status">all positions</p>
   </section>
 
   <section class="panel">
-    <div class="phead"><h2>Speaker</h2><span class="count" id="spk-count"></span></div>
+    <div class="phead"><h2>Speaker</h2>
+      <span class="count" id="spk-count"></span>
+      <span class="links"><button class="link" data-all="speakers">all</button><button class="link" data-none="speakers">none</button></span>
+    </div>
     <svg id="speakers"></svg>
-    <div class="links"><button class="link" data-all="speakers">all</button><button class="link" data-none="speakers">none</button></div>
   </section>
 
   <section class="panel">
-    <div class="phead"><h2>Split</h2><span class="count" id="split-count"></span></div>
+    <div class="phead"><h2>Split</h2>
+      <span class="count" id="split-count"></span>
+      <span class="links"><button class="link" data-all="splits">all</button><button class="link" data-none="splits">none</button></span>
+    </div>
     <div class="chips" id="split-chips"></div>
-    <div class="links"><button class="link" data-all="splits">all</button><button class="link" data-none="splits">none</button></div>
   </section>
 
   <section class="panel">
-    <div class="phead"><h2>Layout</h2><span class="count" id="layout-count"></span></div>
+    <div class="phead"><h2>Layout</h2>
+      <span class="count" id="layout-count"></span>
+      <span class="links"><button class="link" data-all="layouts">all</button><button class="link" data-none="layouts">none</button></span>
+    </div>
     <div class="chips" id="layout-chips"></div>
-    <div class="links"><button class="link" data-all="layouts">all</button><button class="link" data-none="layouts">none</button></div>
   </section>
 
   <section class="panel">
-    <div class="phead"><h2>Objects</h2><span class="count" id="nobj-count"></span></div>
+    <div class="phead"><h2>Objects</h2>
+      <span class="count" id="nobj-count"></span>
+      <span class="links"><button class="link" data-all="nObjects">all</button><button class="link" data-none="nObjects">none</button></span>
+    </div>
     <div class="chips" id="nobj-chips"></div>
-    <div class="links"><button class="link" data-all="nObjects">all</button><button class="link" data-none="nObjects">none</button></div>
   </section>
 
   <section class="panel">
-    <div class="phead"><h2>Metrics</h2><button class="link" id="metric-reset">reset</button></div>
+    <div class="phead"><h2>Metrics</h2><span class="count"></span>
+      <span class="links"><button class="link" id="metric-reset">reset</button></span>
+    </div>
     <p class="hint" id="metric-scope">across all loaded runs</p>
     <div id="sliders"></div>
   </section>
 </aside>
 
 <main>
-  <div id="toolbar">
-    <div id="runbar"></div>
-    <div class="grow"></div>
-    <span id="rowcount" class="count"></span>
-    <button id="add-run" class="btn">+ Add run</button>
-  </div>
   <div id="scroller"><div id="spacer"></div><div id="rows"></div></div>
   <div id="empty" hidden>No samples match these filters.</div>
 </main>

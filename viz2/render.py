@@ -140,7 +140,7 @@ def _backdrop(sid: int) -> Image.Image | None:
 
 
 @lru_cache(maxsize=200_000)
-def _cached(kind: str, run: str, sid: int, mode: str, background: bool, _v: int) -> bytes:
+def _cached(kind: str, run: str, sid: int, mode: str, background: bool, epoch: int) -> bytes:
     from viz2.app import registry  # set at startup
     bd = _backdrop(sid) if background else None
     if kind == "gt":
@@ -154,7 +154,11 @@ def _cached(kind: str, run: str, sid: int, mode: str, background: bool, _v: int)
 
 
 def cached_mask(kind: str, run: str, sid: int, mode: str, background: bool) -> bytes:
-    return _cached(kind, run, sid, mode, background, 1)
+    # The run's loaded epoch is part of the cache key: a run that is still training gets
+    # reloaded with new predictions, and a fixed key would keep serving the old render.
+    from viz2.app import registry
+    epoch = registry.run(run).epoch if kind != "gt" else 0
+    return _cached(kind, run, sid, mode, background, epoch)
 
 
 def media_type(data: bytes) -> str:

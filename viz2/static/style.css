@@ -80,11 +80,14 @@ body { display: flex; overflow: hidden; }
   margin: 0 0 9px; font-size: 10px; font-weight: 600;
   letter-spacing: .09em; text-transform: uppercase; color: var(--ink-3);
 }
-.phead { display: flex; align-items: baseline; justify-content: space-between; }
-.phead h2 { margin-bottom: 9px; }
+/* Panel heading row: title, then its count, with the all/none/clear actions pinned to
+   the right so every filter is controlled from the same place. */
+.phead { display: flex; align-items: baseline; gap: 6px; margin-bottom: 9px; }
+.phead h2 { margin: 0; }
+.phead .count { margin-right: auto; }
 .hint { margin: 0 0 8px; font-size: 10.5px; color: var(--ink-3); line-height: 1.45; }
 .count { font-size: 10.5px; color: var(--ink-3); font-variant-numeric: tabular-nums; }
-.links { margin-top: 8px; display: flex; gap: 12px; }
+.links { display: inline-flex; gap: 9px; }
 
 .link {
   background: none; border: 0; padding: 0; cursor: pointer;
@@ -131,7 +134,7 @@ body { display: flex; overflow: hidden; }
 
 /* ***** speaker + position diagrams ***** */
 
-#speakers { width: 100%; height: 132px; display: block; }
+#speakers { width: 100%; height: 148px; display: block; }   /* matches the viewBox */
 .spk { cursor: pointer; }
 .spk circle { fill: var(--accent); stroke: var(--accent); stroke-width: 1.5; }
 .spk text { fill: #fff; font-size: 9px; text-anchor: middle; dominant-baseline: central; font-weight: 600; }
@@ -200,29 +203,23 @@ body { display: flex; overflow: hidden; }
 
 main { flex: 1; min-width: 0; display: flex; flex-direction: column; height: 100vh; }
 
-#toolbar {
-  display: flex; align-items: center; gap: 10px;
-  padding: 9px 14px; background: var(--surface-1);
-  border-bottom: 1px solid var(--line); flex: none;
-}
-.grow { flex: 1; }
-
 .btn {
   font: inherit; font-size: 11.5px; cursor: pointer;
   padding: 6px 12px; border-radius: var(--r);
   border: 1px solid var(--accent); background: var(--accent); color: #fff;
 }
 .btn:hover { filter: brightness(1.06); }
+.btn.wide { display: block; width: 100%; padding: 8px 12px; }
 
-#runbar { display: flex; gap: 6px; flex-wrap: wrap; }
-.runtag {
-  display: inline-flex; align-items: center; gap: 6px;
-  font-size: 11px; padding: 4px 6px 4px 9px;
-  background: var(--surface-2); border: 1px solid var(--line); border-radius: var(--r);
+/* Row count sits under Add run in the sidebar; the table has no toolbar of its own. */
+.rowcount {
+  margin: 8px 0 0; text-align: center;
+  font-size: 10.5px; color: var(--ink-3); font-variant-numeric: tabular-nums;
 }
-.runtag .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--accent); }
-.runtag button { background: none; border: 0; cursor: pointer; color: var(--ink-3); font-size: 13px; padding: 0 2px; }
-.runtag button:hover { color: var(--pos); }
+.rowcount b { font-weight: 600; color: var(--ink-2); }
+
+/* Loaded runs are visible as columns, so the toolbar carries no list of them -- each
+   column header has its own close button instead. */
 
 /* ***** virtualized table ***** */
 
@@ -261,11 +258,24 @@ main { flex: 1; min-width: 0; display: flex; flex-direction: column; height: 100
 .hcell.run.sorted { border-left-color: var(--accent); background: var(--accent-sf); }
 .hcell.run.dim { opacity: .62; }
 
+.htop { display: flex; align-items: flex-start; gap: 4px; }
 .hname {
+  flex: 1; min-width: 0;
   font-size: 11.5px; font-weight: 600; white-space: nowrap;
   overflow: hidden; text-overflow: ellipsis; cursor: pointer;
 }
 .hname:hover { color: var(--accent); }
+.hclose {
+  flex: none; width: 16px; height: 16px; padding: 0; line-height: 1;
+  border: 0; background: none; cursor: pointer;
+  color: var(--ink-3); font-size: 15px; border-radius: 3px;
+  /* Faint until hover rather than hidden: an invisible control is undiscoverable, but a
+     full-strength X on every column would compete with the run name. */
+  opacity: .4; transition: opacity .12s;
+}
+.hcell.run:hover .hclose { opacity: 1; }
+.hclose:focus-visible { opacity: 1; outline: 2px solid var(--accent); }
+.hclose:hover { color: var(--pos); background: var(--surface-2); }
 .hmeta { font-size: 10px; color: var(--ink-3); margin-top: 2px; font-variant-numeric: tabular-nums; }
 .hstats { display: flex; gap: 9px; margin-top: 5px; font-size: 10px; font-family: var(--mono); color: var(--ink-2); }
 .hstats b { font-weight: 600; color: var(--ink); }
@@ -281,6 +291,35 @@ main { flex: 1; min-width: 0; display: flex; flex-direction: column; height: 100
   background: var(--surface-2); color: var(--ink-2);
 }
 .hsort .dir.on { background: var(--accent); border-color: var(--accent); color: #fff; }
+/* ***** run status *****
+   Status colours are reserved for state and never reused for a data series. Each chip
+   pairs its colour with a text label, so state never depends on colour alone. */
+
+.status {
+  display: inline-flex; align-items: center; gap: 4px;
+  font-size: 9.5px; padding: 1px 6px 1px 5px; border-radius: 999px;
+  border: 1px solid currentColor; white-space: nowrap; vertical-align: middle;
+}
+.status i { width: 5px; height: 5px; border-radius: 50%; background: currentColor; flex: none; }
+.status.running  { color: #1f7a4d; background: #e6f4ec; }
+.status.finished { color: #256abf; background: var(--accent-sf); }
+.status.crashed  { color: #b3261e; background: #fdecea; }
+.status.stopped  { color: #8a6d1f; background: var(--warn-sf); }
+.status.unknown  { color: var(--ink-3); background: var(--surface-2); }
+
+/* A training run's dot pulses, so an active run is noticeable without reading. */
+.status.running i { animation: pulse 1.6s ease-in-out infinite; }
+@keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: .25; } }
+
+@media (prefers-color-scheme: dark) {
+  .status.running  { color: #6cc292; background: #102a1d; }
+  .status.finished { color: #7fb0ee; background: var(--accent-sf); }
+  .status.crashed  { color: #f08a82; background: #2e1512; }
+  .status.stopped  { color: #d9b45a; background: var(--warn-sf); }
+}
+
+@media (prefers-reduced-motion: reduce) { .status.running i { animation: none; } }
+
 .warnbadge {
   display: inline-block; font-size: 9px; padding: 1px 5px; border-radius: 3px;
   background: var(--warn-sf); color: var(--warn); border: 1px solid currentColor; margin-left: 4px;
@@ -400,3 +439,42 @@ main { flex: 1; min-width: 0; display: flex; flex-direction: column; height: 100
 .audio audio { width: 100%; height: 32px; }
 .specimg { width: 100%; border-radius: 4px; margin-top: 8px; background: var(--surface-2); }
 .note { font-size: 10.5px; color: var(--ink-3); margin: 6px 0 0; }
+
+/* ***** predicted-mask neighbours ***** */
+
+.predmask { cursor: pointer; }
+.predmask:hover { outline: 2px solid var(--accent); outline-offset: 1px; }
+.mrun { font-weight: 400; color: var(--ink-3); font-size: 12px; }
+
+/* Prediction, target and their difference at the top of the modal -- the same three
+   views the table offers, so the offset can be seen and not just read as a number. */
+.nbviews { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-bottom: 14px; }
+.nbviews figure { margin: 0; }
+.nbviews img {
+  width: 100%; aspect-ratio: 2 / 1; display: block;
+  border-radius: 4px; image-rendering: pixelated; background: var(--surface-2);
+}
+.nbviews figcaption {
+  margin-top: 4px; font-size: 10px; color: var(--ink-3);
+  text-transform: uppercase; letter-spacing: .06em; text-align: center;
+}
+
+.nbhead { display: flex; gap: 22px; flex-wrap: wrap; }
+.nbhead > div { display: flex; flex-direction: column; gap: 2px; }
+.nbhead .k { font-size: 10px; color: var(--ink-3); text-transform: uppercase; letter-spacing: .06em; }
+.nbhead b { font-family: var(--mono); font-size: 13px; }
+
+.nblist { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+.nb {
+  display: flex; gap: 9px; align-items: center; cursor: pointer;
+  padding: 5px; border: 1px solid var(--line); border-radius: var(--r);
+  border-left-width: 3px;
+}
+.nb.near { border-left-color: var(--accent); }
+.nb.far  { border-left-color: var(--pos); }
+.nb:hover { background: var(--surface-2); }
+.nb img { width: 104px; height: 52px; border-radius: 3px; flex: none; image-rendering: pixelated; }
+.nbmeta { min-width: 0; }
+.nbtop { font-size: 11.5px; display: flex; align-items: center; gap: 5px; }
+.nbtop b { font-family: var(--mono); }
+.nbsub { font-size: 10px; color: var(--ink-3); font-family: var(--mono); margin-top: 2px; }

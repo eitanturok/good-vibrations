@@ -30,6 +30,21 @@ const S = {
 
 const fmt = (v, n = 4) => (v == null || !isFinite(v) ? "–" : v.toFixed(n));
 
+/* Run state, styled like a CI/W&B badge: green while training, blue once finished,
+   red if it died. Colours carry a text label too -- never colour alone. */
+const STATUS = {
+  running:  { label: "running",  title: "Training now — predictions update automatically" },
+  finished: { label: "done",     title: "Training completed cleanly" },
+  crashed:  { label: "crashed",  title: "Training ended in a traceback" },
+  stopped:  { label: "stopped",  title: "Log ends with no clean exit and no error — killed, preempted, or the node went away" },
+  unknown:  { label: "unknown",  title: "No training log found" },
+};
+
+function statusChip(status) {
+  const s = STATUS[status] || STATUS.unknown;
+  return `<span class="status ${status}" title="${s.title}"><i></i>${s.label}</span>`;
+}
+
 /* Layout names run long too (purple-cube-green-cube); keep the colours, drop the noun.
    Full value stays in the chip's title. */
 function shortLayout(s) {
@@ -87,16 +102,27 @@ function buildPositions() {
 
 /* ***** runs ***** */
 
-async function addRun(name) {
-  if (S.runs[name]) return;
-  const d = await api(`/api/run/${encodeURIComponent(name)}`);
+async function addRun(name, reload = false) {
+  if (S.runs[name] && !reload) return;
+  const d = await api(`/api/run/${encodeURIComponent(name)}${reload ? "?reload=1" : ""}`);
   d.entry = S.meta.runs.find((r) => r.name === name);
+  if (reload) {
+    // Refresh in place: keep column order and, crucially, leave the filters alone. A new
+    // epoch must not silently re-check splits the user turned off or move their sliders.
+    const prev = S.runs[name];
+    d.splits = new Set(Object.values(d.samples).map((x) => x.split));
+    for (const sp of d.splits) {
+      if (!prev || !prev.splits.has(sp)) S.filters.splits.add(sp);   // genuinely new only
+    }
+    S.runs[name] = d;
+    recomputeDomains({ preserve: true });
+    return;
+  }
   S.runs[name] = d;
   S.runOrder.push(name);
   d.splits = new Set(Object.values(d.samples).map((x) => x.split));
   for (const sp of d.splits) S.filters.splits.add(sp);
   recomputeDomains();
-  renderRunbar();
   refresh();
 }
 
@@ -105,12 +131,15 @@ function removeRun(name) {
   S.runOrder = S.runOrder.filter((n) => n !== name);
   if (S.sort.run === name) S.sort.run = null;
   recomputeDomains();
-  renderRunbar();
   refresh();
 }
 
 /* Slider bounds track the loaded runs so the handles always span real data. */
-function recomputeDomains() {
+/* `preserve` is set when a run reloads with a new epoch: the slider bounds still track
+   the data, but a range the user is looking through must not be widened underneath them
+   just because the numbers moved. Adding or removing a run is different -- there the
+   untouched sliders should span whatever is now loaded. */
+function recomputeDomains({ preserve = false } = {}) {
   for (const m of METRICS) {
     let lo = Infinity, hi = -Infinity;
     for (const n of S.runOrder)
@@ -121,12 +150,16 @@ function recomputeDomains() {
     if (!isFinite(lo)) { lo = 0; hi = 1; }
     if (hi - lo < 1e-9) hi = lo + 1e-9;
     const prev = S.domain[m.key], cur = S.filters.ranges[m.key];
+    // Never shrink the domain on a reload, or a selection sitting near the old edge
+    // would get clamped away as the run improves.
+    if (preserve && prev) { lo = Math.min(lo, prev[0]); hi = Math.max(hi, prev[1]); }
     S.domain[m.key] = [lo, hi];
-    // keep an explicit user selection; otherwise track the new full domain
-    if (!prev || !cur || (cur[0] <= prev[0] + 1e-12 && cur[1] >= prev[1] - 1e-12))
-      S.filters.ranges[m.key] = [lo, hi];
-    else
-      S.filters.ranges[m.key] = [Math.max(lo, cur[0]), Math.min(hi, cur[1])];
+
+    if (!cur) { S.filters.ranges[m.key] = [lo, hi]; continue; }
+    const untouched = prev && cur[0] <= prev[0] + 1e-12 && cur[1] >= prev[1] - 1e-12;
+    if (preserve) S.filters.ranges[m.key] = untouched ? [lo, hi] : cur;
+    else if (!prev || untouched) S.filters.ranges[m.key] = [lo, hi];
+    else S.filters.ranges[m.key] = [Math.max(lo, cur[0]), Math.min(hi, cur[1])];
   }
   syncSliders();
 }
@@ -253,9 +286,16 @@ function renderHeader() {
       ? `<span class="warnbadge" title="No eval split directories; dataset identity unconfirmed">?</span>` : "";
     const skipped = r.skipped_files.length
       ? ` · <span title="${r.skipped_files.join(", ")}">${r.skipped_files.length} file(s) skipped</span>` : "";
+    // Read status from the latest poll, not the snapshot taken when the run was added --
+    // a run that finishes or crashes while open must update its badge.
+    const live = S.meta.runs.find((x) => x.name === name);
+    const status = (live && live.status) || "unknown";
     cell.innerHTML = `
-      <div class="hname" title="${name} — click to cycle sort">${name}${warn}</div>
-      <div class="hmeta">ep ${r.epoch} · ${r.n}/${S.samples.length}${skipped}</div>
+      <div class="htop">
+        <div class="hname" title="${name} — click to cycle sort">${name}${warn}</div>
+        <button class="hclose" title="Remove this run">&times;</button>
+      </div>
+      <div class="hmeta">${statusChip(status)} ep ${r.epoch} · ${r.n}/${S.samples.length}${skipped}</div>
       <div class="hstats">${METRICS.map((m) => {
         const s = st[m.key];
         return `<span><span class="k">${m.short}</span> <b>${s ? fmt(s.mean, 3) : "–"}</b>${
@@ -267,6 +307,10 @@ function renderHeader() {
         <button class="dir ${sorted ? "on" : ""}">${sorted ? (S.sort.dir === "worst" ? "↓ worst" : "↑ best") : "sort"}</button>
       </div>`;
 
+    cell.querySelector(".hclose").onclick = (e) => {
+      e.stopPropagation();          // must not also cycle the column's sort
+      removeRun(name);
+    };
     cell.querySelector(".hname").onclick = () => {
       if (S.sort.run !== name) S.sort = { run: name, metric: S.sort.metric, dir: "worst" };
       else if (S.sort.dir === "worst") S.sort.dir = "best";
@@ -292,8 +336,11 @@ function renderHeader() {
    cached the old one. */
 function maskURL(run, sid) {
   const { mode, background } = S.view;
+  // The run's epoch is part of the URL: a still-training run writes new predictions, and
+  // without it the browser would keep serving the epoch it first cached.
+  const ep = S.runs[run] ? S.runs[run].epoch : 0;
   return `/api/mask.png?run=${encodeURIComponent(run)}&sid=${sid}&mode=${mode}` +
-    `&bg=${background ? 1 : 0}&v=${S.renderVersion}`;
+    `&bg=${background ? 1 : 0}&v=${S.renderVersion}&ep=${ep}`;
 }
 
 function gtMaskURL(sid) {
@@ -381,10 +428,11 @@ function paintRow(el, rank) {
     // same sample can be train in one run and an eval split in another.
     com.innerHTML = `<span class="tag">com ${fmt(e.com[0], 1)}, ${fmt(e.com[1], 1)}</span>` +
       `<span class="tag split" title="${e.split}">${shortSplit(e.split)}</span>`;
-    m.className = "mask" + (S.view.background ? "" : " nobg");
+    m.className = "mask predmask" + (S.view.background ? "" : " nobg");
     const u = maskURL(name, s.i);
     if (m.getAttribute("src") !== u) m.setAttribute("src", u);
     m.dataset.run = name; m.dataset.sid = s.i;
+    m.onclick = () => openNeighbors(name, s.i);
   });
 }
 
@@ -430,7 +478,10 @@ function refresh(toTop = false) {
   const hh = hdr.offsetHeight;
   $("#rows").style.top = `${hh}px`;
   $("#spacer").style.height = `${hh + S.order.length * ROW_H}px`;
-  $("#rowcount").textContent = `${S.order.length} of ${S.samples.length} samples`;
+  const nRuns = S.runOrder.length;
+  $("#rowcount").innerHTML =
+    `<b>${S.order.length}</b> of ${S.samples.length} samples` +
+    ` · <b>${nRuns}</b> run${nRuns === 1 ? "" : "s"}`;
   $("#empty").hidden = S.order.length > 0;
   renderChips();
   renderScatter();
@@ -475,7 +526,9 @@ const SPEAKERS = { 1: [1, 0], 2: [1, 0.7], 3: [0.8, 1], 4: [0.6, 1], 5: [0.4, 1]
 
 function buildSpeakerDiagram() {
   const svg = $("#speakers");
-  const W = 236, H = 132, M = 22;
+  // Speakers sit OUTSIDE the box, so the margin has to clear the push-out distance plus
+  // the circle radius (OFF + R), or every edge speaker is clipped by the viewport.
+  const W = 236, H = 148, OFF = 16, R = 11, M = OFF + R + 1;
   svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
   const bw = W - 2 * M, bh = H - 2 * M;
   let out = `<rect class="box-outline" x="${M}" y="${M}" width="${bw}" height="${bh}" rx="4"/>
@@ -483,9 +536,9 @@ function buildSpeakerDiagram() {
   for (const [id, [xf, yf]] of Object.entries(SPEAKERS)) {
     // y_frac has 0 at the BOTTOM (draw_speaker flips it), so invert for SVG coords.
     let cx = M + xf * bw, cy = M + (1 - yf) * bh;
-    cx += (xf === 1 ? 14 : xf === 0 ? -14 : 0);
-    cy += (yf === 0 ? 14 : yf === 1 ? -14 : 0);
-    out += `<g class="spk" data-spk="${id}"><circle cx="${cx}" cy="${cy}" r="10"/><text x="${cx}" y="${cy}">${id}</text></g>`;
+    cx += (xf === 1 ? OFF : xf === 0 ? -OFF : 0);
+    cy += (yf === 0 ? OFF : yf === 1 ? -OFF : 0);
+    out += `<g class="spk" data-spk="${id}"><circle cx="${cx}" cy="${cy}" r="${R}"/><text x="${cx}" y="${cy}">${id}</text></g>`;
   }
   svg.innerHTML = out;
   svg.querySelectorAll(".spk").forEach((g) => {
@@ -741,19 +794,63 @@ function syncSliders() {
   });
 }
 
-/* ***** runbar + picker ***** */
+/* ***** live updates *****
+   Runs keep training while viz2 is open. Poll the (cheap, server-throttled) run list;
+   when a loaded run's epoch advances, refetch its metrics and re-render its masks. */
 
-function renderRunbar() {
-  const bar = $("#runbar");
-  bar.innerHTML = "";
-  S.runOrder.forEach((n) => {
-    const t = document.createElement("span");
-    t.className = "runtag";
-    t.innerHTML = `<span class="dot"></span><span>${n}</span><button title="Remove">&times;</button>`;
-    t.querySelector("button").onclick = () => removeRun(n);
-    bar.appendChild(t);
+const POLL_MS = 15000;
+
+async function poll() {
+  let meta;
+  try {
+    meta = await api("/api/runs");
+  } catch {
+    return;                            // server restarting; try again next tick
+  }
+  const prevNames = new Set(S.meta.runs.map((r) => r.name));
+  const prevStatus = new Map(S.meta.runs.map((r) => [r.name, r.status]));
+  S.meta = meta;
+  // A loaded run going running -> done/crashed only shows in its column header.
+  const statusChanged = S.runOrder.some((n) => {
+    const cur = meta.runs.find((r) => r.name === n);
+    return cur && prevStatus.get(n) !== cur.status;
   });
+
+  const advanced = [];
+  for (const name of S.runOrder) {
+    const cur = meta.runs.find((r) => r.name === name);
+    if (cur && S.runs[name] && cur.epoch != null && cur.epoch !== S.runs[name].epoch) {
+      advanced.push(name);
+    }
+  }
+  for (const name of advanced) await addRun(name, true);
+
+  if (advanced.length) {
+    // Mask URLs are cached immutable, so a new epoch needs a new URL to be fetched.
+    S.epochTag = (S.epochTag || 0) + 1;
+    // New metrics can reorder a sorted table. Keep whichever sample is at the top of the
+    // viewport in view, so rows don't slide out from under the user mid-read.
+    const sc = $("#scroller");
+    const hdr = sc.querySelector(".hrow");
+    const anchorRank = Math.floor(Math.max(0, sc.scrollTop - (hdr ? hdr.offsetHeight : 0)) / ROW_H);
+    const anchor = S.order[anchorRank];
+    refresh();
+    if (anchor) {
+      const next = S.order.indexOf(anchor);
+      if (next >= 0 && next !== anchorRank) {
+        sc.scrollTop += (next - anchorRank) * ROW_H;
+        renderVisible();
+      }
+    }
+  }
+  const added = meta.runs.filter((r) => r.compatible && !prevNames.has(r.name));
+  if (added.length && !$("#runpicker").hidden) openPicker();   // keep an open picker live
+  if (!advanced.length && statusChanged) refresh();
 }
+
+/* ***** run picker *****
+   Loaded runs are their own columns, so there is no separate list of them: each column
+   header carries its own close button. */
 
 function openPicker() {
   const list = $("#run-list"), q = $("#run-search");
@@ -767,7 +864,8 @@ function openPicker() {
         const d = document.createElement("div");
         d.className = "ritem" + (r.compatible ? (added ? " added" : "") : " bad");
         d.innerHTML = `<div><div class="nm">${r.name}</div>
-          <div class="sub">${r.compatible ? `ep ${r.epoch ?? "?"} · ${r.eval_splits.length} eval splits` : r.reason}</div></div>
+          <div class="sub">${statusChip(r.status)} ${r.compatible
+            ? `ep ${r.epoch ?? "?"} · ${r.eval_splits.length} eval splits` : r.reason}</div></div>
           <span class="badge">${added ? "added" : r.compatible ? "add" : "unavailable"}</span>`;
         if (r.compatible && !added) d.onclick = async () => { $("#runpicker").hidden = true; await addRun(r.name); };
         list.appendChild(d);
@@ -819,6 +917,7 @@ async function openModal(rank) {
   S.modalRow = rank;
   const s = S.order[rank];
   if (!s) return;
+  $("#m-prev").hidden = $("#m-next").hidden = false;
   const d = await api(`/api/detail/${s.i}`);
   $("#m-title").textContent = `Sample ${d.sample_id}`;
   const coms = Object.entries(d.coms || {})
@@ -868,7 +967,73 @@ async function openModal(rank) {
   $("#modal").hidden = false;
 }
 
+/* ***** predicted-mask modal *****
+   Ranks ground-truth samples by how close their center of mass is to what this run
+   predicted, which shows whether a prediction looks like a different scene than its own
+   target. Positions are deduped: 8 samples share each one, differing only by speaker. */
+
+async function openNeighbors(run, sid) {
+  const d = await api(`/api/neighbors?run=${encodeURIComponent(run)}&sid=${sid}&k=5`);
+  const dc = (a, b) => `${fmt(a, 1)}, ${fmt(b, 1)}`;
+  const off = Math.hypot(d.pred_com[0] - d.gt_com[0], d.pred_com[1] - d.gt_com[1]);
+
+  const list = (rows, cls) => rows.map((x) => `
+    <li class="nb ${cls}" data-i="${x.i}">
+      <img src="/api/gt_mask.png?sid=${x.i}&bg=1&v=${S.renderVersion}" loading="lazy" alt="">
+      <div class="nbmeta">
+        <div class="nbtop"><b>${+x.sample_id}</b> <span class="tag">pos ${+x.output_id}</span></div>
+        <div class="nbsub">d ${fmt(x.distance, 3)} · com ${dc(x.com[0], x.com[1])}</div>
+        <div class="nbsub">${shortLayout(x.layout)} · ${x.n_objects} obj</div>
+      </div>
+    </li>`).join("");
+
+  const v = `v=${S.renderVersion}`;
+  const ep = S.runs[run] ? `&ep=${S.runs[run].epoch}` : "";
+  const e = S.runs[run] && S.runs[run].samples[sid];
+
+  $("#m-title").innerHTML = `Sample ${+d.sample_id} — <span class="mrun">${run}</span>`;
+  $("#m-body").innerHTML = `
+    <div class="msec">
+      <h3>This prediction</h3>
+      <div class="nbviews">
+        <figure><img src="/api/mask.png?run=${encodeURIComponent(run)}&sid=${sid}&mode=pred&bg=1&${v}${ep}" alt="">
+          <figcaption>predicted</figcaption></figure>
+        <figure><img src="/api/gt_mask.png?sid=${sid}&bg=1&${v}" alt="">
+          <figcaption>ground truth</figcaption></figure>
+        <figure><img src="/api/mask.png?run=${encodeURIComponent(run)}&sid=${sid}&mode=diff&bg=1&${v}${ep}" alt="">
+          <figcaption>difference</figcaption></figure>
+      </div>
+      <div class="nbhead">
+        <div><span class="k">predicted com</span><b>${dc(d.pred_com[0], d.pred_com[1])}</b></div>
+        <div><span class="k">ground truth</span><b>${dc(d.gt_com[0], d.gt_com[1])}</b></div>
+        <div><span class="k">offset</span><b>${fmt(off, 2)} cells</b></div>
+        ${e ? `<div><span class="k">mse</span><b>${fmt(e.mse, 4)}</b></div>
+               <div><span class="k">soft iou</span><b>${fmt(e.iou, 3)}</b></div>
+               <div><span class="k">com dist</span><b>${e.comdist == null ? "–" : fmt(e.comdist, 3)}</b></div>` : ""}
+      </div>
+      <p class="note">Ground-truth scenes ranked by distance from this run's predicted
+        center of mass, over ${d.n_candidates} samples with an object (empty boxes
+        excluded). One entry per physical position.</p>
+    </div>
+    <div class="mgrid">
+      <div class="msec"><h3>Most similar to the prediction</h3><ul class="nblist">${list(d.most_similar, "near")}</ul></div>
+      <div class="msec"><h3>Least similar</h3><ul class="nblist">${list(d.least_similar, "far")}</ul></div>
+    </div>`;
+
+  // Each neighbour opens its own ground-truth detail, if it is on screen.
+  $("#m-body").querySelectorAll(".nb").forEach((li) => {
+    li.onclick = () => {
+      const rank = S.order.findIndex((s) => s.i === +li.dataset.i);
+      if (rank >= 0) openModal(rank);
+    };
+  });
+  S.modalRow = -1;                       // arrow-key stepping applies to GT modals only
+  $("#m-prev").hidden = $("#m-next").hidden = true;
+  $("#modal").hidden = false;
+}
+
 function stepModal(delta) {
+  if (S.modalRow < 0) return;            // neighbour modal has no position in the table
   const next = S.modalRow + delta;
   if (next >= 0 && next < S.order.length) openModal(next);
 }
@@ -923,6 +1088,7 @@ function bindUI() {
 
   bindTooltip();
   renderLegend();
+  setInterval(poll, POLL_MS);   // pick up new runs and new epochs of training ones
 }
 
 function renderLegend() {
