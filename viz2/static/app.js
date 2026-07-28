@@ -307,7 +307,7 @@ function buildRow() {
     <div class="cell gt sticky-2 gtcell">
       <div class="tags gt-head"></div>
       <img class="mask gtimg" loading="lazy" decoding="async" alt="">
-      <div class="tags"></div>
+      <div class="tags gt-foot"></div>
     </div>`;
   el._runCells = [];
   return el;
@@ -332,7 +332,9 @@ function paintRow(el, rank) {
   // samples sharing a position differ only by speaker, so all three belong together.
   const pos = s.output_id == null ? "–" : +s.output_id;
   el.querySelector(".gt-head").innerHTML =
-    `<span class="tag strong">sample ${+s.sample_id}, pos ${pos}, spk ${s.speaker}</span>`;
+    `<span class="tag strong">sample ${+s.sample_id}</span>` +
+    `<span class="tag">pos ${pos}</span>` +
+    `<span class="tag">spk ${s.speaker}</span>`;
 
   // The ground-truth cell shows the same 20x40 target the runs predict, over the same
   // backdrop, so it is directly comparable with every prediction column. The speaker
@@ -347,7 +349,7 @@ function paintRow(el, rank) {
   // run column rather than here.
   const com = s.com_gt && s.com_gt[0] != null && s.com_gt[0] >= 0
     ? `${fmt(s.com_gt[0], 1)}, ${fmt(s.com_gt[1], 1)}` : "–";
-  el.querySelector(".tags").innerHTML =
+  el.querySelector(".gt-foot").innerHTML =
     `<span class="tag">com ${com}</span>` +
     `<span class="tag" title="${s.layout}">${shortLayout(s.layout)}</span>` +
     `<span class="tag">${s.n_objects} obj</span>`;
@@ -529,7 +531,11 @@ function buildScatter() {
   svg.innerHTML = S.positions.map((p) =>
     `<circle class="pt" data-p="${p.i}" cx="${sc.x(p.c).toFixed(1)}" cy="${sc.y(p.r).toFixed(1)}" r="${SC.r}"/>`).join("")
     + `<circle class="pt-hot" r="${SC.r + 2.5}" hidden></circle>`
-    + `<polygon class="lasso" points="" hidden></polygon>`;
+    // Two marks for the drag: a filled polygon previewing the region that will be
+    // captured, and a polyline tracing the exact path drawn so far (a polygon alone
+    // would silently close the shape and hide where the cursor actually went).
+    + `<polygon class="lasso-fill" points="" hidden></polygon>`
+    + `<polyline class="lasso-line" points="" hidden></polyline>`;
 
   let drag = null;
   const pt = (ev) => {
@@ -549,31 +555,69 @@ function buildScatter() {
     return bd < 14 ? best : -1;
   };
 
+  /* `el.hidden = x` only reflects to the hidden ATTRIBUTE on HTML elements. On SVG
+     elements it just sets a stray JS property, leaving the attribute -- and so the
+     `[hidden] { display: none }` rule -- in place, which is why these never appeared.
+     Toggle the attribute directly instead. */
+  const show = (el, on) => (on ? el.removeAttribute("hidden") : el.setAttribute("hidden", ""));
+
+  const drawLasso = (pts, closed) => {
+    const s = pts.map((q) => `${q[0].toFixed(1)},${q[1].toFixed(1)}`).join(" ");
+    const line = svg.querySelector(".lasso-line"), fill = svg.querySelector(".lasso-fill");
+    line.setAttribute("points", s); show(line, true);
+    if (closed) fill.setAttribute("points", s);
+    show(fill, closed);
+  };
+  const clearLasso = () => {
+    for (const c of [".lasso-line", ".lasso-fill"]) {
+      const e = svg.querySelector(c);
+      show(e, false); e.setAttribute("points", "");
+    }
+  };
+
   svg.addEventListener("pointerdown", (ev) => {
     svg.focus();
     svg.setPointerCapture(ev.pointerId);
     drag = { pts: [pt(ev)], add: ev.shiftKey, moved: false };
+    show(svg.querySelector(".pt-hot"), false);
+    drawLasso(drag.pts, false);              // show the trail from the first pixel
   });
   svg.addEventListener("pointermove", (ev) => {
     if (!drag) {
       const [x, y] = pt(ev), i = nearest(x, y), hot = svg.querySelector(".pt-hot");
       const p = i >= 0 ? S.positions[i] : null;
-      hot.hidden = !p;
       if (p) { const s2 = scaleP(); hot.setAttribute("cx", s2.x(p.c)); hot.setAttribute("cy", s2.y(p.r)); }
+      show(hot, !!p);
       return;
     }
     const p = pt(ev), last = drag.pts[drag.pts.length - 1];
-    if (Math.hypot(p[0] - last[0], p[1] - last[1]) < 2) return;
+    if (Math.hypot(p[0] - last[0], p[1] - last[1]) < 1.5) return;
     drag.pts.push(p); drag.moved = true;
-    const poly = svg.querySelector(".lasso");
-    poly.hidden = false;
-    poly.setAttribute("points", drag.pts.map((q) => q.join(",")).join(" "));
+    // Fill as soon as the path can enclose anything (3 points), so the region being
+    // captured is visible while the lasso grows rather than only at the end.
+    drawLasso(drag.pts, drag.pts.length >= 3);
+    // Preview which points the current path would capture, so the selection is visible
+    // before releasing rather than only after.
+    if (drag.pts.length > 2) {
+      const s2 = scaleP();
+      svg.querySelectorAll(".pt").forEach((c) => {
+        const q = S.positions[+c.dataset.p];
+        c.classList.toggle("lassoed", inPoly(s2.x(q.c), s2.y(q.r), drag.pts));
+      });
+    }
   });
-  svg.addEventListener("pointerleave", () => { svg.querySelector(".pt-hot").hidden = true; });
+  svg.addEventListener("pointerleave", () => show(svg.querySelector(".pt-hot"), false));
+  // A cancelled gesture (pointer leaves the window, touch interrupted) must not leave
+  // the trail painted on screen.
+  svg.addEventListener("pointercancel", () => {
+    drag = null;
+    clearLasso();
+    svg.querySelectorAll(".pt.lassoed").forEach((c) => c.classList.remove("lassoed"));
+  });
   svg.addEventListener("pointerup", (ev) => {
     if (!drag) return;
-    const poly = svg.querySelector(".lasso");
-    poly.hidden = true; poly.setAttribute("points", "");
+    clearLasso();
+    svg.querySelectorAll(".pt.lassoed").forEach((c) => c.classList.remove("lassoed"));
     if (drag.moved && drag.pts.length > 2) {
       const hit = new Set(drag.add && S.filters.positions ? S.filters.positions : []);
       const sc2 = scaleP();

@@ -151,7 +151,25 @@ body { display: flex; overflow: hidden; }
 .pt.off { fill: var(--ink-3); opacity: .28; }
 .pt.active { stroke: var(--ink); stroke-width: 2.5; paint-order: stroke; }
 .pt-hot { fill: none; stroke: var(--ink); stroke-width: 1.5; opacity: .55; pointer-events: none; }
-.lasso { fill: rgba(37,106,191,.12); stroke: var(--accent); stroke-width: 2; stroke-dasharray: 5 3; }
+/* The drag trail: a solid line following the cursor exactly, over a translucent fill
+   previewing the region it encloses. Neither may swallow pointer events. */
+/* Drawn at 2x scale (the viewBox is 472 wide in a ~236px box), so widths are doubled
+   to land at the intended on-screen thickness. */
+.lasso-line {
+  fill: none; stroke: var(--accent); stroke-width: 3;
+  stroke-linejoin: round; stroke-linecap: round; pointer-events: none;
+}
+.lasso-fill {
+  fill: rgba(37,106,191,.18);
+  stroke: var(--accent); stroke-width: 2; stroke-dasharray: 6 4;
+  pointer-events: none;
+}
+/* Points the current drag would capture, highlighted before release. Must also undo the
+   dimming from .pt.off, or previewed points stay faded while being selected. */
+.pt.lassoed {
+  fill: var(--accent); opacity: 1;
+  stroke: var(--ink); stroke-width: 1.5; paint-order: stroke;
+}
 
 /* ***** sliders ***** */
 
