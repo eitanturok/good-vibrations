@@ -1,13 +1,7 @@
 import numpy as np
 
-# On Windows, cupy needs the CUDA DLLs from the pip-installed nvidia-* wheels
-# (no system CUDA toolkit). Register them before any cupy import: ctypes resolves
-# via add_dll_directory, but nvrtc loads its builtins DLL through PATH.
-import os, sys, glob, sysconfig
-if sys.platform == "win32":
-    for _d in glob.glob(os.path.join(sysconfig.get_paths()["purelib"], "nvidia", "*", "bin")):
-        os.add_dll_directory(_d)
-        os.environ["PATH"] = _d + os.pathsep + os.environ["PATH"]
+# Must run before any `import cupy` in the process (see utils/cuda_env.py).
+from utils import cuda_env  # noqa: F401
 
 #***** PCLK algorithm *****
 # cupy is imported lazily inside each fn (originally it was only available inside Modal).
@@ -118,7 +112,7 @@ def compute_shifts_for_roi(video, batch_size):
     return cp.asnumpy(cp.cumsum(all_reference_shifts, axis=0))
 
 
-def compute_shifts_for_all_rois_batched(videos, batch_size):
+def compute_shifts_for_all_rois_batched(videos, batch_size, desc=None):
     """Process all ROIs in parallel on the GPU.
 
     Same algorithm as pclk_old.py but with all L ROIs flattened together
@@ -129,6 +123,7 @@ def compute_shifts_for_all_rois_batched(videos, batch_size):
     Args:
         videos: (L, T, H, W) numpy array — all ROI crops stacked (stays on CPU)
         batch_size: number of frame pairs per GPU batch
+        desc: tqdm progress bar label (e.g. the sample id)
     Returns:
         (L, T, 2) numpy array of cumulative shifts
     """
@@ -139,7 +134,7 @@ def compute_shifts_for_all_rois_batched(videos, batch_size):
     all_shifts = np.zeros((L, T, 2), dtype=np.float32)
     N_batches  = int(np.ceil((T - 1) / batch_size))
 
-    for i in tqdm(range(N_batches)):
+    for i in tqdm(range(N_batches), desc=desc):
         start = i * batch_size
         end   = min((i + 1) * batch_size, T - 1)
 
@@ -222,7 +217,7 @@ def compute_shifts_for_all_rois_batched(videos, batch_size):
     return np.cumsum(all_shifts, axis=1)                     # (L, T, 2)
 
 
-def compute_shifts_for_all_rois_batched_optimized(videos, batch_size, debug:bool=False, progress:bool=True):
+def compute_shifts_for_all_rois_batched_optimized(videos, batch_size, debug:bool=False, progress:bool=True, desc=None):
     """Same as compute_shifts_for_all_rois_batched with additional optimizations:
     - hannW_pad precomputed once outside the batch loop
     - hann window applied in-place with *= to avoid broadcast allocation
@@ -234,6 +229,7 @@ def compute_shifts_for_all_rois_batched_optimized(videos, batch_size, debug:bool
         batch_size: number of frame pairs per GPU batch
         debug: print GPU memory-pool usage at each stage of every batch
         progress: show the tqdm progress bar over batches
+        desc: tqdm progress bar label (e.g. the sample id)
     Returns:
         (L, T, 2) numpy array of cumulative shifts
     """
@@ -254,7 +250,7 @@ def compute_shifts_for_all_rois_batched_optimized(videos, batch_size, debug:bool
     hannW_pad = _pad(hannW, up_pad, down_pad, left_pad, right_pad)
     pH, pW = hannW_pad.shape
 
-    for i in tqdm(range(N_batches), disable=not progress):
+    for i in tqdm(range(N_batches), desc=desc, disable=not progress):
         start = i * batch_size
         end   = min((i + 1) * batch_size, T - 1)
 

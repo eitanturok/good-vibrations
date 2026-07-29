@@ -1,5 +1,8 @@
 import cv2
 import numpy as np
+
+# Must run before any `import cupy` in the process (see utils/cuda_env.py).
+from utils import cuda_env  # noqa: F401
 import cupy as cp
 from tqdm import tqdm
 from scipy import signal
