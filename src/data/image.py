@@ -15,9 +15,9 @@ from utils.metrics import center_of_mass
 
 #***** 1 crop *****
 
-def crop(image: Image.Image, left: float, right: float, up: float, down: float, max_side:int) -> Image.Image:
-    """Crop so only box in the image. Downscale image so segmentation model inference runs faster."""
-    # crop
+def crop(image: Image.Image, left: float, right: float, up: float, down: float) -> Image.Image:
+    """Crop so only the box is in the image. Downscaling for faster segmentation inference happens
+    later, via segment_scale (see segment())."""
     w, h = image.size
     return image.crop((int(w * left), int(h * up), int(w * right), int(h * down)))
 
@@ -176,7 +176,7 @@ def process_overhead(raw_overhead: Image.Image, output_dir: Path, left: float = 
 
     # crop image
     with Timing(f"[output {output_id}] crop the overhead image: ", enabled=verbose >= 2):
-        cropped_overhead = crop(raw_overhead, left, right, up, down, max_side)
+        cropped_overhead = crop(raw_overhead, left, right, up, down)
         save(cropped_overhead, output_dir / "01_cropped.png", do_save)
         append({'cropped_overhead': datetime.now(timezone.utc).isoformat()}, output_dir / 'times.jsonl', do_save)
 
