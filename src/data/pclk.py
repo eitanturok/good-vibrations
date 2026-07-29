@@ -92,11 +92,17 @@ def find_frame_translation_LKi_cupy(video, iterations=3):
         aligned_image = warp_video_fft(aligned_image, -delta)
     return shift
 
-def find_frame_translation_PCLKi_cupy(video, iterations=3):
-    shifts_PC, video_cp = find_frame_translation_PC_cupy(video)
-    video_aligned_roll  = warp_roll(video_cp, -shifts_PC)
-    shifts_LK           = find_frame_translation_LKi_cupy(video_aligned_roll, iterations)
-    return shifts_PC + shifts_LK
+def find_frame_translation_PCLKi_cupy(video, iterations=3, use_PC=True):
+    if use_PC:
+        shifts_PC, video_cp = find_frame_translation_PC_cupy(video)
+        video_aligned_roll  = warp_roll(video_cp, -shifts_PC)
+        shifts_LK           = find_frame_translation_LKi_cupy(video_aligned_roll, iterations)
+        return shifts_PC + shifts_LK
+    else:
+        import cupy as cp
+        video_aligned_roll = cp.asarray(video, dtype=cp.float32) / 255
+        shifts_LK          = find_frame_translation_LKi_cupy(video_aligned_roll, iterations)
+        return shifts_LK
 
 def compute_shifts_for_roi(video, batch_size):
     import cupy as cp
