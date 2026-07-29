@@ -362,9 +362,8 @@ def process_vibrations_2(sample_dir:Path, raw_vibrations:np.ndarray=None, use_mo
 
 def save_and_process_vibrations(raw_vibrations:np.ndarray, sample_dir:Path, audio_dir:Path, min_freq:int, max_freq:int, use_modal:bool=False, pclk_mode:str='batched_optimized', pclk_batch_size:int=256, do_save:bool=True, verbose:int=1, spectrogram_video:bool=True, laser_idx:int|None=None, xy_idx:int=0):
     save_vibrations(raw_vibrations, sample_dir, audio_dir, do_save, verbose)
-    # delete vibrations as soon as we finish saving it
-    del raw_vibrations
-    process_vibrations(sample_dir, use_modal, pclk_mode, pclk_batch_size, do_save, verbose, spectrogram_video=spectrogram_video, laser_idx=laser_idx, xy_idx=xy_idx)
+    # on modal, raw_vibrations must already be on disk (see process_vibrations' assert) -- not passed in-memory
+    process_vibrations(sample_dir, raw_vibrations=None if use_modal else raw_vibrations, use_modal=use_modal, pclk_mode=pclk_mode, pclk_batch_size=pclk_batch_size, do_save=do_save, verbose=verbose, spectrogram_video=spectrogram_video, laser_idx=laser_idx, xy_idx=xy_idx)
 
 
 
