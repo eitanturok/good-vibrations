@@ -78,6 +78,12 @@ def _epoch_of(p: Path) -> int:
     return int(p.stem.split("-")[0].removeprefix("ep"))
 
 
+def _batch_of(p: Path) -> int:
+    """Batch index from `ep{E}-ba{B}.pt`. Filenames sort correctly as strings today, but
+    only because B is zero-padded; parse it so that stays true if the width changes."""
+    return int(p.stem.split("-")[1].removeprefix("ba"))
+
+
 def _as_int_array(v) -> np.ndarray:
     """info['sample_id'] is a tensor on most runs but a plain list on some."""
     if torch.is_tensor(v):
@@ -337,7 +343,9 @@ def load_run(name: str, runs_dir: Path, gt: GtIndex, family: str = "unknown",
         # epoch was requested there is only one candidate, so this is a no-op.
         for last in sorted({_epoch_of(f) for f in files}, reverse=True):
             got = False
-            for p in [f for f in files if _epoch_of(f) == last]:  # train: one file per batch
+            # Ascending batch order, so that if a sample appears in more than one batch
+            # of this epoch the LAST write is the one kept by the dedupe below.
+            for p in sorted([f for f in files if _epoch_of(f) == last], key=_batch_of):
                 try:
                     obj = torch.load(p, map_location="cpu", weights_only=False)
                 except Exception:
@@ -369,7 +377,20 @@ def load_run(name: str, runs_dir: Path, gt: GtIndex, family: str = "unknown",
                        np.zeros((0, 2)), {}, skipped, family)
 
     sample_ids = np.concatenate(ids)
-    pred = torch.from_numpy(np.concatenate(masks).astype(np.float32))
+    preds = np.concatenate(masks).astype(np.float32)
+
+    # A sample can be written more than once in an epoch (at ep0 the train split spans two
+    # partial passes, so ~460 ids appear twice). Keep only the last write per sample --
+    # otherwise duplicates are scored twice and skew the column's mean and std.
+    if len(np.unique(sample_ids)) != len(sample_ids):
+        keep = np.zeros(len(sample_ids), dtype=bool)
+        # Later rows come from later batches, so reversing makes "first seen" the newest.
+        _, first = np.unique(sample_ids[::-1], return_index=True)
+        keep[len(sample_ids) - 1 - first] = True
+        sample_ids, preds = sample_ids[keep], preds[keep]
+        splits = [s for s, k in zip(splits, keep) if k]
+
+    pred = torch.from_numpy(preds)
     truth = torch.from_numpy(gt.masks[sample_ids])
 
     # mask_pred is already sigmoid probabilities -- do not re-sigmoid.

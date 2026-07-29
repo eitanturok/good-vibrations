@@ -17,9 +17,11 @@
   --warn:      #8a6d1f;
   --warn-sf:   #fbf3dc;
 
-  /* Fixed row height drives the virtualizer. Budget: 8 padding + 17 chips + 4 gap
-     + 110 mask + 4 gap + 17 chips + 8 padding = 168, plus slack for chip wrapping. */
-  --row-h: 182px;
+  /* Fixed row height drives the virtualizer. Budget: 8 padding + 26 two-line title
+     + 4 gap + 110 mask + 4 gap + 38 two-line chips + 8 padding = 198, plus slack.
+     The run column needs two chip lines (com, then the three metrics); the ground-truth
+     column uses one, and simply has more headroom. */
+  --row-h: 206px;
   --mask-w: 220px;
   --mask-h: 110px;
   --col-w: 240px;   /* same as --gt-w so masks align across the whole row */
@@ -321,13 +323,19 @@ main { flex: 1; min-width: 0; display: flex; flex-direction: column; height: 100
   border-bottom: 1px solid var(--line);
 }
 /* Stacked mode gives every prediction cell a second mask box, so rows grow by one box
-   plus its gap. Must stay in sync with ROW_H_BASE + MASK_BOX in app.js. */
+   plus its gap. app.js reads --row-h and --mask-h directly (readRowMetrics), so these
+   values are the single source of truth for both the CSS and the virtualizer. */
 body.stacked .row { height: calc(var(--row-h) + 114px); }
 .truthmask { margin-top: 4px; }
 /* The run cells put the target in their LOWER box, so the ground-truth column drops by
    exactly one box + gap to sit on the same line rather than floating above it. */
 body.stacked .gtimg { margin-top: 114px; }
-.row:hover { background: var(--surface-1); }
+/* Rows are absolutely positioned and the virtualizer RECYCLES their nodes, so DOM order
+   does not track visual order -- without this the row that happens to come later in the
+   pool paints over the hovered row's mask outline, which reads as the cell below
+   overlapping. Lifting the hovered row settles it regardless of pool order.
+   Must clear the sticky cells' z-index 20, but stay under the sticky header at 30. */
+.row:hover { background: var(--surface-1); z-index: 25; }
 
 .cell { flex: none; padding: 8px 10px; border-right: 1px solid var(--line); }
 .cell.idx { width: var(--idx-w); }
@@ -350,12 +358,25 @@ body.stacked .gtimg { margin-top: 114px; }
 .hcell.run.sorted { border-left-color: var(--accent); background: var(--accent-sf); }
 .hcell.run.dim { opacity: .62; }
 
-.htop { display: flex; align-items: flex-start; gap: 4px; }
+.htop { display: flex; align-items: baseline; gap: 4px; }
+/* Only the name gives way: the epoch sits beside it and the close button holds the far
+   edge, so a long run name ellipsises rather than pushing them out of the header. This
+   mirrors the run cells, where the same three parts share one line. */
 .hname {
-  flex: 1; min-width: 0;
+  flex: 0 1 auto; min-width: 0;
   font-size: 11.5px; font-weight: 600; white-space: nowrap;
   overflow: hidden; text-overflow: ellipsis; cursor: pointer;
 }
+.hep {
+  flex: none; margin-right: auto;
+  font-size: 10px; color: var(--ink-3); font-variant-numeric: tabular-nums;
+}
+.hep b { font-weight: 600; color: var(--ink-2); }
+.hep b.scrub { color: var(--accent); }
+/* In "ep x/y" only y is a control: clicking it pins every column to this run's endpoint. */
+.hep b.goep { cursor: pointer; text-decoration: underline dotted; text-underline-offset: 2px; }
+.hep b.goep:hover { color: var(--accent); }
+.hep .k { color: var(--ink-3); font-weight: 400; }
 .hname:hover { color: var(--accent); }
 .hclose {
   flex: none; width: 16px; height: 16px; padding: 0; line-height: 1;
@@ -370,8 +391,6 @@ body.stacked .gtimg { margin-top: 114px; }
 .hclose:hover { color: var(--pos); background: var(--surface-2); }
 .hmeta { font-size: 10px; color: var(--ink-3); margin-top: 2px; font-variant-numeric: tabular-nums; }
 .hmeta b { font-weight: 600; color: var(--ink-2); }
-/* Viewing a historical epoch rather than the newest predictions. */
-.hmeta b.scrub { color: var(--accent); }
 .hmeta .k { color: var(--ink-3); font-weight: 400; }
 #epoch-label b { font-weight: 600; color: var(--ink-2); }
 #epoch-label .k { color: var(--accent); }
@@ -437,10 +456,38 @@ body.stacked .gtimg { margin-top: 114px; }
 .gtcell { cursor: pointer; }
 .gtcell:hover .gtimg { outline: 2px solid var(--accent); outline-offset: 1px; }
 
-/* One chip style for every field in the grid -- sample/position above the image,
-   metrics, COM and split below it -- so the columns read as one system. */
+/* Two-line cell title. Line 1 names the thing (Ground truth, or run + epoch + split),
+   line 2 identifies the sample. Both are clamped to one line each and ellipsised: the row
+   height is fixed for the virtualizer, so a wrapped title would overflow into the mask. */
+.ctitle {
+  margin: 0 0 4px; height: 26px;
+  display: flex; flex-direction: column;
+  /* The two 13px lines fill this box exactly, so anything that renders taller -- a flex
+     line box, a tall glyph -- has nowhere to go and would paint up into the row above.
+     Clip here so the title can never escape its own cell. */
+  overflow: hidden;
+}
+.ctitle .t1, .ctitle .t2 {
+  display: block; height: 13px; line-height: 13px; flex: none;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.ctitle .t1 { font-size: 10px; font-weight: 600; color: var(--ink); }
+.ctitle .t2 { font-size: 9.5px; color: var(--ink-3); font-variant-numeric: tabular-nums; }
+
+/* Run title: epoch and split are pinned and the NAME is what gives way. They identify
+   which frame the cell is showing, so an ellipsis must never eat them. */
+/* align-items:center, not baseline: baseline lets a child's line box grow the row past
+   the 13px the title budget allows. */
+.ctitle .t1.run { display: flex; align-items: center; gap: 4px; }
+.ctitle .rn { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ctitle .t1 b, .ctitle .t1 .sp { flex: none; }
+.ctitle .t1 b { font-weight: 600; color: var(--ink-3); font-variant-numeric: tabular-nums; }
+.ctitle .t1 b.scrub { color: var(--accent); }
+.ctitle .t1 .sp { font-weight: 400; color: var(--ink-3); }
+
+/* One chip style for every field in the grid -- metrics, COM, layout -- so the columns
+   read as one system. */
 .tags { display: flex; gap: 4px; flex-wrap: wrap; margin-top: 4px; }
-.tags.gt-head, .tags.mstats { margin: 0 0 4px; }
 /* The ground-truth footer carries four chips (com, layout, count, box) in 224px. They
    must stay on ONE line: the row height is fixed for the virtualizer, and a wrapped
    line would overflow it. Tighter padding and a 3px gap keep the worst case (two-object
@@ -453,10 +500,18 @@ body.stacked .gtimg { margin-top: 114px; }
   font-variant-numeric: tabular-nums; white-space: nowrap;
 }
 .tag.strong { font-family: var(--mono); font-weight: 600; color: var(--ink); }
-.mstats .tag { font-family: var(--mono); }
-.mstats .k { color: var(--ink-3); }
-.mstats b { font-weight: 600; color: var(--ink); }
-.subtags .tag { font-family: var(--mono); }
+/* Prediction chips: com on the first line, then mse/iou/com-dist on the second. All four
+   at a readable size do not fit 224px on one line, and the metrics are what gets scanned
+   down the column, so the com chip is the one that gives way. */
+.subtags { gap: 3px; }
+/* The com chip owns its own line but must still hug its text. A flex item cannot do both,
+   so the LINE BREAK comes from a zero-height spacer after it and the chip itself stays
+   auto-width. */
+.subtags .com { flex: none; }
+.subtags .com + .brk { flex-basis: 100%; height: 0; }
+.subtags .tag { font-family: var(--mono); padding: 1px 4px; }
+.subtags .k { color: var(--ink-3); }
+.subtags b { font-weight: 600; color: var(--ink); }
 /* Epoch chip: accented while scrubbing so a cell showing older predictions is obvious. */
 .tag.ep.scrub { border-color: var(--accent); color: var(--accent); background: var(--accent-sf); }
 

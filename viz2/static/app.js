@@ -10,8 +10,20 @@
 
 const $ = (s) => document.querySelector(s);
 /* Row height. Stacked mode adds a second mask box per cell, so rows grow by one mask
-   plus its gap; the virtualizer, the spacer and the scroll anchoring all read this. */
-const ROW_H_BASE = 182, MASK_BOX = 114;   // must match --row-h / --mask-h in style.css
+   plus its gap; the virtualizer, the spacer and the scroll anchoring all read this.
+
+   Read from the stylesheet rather than duplicated here. These two numbers have to agree
+   exactly -- the virtualizer positions rows at k*rowH() while CSS gives them their real
+   height, so any drift makes every row overlap its neighbour by the difference. */
+const cssPx = (name, fallback) => {
+  const v = parseFloat(getComputedStyle(document.documentElement).getPropertyValue(name));
+  return Number.isFinite(v) ? v : fallback;
+};
+let ROW_H_BASE = 206, MASK_BOX = 114;
+function readRowMetrics() {
+  ROW_H_BASE = cssPx("--row-h", ROW_H_BASE);
+  MASK_BOX = cssPx("--mask-h", 110) + 4;   // mask box plus the gap above it
+}
 const rowH = () => (S.view.mode === "stacked" ? ROW_H_BASE + MASK_BOX : ROW_H_BASE);
 const METRICS = [
   { key: "mse",     label: "MSE",      short: "mse", worst: "high" },
@@ -37,6 +49,7 @@ const S = {
   lut: null,          // colormaps from the server, so client and server agree on colour
   epochIdx: null,     // null = each run's latest; otherwise an index into the epoch list
   playing: false,
+  frozenOrder: null,  // sid -> rank, pinned while scrubbing so rows hold their places
   frameData: {},      // run -> fp16 masks for the visible rows, all epochs
   truthCache: {},     // sid -> ground-truth values, for client-side diff
 };
@@ -60,6 +73,13 @@ function statusChip(status) {
 
 /* Layout names run long too (purple-cube-green-cube); keep the colours, drop the noun.
    Full value stays in the chip's title. */
+/* The identity line both column types carry: where the capture happened, which speaker
+   played, and the sample it belongs to. Shared so the two titles cannot drift apart. */
+function identity(s) {
+  const pos = s.output_id == null ? "–" : +s.output_id;
+  return `Pos ${pos}, Spk ${s.speaker} (${+s.sample_id})`;
+}
+
 function shortLayout(s) {
   if (!s) return "–";
   if (s === "empty-box") return "empty";
@@ -82,6 +102,7 @@ const api = (u) => fetch(u).then((r) => { if (!r.ok) throw new Error(u); return 
 /* ***** boot ***** */
 
 async function boot() {
+  readRowMetrics();          // before anything measures or positions a row
   const [runs, samples, lut] = await Promise.all([
     api("/api/runs"), api("/api/samples"), api("/api/lut")]);
   S.lut = lut;
@@ -118,29 +139,35 @@ function buildPositions() {
 
 /* ***** runs ***** */
 
+/* Membership at the run's latest epoch: which samples it covers and their splits. This is
+   the run's identity for filtering, and it must survive the epoch scrubber swapping
+   `samples` -- see predictedSplit. */
+function indexMembership(d) {
+  d.splits = new Set(Object.values(d.samples).map((x) => x.split));
+  d.splitOf = Object.fromEntries(Object.entries(d.samples).map(([k, v]) => [k, v.split]));
+}
+
 async function addRun(name, reload = false) {
   if (S.runs[name] && !reload) return;
   const d = await api(`/api/run/${encodeURIComponent(name)}${reload ? "?reload=1" : ""}`);
   d.entry = S.meta.runs.find((r) => r.name === name);
+  d.metricsEpoch = null;        // /api/run without ?epoch scores the latest
+  indexMembership(d);
   if (reload) {
     // Refresh in place: keep column order and, crucially, leave the filters alone. A new
     // epoch must not silently re-check splits the user turned off or move their sliders.
     const prev = S.runs[name];
-    d.splits = new Set(Object.values(d.samples).map((x) => x.split));
     for (const sp of d.splits) {
       if (!prev || !prev.splits.has(sp)) S.filters.splits.add(sp);   // genuinely new only
     }
-    d.metricsEpoch = null;      // /api/run without ?epoch scores the latest
     S.runs[name] = d;
     invalidateEpochs();
     recomputeDomains({ preserve: true });
     return;
   }
-  d.metricsEpoch = null;
   S.runs[name] = d;
   S.runOrder.push(name);
   invalidateEpochs();
-  d.splits = new Set(Object.values(d.samples).map((x) => x.split));
   for (const sp of d.splits) S.filters.splits.add(sp);
   recomputeDomains();
   refresh();
@@ -190,12 +217,15 @@ function recomputeDomains({ preserve = false } = {}) {
 function initFilters() {
   const f = S.filters;
   S.samples.forEach((s) => {
-    if (s.speaker != null) f.speakers.add(s.speaker);
     if (s.layout) f.layouts.add(s.layout);
     if (s.n_objects != null) f.nObjects.add(s.n_objects);
     if (s.box) f.boxes.add(s.box);
     (s.objects && s.objects.length ? s.objects : ["(none)"]).forEach((o) => f.objects.add(o));
   });
+  // Speaker 1 only. The 8 speakers at a position capture the same scene, so showing all
+  // of them makes the table eight rows deep per position; starting on one keeps the
+  // opening view one row per position, and "all" is a click away.
+  f.speakers.add(1);
 }
 
 function uniq(get) {
@@ -204,11 +234,18 @@ function uniq(get) {
   return [...m.entries()].sort((a, b) => (a[0] > b[0] ? 1 : -1));
 }
 
-/* A sample is in the table if any loaded run predicted it. */
+/* A sample is in the table if any loaded run predicted it.
+
+   Read from `splitOf`, the run's membership at its LATEST epoch, not from `samples`,
+   which the epoch scrubber swaps out. A run does not save every sample at every epoch
+   (early epochs in particular cover a different subset), and a sample missing from one
+   epoch has not left the run -- its ground truth certainly has not changed. Keying the
+   filter on the swapped table made those rows fail `passes` and vanish from the table
+   entirely, taking the ground-truth column with them. */
 function predictedSplit(sampleIdx) {
   for (const n of S.runOrder) {
-    const e = S.runs[n].samples[sampleIdx];
-    if (e) return e.split;
+    const sp = S.runs[n].splitOf && S.runs[n].splitOf[sampleIdx];
+    if (sp) return sp;
   }
   return null;
 }
@@ -244,8 +281,11 @@ function passes(s) {
   if (!names.length) return true;
   let any = false;
   for (const n of names) {
-    const e = S.runs[n].samples[s.i];
-    if (!e) continue;
+    const r = S.runs[n];
+    const e = r.samples[s.i];
+    // Covered by the run but not saved at the epoch being viewed: keep the row (its
+    // cell shows "no prediction" for this frame) rather than dropping it from the table.
+    if (!e) { if (r.splitOf && r.splitOf[s.i]) any = true; continue; }
     let ok = true;
     for (const m of METRICS) {
       const [lo, hi] = f.ranges[m.key] || [-Infinity, Infinity];
@@ -261,6 +301,21 @@ function passes(s) {
 function applyFilters() {
   const rows = S.samples.filter(passes);
   const { run, metric, dir } = S.sort;
+
+  // While scrubbing epochs the metrics underneath are changing, and re-sorting on them
+  // would shuffle rows out from under the cursor -- you would be watching a different
+  // sample than the one you were looking at. Hold the order captured when the scrub
+  // began; filters still apply, so rows can leave, but survivors keep their positions.
+  if (S.frozenOrder) {
+    // Anything not in the pinned order (a sample a filter change just admitted) sorts to
+    // the end by sample id, rather than jumping into the middle of the frozen sequence.
+    const rank = S.frozenOrder;
+    const at = (s) => (rank.has(s.i) ? rank.get(s.i) : Number.MAX_SAFE_INTEGER);
+    rows.sort((a, b) => at(a) - at(b) || a.i - b.i);
+    S.order = rows;
+    return;
+  }
+
   if (run && S.runs[run]) {
     const m = METRICS.find((x) => x.key === metric);
     // "worst" means high for MSE/COM-distance but LOW for IoU; the direction button is
@@ -309,13 +364,18 @@ function statsFor(name) {
 /* "which epoch am I looking at, out of how many the run trained for" -- the two are
    easy to confuse once the slider exists, so the header always shows both and calls out
    when you are looking at anything other than the newest predictions. */
+/* The epoch number is a control: clicking it pins every column to this run's last epoch,
+   which is how you line the table up on one run's endpoint. */
 function epochLabel(run) {
   const r = S.runs[run];
   const eps = r.epochs || [];
   const last = eps.length ? eps[eps.length - 1] : r.epoch;
   const shown = epochFor(run);
-  if (shown == null || shown === last) return `ep <b>${last}</b> <span class="k">(latest)</span>`;
-  return `ep <b class="scrub">${shown}</b> <span class="k">of ${last}</span>`;
+  // ep <current>/<last>. Only the last is clickable -- it is the run's endpoint, and
+  // jumping every column there is the useful move; the current epoch is already current.
+  const cur = shown == null ? last : shown;
+  return `ep <b${cur === last ? "" : ` class="scrub"`}>${cur}</b><span class="k">/</span>` +
+    `<b class="goep" data-ep="${last}" title="Show every column at epoch ${last}">${last}</b>`;
 }
 
 function renderHeader() {
@@ -342,9 +402,10 @@ function renderHeader() {
     cell.innerHTML = `
       <div class="htop">
         <div class="hname" title="${name} — click to cycle sort">${name}${warn}</div>
+        <span class="hep">${epochLabel(name)}</span>
         <button class="hclose" title="Remove this run">&times;</button>
       </div>
-      <div class="hmeta">${statusChip(status)} ${epochLabel(name)} · ${r.n}/${S.samples.length}${skipped}</div>
+      <div class="hmeta">${statusChip(status)} ${r.n}/${S.samples.length}${skipped}</div>
       <div class="hstats">${METRICS.map((m) => {
         const s = st[m.key];
         return `<span><span class="k">${m.short}</span> <b>${s ? fmt(s.mean, 3) : "–"}</b>${
@@ -393,7 +454,7 @@ function buildRow() {
   el.className = "row";
   el.innerHTML = `<div class="cell idx sticky-1"><span class="idxn"></span></div>
     <div class="cell gt sticky-2 gtcell">
-      <div class="tags gt-head"></div>
+      <div class="ctitle gt-head"></div>
       <img class="mask gtimg" loading="lazy" decoding="async" alt="">
       <div class="tags gt-foot"></div>
     </div>`;
@@ -410,7 +471,7 @@ function syncRowCells(el) {
     // over a CSS backdrop. Keeping a parallel server-PNG path meant two renderers that
     // had to agree on gamma, alpha and backdrop geometry -- and they drifted.
     // A second canvas for the ground-truth half, shown only in stacked mode.
-    c.innerHTML = `<div class="tags mstats"></div>` +
+    c.innerHTML = `<div class="ctitle run-head"></div>` +
       `<canvas class="mask predmask" width="40" height="20"></canvas>` +
       `<canvas class="mask truthmask" width="40" height="20" hidden></canvas>` +
       `<div class="tags subtags"></div>`;
@@ -425,11 +486,8 @@ function paintRow(el, rank) {
   el.querySelector(".idxn").textContent = rank + 1;
   // Identity line: which sample, where it was captured, which speaker played. The 8
   // samples sharing a position differ only by speaker, so all three belong together.
-  const pos = s.output_id == null ? "–" : +s.output_id;
   el.querySelector(".gt-head").innerHTML =
-    `<span class="tag strong">sample ${+s.sample_id}</span>` +
-    `<span class="tag">pos ${pos}</span>` +
-    `<span class="tag">spk ${s.speaker}</span>`;
+    `<span class="t1">Ground truth</span><span class="t2">${identity(s)}</span>`;
 
   // The ground-truth cell shows the same 20x40 target the runs predict, over the same
   // backdrop, so it is directly comparable with every prediction column. The speaker
@@ -458,12 +516,30 @@ function paintRow(el, rank) {
   S.runOrder.forEach((name, k) => {
     const c = el._runCells[k];
     const e = S.runs[name].samples[s.i];
-    const stats = c.querySelector(".mstats");
+    const head = c.querySelector(".run-head");
     const m = c.querySelector(".mask");
-    const com = c.querySelector(".subtags");
+    const chips = c.querySelector(".subtags");
+
+    // Title line 1 identifies the frame: which run, which epoch it is showing, and the
+    // split THIS run put the sample in (dataloaders decide that independently, so the
+    // same sample can be train in one run and eval in another). Runs also save on
+    // different cadences, so at one slider position two columns can legitimately show
+    // different epochs -- hence the epoch belongs per cell, not just in the header.
+    const cellEp = epochFor(name);
+    const shownEp = cellEp == null ? (S.runs[name].epochs || []).slice(-1)[0] : cellEp;
+    const latest = cellEp == null;
+    const split = e ? e.split : (S.runs[name].splitOf || {})[s.i];
+    // Only the run name truncates. Epoch and split are always legible -- they say which
+    // frame you are looking at, so losing them to an ellipsis would make the cell
+    // ambiguous, whereas a shortened run name is still recognisable.
+    head.innerHTML =
+      `<span class="t1 run"><span class="rn" title="${name}">${name}</span>` +
+      `<b class="ep${latest ? "" : " scrub"}">${shownEp ?? "–"}ep</b>` +
+      `${split ? `<span class="sp" title="${split}">${shortSplit(split)}</span>` : ""}</span>` +
+      `<span class="t2">${identity(s)}</span>`;
+
     if (!e) {
-      stats.innerHTML = "";
-      com.innerHTML = "";
+      chips.innerHTML = "";
       m.hidden = true;
       m.style.backgroundImage = "";
       if (!c._np) { c._np = document.createElement("div"); c._np.className = "nopred"; c._np.textContent = "no prediction"; c.appendChild(c._np); }
@@ -471,23 +547,18 @@ function paintRow(el, rank) {
       return;
     }
     if (c._np) c._np.hidden = true;
-    m.hidden = false;
-    stats.innerHTML = METRICS.map((mm) => {
-      const v = e[mm.key];
-      return `<span class="tag"><span class="k">${mm.short}</span> <b>${
-        v == null ? "–" : fmt(v, mm.key === "mse" ? 4 : 3)}</b></span>`;
-    }).join("");
-    // The split lives here because each run's dataloaders decide it independently -- the
-    // same sample can be train in one run and an eval split in another.
-    // The epoch is per cell because runs save on different cadences: at one slider
-    // position two columns can legitimately be showing different epochs.
-    const cellEp = epochFor(name);
-    const shownEp = cellEp == null ? (S.runs[name].epochs || []).slice(-1)[0] : cellEp;
-    const latest = cellEp == null;
-    com.innerHTML = `<span class="tag">com ${fmt(e.com[0], 1)}, ${fmt(e.com[1], 1)}</span>` +
-      `<span class="tag split" title="${e.split}">${shortSplit(e.split)}</span>` +
-      `<span class="tag ep${latest ? "" : " scrub"}" title="${
-        latest ? "Latest saved epoch" : "Viewing an earlier epoch"}">ep ${shownEp ?? "–"}</span>`;
+    // Predicted centre of mass on its own line, then the three metrics on the next. All
+    // four at full size do not fit 224px on one line, and shrinking them to fit made the
+    // numbers hard to scan -- which is the one thing this column exists for. Splitting
+    // keeps the metrics aligned across every run column at a readable size.
+    chips.innerHTML =
+      `<span class="tag com" title="predicted center of mass (row, col) in grid coords">${
+        fmt(e.com[0], 1)}, ${fmt(e.com[1], 1)}</span><i class="brk"></i>` +
+      METRICS.map((mm) => {
+        const v = e[mm.key];
+        return `<span class="tag"><span class="k">${mm.short}</span> <b>${
+          v == null ? "–" : fmt(v, mm.key === "mse" ? 4 : 3)}</b></span>`;
+      }).join("");
     m.hidden = false;
     m.dataset.run = name; m.dataset.sid = s.i;
     m.onclick = () => openNeighbors(name, s.i);
@@ -546,6 +617,9 @@ function onScroll() {
 }
 
 function refresh(toTop = false) {
+  // toTop is passed exactly by the sort controls, which is also the signal that the user
+  // asked for a new order -- so it releases any pin the epoch scrubber holds.
+  if (toTop) thawOrder();
   applyFilters();
   // Re-sorting puts different samples at rank 1, so keeping the old scroll offset would
   // strand the user mid-list; jump back to the top whenever the order itself changes.
@@ -1028,39 +1102,55 @@ function paintCanvas(cv, run, sid, epoch) {
   if (!S.lut) return;
   const store = S.frameData[run];
   const cells = S.lut.h * S.lut.w;
-  if (!store || !store.sids.has(sid)) { ensureFrames(run); return; }
+  // Every early return clears first. A canvas keeps its last drawing until something
+  // overwrites it, and rows are RECYCLED, so leaving it alone shows the previous
+  // occupant's prediction -- or, once a filter change brings in rows the current store
+  // was not fetched for, a stale mask that never gets repainted.
+  const blank = () => cv.getContext("2d").clearRect(0, 0, S.lut.w, S.lut.h);
+  if (!store || !store.sids.has(sid)) { blank(); ensureFrames(run); return; }
   const eps = store.epochs;
   const ei = epoch == null ? eps.length - 1 : eps.indexOf(epoch);
   const si = store.sids.get(sid);
-  if (ei < 0) return;
+  if (ei < 0) { blank(); return; }
   const off = (ei * store.sids.size + si) * cells;
   for (let i = 0; i < cells; i++) scratch[i] = half(store.raw[off + i]);
-  if (Number.isNaN(scratch[0])) {                   // run has no prediction here
-    cv.getContext("2d").clearRect(0, 0, S.lut.w, S.lut.h);
-    return;
-  }
+  if (Number.isNaN(scratch[0])) { blank(); return; }   // run has no prediction here
   // In stacked mode this canvas is the prediction half only -- the target is drawn into
   // its own canvas below, so it needs no truth here.
   const mode = S.view.mode === "stacked" ? "pred" : S.view.mode;
   const wantTruth = mode === "diff" || needsTruth(mode);
   const truth = wantTruth ? S.truthCache[sid] : null;
-  if (wantTruth && !truth) { ensureTruth(sid); return; }
+  if (wantTruth && !truth) { blank(); ensureTruth(sid); return; }
   drawMask(cv, scratch, mode, truth);
 }
 
-/* Fetch frames for whatever rows are on screen, once per run. */
-let framesPending = new Set();
+/* Fetch frames for whatever rows are on screen, once per run.
+
+   The window is recomputed from the CURRENT scroll position each time, and a second call
+   is allowed to queue while one is in flight: scrolling fast, or jumping to an epoch whose
+   sample set differs, moves the visible rows out from under the request that is already
+   running. Without the re-check those rows would stay blank, because paintCanvas asks for
+   frames and the pending flag would swallow the request. */
+const framesPending = new Set();
+const framesStale = new Set();
 async function ensureFrames(run) {
-  if (framesPending.has(run)) return;
+  if (framesPending.has(run)) { framesStale.add(run); return; }
   framesPending.add(run);
-  const first = Math.max(0, Math.floor(Math.max(0, $("#scroller").scrollTop) / rowH()) - 4);
-  const sids = S.order.slice(first, first + 24).map((s) => s.i);
   try {
-    const d = await fetchFrames(run, sids);
-    S.frameData[run] = d;
-    renderVisible();
+    do {
+      framesStale.delete(run);
+      const first = Math.max(0, Math.floor(Math.max(0, $("#scroller").scrollTop) / rowH()) - 4);
+      const sids = S.order.slice(first, first + 24).map((s) => s.i);
+      if (!sids.length) return;
+      const d = await fetchFrames(run, sids);
+      // Replace rather than merge: a store holds one contiguous window, and its raw blob
+      // is indexed by position, so windows cannot be concatenated without re-laying it out.
+      S.frameData[run] = d;
+      renderVisible();
+    } while (framesStale.has(run));
   } finally {
     framesPending.delete(run);
+    framesStale.delete(run);
   }
 }
 
@@ -1137,13 +1227,73 @@ function stepEpoch(delta) {
   setEpochIdx(cur + delta);
 }
 
+/* Press-and-hold on the epoch arrows, matching a keyboard key's auto-repeat: one step on
+   press, a pause to keep single clicks single, then a steady stream.
+
+   Repeat is driven by requestAnimationFrame rather than setInterval so it cannot outrun
+   the display or pile up work in a background tab. Each step only repaints canvases from
+   frame data already in memory; the metrics fetch behind it is debounced at 250ms, so
+   holding the button costs one request when you let go, not one per epoch. */
+const HOLD_DELAY = 350;   // before repeat begins
+const HOLD_EVERY = 60;    // ~16 epochs/sec while held
+
+function holdToRepeat(btn, step) {
+  let raf = 0, timer = 0;
+  const stop = () => {
+    cancelAnimationFrame(raf); clearTimeout(timer); raf = timer = 0;
+  };
+  btn.addEventListener("pointerdown", (e) => {
+    if (e.button !== 0 || btn.disabled) return;
+    e.preventDefault();
+    btn.setPointerCapture(e.pointerId);   // keep repeating if the cursor slides off
+    step();
+    timer = setTimeout(() => {
+      let last = 0;
+      const tick = (t) => {
+        // A disabled button means we hit the first or last epoch -- stop there rather
+        // than spinning against the clamp.
+        if (btn.disabled) return stop();
+        if (t - last >= HOLD_EVERY) { last = t; step(); }
+        raf = requestAnimationFrame(tick);
+      };
+      raf = requestAnimationFrame(tick);
+    }, HOLD_DELAY);
+  });
+  ["pointerup", "pointercancel", "pointerleave"].forEach((ev) => btn.addEventListener(ev, stop));
+}
+
+/* Jump the whole table to one epoch, from a cell that is already showing it. The value
+   comes from a run's own epoch list, which may not be in the union at that exact number
+   if that run saves on a different cadence -- so snap to the nearest union entry at or
+   below it, the same rule epochFor uses to pick a run's frame. */
+function gotoEpoch(ep) {
+  const eps = allEpochs();
+  if (!eps.length) return;
+  let idx = -1;
+  for (let k = 0; k < eps.length; k++) if (eps[k] <= ep) idx = k;
+  if (idx < 0) idx = 0;
+  S.playing = false;
+  clearInterval(playTimer);
+  setEpochIdx(idx);
+}
+
+/* Every epoch change -- slider, steppers, playback -- goes through here, so this is the
+   one place the order needs pinning. */
 function setEpochIdx(i) {
   const eps = allEpochs();
+  // Pin on entering a scrub; i == null is the un-scrubbed "latest" view, which sorts on
+  // real metrics again.
+  if (i == null) S.frozenOrder = null;
+  else if (!S.frozenOrder) S.frozenOrder = new Map(S.order.map((s, k) => [s.i, k]));
   S.epochIdx = i == null ? null : Math.max(0, Math.min(i, eps.length - 1));
   renderEpochPanel();
   renderVisible();          // masks repaint immediately from local frame data
   fetchEpochMetrics();      // metrics/sort catch up when the server answers
 }
+
+/* Re-sorting or re-filtering is an explicit request for a new order, so it releases the
+   pin the epoch scrubber put on it. */
+const thawOrder = () => { S.frozenOrder = null; };
 
 /* Metrics belong to an epoch as much as the masks do. Without this the table would show
    early-training masks captioned with final-epoch mse/iou and sorted by them -- the most
@@ -1160,6 +1310,9 @@ function fetchEpochMetrics() {
       const q = ep == null ? "" : `?epoch=${ep}`;
       try {
         const d = await api(`/api/run/${encodeURIComponent(name)}${q}`);
+        // Only the per-epoch metrics move. splitOf/splits describe which samples the run
+        // covers, which is epoch-independent -- overwriting them here would make rows
+        // disappear at epochs that saved a different subset.
         cur.samples = d.samples;
         cur.metricsEpoch = ep;
         return true;
@@ -1439,6 +1592,16 @@ function stepModal(delta) {
 
 function bindUI() {
   $("#scroller").addEventListener("scroll", onScroll, { passive: true });
+
+  /* Clicking a column header's epoch pins every column there. Delegated on the scroller
+     because renderHeader rebuilds the header row on every refresh. */
+  $("#scroller").addEventListener("click", (e) => {
+    const b = e.target.closest("b.goep[data-ep]");
+    if (!b) return;
+    e.stopPropagation();          // must not also cycle that column's sort
+    gotoEpoch(+b.dataset.ep);
+  });
+
   window.addEventListener("resize", renderVisible);
 
   /* Collapsing the sidebar hands its 268px to the table, which matters when comparing
@@ -1468,8 +1631,8 @@ function bindUI() {
 
   $("#epoch-slider").oninput = (e) => setEpochIdx(+e.target.value);
   $("#epoch-play").onclick = togglePlay;
-  $("#epoch-prev").onclick = () => stepEpoch(-1);
-  $("#epoch-next").onclick = () => stepEpoch(1);
+  holdToRepeat($("#epoch-prev"), () => stepEpoch(-1));
+  holdToRepeat($("#epoch-next"), () => stepEpoch(1));
   $("#epoch-latest").onclick = () => {
     S.playing = false; clearInterval(playTimer);
     S.frameData = {};                 // drop frames so the latest epoch refetches cleanly
