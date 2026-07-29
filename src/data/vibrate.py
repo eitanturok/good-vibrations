@@ -19,7 +19,7 @@ from utils.viz import make_spectrogram_video, plot_spectrogram, plot_fft
 from data.audio import get_spectrogram
 
 MIN_FREQ, MAX_FREQ = 50, 1000
-DEFAULT_RECOVERY_LASER_IDX = 50
+DEFAULT_RECOVERY_LASER_IDX = 55
 
 #***** 0 capture vibrations *****
 
@@ -53,7 +53,7 @@ def get_vibrations(cam, speaker, play_audio_fxn, capture_n_frames_fxn, audio_dir
 
 #***** 1 speckle shifts from speckle vibrations *****
 
-def get_shifts(frame_recording:np.ndarray, rois: list[list[int]], batch_size: int, pclk_mode: str = "sequential", laser_idx: int | None = None) -> np.ndarray:
+def get_shifts(frame_recording:np.ndarray, rois: list[list[int]], batch_size: int, pclk_mode: str = "sequential", laser_idx: int | None = None, desc: str | None = None) -> np.ndarray:
     from data.pclk import compute_shifts_for_roi, compute_shifts_for_all_rois_batched, compute_shifts_for_all_rois_batched_optimized
     if laser_idx is not None:
         x, y, w, h = rois[laser_idx]
@@ -61,14 +61,14 @@ def get_shifts(frame_recording:np.ndarray, rois: list[list[int]], batch_size: in
         return shifts[None]  # (1, T, 2)
     if pclk_mode == "batched":
         crops = np.stack([frame_recording[:, y:y+h, x:x+w] for x, y, w, h in rois])  # (L, T, H, W)
-        return compute_shifts_for_all_rois_batched(crops, batch_size)                  # (L, T, 2)
+        return compute_shifts_for_all_rois_batched(crops, batch_size, desc=desc)       # (L, T, 2)
     if pclk_mode == "batched_optimized":
         crops = np.stack([frame_recording[:, y:y+h, x:x+w] for x, y, w, h in rois])  # (L, T, H, W)
-        return compute_shifts_for_all_rois_batched_optimized(crops, batch_size)        # (L, T, 2)
+        return compute_shifts_for_all_rois_batched_optimized(crops, batch_size, desc=desc)  # (L, T, 2)
     elif pclk_mode == 'sequential':
         from tqdm import tqdm
         all_shifts = []
-        for x, y, w, h in tqdm(rois):
+        for x, y, w, h in tqdm(rois, desc=desc):
             all_shifts.append(compute_shifts_for_roi(frame_recording[:, y:y+h, x:x+w], batch_size))
         return np.stack(all_shifts, axis=0)  # (L, T, 2)
     else:
@@ -169,7 +169,7 @@ def _process_vibrations(sample_dir:Path, raw_vibrations:np.ndarray=None, min_fre
             raw_shifts = load(raw_shifts_path)
             logger.debug(f'[sample {sample_id}] pclk already computed, loaded {raw_shifts.shape=} from disk')
         else:
-            raw_shifts = get_shifts(raw_vibrations if raw_vibrations is not None else load(raw_vibration_path), rois, pclk_batch_size, pclk_mode, laser_idx=laser_idx)  # (L, T, 2)
+            raw_shifts = get_shifts(raw_vibrations if raw_vibrations is not None else load(raw_vibration_path), rois, pclk_batch_size, pclk_mode, laser_idx=laser_idx, desc=f"[sample {sample_id}]")  # (L, T, 2)
             logger.debug(f'[sample {sample_id}] {raw_shifts.shape=}=(lasers, frames, x/y)')
             save(raw_shifts, raw_shifts_path, do_save)
             append({"pclk": datetime.now(timezone.utc).isoformat()}, sample_dir / "times.jsonl", do_save)
@@ -367,7 +367,7 @@ def save_and_process_vibrations(raw_vibrations:np.ndarray, sample_dir:Path, audi
 
 
 
-def get_shifts(raw_vibrations:np.ndarray, rois: list[list[int]], batch_size: int, pclk_mode: str = "sequential", laser_idx: int | None = None) -> np.ndarray:
+def get_shifts(raw_vibrations:np.ndarray, rois: list[list[int]], batch_size: int, pclk_mode: str = "sequential", laser_idx: int | None = None, desc: str | None = None) -> np.ndarray:
     from data.pclk import compute_shifts_for_roi, compute_shifts_for_all_rois_batched, compute_shifts_for_all_rois_batched_optimized
     if laser_idx is not None:
         x, y, w, h = rois[laser_idx]
@@ -375,20 +375,20 @@ def get_shifts(raw_vibrations:np.ndarray, rois: list[list[int]], batch_size: int
         return shifts[None]  # (1, T, 2)
     if pclk_mode == "batched":
         crops = np.stack([raw_vibrations[:, y:y+h, x:x+w] for x, y, w, h in rois])  # (L, T, H, W)
-        return compute_shifts_for_all_rois_batched(crops, batch_size)                  # (L, T, 2)
+        return compute_shifts_for_all_rois_batched(crops, batch_size, desc=desc)       # (L, T, 2)
     if pclk_mode == "batched_optimized":
         crops = np.stack([raw_vibrations[:, y:y+h, x:x+w] for x, y, w, h in rois])  # (L, T, H, W)
-        return compute_shifts_for_all_rois_batched_optimized(crops, batch_size)        # (L, T, 2)
+        return compute_shifts_for_all_rois_batched_optimized(crops, batch_size, desc=desc)  # (L, T, 2)
     elif pclk_mode == 'sequential':
         from tqdm import tqdm
         all_shifts = []
-        for x, y, w, h in tqdm(rois):
+        for x, y, w, h in tqdm(rois, desc=desc):
             all_shifts.append(compute_shifts_for_roi(raw_vibrations[:, y:y+h, x:x+w], batch_size))
         return np.stack(all_shifts, axis=0)  # (L, T, 2)
     else:
         raise ValueError(f'Incorrect value {pclk_mode=}')
 
-def process_vibrations_3(sample_dir, raw_vibrations, pclk_batch_size, pclk_lasers=None, recovery_laser=50, recovery_xy=0, min_freq=MIN_FREQ, max_freq=MAX_FREQ, do_save:int=2):
+def process_vibrations_3(sample_dir, raw_vibrations, pclk_batch_size, pclk_lasers=None, recovery_laser=55, recovery_xy=0, min_freq=MIN_FREQ, max_freq=MAX_FREQ, do_save:int=2):
     from data.pclk import compute_shifts_for_roi
 
     audio_sample_rate = 22050
