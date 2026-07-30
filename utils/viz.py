@@ -271,9 +271,14 @@ def plot_live_image(result:dict, image, objects:list[str]|None, audio_samples:np
     plt.show()
     display(Audio(audio_samples, rate=audio_fs))
 
+
+def plot_shifts(axs, laser_shifts):
+    axs.plot(laser_shifts[:, 0], label='x shifts')
+    axs.plot(laser_shifts[:, 1], label='y shifts')
+
 def plot_live_sample(sample_overhead, raw_vibrations, box_coverage, sample_dir, result:dict,
                      freqs:np.ndarray, fft:np.ndarray, xy_idx:int, laser_idx:int|None, audio_samples:np.ndarray, audio_fs:int,
-                     spec_freqs:np.ndarray, spec_times:np.ndarray, Sxx:np.ndarray, max_freq:float|None=None, header:str='') -> None:
+                     spec_freqs:np.ndarray, spec_times:np.ndarray, Sxx:np.ndarray, max_freq:float|None=None, raw_shifts=None, header:str='') -> None:
     """Live 5-panel row shown once per speaker/sample during recording:
     overhead (+COMs), laser speckles, box coverage, FFT of the recovered audio,
     spectrogram of the recovered audio — followed by a playable Audio widget of it.
@@ -286,7 +291,10 @@ def plot_live_sample(sample_overhead, raw_vibrations, box_coverage, sample_dir, 
     _draw_vibration_image(axes[1], raw_vibrations)
     axes[1].set_title('Laser Speckles')
     _draw_box_coverage(axes[2], box_coverage, sample_dir)
-    _draw_fft(axes[3], freqs, _slice_fft(fft, xy_idx), title=f'Recovered Audio FFT, {recovery_label}', max_freq=max_freq)
+
+    plot_shifts(axes[3], raw_vibrations[:, laser_idx])
+
+
     im = _draw_spectrogram(axes[4], spec_freqs, spec_times, Sxx, label=f'Recovered Audio Spectrogram: {{duration}}s, {recovery_label}', max_freq=max_freq)
     fig.colorbar(im, ax=axes[4], label='Power (dB)')
     if header: fig.suptitle(header, fontsize=20, fontweight='bold')

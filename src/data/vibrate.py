@@ -53,23 +53,23 @@ def get_vibrations(cam, speaker, play_audio_fxn, capture_n_frames_fxn, audio_dir
 
 #***** 1 speckle shifts from speckle vibrations *****
 
-def get_shifts(frame_recording:np.ndarray, rois: list[list[int]], batch_size: int, pclk_mode: str = "sequential", laser_idx: int | None = None, desc: str | None = None) -> np.ndarray:
+def get_shifts(frame_recording:np.ndarray, rois: list[list[int]], batch_size: int, pclk_mode: str = "sequential", laser_idx: int | None = None, desc: str | None = None, use_PC: bool = True) -> np.ndarray:
     from data.pclk import compute_shifts_for_roi, compute_shifts_for_all_rois_batched, compute_shifts_for_all_rois_batched_optimized
     if laser_idx is not None:
         x, y, w, h = rois[laser_idx]
-        shifts = compute_shifts_for_roi(frame_recording[:, y:y+h, x:x+w], batch_size)  # (T, 2)
+        shifts = compute_shifts_for_roi(frame_recording[:, y:y+h, x:x+w], batch_size, use_PC=use_PC)  # (T, 2)
         return shifts[None]  # (1, T, 2)
     if pclk_mode == "batched":
         crops = np.stack([frame_recording[:, y:y+h, x:x+w] for x, y, w, h in rois])  # (L, T, H, W)
-        return compute_shifts_for_all_rois_batched(crops, batch_size, desc=desc)       # (L, T, 2)
+        return compute_shifts_for_all_rois_batched(crops, batch_size, desc=desc, use_PC=use_PC)       # (L, T, 2)
     if pclk_mode == "batched_optimized":
         crops = np.stack([frame_recording[:, y:y+h, x:x+w] for x, y, w, h in rois])  # (L, T, H, W)
-        return compute_shifts_for_all_rois_batched_optimized(crops, batch_size, desc=desc)  # (L, T, 2)
+        return compute_shifts_for_all_rois_batched_optimized(crops, batch_size, desc=desc, use_PC=use_PC)  # (L, T, 2)
     elif pclk_mode == 'sequential':
         from tqdm import tqdm
         all_shifts = []
         for x, y, w, h in tqdm(rois, desc=desc):
-            all_shifts.append(compute_shifts_for_roi(frame_recording[:, y:y+h, x:x+w], batch_size))
+            all_shifts.append(compute_shifts_for_roi(frame_recording[:, y:y+h, x:x+w], batch_size, use_PC=use_PC))
         return np.stack(all_shifts, axis=0)  # (L, T, 2)
     else:
         raise ValueError(f'Incorrect value {pclk_mode=}')
@@ -151,7 +151,7 @@ def save_vibrations(raw_vibrations:np.ndarray, sample_dir:Path, audio_dir:Path, 
         append({"sample_id": sample_id, "time": timestamp}, audio_dir.parent / "samples.jsonl", do_save)
 
 def _process_vibrations(sample_dir:Path, raw_vibrations:np.ndarray=None, min_freq:int=MIN_FREQ, max_freq:int=MAX_FREQ, audio_sample_rate:int=22050, pclk_batch_size:int=256, pclk_mode:str='batched_optimized',
-                        verbose:int=1, do_save:bool=True, cleanup_raw_vibrations:str='compress', spectrogram_video:bool=True, laser_idx:int|None=None, xy_idx:int=0):
+                        verbose:int=1, do_save:bool=True, cleanup_raw_vibrations:str='compress', spectrogram_video:bool=True, laser_idx:int|None=None, xy_idx:int=0, use_PC:bool=True):
     sample_id = sample_dir.name
     metadata = {k: v for d in load(sample_dir / 'metadata.jsonl') for k, v in d.items()}
     fps, rois = int(metadata['fps']), metadata['roi']
@@ -169,7 +169,7 @@ def _process_vibrations(sample_dir:Path, raw_vibrations:np.ndarray=None, min_fre
             raw_shifts = load(raw_shifts_path)
             logger.debug(f'[sample {sample_id}] pclk already computed, loaded {raw_shifts.shape=} from disk')
         else:
-            raw_shifts = get_shifts(raw_vibrations if raw_vibrations is not None else load(raw_vibration_path), rois, pclk_batch_size, pclk_mode, laser_idx=laser_idx, desc=f"[sample {sample_id}]")  # (L, T, 2)
+            raw_shifts = get_shifts(raw_vibrations if raw_vibrations is not None else load(raw_vibration_path), rois, pclk_batch_size, pclk_mode, laser_idx=laser_idx, desc=f"[sample {sample_id}]", use_PC=use_PC)  # (L, T, 2)
             logger.debug(f'[sample {sample_id}] {raw_shifts.shape=}=(lasers, frames, x/y)')
             save(raw_shifts, raw_shifts_path, do_save)
             append({"pclk": datetime.now(timezone.utc).isoformat()}, sample_dir / "times.jsonl", do_save)
@@ -267,13 +267,13 @@ def _process_vibrations_modal(sample_dir_name: str, **kwargs):
 
 PROCESSED_FILES = ["01_raw_shifts.npy", "02_clean_shifts.npy", "03_fft.npz"]
 
-def process_vibrations(sample_dir:Path, raw_vibrations:np.ndarray=None, use_modal:bool=False, pclk_mode:str='batched_optimized', pclk_batch_size:int=256, do_save:bool=True, verbose:int=1, cleanup_raw_vibrations:str|None=None, spectrogram_video:bool=True, laser_idx:int|None=None, xy_idx:int=0):
+def process_vibrations(sample_dir:Path, raw_vibrations:np.ndarray=None, use_modal:bool=False, pclk_mode:str='batched_optimized', pclk_batch_size:int=256, do_save:bool=True, verbose:int=1, cleanup_raw_vibrations:str|None=None, spectrogram_video:bool=True, laser_idx:int|None=None, xy_idx:int=0, use_PC:bool=True):
     sample_id = sample_dir.name
 
     # run locally
     if not use_modal:
         with Timing(f'[sample {sample_id}] process vibrations locally: ', enabled=verbose >= 1):
-            return _process_vibrations_local(sample_dir, raw_vibrations=raw_vibrations, pclk_mode=pclk_mode, pclk_batch_size=pclk_batch_size, do_save=do_save, verbose=verbose, cleanup_raw_vibrations=cleanup_raw_vibrations, spectrogram_video=spectrogram_video, laser_idx=laser_idx, xy_idx=xy_idx)
+            return _process_vibrations_local(sample_dir, raw_vibrations=raw_vibrations, pclk_mode=pclk_mode, pclk_batch_size=pclk_batch_size, do_save=do_save, verbose=verbose, cleanup_raw_vibrations=cleanup_raw_vibrations, spectrogram_video=spectrogram_video, laser_idx=laser_idx, xy_idx=xy_idx, use_PC=use_PC)
 
     assert raw_vibrations is None, "On modal, raw_vibrations must be already be saved in sample_dir. Cannot be passed in as a np.ndarray because it is too big"
     # upload raw vibrations DISK->modal_volume
@@ -283,7 +283,7 @@ def process_vibrations(sample_dir:Path, raw_vibrations:np.ndarray=None, use_moda
 
     # process raw vibrations remotely
     with Timing(f'[sample {sample_id}] process vibrations on modal: ', enabled=verbose >= 1):
-        _process_vibrations_modal.remote(sample_dir.name, pclk_batch_size=pclk_batch_size, pclk_mode=pclk_mode, verbose=verbose, cleanup_raw_vibrations=cleanup_raw_vibrations, spectrogram_video=spectrogram_video, laser_idx=laser_idx, xy_idx=xy_idx)
+        _process_vibrations_modal.remote(sample_dir.name, pclk_batch_size=pclk_batch_size, pclk_mode=pclk_mode, verbose=verbose, cleanup_raw_vibrations=cleanup_raw_vibrations, spectrogram_video=spectrogram_video, laser_idx=laser_idx, xy_idx=xy_idx, use_PC=use_PC)
 
     # download processed vibrations modal_volume->DISK
     recovered_laser = laser_idx if laser_idx is not None else DEFAULT_RECOVERY_LASER_IDX
@@ -317,7 +317,7 @@ def warmup_pclk(verbose:int=1):
         compute_shifts_for_all_rois_batched_optimized(dummy, batch_size=64, progress=False)
 
 def process_vibrations_2(sample_dir:Path, raw_vibrations:np.ndarray=None, use_modal:bool=False, pclk_mode:str='batched_optimized', pclk_batch_size:int=3000,
-                         do_save:bool=True, verbose:int=1, cleanup_raw_vibrations:str|None=None, spectrogram_video:bool=True, laser_idx:int|None=None, xy_idx:int=0):
+                         do_save:bool=True, verbose:int=1, cleanup_raw_vibrations:str|None=None, spectrogram_video:bool=True, laser_idx:int|None=None, xy_idx:int=0, use_PC:bool=True):
     """Fast single-laser display path for the live loop. Same signature and return dict as
     process_vibrations, same math (get_clean_shifts/get_fft_shifts/get_recovered_audio/
     get_spectrogram), but:
@@ -332,58 +332,51 @@ def process_vibrations_2(sample_dir:Path, raw_vibrations:np.ndarray=None, use_mo
     sample_id = sample_dir.name
     recovered_laser = laser_idx if laser_idx is not None else DEFAULT_RECOVERY_LASER_IDX
 
-    with Timing(f'[sample {sample_id}] process vibrations (fast): ', enabled=verbose >= 1):
-        metadata = {k: v for d in load(sample_dir / 'metadata.jsonl') for k, v in d.items()}
-        fps, rois = int(metadata['fps']), metadata['roi']
+    metadata = {k: v for d in load(sample_dir / 'metadata.jsonl') for k, v in d.items()}
+    fps, rois = int(metadata['fps']), metadata['roi']
 
-        # crop the single ROI up front — never touch the other 99 lasers' pixels
-        with Timing(f"[sample {sample_id}] crop roi: ", enabled=verbose >= 2):
-            if raw_vibrations is None: raw_vibrations = load(sample_dir / 'vibration/00_raw_vibrations.npy')
-            x, y, w, h = rois[recovered_laser]
-            crop = np.ascontiguousarray(raw_vibrations[:, y:y+h, x:x+w])[None]  # (1, T, h, w)
+    # crop the single ROI up front — never touch the other 99 lasers' pixels
+    if raw_vibrations is None: raw_vibrations = load(sample_dir / 'vibration/00_raw_vibrations.npy')
+    x, y, w, h = rois[recovered_laser]
+    crop = np.ascontiguousarray(raw_vibrations[:, y:y+h, x:x+w])[None]  # (1, T, h, w)
 
-        with Timing(f"[sample {sample_id}] pclk (fast): ", enabled=verbose >= 2):
-            raw_shifts = compute_shifts_for_all_rois_batched_optimized(crop, pclk_batch_size, progress=False)  # (1, T, 2)
+    raw_shifts = compute_shifts_for_all_rois_batched_optimized(crop, pclk_batch_size, progress=False, use_PC=use_PC)  # (1, T, 2)
 
-        with Timing(f"[sample {sample_id}] clean shifts: ", enabled=verbose >= 2):
-            clean_shifts = get_clean_shifts(raw_shifts[None], fps, MIN_FREQ, MAX_FREQ)  # (1, 1, T, 2)
+    clean_shifts = get_clean_shifts(raw_shifts[None], fps, MIN_FREQ, MAX_FREQ)  # (1, 1, T, 2)
 
-        with Timing(f"[sample {sample_id}] fft shifts: ", enabled=verbose >= 2):
-            fft, freqs, n_samples = get_fft_shifts(clean_shifts, fps, MIN_FREQ, MAX_FREQ)
+    fft, freqs, n_samples = get_fft_shifts(clean_shifts, fps, MIN_FREQ, MAX_FREQ)
 
-        with Timing(f"[sample {sample_id}] recover audio: ", enabled=verbose >= 2):
-            recovered_audio = get_recovered_audio(fft, n_samples, fps, audio_sample_rate, MIN_FREQ, MAX_FREQ, laser_idx=0, xy_idx=xy_idx)
+    recovered_audio = get_recovered_audio(fft, n_samples, fps, audio_sample_rate, MIN_FREQ, MAX_FREQ, laser_idx=0, xy_idx=xy_idx)
 
-        with Timing(f"[sample {sample_id}] spectrogram: ", enabled=verbose >= 2):
-            spec_freqs, spec_times, Sxx = get_spectrogram(recovered_audio, audio_sample_rate)
+    spec_freqs, spec_times, Sxx = get_spectrogram(recovered_audio, audio_sample_rate)
 
     return {'fft': fft, 'freqs': freqs, 'n_samples': n_samples, 'recovered_audio': recovered_audio, 'audio_sample_rate': audio_sample_rate,
-            'spec_freqs': spec_freqs, 'spec_times': spec_times, 'Sxx': Sxx, 'max_freq': MAX_FREQ, 'laser_idx': recovered_laser, 'xy_idx': xy_idx}
+            'spec_freqs': spec_freqs, 'spec_times': spec_times, 'Sxx': Sxx, 'max_freq': MAX_FREQ, 'laser_idx': recovered_laser, 'xy_idx': xy_idx, 'raw_shifts': raw_shifts}
 
-def save_and_process_vibrations(raw_vibrations:np.ndarray, sample_dir:Path, audio_dir:Path, min_freq:int, max_freq:int, use_modal:bool=False, pclk_mode:str='batched_optimized', pclk_batch_size:int=256, do_save:bool=True, verbose:int=1, spectrogram_video:bool=True, laser_idx:int|None=None, xy_idx:int=0):
+def save_and_process_vibrations(raw_vibrations:np.ndarray, sample_dir:Path, audio_dir:Path, min_freq:int, max_freq:int, use_modal:bool=False, pclk_mode:str='batched_optimized', pclk_batch_size:int=256, do_save:bool=True, verbose:int=1, spectrogram_video:bool=True, laser_idx:int|None=None, xy_idx:int=0, use_PC:bool=True):
     save_vibrations(raw_vibrations, sample_dir, audio_dir, do_save, verbose)
     # on modal, raw_vibrations must already be on disk (see process_vibrations' assert) -- not passed in-memory
-    process_vibrations(sample_dir, raw_vibrations=None if use_modal else raw_vibrations, use_modal=use_modal, pclk_mode=pclk_mode, pclk_batch_size=pclk_batch_size, do_save=do_save, verbose=verbose, spectrogram_video=spectrogram_video, laser_idx=laser_idx, xy_idx=xy_idx)
+    process_vibrations(sample_dir, raw_vibrations=None if use_modal else raw_vibrations, use_modal=use_modal, pclk_mode=pclk_mode, pclk_batch_size=pclk_batch_size, do_save=do_save, verbose=verbose, spectrogram_video=spectrogram_video, laser_idx=laser_idx, xy_idx=xy_idx, use_PC=use_PC)
 
 
 
-def get_shifts(raw_vibrations:np.ndarray, rois: list[list[int]], batch_size: int, pclk_mode: str = "sequential", laser_idx: int | None = None, desc: str | None = None) -> np.ndarray:
+def get_shifts(raw_vibrations:np.ndarray, rois: list[list[int]], batch_size: int, pclk_mode: str = "sequential", laser_idx: int | None = None, desc: str | None = None, use_PC: bool = True) -> np.ndarray:
     from data.pclk import compute_shifts_for_roi, compute_shifts_for_all_rois_batched, compute_shifts_for_all_rois_batched_optimized
     if laser_idx is not None:
         x, y, w, h = rois[laser_idx]
-        shifts = compute_shifts_for_roi(raw_vibrations[:, y:y+h, x:x+w], batch_size)  # (T, 2)
+        shifts = compute_shifts_for_roi(raw_vibrations[:, y:y+h, x:x+w], batch_size, use_PC=use_PC)  # (T, 2)
         return shifts[None]  # (1, T, 2)
     if pclk_mode == "batched":
         crops = np.stack([raw_vibrations[:, y:y+h, x:x+w] for x, y, w, h in rois])  # (L, T, H, W)
-        return compute_shifts_for_all_rois_batched(crops, batch_size, desc=desc)       # (L, T, 2)
+        return compute_shifts_for_all_rois_batched(crops, batch_size, desc=desc, use_PC=use_PC)       # (L, T, 2)
     if pclk_mode == "batched_optimized":
         crops = np.stack([raw_vibrations[:, y:y+h, x:x+w] for x, y, w, h in rois])  # (L, T, H, W)
-        return compute_shifts_for_all_rois_batched_optimized(crops, batch_size, desc=desc)  # (L, T, 2)
+        return compute_shifts_for_all_rois_batched_optimized(crops, batch_size, desc=desc, use_PC=use_PC)  # (L, T, 2)
     elif pclk_mode == 'sequential':
         from tqdm import tqdm
         all_shifts = []
         for x, y, w, h in tqdm(rois, desc=desc):
-            all_shifts.append(compute_shifts_for_roi(raw_vibrations[:, y:y+h, x:x+w], batch_size))
+            all_shifts.append(compute_shifts_for_roi(raw_vibrations[:, y:y+h, x:x+w], batch_size, use_PC=use_PC))
         return np.stack(all_shifts, axis=0)  # (L, T, 2)
     else:
         raise ValueError(f'Incorrect value {pclk_mode=}')

@@ -1,4 +1,5 @@
 import numpy as np
+from tqdm import tqdm
 
 # Must run before any `import cupy` in the process (see utils/cuda_env.py).
 from utils import cuda_env  # noqa: F401
@@ -104,7 +105,8 @@ def find_frame_translation_PCLKi_cupy(video, iterations=3, use_PC=True):
         shifts_LK          = find_frame_translation_LKi_cupy(video_aligned_roll, iterations)
         return shifts_LK
 
-def compute_shifts_for_roi(video, batch_size):
+
+def compute_shifts_for_roi(video, batch_size, use_PC=True):
     import cupy as cp
     n_ref_frames            = video.shape[0]
     all_reference_shifts    = cp.empty((n_ref_frames, 2), dtype=cp.float32)
@@ -113,12 +115,32 @@ def compute_shifts_for_roi(video, batch_size):
     for i in range(N_batches):
         start = i * batch_size
         end   = min((i + 1) * batch_size, n_ref_frames - 1)
-        batch_shifts = find_frame_translation_PCLKi_cupy(video[start : end + 2])
+        batch_shifts = find_frame_translation_PCLKi_cupy(video[start : end + 2], use_PC=use_PC)
         all_reference_shifts[start + 1 : end + 2] = batch_shifts
     return cp.asnumpy(cp.cumsum(all_reference_shifts, axis=0))
 
 
-def compute_shifts_for_all_rois_batched(videos, batch_size, desc=None):
+def pclk(video, rois, batch_size=256, laser_idx:int|None=None, desc:None|str=None, use_PC:bool=True):
+    """Crop `video` to `rois` and recover PCLK shifts.
+
+    Args:
+        video: (T, H, W) full frame recording
+        rois: list of [x, y, w, h] boxes, one per laser point
+        batch_size: number of frame pairs per GPU batch
+        laser_idx: if set, only compute shifts for this one roi (index into `rois`);
+                   if None, compute shifts for every roi. Either way the result keeps
+                   a leading L dim so callers don't need to special-case laser_idx.
+        use_PC: run the phase-correlation pre-alignment step before LK; if False, LK runs directly on the raw frames
+    Returns:
+        (L, T, 2) numpy array of cumulative shifts — L == 1 when laser_idx is set
+    """
+    if laser_idx is not None: rois = [rois[laser_idx]]
+    return np.stack([compute_shifts_for_roi(video[:, y:y+h, x:x+w], batch_size, use_PC=use_PC) for x, y, w, h in tqdm(rois, desc=desc, disable=True)], axis=0)                                  # (L, T, 2)
+
+
+
+
+def compute_shifts_for_all_rois_batched(videos, batch_size, desc=None, use_PC=True):
     """Process all ROIs in parallel on the GPU.
 
     Same algorithm as pclk_old.py but with all L ROIs flattened together
@@ -130,6 +152,7 @@ def compute_shifts_for_all_rois_batched(videos, batch_size, desc=None):
         videos: (L, T, H, W) numpy array — all ROI crops stacked (stays on CPU)
         batch_size: number of frame pairs per GPU batch
         desc: tqdm progress bar label (e.g. the sample id)
+        use_PC: run the phase-correlation pre-alignment step before LK; if False, LK runs directly on the raw frames
     Returns:
         (L, T, 2) numpy array of cumulative shifts
     """
@@ -148,46 +171,50 @@ def compute_shifts_for_all_rois_batched(videos, batch_size, desc=None):
         clip    = cp.asarray(videos[:, start : end + 2], dtype=cp.float32) / 255
         n_pairs = clip.shape[1] - 1
 
-        # ---- phase correlation (flattened over L and frames) ----
-        N, h, w = L * (n_pairs + 1), H, W
-        hannW   = cp.outer(cp.hanning(h), cp.hanning(w))
-        left_pad, right_pad = get_pad_size(w)
-        up_pad,   down_pad  = get_pad_size(h)
-        hannW_pad = _pad(hannW, up_pad, down_pad, left_pad, right_pad)
-        pH, pW = hannW_pad.shape
+        if use_PC:
+            # ---- phase correlation (flattened over L and frames) ----
+            N, h, w = L * (n_pairs + 1), H, W
+            hannW   = cp.outer(cp.hanning(h), cp.hanning(w))
+            left_pad, right_pad = get_pad_size(w)
+            up_pad,   down_pad  = get_pad_size(h)
+            hannW_pad = _pad(hannW, up_pad, down_pad, left_pad, right_pad)
+            pH, pW = hannW_pad.shape
 
-        flat     = clip.reshape(N, H, W)
-        flat_pad = _pad(flat, up_pad, down_pad, left_pad, right_pad)
-        del flat
-        video_fft = cp.fft.fft2(flat_pad * hannW_pad, axes=(-2, -1))
-        del flat_pad, hannW_pad
-        cp.get_default_memory_pool().free_all_blocks()
+            flat     = clip.reshape(N, H, W)
+            flat_pad = _pad(flat, up_pad, down_pad, left_pad, right_pad)
+            del flat
+            video_fft = cp.fft.fft2(flat_pad * hannW_pad, axes=(-2, -1))
+            del flat_pad, hannW_pad
+            cp.get_default_memory_pool().free_all_blocks()
 
-        video_fft = video_fft.reshape(L, n_pairs + 1, pH, pW)
-        R = video_fft[:, :-1] * cp.conj(video_fft[:, 1:])   # (L, n_pairs, pH, pW)
-        del video_fft
-        cp.get_default_memory_pool().free_all_blocks()
+            video_fft = video_fft.reshape(L, n_pairs + 1, pH, pW)
+            R = video_fft[:, :-1] * cp.conj(video_fft[:, 1:])   # (L, n_pairs, pH, pW)
+            del video_fft
+            cp.get_default_memory_pool().free_all_blocks()
 
-        R /= (cp.abs(R) + 1e-8)
-        corr = cp.fft.ifft2(R, axes=(-2, -1)).real
-        del R
-        cp.get_default_memory_pool().free_all_blocks()
+            R /= (cp.abs(R) + 1e-8)
+            corr = cp.fft.ifft2(R, axes=(-2, -1)).real
+            del R
+            cp.get_default_memory_pool().free_all_blocks()
 
-        corr      = cp.fft.fftshift(corr, axes=(-2, -1))
-        corr_flat = corr.reshape(L * n_pairs, -1)
-        max_idx   = cp.argmax(corr_flat, axis=1)
-        del corr, corr_flat
-        cp.get_default_memory_pool().free_all_blocks()
+            corr      = cp.fft.fftshift(corr, axes=(-2, -1))
+            corr_flat = corr.reshape(L * n_pairs, -1)
+            max_idx   = cp.argmax(corr_flat, axis=1)
+            del corr, corr_flat
+            cp.get_default_memory_pool().free_all_blocks()
 
-        peak_row  = max_idx // pW
-        peak_col  = max_idx % pW
-        shifts_PC = -cp.stack([peak_col - pW // 2, peak_row - pH // 2], axis=1)
-        shifts_PC = shifts_PC.reshape(L, n_pairs, 2).astype(cp.float32)
+            peak_row  = max_idx // pW
+            peak_col  = max_idx % pW
+            shifts_PC = -cp.stack([peak_col - pW // 2, peak_row - pH // 2], axis=1)
+            shifts_PC = shifts_PC.reshape(L, n_pairs, 2).astype(cp.float32)
 
-        # ---- warp_roll per ROI (identical to pclk_old.py) ----
-        aligned = cp.empty((L, n_pairs, H, W), dtype=cp.float32)
-        for l in range(L):
-            aligned[l] = warp_roll(clip[l], -cp.round(shifts_PC[l]).astype(cp.int32))[1:]
+            # ---- warp_roll per ROI (identical to pclk_old.py) ----
+            aligned = cp.empty((L, n_pairs, H, W), dtype=cp.float32)
+            for l in range(L):
+                aligned[l] = warp_roll(clip[l], -cp.round(shifts_PC[l]).astype(cp.int32))[1:]
+        else:
+            shifts_PC = cp.zeros((L, n_pairs, 2), dtype=cp.float32)
+            aligned   = clip[:, 1:].copy()
 
         # ---- Lucas-Kanade per ROI, flattened over L (identical to pclk_old.py) ----
         image1    = clip[:, :-1]   # (L, n_pairs, H, W)
@@ -223,7 +250,7 @@ def compute_shifts_for_all_rois_batched(videos, batch_size, desc=None):
     return np.cumsum(all_shifts, axis=1)                     # (L, T, 2)
 
 
-def compute_shifts_for_all_rois_batched_optimized(videos, batch_size, debug:bool=False, progress:bool=True, desc=None):
+def compute_shifts_for_all_rois_batched_optimized(videos, batch_size, debug:bool=False, progress:bool=True, desc=None, use_PC=True):
     """Same as compute_shifts_for_all_rois_batched with additional optimizations:
     - hannW_pad precomputed once outside the batch loop
     - hann window applied in-place with *= to avoid broadcast allocation
@@ -236,6 +263,7 @@ def compute_shifts_for_all_rois_batched_optimized(videos, batch_size, debug:bool
         debug: print GPU memory-pool usage at each stage of every batch
         progress: show the tqdm progress bar over batches
         desc: tqdm progress bar label (e.g. the sample id)
+        use_PC: run the phase-correlation pre-alignment step before LK; if False, LK runs directly on the raw frames
     Returns:
         (L, T, 2) numpy array of cumulative shifts
     """
@@ -271,41 +299,47 @@ def compute_shifts_for_all_rois_batched_optimized(videos, batch_size, debug:bool
         image2 = cp.asarray(videos[:, start+1:end+1], dtype=cp.float32) / 255
         mprint("after image1+image2")
 
-        buf_pad  = _pad(image1.reshape(L * n_pairs, H, W), up_pad, down_pad, left_pad, right_pad)
-        buf_pad *= hannW_pad
-        fft_left = cp.fft.fft2(buf_pad, axes=(-2, -1)); del buf_pad
-        mprint("after fft_left")
+        if use_PC:
+            buf_pad  = _pad(image1.reshape(L * n_pairs, H, W), up_pad, down_pad, left_pad, right_pad)
+            buf_pad *= hannW_pad
+            fft_left = cp.fft.fft2(buf_pad, axes=(-2, -1)); del buf_pad
+            mprint("after fft_left")
 
-        buf_pad  = _pad(image2.reshape(L * n_pairs, H, W), up_pad, down_pad, left_pad, right_pad)
-        buf_pad *= hannW_pad
-        mprint("after buf_pad right (peak: fft_left + buf_pad)")
-        # compute right FFT inline and multiply into fft_left — fft_right never persists as a named var
-        fft_left *= cp.conj(cp.fft.fft2(buf_pad, axes=(-2, -1))); del buf_pad
-        mprint("after cross-power (fft_right freed)")
-        fft_left /= (cp.abs(fft_left) + 1e-8)
-        corr = cp.fft.ifft2(fft_left, axes=(-2, -1)).real
-        del fft_left
-        mprint("after ifft (fft_left freed)")
+            buf_pad  = _pad(image2.reshape(L * n_pairs, H, W), up_pad, down_pad, left_pad, right_pad)
+            buf_pad *= hannW_pad
+            mprint("after buf_pad right (peak: fft_left + buf_pad)")
+            # compute right FFT inline and multiply into fft_left — fft_right never persists as a named var
+            fft_left *= cp.conj(cp.fft.fft2(buf_pad, axes=(-2, -1))); del buf_pad
+            mprint("after cross-power (fft_right freed)")
+            fft_left /= (cp.abs(fft_left) + 1e-8)
+            corr = cp.fft.ifft2(fft_left, axes=(-2, -1)).real
+            del fft_left
+            mprint("after ifft (fft_left freed)")
 
-        # skip fftshift: find argmax on raw ifft output, then map back with wrap arithmetic
-        corr_flat = corr.reshape(L * n_pairs, -1)
-        max_idx   = cp.argmax(corr_flat, axis=1)
-        del corr, corr_flat
+            # skip fftshift: find argmax on raw ifft output, then map back with wrap arithmetic
+            corr_flat = corr.reshape(L * n_pairs, -1)
+            max_idx   = cp.argmax(corr_flat, axis=1)
+            del corr, corr_flat
 
-        peak_row  = max_idx // pW
-        peak_col  = max_idx % pW
-        # wrap: shift = (peak + half) % size - half  (equivalent to fftshift + subtract half)
-        shift_x = (peak_col + pW // 2) % pW - pW // 2
-        shift_y = (peak_row + pH // 2) % pH - pH // 2
-        shifts_PC = -cp.stack([shift_x, shift_y], axis=1)
-        shifts_PC = shifts_PC.reshape(L, n_pairs, 2).astype(cp.float32)
+            peak_row  = max_idx // pW
+            peak_col  = max_idx % pW
+            # wrap: shift = (peak + half) % size - half  (equivalent to fftshift + subtract half)
+            shift_x = (peak_col + pW // 2) % pW - pW // 2
+            shift_y = (peak_row + pH // 2) % pH - pH // 2
+            shifts_PC = -cp.stack([shift_x, shift_y], axis=1)
+            shifts_PC = shifts_PC.reshape(L, n_pairs, 2).astype(cp.float32)
 
-        # ---- PC warp via FFT phase shift with cumulative float shifts ----
-        cum_shifts   = cp.cumsum(shifts_PC, axis=1)
-        aligned_flat = image2.reshape(L * n_pairs, H, W)
-        aligned_flat = warp_video_fft(aligned_flat, -cum_shifts.reshape(L * n_pairs, 2))
-        del cum_shifts, image2
-        mprint("after PC warp (image2 freed)")
+            # ---- PC warp via FFT phase shift with cumulative float shifts ----
+            cum_shifts   = cp.cumsum(shifts_PC, axis=1)
+            aligned_flat = image2.reshape(L * n_pairs, H, W)
+            aligned_flat = warp_video_fft(aligned_flat, -cum_shifts.reshape(L * n_pairs, 2))
+            del cum_shifts, image2
+            mprint("after PC warp (image2 freed)")
+        else:
+            shifts_PC    = cp.zeros((L, n_pairs, 2), dtype=cp.float32)
+            aligned_flat = image2.reshape(L * n_pairs, H, W)
+            del image2
+            mprint("after skip PC (image2 freed)")
 
         # ---- Lucas-Kanade with axis=(-2,-1) sums over (L, n_pairs, H, W) ----
         shifts_LK = cp.zeros((L, n_pairs, 2), dtype=cp.float32)

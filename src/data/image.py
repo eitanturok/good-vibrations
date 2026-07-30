@@ -8,7 +8,7 @@ import modal
 import numpy as np
 from PIL import Image, ImageDraw
 
-from utils.io_utils import save, load, append
+from utils.io_utils import save, load, append, to_jpeg_bytes, unpack_masks
 from utils.helpers import Timing
 from utils.metrics import center_of_mass
 
@@ -43,10 +43,14 @@ def segment(image: Image.Image, objects: dict[str, int], prompts: dict[str, str]
     unique_prompts = list(dict.fromkeys(prompts[name] for name in object_names))
     total_by_prompt = {p: sum(objects[n] for n in object_names if prompts[n] == p) for p in unique_prompts}
 
-    # launch parallel segmentation on modal via threads + .remote()
+    # launch parallel segmentation on modal via threads + .remote() -- image encoded once,
+    # reused across every thread (run() takes prompts/top_k as single-element lists and
+    # returns a single-element list per call; see src/data/segment.py's Segmenter.run())
+    image_bytes = to_jpeg_bytes(image)
     segmenter = modal.Cls.from_name("segment", "Segmenter")()
     with ThreadPoolExecutor(max_workers=len(unique_prompts)) as executor:
-        outs = dict(zip(unique_prompts, executor.map(lambda p: segmenter.run.remote(image, p, scale=segment_scale, top_k=total_by_prompt[p]), unique_prompts)))
+        raw = dict(zip(unique_prompts, executor.map(lambda p: segmenter.run.remote(image_bytes, [p], scale=segment_scale, top_k=[total_by_prompt[p]]), unique_prompts)))
+    outs = {p: unpack_masks(r)[0] for p, r in raw.items()}
 
     # per prompt: keep the top instances by score, then order them left-to-right by mask COM —
     # the objects sharing the prompt consume them in `objects` dict order (see docstring)

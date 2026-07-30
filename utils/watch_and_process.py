@@ -48,8 +48,8 @@ class LocalEngine:
     """Runs pclk on this machine's GPU. One worker: batched_optimized already
     saturates the GPU per-sample, so concurrent samples would only add VRAM
     contention, not speed."""
-    def __init__(self, pclk_mode: str, pclk_batch_size: int, verbose: int, cleanup_raw_vibrations: str):
-        self.pclk_mode, self.pclk_batch_size, self.verbose, self.cleanup_raw_vibrations = pclk_mode, pclk_batch_size, verbose, cleanup_raw_vibrations
+    def __init__(self, pclk_mode: str, pclk_batch_size: int, verbose: int, cleanup_raw_vibrations: str, use_pc: bool = True):
+        self.pclk_mode, self.pclk_batch_size, self.verbose, self.cleanup_raw_vibrations, self.use_pc = pclk_mode, pclk_batch_size, verbose, cleanup_raw_vibrations, use_pc
         self.q: queue.Queue[Path] = queue.Queue()
         self.done = set()
         threading.Thread(target=self._worker, daemon=True).start()
@@ -66,7 +66,7 @@ class LocalEngine:
             try:
                 process_vibrations(sample_dir, use_modal=False, pclk_mode=self.pclk_mode,
                                     pclk_batch_size=self.pclk_batch_size, do_save=True, verbose=self.verbose,
-                                    cleanup_raw_vibrations=self.cleanup_raw_vibrations)
+                                    cleanup_raw_vibrations=self.cleanup_raw_vibrations, use_PC=self.use_pc)
                 print(f"✅ [sample {sid}] complete.")
             except Exception as e:
                 print(f"❌ [sample {sid}] local processing failed: {e}", file=sys.stderr)
@@ -76,8 +76,8 @@ class ModalEngine:
     """Two-pool upload/spawn/poll/download so the bandwidth-bound upload never
     blocks on remote GPU compute, and results download the moment they're ready."""
     def __init__(self, pclk_mode: str, pclk_batch_size: int, verbose: int, cleanup_raw_vibrations: str, watch_path: Path,
-                 upload_workers: int, download_workers: int, poll_rate: float):
-        self.pclk_mode, self.pclk_batch_size, self.verbose, self.cleanup_raw_vibrations = pclk_mode, pclk_batch_size, verbose, cleanup_raw_vibrations
+                 upload_workers: int, download_workers: int, poll_rate: float, use_pc: bool = True):
+        self.pclk_mode, self.pclk_batch_size, self.verbose, self.cleanup_raw_vibrations, self.use_pc = pclk_mode, pclk_batch_size, verbose, cleanup_raw_vibrations, use_pc
         self.poll_rate = poll_rate
         self.ledger_path = watch_path / "jobs.jsonl"
         self.failed_path = watch_path / "failed_samples.jsonl"
@@ -120,7 +120,8 @@ class ModalEngine:
             with Timing(f"⬆️  [sample {sid}] upload: ", enabled=self.verbose >= 1):
                 modal_upload(volume, sample_dir, verbose=self.verbose)
             fc = _process_vibrations_modal.spawn(sid, pclk_batch_size=self.pclk_batch_size,
-                                                  pclk_mode=self.pclk_mode, verbose=self.verbose, cleanup_raw_vibrations=self.cleanup_raw_vibrations)
+                                                  pclk_mode=self.pclk_mode, verbose=self.verbose, cleanup_raw_vibrations=self.cleanup_raw_vibrations,
+                                                  use_PC=self.use_pc)
             self._set_status(sid, "running", sample_dir, fc.object_id)
             print(f"🚀 [sample {sid}] spawned modal job {fc.object_id}")
         except Exception as e:
@@ -180,11 +181,14 @@ def main():
     p.add_argument("--poll-rate", type=float, default=2.0, help="Seconds between scan / job-poll ticks.")
     p.add_argument("--cleanup-raw-vibrations", default="delete", choices=["compress", "delete"],
                     help="What to do with the raw vibrations file once pclk is done with it.")
+    p.add_argument("--use-pc", type=int, default=1, choices=[0, 1],
+                    help="1 (default) runs the phase-correlation pre-alignment step before LK; 0 skips it and runs LK directly on the raw frames.")
     args = p.parse_args()
+    args.use_pc = bool(args.use_pc)
 
     watch_path = Path(args.dir).resolve()
     print("=" * 80)
-    print(f"👁️  WATCHER | {watch_path} | engine={'modal' if args.modal else 'local'} | pclk={args.pclk_mode} (batch={args.pclk_batch_size}) | cleanup={args.cleanup_raw_vibrations}")
+    print(f"👁️  WATCHER | {watch_path} | engine={'modal' if args.modal else 'local'} | pclk={args.pclk_mode} (batch={args.pclk_batch_size}) | use_pc={args.use_pc} | cleanup={args.cleanup_raw_vibrations}")
     print("=" * 80)
 
     def watch_loop(engine):
@@ -209,10 +213,10 @@ def main():
         if args.modal:
             with app.run():
                 engine = ModalEngine(args.pclk_mode, args.pclk_batch_size, args.verbose, args.cleanup_raw_vibrations,
-                                      watch_path, args.upload_workers, args.download_workers, args.poll_rate)
+                                      watch_path, args.upload_workers, args.download_workers, args.poll_rate, use_pc=args.use_pc)
                 watch_loop(engine)
         else:
-            engine = LocalEngine(args.pclk_mode, args.pclk_batch_size, args.verbose, args.cleanup_raw_vibrations)
+            engine = LocalEngine(args.pclk_mode, args.pclk_batch_size, args.verbose, args.cleanup_raw_vibrations, use_pc=args.use_pc)
             watch_loop(engine)
     except KeyboardInterrupt:
         print("\n🛑 Stopped. In-flight modal jobs (if any) are tracked in the ledger.")

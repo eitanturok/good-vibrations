@@ -1,5 +1,5 @@
 
-import bz2, contextlib, functools, logging, os, sys, threading, time, json, shutil
+import bz2, contextlib, functools, logging, os, sys, threading, time, json, shutil, io
 from pathlib import Path
 from datetime import datetime, timezone
 
@@ -39,6 +39,8 @@ def save(x, path:Path, enabled:bool=True):
     elif path.suffix == '.npz':
         if not isinstance(x, dict): raise ValueError("save to .npz requires a dict of arrays")
         np.savez(path, **x)
+    elif path.suffix in ('.png', '.jpg', '.jpeg'):
+        (x if isinstance(x, Image.Image) else Image.fromarray(x)).save(path)
     elif isinstance(x, np.ndarray):
         with open(path, 'wb') as f:
             if x.flags['C_CONTIGUOUS'] and x.size > 0: _save_npy_chunked(f, x)
@@ -145,14 +147,14 @@ COPIED_FILES = ["times.jsonl", "metadata.jsonl"]
 def copy_to_sample(sample_dir:Path, output_dir:Path, audio_dir:Path, speaker:int, do_save:bool=True):
     sample_id = sample_dir.name
 
-    # symlink the shared+copy artifacts from output_dir to the current sample_dir
+    # copy the shared+copy artifacts from output_dir to the current sample_dir
     assert all((output_dir / a).exists() for a in SHARED_FILES+SHARED_DIRS+COPIED_FILES), f"[sample {sample_id}] Missing shared or copied artifact"
-    for artifact in SHARED_FILES: symlink(output_dir / artifact, sample_dir / f"image/{artifact}", do_save)
-    for d in SHARED_DIRS: symlink(output_dir / d, sample_dir / f"image/{d}", do_save)
+    for artifact in SHARED_FILES: copy(output_dir / artifact, sample_dir / f"image/{artifact}", do_save)
+    for d in SHARED_DIRS: copy(output_dir / d, sample_dir / f"image/{d}", do_save)
     for artifact in COPIED_FILES: copy(output_dir / artifact, sample_dir / artifact, do_save)
 
-    # symlink the audio file from audio_dir to the current sample_dir
-    symlink(audio_dir / 'audio.wav', sample_dir / "audio.wav", do_save)
+    # copy the audio file from audio_dir to the current sample_dir
+    copy(audio_dir / 'audio.wav', sample_dir / "audio.wav", do_save)
     append([{'audio_dir': sample_dir / "audio.wav"}, {'speaker': speaker}], sample_dir / "metadata.jsonl", do_save)
     append({'sample_id': sample_id, "sample_dir": sample_dir}, audio_dir.parent / "samples.jsonl", do_save)
 
@@ -218,3 +220,33 @@ def fix_symlinks(sample_dir, symlinks:list[tuple[str,str]]|None=None):
         dst, src = sample_dir / dst_rel, sample_dir / src_rel
         if dst.exists() or dst.is_symlink(): dst.unlink()
         dst.symlink_to(src.relative_to(dst.parent))
+
+
+def load_metadata(path):
+    metadata = {}
+    with open(path, "r", encoding="utf-8") as f: lines = f.readlines()
+    for line in lines:  metadata |= json.loads(line)
+    return metadata
+
+
+def to_jpeg_bytes(image: np.ndarray | Image.Image, quality: int = 95) -> bytes:
+    """Cpnvert image to JPEG so uploading it to modal is faster.
+    
+    On modal, payloads under 2MB take 700ms. They ride inline with the RPC call. 
+    
+    Anything above 2MB takes at least 2.5s through blob storage.
+    
+    So we convert the image to JPEG to make it smaller and faster.
+    (e.g. ~0.26MB for a 1337x1110 image vs ~4.45MB raw)."""
+    if isinstance(image, np.ndarray): image = Image.fromarray(image)
+    buf = io.BytesIO()
+    image.convert("RGB").save(buf, format="JPEG", quality=quality)
+    return buf.getvalue()
+
+
+def unpack_masks(results: list[dict]) -> list[dict]:
+    """Given segmention model's results, unpack the bit-packed masks."""
+    for result in results:
+        result["masks"] = np.unpackbits(result["masks_packed"], count=int(np.prod(result["masks_shape"]))).reshape(result["masks_shape"]).astype(bool)
+        del result["masks_packed"], result["masks_shape"]
+    return results
