@@ -30,17 +30,21 @@ modal_image = (
     scaledown_window=60 * 10,  # shut down after 10 min idle
 )
 class Segmenter:
+    IMAGE_SIZE = 672
+
     @modal.enter()
     def load(self):
         import torch
-
         # much faster than `import transformers`b/c transformers is a huge package
+        from transformers import Sam3Config
         from transformers.models.sam3.modeling_sam3 import Sam3Model
         from transformers.models.sam3.processing_sam3 import Sam3Processor
 
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.processor = Sam3Processor.from_pretrained("facebook/sam3")
-        self.model = Sam3Model.from_pretrained("facebook/sam3", torch_dtype=torch.bfloat16, device_map=self.device)
+        self.processor = Sam3Processor.from_pretrained("facebook/sam3", size={"height": self.IMAGE_SIZE, "width": self.IMAGE_SIZE})
+        config = Sam3Config.from_pretrained("facebook/sam3")
+        config.vision_config.image_size = self.IMAGE_SIZE
+        self.model = Sam3Model.from_pretrained("facebook/sam3", config=config, torch_dtype=torch.bfloat16, device_map=self.device)
         if self.device == "cuda": torch.cuda.synchronize()
 
     def downsample(self, image: np.ndarray, scale: float) -> np.ndarray:
