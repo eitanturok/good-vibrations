@@ -132,7 +132,7 @@ class ModalEngine:
     def _download_worker(self, sample_dir: Path, call_id: str):
         sid = sample_dir.name
         try:
-            files = PROCESSED_FILES + (["00_raw_vibrations.npy.bz2"] if self.cleanup_raw_vibrations == 'compress' else [])
+            files = PROCESSED_FILES + (["01_raw_vibrations.npy.bz2"] if self.cleanup_raw_vibrations == 'compress' else [])
             with Timing(f"⬇️  [sample {sid}] download: ", enabled=self.verbose >= 1):
                 for f in files:
                     modal_download(volume, f"{sid}/vibration/{f}", sample_dir / f"vibration/{f}")
@@ -179,29 +179,38 @@ def main():
     p.add_argument("--download-workers", type=int, default=4, help="[modal only] parallel downloaders (results are small).")
     p.add_argument("--verbose", type=int, default=1)
     p.add_argument("--poll-rate", type=float, default=2.0, help="Seconds between scan / job-poll ticks.")
-    p.add_argument("--cleanup-raw-vibrations", default="delete", choices=["compress", "delete"],
-                    help="What to do with the raw vibrations file once pclk is done with it.")
+    cleanup_group = p.add_mutually_exclusive_group()
+    cleanup_group.add_argument("--compress", action="store_true",
+                    help="Compress the raw vibrations file after pclk (then remove the uncompressed original). Mutually exclusive with --delete.")
+    cleanup_group.add_argument("--delete", action="store_true",
+                    help="Delete the raw vibrations file after pclk, uncompressed. Mutually exclusive with --compress.")
+    # default (neither flag): keep the raw file exactly as-is -- no cleanup at all.
     p.add_argument("--use-pc", type=int, default=1, choices=[0, 1],
                     help="1 (default) runs the phase-correlation pre-alignment step before LK; 0 skips it and runs LK directly on the raw frames.")
     args = p.parse_args()
     args.use_pc = bool(args.use_pc)
+    cleanup_raw_vibrations = "delete" if args.delete else ("compress" if args.compress else None)
 
     watch_path = Path(args.dir).resolve()
     print("=" * 80)
-    print(f"👁️  WATCHER | {watch_path} | engine={'modal' if args.modal else 'local'} | pclk={args.pclk_mode} (batch={args.pclk_batch_size}) | use_pc={args.use_pc} | cleanup={args.cleanup_raw_vibrations}")
+    print(f"👁️  WATCHER | {watch_path} | engine={'modal' if args.modal else 'local'} | pclk={args.pclk_mode} (batch={args.pclk_batch_size}) | use_pc={args.use_pc} | cleanup={cleanup_raw_vibrations or 'keep'}")
     print("=" * 80)
 
     def watch_loop(engine):
         seen_done = set()
         while True:
-            for npy_path in watch_path.rglob("**/vibration/00_raw_vibrations.npy"):
+            for npy_path in watch_path.rglob("**/vibration/01_raw_vibrations.npy"):
                 sample_dir = npy_path.parents[1]
                 sid = sample_dir.name
                 if sid in seen_done: continue
                 if not is_file_ready(npy_path): continue
-                pclk_done = (sample_dir / "vibration/01_raw_shifts.npy").exists()
-                status = f"pclk already done, {args.cleanup_raw_vibrations} only" if pclk_done else f"pclk + {args.cleanup_raw_vibrations}"
-                print(f"📥 [sample {sid}] raw ready ({npy_path.stat().st_size / 1e9:.2f} GB) -- {status}. Queuing...")
+                if (sample_dir / "vibration/02_raw_shifts.npy").exists():
+                    # pclk already computed (e.g. from a prior watcher run, with the raw file
+                    # kept around) -- skip resubmitting, no need to recompute or re-upload
+                    print(f"⏭️  [sample {sid}] pclk already computed, skipping.")
+                    seen_done.add(sid)
+                    continue
+                print(f"📥 [sample {sid}] raw ready ({npy_path.stat().st_size / 1e9:.2f} GB) -- pclk + {cleanup_raw_vibrations or 'keep'}. Queuing...")
                 engine.submit(sample_dir)
                 # mark as seen once queued, not on some "done" file -- the raw .npy only
                 # disappears once _process_vibrations compresses/deletes it, and relying on
@@ -212,11 +221,11 @@ def main():
     try:
         if args.modal:
             with app.run():
-                engine = ModalEngine(args.pclk_mode, args.pclk_batch_size, args.verbose, args.cleanup_raw_vibrations,
+                engine = ModalEngine(args.pclk_mode, args.pclk_batch_size, args.verbose, cleanup_raw_vibrations,
                                       watch_path, args.upload_workers, args.download_workers, args.poll_rate, use_pc=args.use_pc)
                 watch_loop(engine)
         else:
-            engine = LocalEngine(args.pclk_mode, args.pclk_batch_size, args.verbose, args.cleanup_raw_vibrations, use_pc=args.use_pc)
+            engine = LocalEngine(args.pclk_mode, args.pclk_batch_size, args.verbose, cleanup_raw_vibrations, use_pc=args.use_pc)
             watch_loop(engine)
     except KeyboardInterrupt:
         print("\n🛑 Stopped. In-flight modal jobs (if any) are tracked in the ledger.")

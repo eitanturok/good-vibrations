@@ -189,11 +189,11 @@ def retry(attempts=4, delay=2.0, backoff=2.0, exceptions=(Exception,)):
 @retry()
 def modal_upload(volume, sample_dir, verbose:int=1):
     sample_id = sample_dir.name
-    raw_path = sample_dir / 'vibration/00_raw_vibrations.npy'
+    raw_path = sample_dir / 'vibration/01_raw_vibrations.npy'
     nbytes = raw_path.stat().st_size + (sample_dir / 'metadata.jsonl').stat().st_size
     t0 = time.perf_counter()
     with volume.batch_upload(force=True) as batch:
-            batch.put_file(raw_path, f"{sample_id}/vibration/00_raw_vibrations.npy")
+            batch.put_file(raw_path, f"{sample_id}/vibration/01_raw_vibrations.npy")
             batch.put_file(sample_dir / 'metadata.jsonl', f"{sample_id}/metadata.jsonl")
     dt = time.perf_counter() - t0
     if verbose >= 1:

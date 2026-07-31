@@ -143,7 +143,7 @@ def save_vibrations(raw_vibrations:np.ndarray, sample_dir:Path, audio_dir:Path, 
     sample_id = sample_dir.name
 
     # save raw vibrations RAM->DISK (~2.7 GB per sample)
-    raw_vibration_path = sample_dir / 'vibration/00_raw_vibrations.npy'
+    raw_vibration_path = sample_dir / 'vibration/01_raw_vibrations.npy'
     with Timing(f'[sample {sample_id}] save raw vibrations RAM->DISK::{raw_vibration_path}: ', enabled=verbose >= 2):
         save(raw_vibrations, raw_vibration_path, do_save)
         timestamp = datetime.now(timezone.utc).isoformat()
@@ -154,8 +154,8 @@ def _process_vibrations(sample_dir:Path, raw_vibrations:np.ndarray=None, min_fre
                         verbose:int=1, do_save:bool=True, cleanup_raw_vibrations:str='compress', spectrogram_video:bool=True, laser_idx:int|None=None, xy_idx:int=0, use_PC:bool=True):
     sample_id = sample_dir.name
     metadata = {k: v for d in load(sample_dir / 'metadata.jsonl') for k, v in d.items()}
-    fps, rois = int(metadata['fps']), metadata['roi']
-    raw_vibration_path, raw_shifts_path = sample_dir / 'vibration/00_raw_vibrations.npy', sample_dir / 'vibration/01_raw_shifts.npy'
+    fps, rois = int(metadata['fps']), metadata['rois']
+    raw_vibration_path, raw_shifts_path = sample_dir / 'vibration/01_raw_vibrations.npy', sample_dir / 'vibration/02_raw_shifts.npy'
 
     # laser_idx=None -> pclk over all lasers, recover the default laser below; a specific
     # laser_idx -> only that laser is ever computed, so it's also the one recovered
@@ -265,7 +265,7 @@ def _process_vibrations_modal(sample_dir_name: str, **kwargs):
     _process_vibrations(VOLUME_PATH / sample_dir_name, **kwargs)
     volume.commit()
 
-PROCESSED_FILES = ["01_raw_shifts.npy", "02_clean_shifts.npy", "03_fft.npz"]
+PROCESSED_FILES = ["02_raw_shifts.npy", "02_clean_shifts.npy", "03_fft.npz"]
 
 def process_vibrations(sample_dir:Path, raw_vibrations:np.ndarray=None, use_modal:bool=False, pclk_mode:str='batched_optimized', pclk_batch_size:int=256, do_save:bool=True, verbose:int=1, cleanup_raw_vibrations:str|None=None, spectrogram_video:bool=True, laser_idx:int|None=None, xy_idx:int=0, use_PC:bool=True):
     sample_id = sample_dir.name
@@ -333,10 +333,10 @@ def process_vibrations_2(sample_dir:Path, raw_vibrations:np.ndarray=None, use_mo
     recovered_laser = laser_idx if laser_idx is not None else DEFAULT_RECOVERY_LASER_IDX
 
     metadata = {k: v for d in load(sample_dir / 'metadata.jsonl') for k, v in d.items()}
-    fps, rois = int(metadata['fps']), metadata['roi']
+    fps, rois = int(metadata['fps']), metadata['rois']
 
     # crop the single ROI up front — never touch the other 99 lasers' pixels
-    if raw_vibrations is None: raw_vibrations = load(sample_dir / 'vibration/00_raw_vibrations.npy')
+    if raw_vibrations is None: raw_vibrations = load(sample_dir / 'vibration/01_raw_vibrations.npy')
     x, y, w, h = rois[recovered_laser]
     crop = np.ascontiguousarray(raw_vibrations[:, y:y+h, x:x+w])[None]  # (1, T, h, w)
 
@@ -386,7 +386,7 @@ def process_vibrations_3(sample_dir, raw_vibrations, pclk_batch_size, pclk_laser
 
     audio_sample_rate = 22050
     metadata = {k: v for d in load(sample_dir / 'metadata.jsonl') for k, v in d.items()}
-    fps, rois = int(metadata['fps']), metadata['roi']
+    fps, rois = int(metadata['fps']), metadata['rois']
     if pclk_lasers is not None: rois = [rois[pclk_point] for pclk_point in pclk_lasers]
 
     # 1 pclk turns vibrations into shifts
