@@ -26,7 +26,7 @@ def should_augment(p: float) -> bool:
 
 #***** 0 collect samples *****
 
-REQUIRED_FILES = ["image/02_smask.png", "vibration/03_fft.npz", "metadata.jsonl"]
+REQUIRED_FILES = ["images/03_smask.npy", "vibration/03_fft.npz", "metadata.jsonl"]
 
 def precomputed_fft_name(signal_mode: str, normalize_mode: str, patch_size: int, subtract_speaker_mean: bool) -> str:
     # the speaker mean is baked into the precomputed array, so it has to be part of the filename
@@ -96,7 +96,7 @@ def convert_to_mds(mds_dir: Path, samples: list[tuple[Path, dict]], out_h: int, 
                 X = load_X(sample_dir)
                 assert X.shape == x_shape, f"{sample_dir.name}: X.shape={X.shape} != {x_shape}"
 
-                y = np.load(sample_dir / f"image/05_downsampled_smask_{out_h}h_{out_w}w.npy")  # precomputed by downsample_samples
+                y = np.load(sample_dir / f"images/04_downsampled_smask_{out_h}h_{out_w}w.npy")  # precomputed by downsample_samples
                 assert y.shape == y_shape, f"{sample_dir.name}: y.shape={y.shape} != {y_shape}"
 
                 com = meta.get("downsampled_com", [-1.0, -1.0])
@@ -137,8 +137,8 @@ def downsample_samples(samples: list[tuple[Path, dict]], out_h: int, out_w: int,
     """Downsample every sample's full-resolution mask to (out_h, out_w). Only called when
     build_dataset's hashed mds_dir doesn't already exist, so no per-sample cache check here."""
     for sample_dir, _ in tqdm(samples, desc="downsampling masks", disable=not verbose):
-        out_path = sample_dir / f"image/05_downsampled_smask_{out_h}h_{out_w}w"
-        mask = downsample_mask(Image.open(sample_dir / "image/02_smask.png"), out_h, out_w)
+        out_path = sample_dir / f"images/04_downsampled_smask_{out_h}h_{out_w}w"
+        mask = downsample_mask(Image.open(sample_dir / "images/03_smask.png"), out_h, out_w)
         mask.save(out_path.with_suffix(".png"))
         np.save(out_path.with_suffix(".npy"), np.array(mask, dtype=np.float32) / 255.0)
 
@@ -413,9 +413,76 @@ def exp25_split(mds_path: str | Path, test_size: float = 0.20, unseen_pos_frac: 
 
     return {"train": train_idx, **evals}
 
+
+def split_by_position(index: list[dict], idxs: list[int], percent: float = 0.2, seed: int = 42) -> tuple[list[int], list[int], list[int]]:
+    """Split `idxs` (indices into `index`) three ways by position_id. `percent` of the positions are
+    held out entirely; the remaining 1 - percent are seen in train.
+
+    - unseen_speaker: at each seen position, every speaker independently lands here with probability
+      1/n_speakers (so ~1 of 8 on average). The position is in train, this speaker at it is not.
+    - unseen_position: every sample at a held-out position -- never seen from any speaker.
+    - train: the remaining speakers at each seen position.
+    """
+    rng = np.random.default_rng(seed)
+
+    by_position = {} # position_id -> sample_id
+    for i in idxs: by_position.setdefault(index[i]["position_id"], []).append(i)
+
+    held_out = set(rng.permutation(sorted(by_position))[:round(percent * len(by_position))].tolist())
+
+    unseen_speaker, unseen_position, train = [], [], []
+    for position_id, group in by_position.items():
+        if position_id in held_out:
+            unseen_position += group
+            continue
+        to_eval = rng.random(len(group)) < 1 / len(group)
+        if to_eval.all(): to_eval[rng.integers(len(group))] = False  # keep the position seen in train
+        for i, is_eval in zip(group, to_eval): (unseen_speaker if is_eval else train).append(i)
+
+    return sorted(unseen_speaker), sorted(unseen_position), sorted(train)
+
+
+def gastronorm(mds_path, test_size=0.2, seed=42, speakers=None, n_objects=None, box=None, n_samples: int | None = None, verbose: int = 1, index: list[dict] | None = None):
+
+    if index is None:
+        lines = (Path(mds_path) / "metadata.jsonl").read_text().strip().splitlines()
+        index = [json.loads(line) for line in lines if line]
+
+    keep = [i for i, row in enumerate(index) if _matches(row, speakers, n_objects, box)]
+    if n_samples is not None: keep = keep[:n_samples]
+
+    lines = (Path(mds_path) / "metadata.jsonl").read_text().strip().splitlines()
+    index = [json.loads(line) for line in lines if line]
+
+    # One cube: 80% train, 20% eval.
+    # The eval set is further split into unseen speaker and unseen position.
+    one_cube_train, one_cube_eval = train_test_split([i for i, row in enumerate(index) if row['layout'] == 'purple-cube'], test_size=0.2, random_state=seed, shuffle=True)
+    one_cube_unseen_speaker, one_cube_unseen_position, one_cube_train_2 = split_by_position(index, one_cube_eval, percent=0.2, seed=seed)
+    one_cube_train += one_cube_train_2
+
+    # Two cubes: 80% train, 20% eval.
+    two_cubes_unseen_speaker, two_cubes_unseen_position, two_cubes_train = split_by_position(index, [i for i, row in enumerate(index) if row['layout'] == 'purple--green-cube-grid4'], percent=0.2, seed=seed)
+
+    # make train
+    splits = {}
+    splits['train'] = [i for i, row in enumerate(index) if row['layout'] in ['empty', 'purple--green-cube-grid1', 'purple--green-cube-grid2', 'purple--green-cube-grid3', 'x-shift', 'y-shift']]
+    splits['train'] += one_cube_train + two_cubes_train
+
+    # eval
+    splits |= {'eval/1-cube': one_cube_unseen_position, 'eval/1-cube-speaker': one_cube_unseen_speaker,
+               'eval/2-cubes': two_cubes_unseen_position, 'eval/2-cubes-speaker': two_cubes_unseen_speaker}
+
+    # ood eval
+    splits['eval/3-cubes'] = [i for i, row in enumerate(index) if row['layout'] == 'purple--green-red-cube']
+    splits['eval/red-cube'] = [i for i, row in enumerate(index) if row['layout'] == 'red-cube']
+
+    if verbose:
+        for label, idxs in splits.items(): print(f"{label}: {len(idxs)} samples")
+    return splits
+
 #***** 8 build dataloaders *****
 
-SPLIT_METHODS = {"exp25": exp25_split}
+SPLIT_METHODS = {"exp25": exp25_split, "gastronorm": gastronorm}
 
 def num_samples(batch): return batch["mask_true"].shape[0]
 

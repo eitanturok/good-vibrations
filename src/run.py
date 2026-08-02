@@ -19,6 +19,7 @@ except PermissionError:
 
 import torch
 import modal
+import wandb
 from composer.utils.reproducibility import seed_all
 from composer import Trainer
 from composer.core import Evaluator
@@ -28,6 +29,15 @@ from composer.loggers import WandBLogger, FileLogger
 from composer.callbacks import RuntimeEstimator, SpeedMonitor, OOMObserver, NaNMonitor, SystemMetricsMonitor, OptimizerMonitor, LRMonitor
 from composer.optim import ConstantScheduler, CosineAnnealingScheduler, CosineAnnealingWithWarmupScheduler, LinearWithWarmupScheduler
 from composer.callbacks.speed_monitor import GPU_AVAILABLE_FLOPS
+
+from icecream import install; install()
+
+from model.callbacks import VisualizeSMask, OutputSaver, OUTPUT_EXTRACTORS, DEFAULT_OUTPUT_KEYS
+from model.dataset import build_dataset
+from model.arch import VibrationTransformer, LOSSES
+from utils.helpers import cleanup
+
+BASE_DATA_DIR = Path("/home/ethantu/workspace/good-vibrations/experiments")
 
 # RTX 5080 isn't in composer's GPU_AVAILABLE_FLOPS table yet, so MFU can't be computed. Patch it in here
 GPU_AVAILABLE_FLOPS['nvidia geforce rtx 5080'] = {
@@ -41,13 +51,6 @@ GPU_AVAILABLE_FLOPS['nvidia geforce rtx 5080'] = {
     'amp_fp8': 450.2e12,
     'int8': 900.4e12,
 }
-from icecream import install; install()
-import wandb
-
-from model.callbacks import VisualizeSMask, OutputSaver, OUTPUT_EXTRACTORS, DEFAULT_OUTPUT_KEYS
-from model.dataset import build_dataset
-from model.arch import VibrationTransformer, LOSSES
-from utils.helpers import cleanup
 
 SCHEDULERS = {
     "constant": lambda t_warmup: ConstantScheduler(),
@@ -66,18 +69,16 @@ def get_parser():
     parser.add_argument("--verbose",                    type=int,   default=2, help="If >=2, show torch.compile (TorchDynamo) logs.")
 
     # build data
-    parser.add_argument("--mds-dir",                    type=str,   default=r"D:/eturok/datasets/000-cylinder-dataset/mds")
-    parser.add_argument("--split",                      type=str,   default="exp25", help="Which split method from SPLIT_METHODS to use (e.g. 'exp22', 'exp23').")
+    parser.add_argument("--data-dir",                    type=str,  default=BASE_DATA_DIR / "31_07_2026_gastronorm_exp1")
+    parser.add_argument("--split",                      type=str,   default="gastronorm", help="Which split method from SPLIT_METHODS to use (e.g. 'exp22', 'exp23').")
     parser.add_argument("--num-workers",                type=int,   default=4)
     parser.add_argument("--test-size",                  type=float, default=0.2)
 
-    parser.add_argument("--out-h",                      type=int,   default=20)
-    parser.add_argument("--out-w",                      type=int,   default=40)
+    parser.add_argument("--out-h",                      type=int,   default=30)
+    parser.add_argument("--out-w",                      type=int,   default=30)
     parser.add_argument("--n-laser-rows",               type=int,   default=10)
     parser.add_argument("--n-laser-cols",               type=int,   default=10)
     parser.add_argument("--patch-size",                 type=int,   default=256)
-    parser.add_argument("--n-freqs",                    type=int,   default=2946)
-    parser.add_argument("--n-channels",                 type=int,   default=2, help="Last dim of X: 2 for magnitude, 4 for complex/mag_phase signal modes.")
 
     parser.add_argument("--signal-mode",                type=str,   default="magnitude", choices=["magnitude", "complex", "mag_phase"])
     parser.add_argument("--normalize-mode",             type=str,   default="std")
@@ -107,7 +108,7 @@ def get_parser():
     parser.add_argument("--compile-mode",               type=str,   default="default", help="torch.compile mode, e.g. 'default', 'reduce-overhead', 'max-autotune'.")
     # train
     parser.add_argument("--batch-size",                 type=int,   default=256)
-    parser.add_argument("--lr",                         type=float, default=1e-3)
+    parser.add_argument("--lr",                         type=float, default=1e-4)
     parser.add_argument("--weight-decay",               type=float, default=1e-2)
     parser.add_argument("--scheduler",                  type=str,   default="cosine-warmup", choices=tuple(SCHEDULERS), help="LR schedule. 'constant' reproduces the old no-scheduler behavior.")
     parser.add_argument("--t-warmup",                   type=str,   default="100ep", help="Warmup length for the *-warmup schedulers; ignored by 'constant'.")
@@ -192,14 +193,15 @@ def run(**kwargs):
 
     # dataset
     train_loader, eval_loaders, train_eval_loader = build_dataset(
-        args.mds_dir, batch_size=args.batch_size, eval_batch_size=args.eval_batch_size, num_workers=args.num_workers,
+        args.data_dir, batch_size=args.batch_size, eval_batch_size=args.eval_batch_size, num_workers=args.num_workers,
         split=args.split, test_size=args.test_size, speakers=args.speakers, n_objects=args.n_objects, box=args.box, n_samples=args.n_samples,
         out_h=args.out_h, out_w=args.out_w, signal_mode=args.signal_mode, normalize_mode=args.normalize_mode, patch_size=args.patch_size, seed=args.seed,
         augment_fft=args.augment_fft, augment_mask=args.augment_mask, subtract_speaker_mean=bool(args.subtract_speaker_mean))
     boundary_loaders = eval_loaders + [Evaluator(label='train', dataloader=train_eval_loader)]
 
-    # model
-    data_info = dict(out_h=args.out_h, out_w=args.out_w, n_laser_rows=args.n_laser_rows, n_laser_cols=args.n_laser_cols, patch_size=args.patch_size, n_freqs=args.n_freqs, n_channels=args.n_channels)
+    # read n_freqs, n_channels from the dataset
+    _, n_patches, patch_size, n_channels = train_loader.dataloader.dataset[0]['fft'].shape  # (L,P,PS,C)
+    data_info = dict(out_h=args.out_h, out_w=args.out_w, n_laser_rows=args.n_laser_rows, n_laser_cols=args.n_laser_cols, patch_size=args.patch_size, n_freqs=n_patches * patch_size, n_channels=n_channels)
     model = VibrationTransformer(args.d_model, args.pnt_num_heads, args.pnt_num_layers, args.seq_num_heads, args.seq_num_layers, data_info, args.decoder, args.decoder_num_heads, args.decoder_num_layers, freq_dropout=args.freq_dropout, laser_dropout=args.laser_dropout, loss_fn=args.loss_fn)
     load_path = str(args.checkpoint_path) if args.checkpoint_path else None
 
