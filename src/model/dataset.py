@@ -127,11 +127,12 @@ def convert_to_mds(mds_dir: Path, samples: list[tuple[Path, dict]], out_h: int, 
 
 #***** 2 downsample image *****
 
-def downsample_mask(mask: Image.Image, out_h: int, out_w: int) -> Image.Image:
-    # BOX resampling area-averages over the full H x W mask (unlike a floor-division block
-    # reshape, which silently truncates to block_h*out_h x block_w*out_w and drops the
-    # bottom/right edge whenever out_h/out_w don't evenly divide H/W).
-    return mask.resize((out_w, out_h), resample=Image.BOX)
+def downsample_mask(mask: Image.Image, out_h: int, out_w: int) -> np.ndarray:
+    # BOX resampling area-averages over the full H x W mask
+    # Convert to float FIRST so BOX
+    # would threshold the average back to binary and throw away partial coverage.
+    out = np.array(mask.convert("F").resize((out_w, out_h), resample=Image.BOX), dtype=np.float32)
+    return np.clip(out / 255.0, 0.0, 1.0)
 
 def downsample_samples(samples: list[tuple[Path, dict]], out_h: int, out_w: int, verbose: int = 1) -> None:
     """Downsample every sample's full-resolution mask to (out_h, out_w). Only called when
@@ -139,8 +140,8 @@ def downsample_samples(samples: list[tuple[Path, dict]], out_h: int, out_w: int,
     for sample_dir, _ in tqdm(samples, desc="downsampling masks", disable=not verbose):
         out_path = sample_dir / f"images/04_downsampled_smask_{out_h}h_{out_w}w"
         mask = downsample_mask(Image.open(sample_dir / "images/03_smask.png"), out_h, out_w)
-        mask.save(out_path.with_suffix(".png"))
-        np.save(out_path.with_suffix(".npy"), np.array(mask, dtype=np.float32) / 255.0)
+        Image.fromarray((mask * 255).astype(np.uint8)).save(out_path.with_suffix(".png"))
+        np.save(out_path.with_suffix(".npy"), mask)
 
 #***** 3 process image *****
 
@@ -494,7 +495,7 @@ def loader(dataset, idxs, bs, num_workers, generator, shuffle=False, drop_last=F
 def build_dataset(data_dir: str | Path, split: str = "exp25", batch_size: int = 64, eval_batch_size: int = 64,
                    num_workers: int = 8, out_h: int = 20, out_w: int = 40, signal_mode: str = "magnitude",
                    normalize_mode: str = "std", patch_size: int = 256, seed: int = 42,
-                   force_mds: bool = False, augment_fft: float = 0.5, augment_mask: float = 0.5,
+                   force_rebuild_data: bool = False, augment_fft: float = 0.5, augment_mask: float = 0.5,
                    subtract_speaker_mean: bool = False, verbose: int = 1, **split_kwargs):
 
     if split not in SPLIT_METHODS: raise ValueError(f"Unknown split {split!r}, expected one of {sorted(SPLIT_METHODS)}")
@@ -511,7 +512,7 @@ def build_dataset(data_dir: str | Path, split: str = "exp25", batch_size: int = 
     mds_dir = data_dir / "mds" / hash_samples(samples, out_h, out_w, raw_fft, signal_mode, normalize_mode, patch_size, subtract_speaker_mean)[:16]
     done = mds_dir / "metadata.jsonl"  # last file convert_to_mds writes -- its presence means the build completed
 
-    if force_mds and mds_dir.exists():
+    if force_rebuild_data and mds_dir.exists():
         shutil.rmtree(mds_dir)
         if verbose: print(f"Overwriting {mds_dir=}")
 
