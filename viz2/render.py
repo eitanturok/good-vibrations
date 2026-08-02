@@ -199,7 +199,7 @@ def _backdrop(sid: int) -> Image.Image | None:
     """The cropped overhead frame the masks are aligned to, kept decoded so repeated
     composites for the same sample don't re-read the file."""
     from viz2.app import registry
-    p = registry.sample_dir(sid) / config.BACKDROP_REL
+    p = registry.sample_dir(sid) / registry.gt.layout.backdrop
     if not p.exists():
         return None
     im = Image.open(p)

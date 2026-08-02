@@ -20,30 +20,138 @@ PORT = 8503  # 8502 is taken by the other explorer
 
 # ***** dataset shape *****
 
+# The target grid. A dataset may ship masks at several downsample sizes side by side
+# (the gastronorm captures write both 20x40 and 30x30), and a run is only comparable
+# against the size it was trained on -- so this is overridable from the command line
+# (--mask 30x30) rather than a fixed property of the code. set_mask_shape rebinds it.
 MASK_H, MASK_W = 20, 40
 N_SAMPLES = 1024
-GT_MASK_REL = f"image/05_downsampled_smask_{MASK_H}h_{MASK_W}w.npy"
 
-# The cropped frame is the one the masks were derived from: 02_smask.npy is (309,679),
-# pixel-aligned to it, and the 20x40 target is an exact box-downsample of that (verified
-# corr=1.0000). Used as the backdrop under every mask so predictions sit in the real
-# scene. 05_overhead_speaker.png is NOT interchangeable -- it adds padding for the
-# speaker icon, so a mask drawn over it would be offset.
-BACKDROP_REL = "image/01_cropped.png"
-OVERHEAD_REL = "image/05_overhead_speaker.png"   # detail modal only (shows the speaker)
 
-# Per-sample extras shown in the detail modal. laser index 50 / x axis is
-# DEFAULT_RECOVERY_LASER_IDX in src/data/vibrate.py, but the files are globbed rather
-# than hardcoded so a different recovery laser still resolves.
-VIBRATION_GLOB = {
-    "spectrogram": "vibration/05_spectrogram_laser*_*.png",
-    "fft": "vibration/03_fft_laser*_*.png",
+def set_mask_shape(h: int, w: int) -> None:
+    """Point viz2 at a different target grid, before anything reads the constants.
+
+    Layout paths embed {h}/{w}, and Layout instances are built after this runs, so the
+    ground-truth filename follows automatically.
+    """
+    global MASK_H, MASK_W
+    MASK_H, MASK_W = int(h), int(w)
+
+
+def mask_shapes(samples_dir) -> list[tuple[int, int]]:
+    """Downsampled-mask sizes actually present, newest-layout first, for error messages
+    and for --mask's default. Reads one sample dir; sizes are uniform across a dataset."""
+    import re
+    out = set()
+    try:
+        probes = sorted(p for p in samples_dir.iterdir() if p.is_dir())[:25]
+    except OSError:
+        return []
+    for d in probes:
+        for sub in ("images", "image"):
+            for f in (d / sub).glob("*_downsampled_smask_*h_*w.npy"):
+                m = re.search(r"_(\d+)h_(\d+)w\.npy$", f.name)
+                if m:
+                    out.add((int(m.group(1)), int(m.group(2))))
+        if out:
+            break
+    return sorted(out)
+
+# Sample-directory layout is NOT fixed across experiments. experiment-25 writes an
+# `image/` directory with a `05_` mask prefix; the gastronorm experiments write `images/`
+# with a `04_` prefix and a differently named crop. Nothing in the files themselves
+# declares which era they belong to, so `Layout.detect` probes a real sample directory
+# rather than making viz2 depend on one hardcoded set of names.
+#
+# Every entry is a path RELATIVE TO A SAMPLE DIR. `{h}`/`{w}` are filled with MASK_H and
+# MASK_W so the mask name follows the configured target shape.
+LAYOUTS = {
+    "experiment-25": {
+        "image_dir": "image",
+        "gt_mask": "image/05_downsampled_smask_{h}h_{w}w.npy",
+        # The cropped frame is the one the masks were derived from: 02_smask.npy is
+        # (309,679), pixel-aligned to it, and the 20x40 target is an exact box-downsample
+        # of that (verified corr=1.0000). Used as the backdrop under every mask so
+        # predictions sit in the real scene. 05_overhead_speaker.png is NOT
+        # interchangeable -- it adds padding for the speaker icon, so a mask drawn over
+        # it would be offset.
+        "backdrop": "image/01_cropped.png",
+        "overhead": "image/05_overhead_speaker.png",  # detail modal (shows the speaker)
+        "audio": {"original": "audio.wav", "recovered": "recovered_audio.wav"},
+    },
+    "gastronorm": {
+        "image_dir": "images",
+        "gt_mask": "images/04_downsampled_smask_{h}h_{w}w.npy",
+        "backdrop": "images/02_cropped_overhead.png",
+        # No speaker-annotated overhead is rendered by this pipeline. The cropped frame
+        # stands in so the detail modal still shows the scene; the modal degrades to
+        # "not generated" for anything that genuinely has no file.
+        "overhead": "images/02_cropped_overhead.png",
+        # These captures ship no source audio -- `audio/` exists but is empty. Only the
+        # recovered waveform is present.
+        "audio": {"recovered": "recovered_audio.wav"},
+    },
 }
-AUDIO_REL = {"original": "audio.wav", "recovered": "recovered_audio.wav"}
 
-# Stale Windows paths (D:\...) recorded at capture time. Dropped when metadata is
-# parsed so they can never leak into a route; all paths are rebuilt from EXPERIMENT_DIR.
-STALE_METADATA_KEYS = {"output_dir", "sample_dir", "audio_dir"}
+# Probed in order; the first layout whose mask file exists in a sample dir wins.
+LAYOUT_ORDER = ["experiment-25", "gastronorm"]
+
+# Per-sample extras shown in the detail modal. The recovery laser index varies by
+# experiment (50 on experiment-25, 55 on gastronorm), and gastronorm drops the axis
+# suffix on some files, so these are globbed rather than hardcoded.
+VIBRATION_GLOB = {
+    "spectrogram": "vibration/05_spectrogram_laser*.png",
+    "fft": "vibration/03_fft_laser*.png",
+}
+
+# Stale Windows paths (D:\... , C:\...) recorded at capture time. Dropped when metadata
+# is parsed so they can never leak into a route; all paths are rebuilt from
+# EXPERIMENT_DIR. `experiment_dir` is the gastronorm-era spelling of `output_dir`.
+STALE_METADATA_KEYS = {"output_dir", "sample_dir", "audio_dir", "experiment_dir"}
+
+
+class Layout:
+    """Which per-sample filenames an experiment uses, resolved once at startup.
+
+    Holds only relative paths; joining against a sample dir stays the caller's job, so
+    there is still exactly one place (Registry.sample_dir) that touches the filesystem
+    with a user-supplied id.
+    """
+
+    def __init__(self, name: str, spec: dict):
+        fmt = {"h": MASK_H, "w": MASK_W}
+        self.name = name
+        self.image_dir = spec["image_dir"]
+        self.gt_mask = spec["gt_mask"].format(**fmt)
+        self.backdrop = spec["backdrop"].format(**fmt)
+        self.overhead = spec["overhead"].format(**fmt)
+        self.audio = dict(spec["audio"])
+
+    @classmethod
+    def detect(cls, samples_dir) -> "Layout":
+        """Pick the layout whose ground-truth mask actually exists on disk.
+
+        Probes several sample dirs, not one: a partially-written capture can be missing
+        its mask entirely (000009 in the gastronorm run has no downsampled mask), and
+        probing only the first directory would then fall through to the wrong layout --
+        or to none at all -- for an otherwise healthy 3000-sample dataset.
+        """
+        try:
+            probes = sorted(p for p in samples_dir.iterdir() if p.is_dir())[:25]
+        except OSError:
+            probes = []
+        for name in LAYOUT_ORDER:
+            layout = cls(name, LAYOUTS[name])
+            if any((d / layout.gt_mask).exists() for d in probes):
+                return layout
+        known = ", ".join(LAYOUT_ORDER)
+        raise SystemExit(
+            f"[viz2] no known sample layout under {samples_dir}.\n"
+            f"       tried: {known}. Expected one of "
+            + ", ".join(cls(n, LAYOUTS[n]).gt_mask for n in LAYOUT_ORDER)
+            + "\n       Add a new entry to LAYOUTS in viz2/config.py if this is a new "
+              "dataset format."
+        )
 
 # ***** predictions *****
 
@@ -54,10 +162,20 @@ OUTPUTS_SUBDIR = "outputs_history"
 # Eval-split directory names identify which dataset a run was trained on. Sample ids
 # collide across experiments, so joining a cylinder/bullet run against experiment-25
 # ground truth would silently produce meaningless metrics.
-EXP25_EVAL_SPLITS = {
-    "purple_cube", "purple_cube_speaker",
-    "green_cube", "green_cube_speaker",
-    "purple_green_cubes", "purple_green_cubes_speaker",
+#
+# Keyed by layout name: a run is only comparable against the ground truth currently
+# loaded, and the layouts are different datasets. A layout absent from this map (or
+# mapped to None) accepts any split names and falls back to the sample-id overlap check
+# in data._classify, which is weaker but dataset-agnostic.
+EVAL_SPLITS = {
+    "experiment-25": {
+        "purple_cube", "purple_cube_speaker",
+        "green_cube", "green_cube_speaker",
+        "purple_green_cubes", "purple_green_cubes_speaker",
+    },
+    "gastronorm": {
+        "1-cube", "1-cube-speaker", "2-cubes", "2-cubes-speaker", "3-cubes", "red-cube",
+    },
 }
 
 N_DEFAULT_RUNS = 3  # auto-loaded on first open, most recently modified first
