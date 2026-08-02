@@ -13,7 +13,10 @@ from model.arch import com_distances, mses
 
 MAX_WANDB_IMAGES = 108  # wandb.Image caps any single log_images call at this many items
 
-def _to_cpu(x: torch.Tensor): return x.detach().to('cpu', copy=True)
+def _to_cpu(x: torch.Tensor):
+    # upcast reduced-precision autocast outputs (bf16/fp16): numpy has no bf16 dtype
+    x = x.detach().to('cpu', copy=True)
+    return x.float() if x.dtype in (torch.bfloat16, torch.float16) else x
 
 def _is_due(interval: Time, state: State, force: bool) -> bool:
     """True when the trainer timestamp lands on an interval boundary, or `force` overrides it."""
@@ -36,7 +39,7 @@ class VisualizeSMask(Callback):
             panel = Image.fromarray((arr * 255).clip(0, 255).astype(np.uint8)).resize((pw, ph), Image.NEAREST)
             canvas.paste(panel, (j * (pw + sep), text_height))
             ImageDraw.Draw(canvas).text((j * (pw + sep) + pw // 2, text_height - 14), label, fill=(0, 0, 0), font=font, anchor="mt")
-        text = (f"id={info['sample_id'][i]}  out={info['output_id'][i]}  spk={info['speaker'][i]}  objs={info['n_objects'][i]}  "
+        text = (f"id={info['sample_id'][i]}  pos={info['position_id'][i]}  spk={info['speaker'][i]}  objs={info['n_objects'][i]}  "
                 f"com=({info['x_com'][i]:.1f},{info['y_com'][i]:.1f})  mse={mse_vals[i]:.4f}  com_dist={com_dists[i]:.4f}")
         ImageDraw.Draw(canvas).text((pw + sep // 2, 2), text, fill=(80, 80, 80), font=font, anchor="mt")
         return np.array(canvas)
