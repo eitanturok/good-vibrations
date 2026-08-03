@@ -590,7 +590,15 @@ body.stacked .gtimg { margin-top: 114px; }
   margin: 0 0 9px; font-size: 10px; letter-spacing: .09em;
   text-transform: uppercase; color: var(--ink-3);
 }
-#m-body .hero { width: 100%; border-radius: var(--r); display: block; background: var(--surface-2); }
+/* The overhead photo. Height is CAPPED, not just width: source aspect ratios differ by
+   experiment (experiment-25 crops to 949x579, the gastronorm captures to 1337x1110), and
+   width:100% alone let the squarer image grow tall enough to push the metadata and audio
+   below the fold. object-fit:contain keeps the whole scene visible inside the cap --
+   never cropped -- so the mask overlay still lines up with what is shown. */
+#m-body .hero {
+  width: 100%; max-height: 340px; object-fit: contain; object-position: center;
+  border-radius: var(--r); display: block; background: var(--surface-2);
+}
 .mgrid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
 .kv { display: grid; grid-template-columns: auto 1fr; gap: 4px 14px; font-size: 11.5px; align-items: baseline; }
 .kv dt { color: var(--ink-3); }

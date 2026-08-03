@@ -5,11 +5,39 @@ Compare predicted segmentation masks across training runs, sample by sample.
 ```bash
 python -m viz2                 # http://127.0.0.1:8503
 python -m viz2 --port 9000 --experiment experiments/experiment-25 --runs runs
+python -m viz2 --experiment experiments/31_07_2026_gastronorm_exp1 --mask 30x30
 ```
 
-Startup is ~0.5 s. No inference runs: ground-truth masks are read from
-`samples/<id>/image/05_downsampled_smask_20h_40w.npy` and predictions from the
-`.pt` files the `OutputSaver` callback already wrote during training.
+Startup is ~0.5 s. No inference runs: ground-truth masks are read from the per-sample
+`.npy` on disk and predictions from the `.pt` files the `OutputSaver` callback already
+wrote during training.
+
+## Dataset layouts
+
+Sample directories are not laid out the same way across experiments, so the filenames
+are detected at startup rather than hardcoded — the banner prints which layout won.
+
+| | `experiment-25` | `gastronorm` |
+|---|---|---|
+| image dir | `image/` | `images/` |
+| GT mask | `05_downsampled_smask_{H}h_{W}w.npy` | `04_downsampled_smask_{H}h_{W}w.npy` |
+| backdrop | `01_cropped.png` | `02_cropped_overhead.png` |
+| overhead | `05_overhead_speaker.png` | *(none — falls back to the crop)* |
+| audio | `audio.wav` + `recovered_audio.wav` | `recovered_audio.wav` only |
+| scene id | `output_id` | `position_id` |
+| `avg_com` | JSON list | `str(ndarray)`, e.g. `"[603.1 901.2]"` |
+
+Add a new format by appending an entry to `LAYOUTS` in `config.py`.
+
+**Sample ids are not row indices.** The gastronorm dataset starts at `000009`, and any
+dataset can be missing a sample whose mask was never written, so every id → row lookup
+goes through `GtIndex.row_of`.
+
+**`--mask HxW`** picks the target grid. A dataset may ship several sizes side by side
+(gastronorm has both `20x40` and `30x30`); viz2 uses the only size on disk when there is
+one, otherwise defaults to `20x40` and says so. Runs trained on a different size are
+listed as incompatible, with the shape mismatch as the reason — so if a run you expect is
+missing, check the mask size first.
 
 ## Layout
 

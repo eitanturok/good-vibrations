@@ -31,32 +31,71 @@ def merge_metadata(path: Path) -> dict:
     return {k: v for k, v in meta.items() if k not in config.STALE_METADATA_KEYS}
 
 
+def parse_com(v) -> list[float]:
+    """A center of mass as [y, x], from any of the shapes metadata.jsonl stores it in.
+
+    experiment-25 writes a JSON list. The gastronorm pipeline writes `str(ndarray)` --
+    "[603.12363008 901.16480443]" -- which is whitespace-separated and NOT valid JSON, so
+    it arrives here as a plain string. Returning the [-1,-1] "no position" sentinel on
+    anything unparseable keeps a malformed record from taking down the whole load.
+    """
+    if isinstance(v, str):
+        v = v.replace("[", " ").replace("]", " ").replace(",", " ").split()
+    if isinstance(v, (list, tuple)):
+        try:
+            flat = np.asarray(v, dtype=np.float64).reshape(-1)
+        except (ValueError, TypeError):
+            return [-1.0, -1.0]
+        if flat.size >= 2:
+            return [float(flat[0]), float(flat[1])]
+    return [-1.0, -1.0]
+
+
 @dataclass
 class GtIndex:
-    sample_ids: list[str]        # zero-padded "000000".. , index == int(sample_id)
+    sample_ids: list[str]        # zero-padded "000000"..; ids need NOT start at 0
     masks: np.ndarray            # (N,20,40) float32, contiguous
     meta: list[dict]
     com_gt: np.ndarray           # (N,2) grid-space COM of the target mask
     avg_com: np.ndarray          # (N,2) full-res image coords, for the position scatter
+    layout: config.Layout        # which per-sample filenames this experiment uses
+    # sample id -> row. Ids are NOT an identity map into the arrays: the gastronorm
+    # dataset starts at 000009, and any dataset can be missing a sample whose mask was
+    # never written. Every id->row lookup must go through this.
+    row_of: dict[int, int] = field(default_factory=dict)
 
     def __len__(self) -> int:
         return len(self.sample_ids)
 
 
 def load_gt(experiment_dir: Path) -> GtIndex:
-    sample_dirs = sorted((experiment_dir / "samples").iterdir())
+    samples_dir = experiment_dir / "samples"
+    layout = config.Layout.detect(samples_dir)
+    sample_dirs = sorted(p for p in samples_dir.iterdir() if p.is_dir())
     ids, masks, meta = [], [], []
     for d in sample_dirs:
-        gt = d / config.GT_MASK_REL
+        gt = d / layout.gt_mask
         if not gt.exists():
             continue
+        m = np.load(gt)
+        # A dataset can carry masks at several downsample sizes side by side (gastronorm
+        # writes both 20x40 and 30x30). Only the configured target shape is loadable as
+        # ground truth; a mismatch would otherwise fail deep inside np.stack.
+        if m.shape != (config.MASK_H, config.MASK_W):
+            continue
         ids.append(d.name)
-        masks.append(np.load(gt))
+        masks.append(m)
         meta.append(merge_metadata(d / "metadata.jsonl"))
+    if not masks:
+        raise SystemExit(
+            f"[viz2] no {config.MASK_H}x{config.MASK_W} ground-truth masks under "
+            f"{samples_dir} (layout '{layout.name}', expected {layout.gt_mask})."
+        )
     masks = np.ascontiguousarray(np.stack(masks).astype(np.float32))
     com_gt = np.asarray(center_of_mass(masks), dtype=np.float64)
-    avg_com = np.asarray([m.get("avg_com", [-1.0, -1.0]) for m in meta], dtype=np.float64)
-    return GtIndex(ids, masks, meta, com_gt, avg_com)
+    avg_com = np.asarray([parse_com(m.get("avg_com")) for m in meta], dtype=np.float64)
+    row_of = {int(s): i for i, s in enumerate(ids)}
+    return GtIndex(ids, masks, meta, com_gt, avg_com, layout, row_of)
 
 
 # ***** run scanning *****
@@ -165,8 +204,13 @@ def _probe(files: list[Path]) -> tuple[dict | None, str | None]:
             mask, info = obj.get("mask_pred"), obj.get("info") or {}
             # Keep only the few facts classification needs; holding the tensors would
             # pin hundreds of MB across every scanned run for no benefit.
+            sid = info.get("sample_id")
             result = ({"shape": tuple(mask.shape[-2:]) if mask is not None else None,
-                       "info_keys": set(info)}, None)
+                       "info_keys": set(info),
+                       # A few ids are enough to tell which dataset a run was trained on
+                       # when its split names carry no whitelist.
+                       "sample_ids": _as_int_array(sid).tolist() if sid is not None else []},
+                      None)
             break
         except Exception:
             continue
@@ -174,7 +218,7 @@ def _probe(files: list[Path]) -> tuple[dict | None, str | None]:
     return result
 
 
-def _classify(name: str, run_dir: Path) -> RunEntry:
+def _classify(name: str, run_dir: Path, gt: GtIndex) -> RunEntry:
     outputs = run_dir / config.OUTPUTS_SUBDIR
     if not outputs.is_dir():
         return RunEntry(name, False, "no outputs_history/ (older run format)")
@@ -200,24 +244,37 @@ def _classify(name: str, run_dir: Path) -> RunEntry:
     splits = [p.name for p in _eval_dirs(outputs)]
 
     # Sample ids collide across experiments, so a run from another dataset would join
-    # cleanly against experiment-25 ground truth and produce silently wrong metrics.
-    if splits and not set(splits) <= config.EXP25_EVAL_SPLITS:
-        preview = ", ".join(splits[:3])
-        return RunEntry(name, False, f"different dataset (eval splits: {preview})", eval_splits=splits)
+    # cleanly against the loaded ground truth and produce silently wrong metrics.
+    # Where the layout declares its split names, that is the strongest available signal.
+    allowed = config.EVAL_SPLITS.get(gt.layout.name)
+    if allowed is not None:
+        if splits and not set(splits) <= allowed:
+            preview = ", ".join(splits[:3])
+            return RunEntry(name, False, f"different dataset (eval splits: {preview})",
+                            eval_splits=splits)
+    else:
+        # No whitelist for this layout: fall back to requiring that EVERY sample id in
+        # the probe exists here. Weaker than matching split names -- two datasets with
+        # overlapping id ranges still pass -- so it is a backstop for a not-yet-declared
+        # layout, not a substitute for adding one to config.EVAL_SPLITS.
+        probe_ids = obj["sample_ids"]
+        if probe_ids and not all(int(s) in gt.row_of for s in probe_ids):
+            return RunEntry(name, False, "different dataset (sample ids not in this dataset)",
+                            eval_splits=splits)
 
-    family = "experiment-25" if splits else "unknown"
+    family = gt.layout.name if splits else "unknown"
     # Recency comes from the highest-epoch file rather than a stat() of every .pt: epochs
     # are written in order, so it ranks runs identically at a fraction of the cost.
     newest = files[0]
     return RunEntry(name, True, None, newest.stat().st_mtime, _epoch_of(newest), splits, family)
 
 
-def scan_runs(runs_dir: Path) -> list[RunEntry]:
+def scan_runs(runs_dir: Path, gt: GtIndex) -> list[RunEntry]:
     entries = []
     for d in sorted(runs_dir.iterdir()):
         if not d.is_dir():
             continue
-        e = _classify(d.name, d)
+        e = _classify(d.name, d, gt)
         e.status = run_status(d)      # status is useful even for runs we can't compare
         entries.append(e)
     entries.sort(key=lambda e: (not e.compatible, -e.mtime, e.name))
@@ -390,8 +447,24 @@ def load_run(name: str, runs_dir: Path, gt: GtIndex, family: str = "unknown",
         sample_ids, preds = sample_ids[keep], preds[keep]
         splits = [s for s, k in zip(splits, keep) if k]
 
+    # Sample ids are not row indices into the ground truth (gastronorm starts at 000009,
+    # and any dataset may be missing a sample). Map through gt.row_of, and drop
+    # predictions for samples this dataset has no target for rather than indexing
+    # something arbitrary -- a stray id would otherwise be scored against a real but
+    # unrelated mask.
+    gt_rows = np.array([gt.row_of.get(int(s), -1) for s in sample_ids], dtype=np.int64)
+    if (gt_rows < 0).any():
+        keep = gt_rows >= 0
+        sample_ids, preds, gt_rows = sample_ids[keep], preds[keep], gt_rows[keep]
+        splits = [s for s, k in zip(splits, keep) if k]
+
+    if len(sample_ids) == 0:
+        empty_f = np.zeros(0, dtype=np.float64)
+        return RunData(name, epoch, sample_ids, preds, splits, empty_f, empty_f,
+                       empty_f, np.zeros((0, 2)), {}, skipped, family)
+
     pred = torch.from_numpy(preds)
-    truth = torch.from_numpy(gt.masks[sample_ids])
+    truth = torch.from_numpy(gt.masks[gt_rows])
 
     # mask_pred is already sigmoid probabilities -- do not re-sigmoid.
     mse = (pred - truth).square().mean(dim=(-2, -1)).numpy()
@@ -429,13 +502,14 @@ class Registry:
         self._runs: dict[tuple[str, int | None], RunData] = {}
         n_ok = sum(e.compatible for e in self.entries)
         self.startup_s = time.perf_counter() - t0
-        print(f"[viz2] {len(self.gt)} samples | {n_ok} compatible / "
+        print(f"[viz2] {experiment_dir.name} | layout '{self.gt.layout.name}' | "
+              f"{len(self.gt)} samples | {n_ok} compatible / "
               f"{len(self.entries) - n_ok} incompatible runs | {self.startup_s:.2f}s")
 
     def rescan(self) -> None:
         """Re-read the runs directory so runs that finish while viz2 is open show up
         without a restart. Costs ~0.15s, and only probes one file per run."""
-        self.entries = scan_runs(self.runs_dir)
+        self.entries = scan_runs(self.runs_dir, self.gt)
         self.by_name = {e.name: e for e in self.entries}
         self._scanned_at = time.monotonic()
 
@@ -471,12 +545,26 @@ class Registry:
         return run_epochs(name, self.runs_dir)
 
     def sample_index(self, sid) -> int:
-        """Validate an untrusted sample id: coerced to int and range-checked so no
-        user string ever reaches a filesystem join."""
-        i = int(sid)
-        if not 0 <= i < len(self.gt):
+        """Row for an untrusted sample id.
+
+        Coerced to int and resolved through the id->row map, so no user string ever
+        reaches a filesystem join. This is a LOOKUP, not a range check: ids do not start
+        at zero on every dataset, so treating the id as the row silently served the wrong
+        sample's mask and images.
+        """
+        i = self.gt.row_of.get(int(sid))
+        if i is None:
             raise KeyError(sid)
         return i
 
-    def sample_dir(self, sid) -> Path:
-        return self.experiment_dir / "samples" / self.gt.sample_ids[self.sample_index(sid)]
+    def sample_dir(self, row: int) -> Path:
+        """Directory for a ROW (what sample_index returns), not a sample id.
+
+        Every caller already holds a row from _sid()/sample_index. Taking an id here and
+        re-resolving it worked only while row == int(id); on a dataset whose ids start
+        anywhere but zero it silently served a different sample's images. The name comes
+        off gt.sample_ids, so nothing user-supplied reaches the join.
+        """
+        if not 0 <= int(row) < len(self.gt):
+            raise KeyError(row)
+        return self.experiment_dir / "samples" / self.gt.sample_ids[int(row)]

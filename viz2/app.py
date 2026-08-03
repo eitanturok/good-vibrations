@@ -83,7 +83,9 @@ def api_samples():
         out.append({
             "i": i,
             "sample_id": sid,
-            "output_id": m.get("output_id"),
+            # position_id is the gastronorm spelling of output_id: the scene identity
+            # shared by the 8 samples that differ only in which speaker played.
+            "output_id": m.get("output_id") or m.get("position_id"),
             "layout": m.get("layout"),
             "n_objects": m.get("n_objects"),
             # Object types present, independent of layout: lets the UI ask "contains a
@@ -195,7 +197,7 @@ def api_values(sid: int, run: str = "", mode: str = "pred"):
 
 @app.get("/api/overhead/{sid}.png")
 def api_overhead(sid: int):
-    p = registry.sample_dir(_sid(sid)) / config.OVERHEAD_REL
+    p = registry.sample_dir(_sid(sid)) / registry.gt.layout.overhead
     if not p.exists():
         raise HTTPException(404, "no overhead image")
     return FileResponse(p, media_type="image/png", headers=IMMUTABLE)
@@ -214,8 +216,10 @@ def api_vibration(sid: int, which: str):
 
 @app.get("/api/audio/{sid}/{which}")
 def api_audio(sid: int, which: str):
-    rel = config.AUDIO_REL.get(which)
+    rel = registry.gt.layout.audio.get(which)
     if rel is None:
+        # Either an unknown name or a track this layout never produces (the gastronorm
+        # captures ship no source audio, only the recovered waveform).
         raise HTTPException(404, "unknown audio")
     p = registry.sample_dir(_sid(sid)) / rel
     if not p.exists():
@@ -298,13 +302,26 @@ def api_neighbors(run: str, sid: int, k: int = 5):
     order = [j for j in order if not np.isnan(d[j])]
     k = max(1, min(int(k), 25))
 
+    def position_key(m: dict):
+        """What identifies a physical scene, independent of which speaker played.
+
+        experiment-25 calls it output_id, the gastronorm captures call it position_id.
+        Falling back to the sample id when neither is present keeps every candidate
+        distinct -- a key of None for every sample would otherwise collapse the whole
+        list to a single entry rather than merely failing to dedupe.
+        """
+        for key in ("output_id", "position_id"):
+            if m.get(key) is not None:
+                return (key, m[key])
+        return ("sample_id", m.get("sample_id"))
+
     def distinct(seq):
-        """One entry per physical position: 8 samples share each output_id (one per
+        """One entry per physical position: 8 samples share each position (one per
         speaker) with identical ground-truth COM, so without this every slot in the list
         would be the same scene repeated."""
         seen, out = set(), []
         for j in seq:
-            key = gt.meta[j].get("output_id")
+            key = position_key(gt.meta[j])
             if key in seen:
                 continue
             seen.add(key)
@@ -316,7 +333,8 @@ def api_neighbors(run: str, sid: int, k: int = 5):
     def pack(idx):
         m = gt.meta[idx]
         return {"i": int(idx), "sample_id": gt.sample_ids[idx],
-                "output_id": m.get("output_id"), "speaker": m.get("speaker"),
+                "output_id": m.get("output_id") or m.get("position_id"),
+                "speaker": m.get("speaker"),
                 "layout": m.get("layout"), "n_objects": m.get("n_objects"),
                 "com": [_clean(gt.com_gt[idx][0]), _clean(gt.com_gt[idx][1])],
                 "distance": _clean(d[idx])}
@@ -334,14 +352,24 @@ def api_detail(sid: int):
     i = _sid(sid)
     m = registry.gt.meta[i]
     d = registry.sample_dir(i)
-    keys = ["sample_id", "output_id", "description", "layout", "n_objects", "objects",
-            "coms", "avg_com", "box", "is_empty_box", "speaker", "min_freq", "max_freq",
-            "n_lasers", "fps", "n_capture_seconds"]
+    # Union of both eras' metadata: experiment-25 writes output_id/n_lasers, the
+    # gastronorm captures write position_id/laser_idx/timestamp/n_rows/n_cols. Missing
+    # keys come back null and the modal omits them, so one list serves both.
+    keys = ["sample_id", "output_id", "position_id", "description", "layout",
+            "n_objects", "objects", "coms", "avg_com", "box", "is_empty_box", "speaker",
+            "min_freq", "max_freq", "n_lasers", "n_rows", "n_cols", "laser_idx",
+            "fps", "n_capture_seconds", "timestamp"]
     out = {k: m.get(k) for k in keys}
+    # coms/avg_com are numpy reprs on the gastronorm layout; normalise the one the UI
+    # actually plots so the modal never prints a raw "[603.1 901.2]" string.
+    out["avg_com"] = data.parse_com(m.get("avg_com"))
     out["com_gt_grid"] = [_clean(registry.gt.com_gt[i][0]), _clean(registry.gt.com_gt[i][1])]
+    audio = registry.gt.layout.audio
     out["has"] = {
-        "original": (d / config.AUDIO_REL["original"]).exists(),
-        "recovered": (d / config.AUDIO_REL["recovered"]).exists(),
+        # A track the layout does not define is simply absent, so the modal hides it
+        # rather than offering a control that 404s.
+        "original": bool(audio.get("original")) and (d / audio["original"]).exists(),
+        "recovered": bool(audio.get("recovered")) and (d / audio["recovered"]).exists(),
         "spectrogram": bool(list(d.glob(config.VIBRATION_GLOB["spectrogram"]))),
         "fft": bool(list(d.glob(config.VIBRATION_GLOB["fft"]))),
     }
