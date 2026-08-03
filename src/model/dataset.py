@@ -26,12 +26,12 @@ def should_augment(p: float) -> bool:
 
 #***** 0 collect samples *****
 
-REQUIRED_FILES = ["image/03_smask.npy", "vibration/03_fft.npz", "metadata.jsonl"]
+REQUIRED_FILES = ["image/03_smask.npy", "vibration/04_fft.npz", "metadata.jsonl"]
 
 def precomputed_fft_name(signal_mode: str, normalize_mode: str, patch_size: int, subtract_speaker_mean: bool) -> str:
     # the speaker mean is baked into the precomputed array, so it has to be part of the filename
     suffix = "_spkmean" if subtract_speaker_mean else ""
-    return f"vibration/04_precomputed_fft_{signal_mode}_{normalize_mode}_{patch_size}{suffix}.npy"
+    return f"vibration/05_precomputed_fft_{signal_mode}_{normalize_mode}_{patch_size}{suffix}.npy"
 
 def mds_columns(augment_fft: bool) -> dict[str, str]:
     x_dtype = "complex64" if augment_fft else "float32"  # raw fft is complex; precomputed signal is real
@@ -79,7 +79,7 @@ def convert_to_mds(mds_dir: Path, samples: list[tuple[Path, dict]], out_h: int, 
     def load_X(sample_dir: Path) -> np.ndarray:
         if not augment_fft:
             return np.load(sample_dir / precomputed_fft_name(signal_mode, normalize_mode, patch_size, subtract_speaker_mean))
-        X = np.load(sample_dir / "vibration/03_fft.npz")["fft"]  # (1, L, F, C) complex64
+        X = np.load(sample_dir / "vibration/04_fft.npz")["fft"]  # (1, L, F, C) complex64
         return np.squeeze(X, axis=0) if X.ndim == 4 and X.shape[0] == 1 else X
 
     x_shape, y_shape = load_X(samples[0][0]).shape, (out_h, out_w)  # y: downsampled (out_h,out_w) mask
@@ -116,7 +116,7 @@ def convert_to_mds(mds_dir: Path, samples: list[tuple[Path, dict]], out_h: int, 
         os.chdir(cwd)
 
     # freqs is identical across every sample (same fft grid) -- one sidecar, not duplicated per-row
-    freqs = np.load(samples[0][0] / "vibration/03_fft.npz")["freqs"]
+    freqs = np.load(samples[0][0] / "vibration/04_fft.npz")["freqs"]
     np.save(mds_dir / "freqs.npy", freqs)
 
     # save metadata as a sidecar for loader-side filtering
@@ -139,7 +139,7 @@ def downsample_samples(samples: list[tuple[Path, dict]], out_h: int, out_w: int,
     build_dataset's hashed mds_dir doesn't already exist, so no per-sample cache check here."""
     for sample_dir, _ in tqdm(samples, desc="downsampling masks", disable=not verbose):
         out_path = sample_dir / f"image/04_downsampled_smask_{out_h}h_{out_w}w"
-        mask = downsample_mask(Image.open(sample_dir / "image/03_smask.png"), out_h, out_w)
+        mask = downsample_mask(Image.open(sample_dir / "image/04_smask.png"), out_h, out_w)
         Image.fromarray((mask * 255).astype(np.uint8)).save(out_path.with_suffix(".png"))
         np.save(out_path.with_suffix(".npy"), mask)
 

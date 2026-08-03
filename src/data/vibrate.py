@@ -155,7 +155,7 @@ def _process_vibrations(sample_dir:Path, raw_vibrations:np.ndarray=None, min_fre
     sample_id = sample_dir.name
     metadata = {k: v for d in load(sample_dir / 'metadata.jsonl') for k, v in d.items()}
     fps, rois = int(metadata['fps']), metadata['roi']
-    raw_vibration_path, raw_shifts_path = sample_dir / 'vibration/00_raw_vibrations.npy', sample_dir / 'vibration/01_raw_shifts.npy'
+    raw_vibration_path, raw_shifts_path = sample_dir / 'vibration/00_raw_vibrations.npy', sample_dir / 'vibration/02_raw_shifts.npy'
 
     # laser_idx=None -> pclk over all lasers, recover the default laser below; a specific
     # laser_idx -> only that laser is ever computed, so it's also the one recovered
@@ -193,20 +193,20 @@ def _process_vibrations(sample_dir:Path, raw_vibrations:np.ndarray=None, min_fre
     with Timing(f"[sample {sample_id}] clean shifts: ", enabled=verbose >= 2):
         clean_shifts = get_clean_shifts(raw_shifts[None], fps, min_freq, max_freq)  # (L,T,2) -> (B,L,T,2)
         logger.debug(f'[sample {sample_id}] {clean_shifts.shape=}=(batch, lasers, frames, x/y)')
-        save(clean_shifts, sample_dir / 'vibration/02_clean_shifts.npy', do_save)
+        save(clean_shifts, sample_dir / 'vibration/03_clean_shifts.npy', do_save)
         append({"clean_shifts": datetime.now(timezone.utc).isoformat()}, sample_dir / "times.jsonl", do_save)
 
     # fft the shifts
     with Timing(f"[sample {sample_id}] fft shifts: ", enabled=verbose >= 2):
         fft, freqs, n_samples = get_fft_shifts(clean_shifts, fps, min_freq, max_freq) # (B,L,T,2) -> (B,L,F,2), (F,) (,)
         logger.debug(f'[sample {sample_id}] {fft.shape=}=(batch, lasers, freq bins, x/y)\n[sample {sample_id}] {freqs.shape=}=(freq bins)\n[sample {sample_id}] {n_samples=}')
-        save({'fft': fft, 'freqs': freqs, 'n_samples': n_samples}, sample_dir / 'vibration/03_fft.npz', do_save)
-        plot_fft(freqs, fft[0, 0 if laser_idx is not None else recovered_laser, :, xy_idx], sample_dir / f'vibration/03_fft{file_suffix}.png',
+        save({'fft': fft, 'freqs': freqs, 'n_samples': n_samples}, sample_dir / 'vibration/04_fft.npz', do_save)
+        plot_fft(freqs, fft[0, 0 if laser_idx is not None else recovered_laser, :, xy_idx], sample_dir / f'vibration/04_fft{file_suffix}.png',
                  title=f'Recovered FFT, Laser {recovered_laser}, {axis_label}-axis', max_freq=max_freq, enabled=do_save)
         append({"fft_shifts": datetime.now(timezone.utc).isoformat()}, sample_dir / "times.jsonl", do_save)
 
     # recover audio from fft
-    audio_path = sample_dir / f'vibration/04_recovered_audio{file_suffix}.wav'
+    audio_path = sample_dir / f'vibration/05_recovered_audio{file_suffix}.wav'
     with Timing(f"[sample {sample_id}] recover audio: ", enabled=verbose >= 2):
         recovered_audio = get_recovered_audio(fft, n_samples, fps, audio_sample_rate, min_freq, max_freq, laser_idx=(0 if laser_idx is not None else recovered_laser), xy_idx=xy_idx)
         save((recovered_audio, audio_sample_rate), audio_path, do_save)
@@ -217,15 +217,15 @@ def _process_vibrations(sample_dir:Path, raw_vibrations:np.ndarray=None, min_fre
     with Timing(f"[sample {sample_id}] spectrogram: ", enabled=verbose >= 2):
         spec_freqs, spec_times, Sxx = get_spectrogram(recovered_audio, audio_sample_rate)
         logger.debug(f'[sample {sample_id}] {Sxx.shape=}=(freq bins, time bins)')
-        save({'freqs': spec_freqs, 'times': spec_times, 'Sxx': Sxx}, sample_dir / f'vibration/05_spectrogram{file_suffix}.npz', do_save)
+        save({'freqs': spec_freqs, 'times': spec_times, 'Sxx': Sxx}, sample_dir / f'vibration/06_spectrogram{file_suffix}.npz', do_save)
 
         audio_name = (sample_dir / 'audio.wav').resolve().parent.name  # e.g. chirp_50_1000_3.0sec, via the symlink to audio_dir
         spec_label = f'Recovered {audio_name} Spectrogram: {{duration}}s, Laser {recovered_laser}, {axis_label}-axis'
-        plot_spectrogram(spec_freqs, spec_times, Sxx, sample_dir / f'vibration/05_spectrogram{file_suffix}.png', label=spec_label, max_freq=max_freq, enabled=do_save)
+        plot_spectrogram(spec_freqs, spec_times, Sxx, sample_dir / f'vibration/06_spectrogram{file_suffix}.png', label=spec_label, max_freq=max_freq, enabled=do_save)
         append({"spectrogram": datetime.now(timezone.utc).isoformat()}, sample_dir / "times.jsonl", do_save)
 
         if spectrogram_video:
-            make_spectrogram_video(spec_freqs, spec_times, Sxx, recovered_audio, audio_sample_rate, sample_dir / f'vibration/05_spectrogram{file_suffix}.mp4', label=spec_label, max_freq=max_freq, enabled=do_save)
+            make_spectrogram_video(spec_freqs, spec_times, Sxx, recovered_audio, audio_sample_rate, sample_dir / f'vibration/06_spectrogram{file_suffix}.mp4', label=spec_label, max_freq=max_freq, enabled=do_save)
             append({"spectrogram_video": datetime.now(timezone.utc).isoformat()}, sample_dir / "times.jsonl", do_save)
 
     # update tracking
@@ -265,7 +265,7 @@ def _process_vibrations_modal(sample_dir_name: str, **kwargs):
     _process_vibrations(VOLUME_PATH / sample_dir_name, **kwargs)
     volume.commit()
 
-PROCESSED_FILES = ["01_raw_shifts.npy", "02_clean_shifts.npy", "03_fft.npz"]
+PROCESSED_FILES = ["02_raw_shifts.npy", "03_clean_shifts.npy", "04_fft.npz"]
 
 def process_vibrations(sample_dir:Path, raw_vibrations:np.ndarray=None, use_modal:bool=False, pclk_mode:str='batched_optimized', pclk_batch_size:int=256, do_save:bool=True, verbose:int=1, cleanup_raw_vibrations:str|None=None, spectrogram_video:bool=True, laser_idx:int|None=None, xy_idx:int=0, use_PC:bool=True):
     sample_id = sample_dir.name
@@ -289,19 +289,19 @@ def process_vibrations(sample_dir:Path, raw_vibrations:np.ndarray=None, use_moda
     recovered_laser = laser_idx if laser_idx is not None else DEFAULT_RECOVERY_LASER_IDX
     axis_label = 'x' if xy_idx == 0 else 'y'
     file_suffix = f'_laser{recovered_laser}_{axis_label}'
-    vibration_files = PROCESSED_FILES + [f'03_fft{file_suffix}.png', f'04_recovered_audio{file_suffix}.wav', f'05_spectrogram{file_suffix}.npz', f'05_spectrogram{file_suffix}.png'] + ([f'05_spectrogram{file_suffix}.mp4'] if spectrogram_video else [])
+    vibration_files = PROCESSED_FILES + [f'04_fft{file_suffix}.png', f'05_recovered_audio{file_suffix}.wav', f'06_spectrogram{file_suffix}.npz', f'06_spectrogram{file_suffix}.png'] + ([f'06_spectrogram{file_suffix}.mp4'] if spectrogram_video else [])
     with Timing(f'[sample {sample_id}] download processed vibrations modal_volume->DISK::{sample_dir}: ', enabled=verbose >= 1):
         for f in vibration_files: modal_download(volume, f"{sample_dir.name}/vibration/{f}", sample_dir / f"vibration/{f}")
-        fix_symlinks(sample_dir, [("recovered_audio.wav", f"vibration/04_recovered_audio{file_suffix}.wav")])
+        fix_symlinks(sample_dir, [("recovered_audio.wav", f"vibration/05_recovered_audio{file_suffix}.wav")])
         append({"modal_upload": upload_timestamp}, sample_dir / "times.jsonl", do_save)
         append({"modal_download": datetime.now(timezone.utc).isoformat()}, sample_dir / "times.jsonl", do_save)
 
     # TODO: doesn't modal remote return this dictionary already? out = f.remote() ?
     # TODO: can we read in these values from sample_dir? Do we really need process_vbrations to return them?
     # same return contract as the local path, loaded from the files we just downloaded
-    fft_data = load(sample_dir / 'vibration/03_fft.npz')
-    recovered_audio, audio_sample_rate = load(sample_dir / f'vibration/04_recovered_audio{file_suffix}.wav')
-    spec_freqs, spec_times, Sxx = load(sample_dir / f'vibration/05_spectrogram{file_suffix}.npz', keys=['freqs', 'times', 'Sxx'])
+    fft_data = load(sample_dir / 'vibration/04_fft.npz')
+    recovered_audio, audio_sample_rate = load(sample_dir / f'vibration/05_recovered_audio{file_suffix}.wav')
+    spec_freqs, spec_times, Sxx = load(sample_dir / f'vibration/06_spectrogram{file_suffix}.npz', keys=['freqs', 'times', 'Sxx'])
     return {'fft': fft_data['fft'], 'freqs': fft_data['freqs'], 'n_samples': fft_data['n_samples'], 'recovered_audio': recovered_audio,
             'audio_sample_rate': audio_sample_rate, 'spec_freqs': spec_freqs, 'spec_times': spec_times, 'Sxx': Sxx, 'max_freq': MAX_FREQ,
             'laser_idx': recovered_laser, 'xy_idx': xy_idx}
@@ -412,22 +412,22 @@ def process_vibrations_3(sample_dir, raw_vibrations, pclk_batch_size, pclk_laser
     file_suffix = f'_laser{recovery_laser}_{axis_label}'
 
     # clean shifts
-    save(clean_shifts, sample_dir / 'vibration/02_clean_shifts.npy', do_save)
+    save(clean_shifts, sample_dir / 'vibration/03_clean_shifts.npy', do_save)
 
     # fft
-    save({'fft': fft, 'freqs': freqs, 'n_samples': n_samples}, sample_dir / f'vibration/03_fft{file_suffix}.npz', do_save)
-    plot_fft(freqs, fft[0, recovery_laser, :, recovery_xy], sample_dir / f'vibration/03_fft{file_suffix}.png', title=f'Recovered FFT, Laser {recovery_laser}, {axis_label}-axis', max_freq=max_freq, enabled=do_save)
+    save({'fft': fft, 'freqs': freqs, 'n_samples': n_samples}, sample_dir / f'vibration/04_fft{file_suffix}.npz', do_save)
+    plot_fft(freqs, fft[0, recovery_laser, :, recovery_xy], sample_dir / f'vibration/04_fft{file_suffix}.png', title=f'Recovered FFT, Laser {recovery_laser}, {axis_label}-axis', max_freq=max_freq, enabled=do_save)
 
     # recovered audio
-    audio_path = sample_dir / f'vibration/04_recovered_audio{file_suffix}.wav'
+    audio_path = sample_dir / f'vibration/05_recovered_audio{file_suffix}.wav'
     save((recovered_audio, audio_sample_rate), audio_path, do_save)
     symlink(audio_path, sample_dir / 'recovered_audio.wav', do_save)
 
     # spectogram
     audio_name = (sample_dir / 'audio.wav').resolve().parent.name
     spec_label = f'Recovered {audio_name} Spectrogram: {{duration}}s, Laser {recovery_laser}, {axis_label}-axis'
-    save({'freqs': spec_freqs, 'times': spec_times, 'Sxx': Sxx}, sample_dir / f'vibration/05_spectrogram{file_suffix}.npz', do_save)
-    plot_spectrogram(spec_freqs, spec_times, Sxx, sample_dir / f'vibration/05_spectrogram{file_suffix}.png', label=spec_label, max_freq=max_freq, enabled=do_save)
-    if do_save >= 2: make_spectrogram_video(spec_freqs, spec_times, Sxx, recovered_audio, audio_sample_rate, sample_dir / f'vibration/05_spectrogram{file_suffix}.mp4', label=spec_label, max_freq=max_freq, enabled=do_save)
+    save({'freqs': spec_freqs, 'times': spec_times, 'Sxx': Sxx}, sample_dir / f'vibration/06_spectrogram{file_suffix}.npz', do_save)
+    plot_spectrogram(spec_freqs, spec_times, Sxx, sample_dir / f'vibration/06_spectrogram{file_suffix}.png', label=spec_label, max_freq=max_freq, enabled=do_save)
+    if do_save >= 2: make_spectrogram_video(spec_freqs, spec_times, Sxx, recovered_audio, audio_sample_rate, sample_dir / f'vibration/06_spectrogram{file_suffix}.mp4', label=spec_label, max_freq=max_freq, enabled=do_save)
 
     return ret
