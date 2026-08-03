@@ -26,7 +26,7 @@ def should_augment(p: float) -> bool:
 
 #***** 0 collect samples *****
 
-REQUIRED_FILES = ["images/03_smask.npy", "vibration/03_fft.npz", "metadata.jsonl"]
+REQUIRED_FILES = ["image/03_smask.npy", "vibration/03_fft.npz", "metadata.jsonl"]
 
 def precomputed_fft_name(signal_mode: str, normalize_mode: str, patch_size: int, subtract_speaker_mean: bool) -> str:
     # the speaker mean is baked into the precomputed array, so it has to be part of the filename
@@ -36,7 +36,7 @@ def precomputed_fft_name(signal_mode: str, normalize_mode: str, patch_size: int,
 def mds_columns(augment_fft: bool) -> dict[str, str]:
     x_dtype = "complex64" if augment_fft else "float32"  # raw fft is complex; precomputed signal is real
     return {"X": f"ndarray:{x_dtype}", "y": "ndarray:float32",
-            "sample_id": "int", "output_id": "int",
+            "sample_id": "int", "position_id": "int",
             "n_objects": "int", "speaker": "int", "box": "str", "is_empty_box": "int", "object": "str",
             "downsampled_com_x": "float64", "downsampled_com_y": "float64"}
 
@@ -96,13 +96,13 @@ def convert_to_mds(mds_dir: Path, samples: list[tuple[Path, dict]], out_h: int, 
                 X = load_X(sample_dir)
                 assert X.shape == x_shape, f"{sample_dir.name}: X.shape={X.shape} != {x_shape}"
 
-                y = np.load(sample_dir / f"images/04_downsampled_smask_{out_h}h_{out_w}w.npy")  # precomputed by downsample_samples
+                y = np.load(sample_dir / f"image/04_downsampled_smask_{out_h}h_{out_w}w.npy")  # precomputed by downsample_samples
                 assert y.shape == y_shape, f"{sample_dir.name}: y.shape={y.shape} != {y_shape}"
 
                 com = meta.get("downsampled_com", [-1.0, -1.0])
                 sample = {
                     "X": X, "y": y,
-                    "sample_id": int(meta.get("sample_id", -1)), "output_id": int(meta.get("output_id", -1)),
+                    "sample_id": int(meta.get("sample_id", -1)), "position_id": int(meta.get('position_id', meta.get("output_id", -1))),
                     "n_objects": int(meta.get("n_objects", -1)),
                     "speaker": int(meta.get("speaker", -1)),
                     "box": str(meta.get("box", "")),
@@ -138,8 +138,8 @@ def downsample_samples(samples: list[tuple[Path, dict]], out_h: int, out_w: int,
     """Downsample every sample's full-resolution mask to (out_h, out_w). Only called when
     build_dataset's hashed mds_dir doesn't already exist, so no per-sample cache check here."""
     for sample_dir, _ in tqdm(samples, desc="downsampling masks", disable=not verbose):
-        out_path = sample_dir / f"images/04_downsampled_smask_{out_h}h_{out_w}w"
-        mask = downsample_mask(Image.open(sample_dir / "images/03_smask.png"), out_h, out_w)
+        out_path = sample_dir / f"image/04_downsampled_smask_{out_h}h_{out_w}w"
+        mask = downsample_mask(Image.open(sample_dir / "image/03_smask.png"), out_h, out_w)
         Image.fromarray((mask * 255).astype(np.uint8)).save(out_path.with_suffix(".png"))
         np.save(out_path.with_suffix(".npy"), mask)
 
@@ -215,10 +215,21 @@ def normalize_fft(x: torch.Tensor, normalize_mode: str) -> torch.Tensor:
     raise ValueError(f"Unknown normalize mode: {normalize_mode}")
 
 def tokenize(x: torch.Tensor, patch_size: int) -> torch.Tensor:
+    """(B,L,F,C) -> (B,L,P,patch_size,C), zero-padding F up to a whole number of patches.
+
+    Padding rather than truncating, because truncating silently dropped the top of the excitation
+    band: 211 of 1235 bins (838-1000Hz) on the gastronorm capture at patch_size=256.
+
+    No attention mask is needed for the padding. Rounding P up means the last patch is always
+    *partly* real (211/256 here), never pure padding, and FreqEncoder.embed collapses each whole
+    patch into one token before attention runs -- so the zeros are absorbed by a Linear that sees
+    them at fixed input positions, and attention only ever sees real tokens.
+    """
     if patch_size <= 0: return x
     B, L, F_, C = x.shape
-    P = F_ // patch_size
-    return x[:, :, :P * patch_size, :].reshape(B, L, P, patch_size, C)
+    P = (F_ + patch_size - 1) // patch_size
+    if pad := P * patch_size - F_: x = F.pad(x, (0, 0, 0, pad))  # (0,0) leaves C, (0,pad) grows F
+    return x.reshape(B, L, P, patch_size, C)
 
 def _hermit_poly(t: torch.Tensor) -> torch.Tensor:
     tt = t[None, :] ** torch.arange(4, device=t.device, dtype=t.dtype)[:, None]
@@ -305,7 +316,7 @@ class VibrationDataset(StreamingDataset):
         s = super().__getitem__(idx)
         X = torch.from_numpy(s.pop("X").copy()).unsqueeze(0).to(self.pk["device"])
         y = torch.from_numpy(s.pop("y").copy()).unsqueeze(0).to(self.pk["device"])
-        info = dict(sample_id=s["sample_id"], output_id=s["output_id"], n_objects=s["n_objects"], speaker=s["speaker"], box=s["box"], is_empty_box=s["is_empty_box"], x_com=s["downsampled_com_x"], y_com=s["downsampled_com_y"])
+        info = dict(sample_id=s["sample_id"], position_id=s["position_id"], n_objects=s["n_objects"], speaker=s["speaker"], box=s["box"], is_empty_box=s["is_empty_box"], x_com=s["downsampled_com_x"], y_com=s["downsampled_com_y"])
         speaker_mean = self.speaker_means[int(s["speaker"])].to(self.pk["device"]) if self.speaker_means is not None else None
         fft = X if self.pk["mds_precomputed_fft"] else process_vibration(X, self.pk["freqs"], self.pk["signal_mode"], self.pk["normalize_mode"], self.pk["patch_size"], augment=self.pk["augment_fft"], speaker_mean=speaker_mean)
         mask_true = process_image(y, self.pk["out_h"], self.pk["out_w"], augment=self.pk["augment_mask"])
@@ -466,7 +477,7 @@ def gastronorm(mds_path, test_size=0.2, seed=42, speakers=None, n_objects=None, 
 
     # make train
     splits = {}
-    splits['train'] = [i for i, row in enumerate(index) if row['layout'] in ['empty', 'purple--green-cube-grid1', 'purple--green-cube-grid2', 'purple--green-cube-grid3', 'x-shift', 'y-shift']]
+    splits['train'] = [i for i, row in enumerate(index) if row['layout'] in ['empty-box', 'purple--green-cube-grid1', 'purple--green-cube-grid2', 'purple--green-cube-grid3', 'x-shift', 'y-shift']]
     splits['train'] += one_cube_train + two_cubes_train
 
     # eval
@@ -481,9 +492,21 @@ def gastronorm(mds_path, test_size=0.2, seed=42, speakers=None, n_objects=None, 
         for label, idxs in splits.items(): print(f"{label}: {len(idxs)} samples")
     return splits
 
+def gastronorm_one_cube(mds_path, test_size=0.2, seed=42, speakers=None, n_objects=None, box=None, n_samples: int | None = None, verbose: int = 1, index: list[dict] | None = None):
+
+    if index is None:
+        lines = (Path(mds_path) / "metadata.jsonl").read_text().strip().splitlines()
+        index = [json.loads(line) for line in lines if line]
+
+    keep = [i for i, row in enumerate(index) if _matches(row, speakers, n_objects, box)]
+    if n_samples is not None: keep = keep[:n_samples]
+
+    one_cube_train, one_cube_eval = train_test_split([i for i, row in enumerate(index) if row['layout'] in ['purple-cube', 'empty-box']], test_size=0.2, random_state=seed, shuffle=True)
+    return {'train': one_cube_train, 'eval/1-cube': one_cube_eval}
+
 #***** 8 build dataloaders *****
 
-SPLIT_METHODS = {"exp25": exp25_split, "gastronorm": gastronorm}
+SPLIT_METHODS = {"exp25": exp25_split, "gastronorm": gastronorm, "gastronorm_one_cube": gastronorm_one_cube}
 
 def num_samples(batch): return batch["mask_true"].shape[0]
 

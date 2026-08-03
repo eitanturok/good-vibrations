@@ -207,7 +207,10 @@ def run(**kwargs):
 
     # read n_freqs, n_channels from the dataset
     _, n_patches, patch_size, n_channels = train_loader.dataloader.dataset[0]['fft'].shape  # (L,P,PS,C)
+    # tokenize() zero-pads the frequency axis, so n_patches * patch_size is the padded length
+    n_freqs_real = len(train_loader.dataloader.dataset.dataset.pk["freqs"])
     data_info = dict(out_h=args.out_h, out_w=args.out_w, n_laser_rows=args.n_laser_rows, n_laser_cols=args.n_laser_cols, patch_size=args.patch_size, n_freqs=n_patches * patch_size, n_channels=n_channels)
+    print(f"{n_freqs_real} freq bins -> {n_patches} patches of {patch_size} = {n_patches * patch_size} ({n_patches * patch_size - n_freqs_real} padded)")
     model = VibrationTransformer(args.d_model, args.pnt_num_heads, args.pnt_num_layers, args.seq_num_heads, args.seq_num_layers, data_info, args.decoder, args.decoder_num_heads, args.decoder_num_layers, freq_dropout=args.freq_dropout, laser_dropout=args.laser_dropout, loss_fn=args.loss_fn)
     load_path = str(args.checkpoint_path) if args.checkpoint_path else None
 
