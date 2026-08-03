@@ -48,20 +48,19 @@ def mask_shapes(samples_dir) -> list[tuple[int, int]]:
     except OSError:
         return []
     for d in probes:
-        for sub in ("images", "image"):
-            for f in (d / sub).glob("*_downsampled_smask_*h_*w.npy"):
-                m = re.search(r"_(\d+)h_(\d+)w\.npy$", f.name)
-                if m:
-                    out.add((int(m.group(1)), int(m.group(2))))
+        for f in (d / "image").glob("*_downsampled_smask_*h_*w.npy"):
+            m = re.search(r"_(\d+)h_(\d+)w\.npy$", f.name)
+            if m:
+                out.add((int(m.group(1)), int(m.group(2))))
         if out:
             break
     return sorted(out)
 
-# Sample-directory layout is NOT fixed across experiments. experiment-25 writes an
-# `image/` directory with a `05_` mask prefix; the gastronorm experiments write `images/`
-# with a `04_` prefix and a differently named crop. Nothing in the files themselves
-# declares which era they belong to, so `Layout.detect` probes a real sample directory
-# rather than making viz2 depend on one hardcoded set of names.
+# Sample-directory layout is NOT fixed across experiments. Both eras keep their per-sample
+# images in `image/`, but the filenames inside differ: experiment-25 uses a `05_` mask
+# prefix, the gastronorm experiments a `04_` prefix and a differently named crop. Nothing
+# in the files themselves declares which era they belong to, so `Layout.detect` probes a
+# real sample directory rather than making viz2 depend on one hardcoded set of names.
 #
 # Every entry is a path RELATIVE TO A SAMPLE DIR. `{h}`/`{w}` are filled with MASK_H and
 # MASK_W so the mask name follows the configured target shape.
@@ -80,13 +79,13 @@ LAYOUTS = {
         "audio": {"original": "audio.wav", "recovered": "recovered_audio.wav"},
     },
     "gastronorm": {
-        "image_dir": "images",
-        "gt_mask": "images/04_downsampled_smask_{h}h_{w}w.npy",
-        "backdrop": "images/02_cropped_overhead.png",
+        "image_dir": "image",
+        "gt_mask": "image/04_downsampled_smask_{h}h_{w}w.npy",
+        "backdrop": "image/02_cropped_overhead.png",
         # No speaker-annotated overhead is rendered by this pipeline. The cropped frame
         # stands in so the detail modal still shows the scene; the modal degrades to
         # "not generated" for anything that genuinely has no file.
-        "overhead": "images/02_cropped_overhead.png",
+        "overhead": "image/02_cropped_overhead.png",
         # These captures ship no source audio -- `audio/` exists but is empty. Only the
         # recovered waveform is present.
         "audio": {"recovered": "recovered_audio.wav"},
