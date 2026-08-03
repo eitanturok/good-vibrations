@@ -19,7 +19,7 @@ are detected at startup rather than hardcoded — the banner prints which layout
 
 | | `experiment-25` | `gastronorm` |
 |---|---|---|
-| image dir | `image/` | `images/` |
+| image dir | `image/` | `image/` |
 | GT mask | `05_downsampled_smask_{H}h_{W}w.npy` | `04_downsampled_smask_{H}h_{W}w.npy` |
 | backdrop | `01_cropped.png` | `02_cropped_overhead.png` |
 | overhead | `05_overhead_speaker.png` | *(none — falls back to the crop)* |
