@@ -45,6 +45,16 @@ def _sid(sid) -> int:
         raise HTTPException(404, "unknown sample")
 
 
+def _parse_shape(s: str) -> tuple[int, int]:
+    """"30x30" -> (30, 30). Untrusted input, so a malformed value is a 400 rather than
+    something that reaches a filename or an array index."""
+    try:
+        h, w = (int(v) for v in s.lower().split("x", 1))
+    except ValueError:
+        raise HTTPException(400, f"bad shape {s!r}, expected HxW")
+    return h, w
+
+
 def _run(name: str):
     try:
         return registry.run(name)
@@ -68,7 +78,8 @@ def api_runs():
     registry.maybe_rescan()
     runs = [{"name": e.name, "compatible": e.compatible, "reason": e.reason,
              "mtime": e.mtime, "epoch": e.epoch, "eval_splits": e.eval_splits,
-             "family": e.family, "status": e.status} for e in registry.entries]
+             "family": e.family, "status": e.status,
+             "shape": list(e.shape) if e.shape else None} for e in registry.entries]
     return {"runs": runs, "default_selected": registry.defaults(),
             "n_samples": len(registry.gt), "render_version": config.RENDER_VERSION}
 
@@ -133,6 +144,9 @@ def api_run(name: str, reload: int = 0, epoch: int | None = None):
             "com": [_clean(rd.com_pred[i][0]), _clean(rd.com_pred[i][1])],
         }
     return {"name": rd.name, "epoch": rd.epoch, "family": rd.family,
+            # The grid this run predicts at. The client sizes the column's canvas from it,
+            # so a 16x16 run and a 30x30 run render correctly in the same table.
+            "h": rd.shape[0], "w": rd.shape[1],
             "skipped_files": rd.skipped_files, "n": len(rd.sample_ids),
             "epochs": registry.epochs(name),   # drives the epoch slider
             "samples": samples}
@@ -175,25 +189,40 @@ def api_colorbar(mode: str):
 
 
 @app.get("/api/values")
-def api_values(sid: int, run: str = "", mode: str = "pred"):
+def api_values(sid: int, run: str = "", mode: str = "pred", shape: str = ""):
     """Grid values behind one cell, for the hover tooltip. Fetched on first hover and
-    memoized client-side -- never prefetched."""
+    memoized client-side -- never prefetched.
+
+    `shape` ("30x30") selects which resolution's ground truth to return, for the
+    truth/diff overlays of a run trained at a non-default grid.
+    """
     i = _sid(sid)
     if not run:
         values = registry.gt.masks[i]
+        if shape:
+            alt = registry.gt.masks_at(_parse_shape(shape))
+            if alt is None:
+                raise HTTPException(404, f"no ground truth at {shape}")
+            values = alt[i]
     else:
         rd = _run(run)
         if i not in rd.row_of:
             raise HTTPException(404, "no prediction for this sample")
         values = rd.masks[rd.row_of[i]]
+        # Ground truth at this run's grid, since diff/overlay are elementwise and the
+        # table can hold runs at several resolutions at once.
+        gt_masks = registry.gt.masks_at(rd.shape)
+        if gt_masks is None:
+            return JSONResponse({"v": np.round(values.astype(np.float64), 4).tolist()},
+                                headers=IMMUTABLE)
         if mode == "diff":
-            values = values - registry.gt.masks[i]
+            values = values - gt_masks[i]
         elif mode in ("overlay", "stacked"):
             # Two masks are on screen, so report both rather than leaving the reader to
             # guess which one a single number belongs to.
             return JSONResponse(
                 {"v": np.round(values.astype(np.float64), 4).tolist(),
-                 "t": np.round(registry.gt.masks[i].astype(np.float64), 4).tolist()},
+                 "t": np.round(gt_masks[i].astype(np.float64), 4).tolist()},
                 headers=IMMUTABLE)
     return JSONResponse({"v": np.round(values.astype(np.float64), 4).tolist()},
                         headers=IMMUTABLE)
@@ -289,8 +318,13 @@ def api_frames(run: str, sids: str, epochs: str = ""):
     if run not in registry.by_name or not registry.by_name[run].compatible:
         raise HTTPException(404, "unknown or incompatible run")
 
+    # Sized from THIS run's grid, not the global default: the table mixes resolutions, so
+    # a fixed cell count would truncate a finer run's mask or pad a coarser one. A
+    # compatible entry always carries a shape (_classify sets it), and the guard above
+    # already rejected anything else.
+    h, w = registry.by_name[run].shape
     want = set(ids)
-    out = np.full((len(eps), len(ids), config.MASK_H * config.MASK_W), np.nan, dtype=np.float16)
+    out = np.full((len(eps), len(ids), h * w), np.nan, dtype=np.float16)
     for ei, ep in enumerate(eps):
         masks = data.load_epoch_masks(run, registry.runs_dir, ep, want)
         for si, i in enumerate(ids):
@@ -317,13 +351,19 @@ def api_neighbors(run: str, sid: int, k: int = 5):
     gt = registry.gt
     # Grid cells are not square (20 rows x 40 cols over the same scene), so normalise to
     # [0,1] on each axis before measuring -- otherwise a column offset counts double.
-    scale = np.array([config.MASK_H - 1, config.MASK_W - 1], dtype=np.float64)
+    # Scale by THIS RUN's grid, and compare against targets measured on that same grid:
+    # com_pred is in the run's coordinates, so using the global default would divide a
+    # 30x30 prediction by 20x40 and rank neighbours in a mixed coordinate system.
+    scale = np.array([rd.shape[0] - 1, rd.shape[1] - 1], dtype=np.float64)
+    com_gt = gt.com_at(rd.shape)
+    if com_gt is None:
+        raise HTTPException(404, "no ground truth at this run's mask size")
     target = pred / scale
-    coms = gt.com_gt / scale
+    coms = com_gt / scale
 
     # Empty boxes carry a (-1,-1) sentinel rather than a position; ranking them would
     # fill the "least similar" list with samples that have no center of mass at all.
-    valid = np.array([not m.get("is_empty_box") and gt.com_gt[j][0] >= 0
+    valid = np.array([not m.get("is_empty_box") and com_gt[j][0] >= 0
                       for j, m in enumerate(gt.meta)])
     d = np.linalg.norm(coms - target, axis=-1)
     d[~valid] = np.nan
@@ -368,12 +408,15 @@ def api_neighbors(run: str, sid: int, k: int = 5):
                 "output_id": m.get("output_id") or m.get("position_id"),
                 "speaker": m.get("speaker"),
                 "layout": m.get("layout"), "n_objects": m.get("n_objects"),
-                "com": [_clean(gt.com_gt[idx][0]), _clean(gt.com_gt[idx][1])],
+                "com": [_clean(com_gt[idx][0]), _clean(com_gt[idx][1])],
                 "distance": _clean(d[idx])}
 
+    # Every coordinate in this payload is in the run's grid, so the modal can print
+    # pred_com and gt_com side by side without them meaning different things.
     return {"run": run, "sample_id": gt.sample_ids[i],
+            "shape": [rd.shape[0], rd.shape[1]],
             "pred_com": [_clean(pred[0]), _clean(pred[1])],
-            "gt_com": [_clean(gt.com_gt[i][0]), _clean(gt.com_gt[i][1])],
+            "gt_com": [_clean(com_gt[i][0]), _clean(com_gt[i][1])],
             "n_candidates": len(order),
             "most_similar": [pack(j) for j in distinct(order)],
             "least_similar": [pack(j) for j in distinct(order[::-1])]}
@@ -396,6 +439,9 @@ def api_detail(sid: int):
     # actually plots so the modal never prints a raw "[603.1 901.2]" string.
     out["avg_com"] = data.parse_com(m.get("avg_com"))
     out["com_gt_grid"] = [_clean(registry.gt.com_gt[i][0]), _clean(registry.gt.com_gt[i][1])]
+    # The grid those coordinates are in. The modal used to hardcode "20x40", which became
+    # a lie the moment the default shape was picked from the data.
+    out["grid"] = [config.MASK_H, config.MASK_W]
     audio = registry.gt.layout.audio
     out["has"] = {
         # A track the layout does not define is simply absent, so the modal hides it

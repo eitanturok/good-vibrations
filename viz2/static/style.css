@@ -206,8 +206,15 @@ body.nosidebar #sidebar {
 #epoch-slider { flex: 1; accent-color: var(--accent); min-width: 0; }
 #epoch-max { flex: none; }
 
-/* Canvas cells render the mask client-side while scrubbing epochs. */
+/* Canvas cells render the mask client-side while scrubbing epochs.
+
+   Every canvas is stretched to the same --mask-w/--mask-h box regardless of its buffer
+   size, so a 16x16 and a 30x30 column already align over the same backdrop. `pixelated`
+   is the default because the cell grid is real -- the hover tooltip reads one value per
+   cell -- but body.smooth interpolates instead, which makes columns of different
+   resolutions directly comparable by eye. */
 canvas.mask { image-rendering: pixelated; }
+body.smooth canvas.mask { image-rendering: auto; }
 canvas.mask.bg { background-size: 100% 100%; background-repeat: no-repeat; background-color: var(--surface-2); }
 
 .check { display: flex; align-items: center; gap: 7px; margin-top: 10px; font-size: 11.5px; cursor: pointer; }

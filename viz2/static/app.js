@@ -148,6 +148,26 @@ function buildPositions() {
 
 /* ***** runs ***** */
 
+/* The grid a run predicts at, as [h, w]. Runs in one table can be trained at different
+   resolutions, so this -- not the global S.lut -- sizes canvases, frame buffers and
+   truth lookups. Falls back to the dataset default for a run not loaded yet. */
+function runShape(name) {
+  const r = S.runs[name];
+  if (r && r.h) return [r.h, r.w];
+  const e = S.meta && S.meta.runs && S.meta.runs.find((x) => x.name === name);
+  if (e && e.shape) return e.shape;
+  return [S.lut.h, S.lut.w];
+}
+
+const truthKey = (sid, h, w) => (h ? `${sid}@${h}x${w}` : String(sid));
+
+/* Whether the loaded columns disagree on grid size, so the header only spends space on
+   the size when it actually disambiguates something. */
+function mixedShapes() {
+  const seen = new Set(S.runOrder.map((n) => runShape(n).join("x")));
+  return seen.size > 1;
+}
+
 /* Membership at the run's latest epoch: which samples it covers and their splits. This is
    the run's identity for filtering, and it must survive the epoch scrubber swapping
    `samples` -- see predictedSplit. */
@@ -483,6 +503,8 @@ function syncRowCells(el) {
     // Canvas dims come from the server's mask shape, never hardcoded: the grid is 20x40
     // on some datasets and 30x30 on others, and a fixed 40x20 buffer would letterbox the
     // mask into the wrong cells entirely.
+    // Sized per column in paintRow, since each run may predict at its own grid; these
+    // are just starting dimensions for a canvas that has not been painted yet.
     const { h: mh, w: mw } = S.lut;
     c.innerHTML = `<div class="ctitle run-head"></div>` +
       `<canvas class="mask predmask" width="${mw}" height="${mh}"></canvas>` +
@@ -526,12 +548,16 @@ function paintRow(el, rank) {
   el.querySelector(".gtcell").onclick = () => openModal(rank);
 
   syncRowCells(el);
+  // Hoisted: depends only on S.runOrder, so computing it per cell rebuilt a Set ~140
+  // times per repaint (28 pooled rows x 5 columns) at scroll frame rate.
+  const mixed = mixedShapes();
   S.runOrder.forEach((name, k) => {
     const c = el._runCells[k];
     const e = S.runs[name].samples[s.i];
     const head = c.querySelector(".run-head");
     const m = c.querySelector(".mask");
     const chips = c.querySelector(".subtags");
+    const [rh, rw] = runShape(name);
 
     // Title line 1 identifies the frame: which run, which epoch it is showing, and the
     // split THIS run put the sample in (dataloaders decide that independently, so the
@@ -545,9 +571,14 @@ function paintRow(el, rank) {
     // Only the run name truncates. Epoch and split are always legible -- they say which
     // frame you are looking at, so losing them to an ellipsis would make the cell
     // ambiguous, whereas a shortened run name is still recognisable.
+    // The grid is shown only when columns disagree on it. Both metrics are
+    // grid-normalized so the numbers share a scale, but a coarser grid is systematically
+    // easier -- a small cross-size gap is not evidence of a better model, so the reader
+    // needs to see which size they are looking at.
+    const gs = mixed ? `<span class="sp gsz" title="mask grid">${rh}x${rw}</span>` : "";
     head.innerHTML =
       `<span class="t1 run"><span class="rn" title="${name}">${name}</span>` +
-      `<b class="ep${latest ? "" : " scrub"}">${shownEp ?? "–"}ep</b>` +
+      `<b class="ep${latest ? "" : " scrub"}">${shownEp ?? "–"}ep</b>${gs}` +
       `${split ? `<span class="sp" title="${split}">${shortSplit(split)}</span>` : ""}</span>` +
       `<span class="t2">${identity(s)}</span>`;
 
@@ -573,6 +604,9 @@ function paintRow(el, rank) {
           v == null ? "–" : fmt(v, mm.key === "mse" ? 4 : 3)}</b></span>`;
       }).join("");
     m.hidden = false;
+    // Match the canvas buffer to THIS run's grid. Rows are recycled across runs, so a
+    // pooled cell can arrive still sized for a column of a different resolution.
+    if (m.width !== rw || m.height !== rh) { m.width = rw; m.height = rh; }
     m.dataset.run = name; m.dataset.sid = s.i;
     m.onclick = () => openNeighbors(name, s.i);
     m.className = "mask predmask" + (S.view.background ? " bg" : " nobg");
@@ -590,9 +624,10 @@ function paintRow(el, rank) {
     if (!tm.hidden) {
       tm.className = "mask truthmask" + (S.view.background ? " bg" : " nobg");
       if (tm.style.backgroundImage !== want) tm.style.backgroundImage = want;
-      const truth = S.truthCache[s.i];
-      if (truth) drawMask(tm, truth, "truth", null);
-      else ensureTruth(s.i);
+      if (tm.width !== rw || tm.height !== rh) { tm.width = rw; tm.height = rh; }
+      const truth = S.truthCache[truthKey(s.i, rh, rw)];
+      if (truth) drawMask(tm, truth, "truth", null, [rh, rw]);
+      else ensureTruth(s.i, rh, rw);
     }
   });
 }
@@ -1037,11 +1072,20 @@ function syncSliders() {
    round-trip and no server render per frame. */
 
 async function fetchFrames(run, sids) {
-  const r = await fetch(`/api/frames?run=${encodeURIComponent(run)}&sids=${sids.join(",")}`);
+  // Ask for an EXPLICIT epoch list rather than letting the server default to its own.
+  // The blob is indexed by epoch position, so the labels must describe the bytes that
+  // came back. Defaulting server-side meant a still-training run answered with more
+  // epochs than the client had cached at load time: the client then indexed an 11-epoch
+  // blob as if it held 5, so `epoch == null` read epoch 200 as "latest" and every newer
+  // epoch fell off the end as index -1 and painted blank.
+  const eps = (S.runs[run] && S.runs[run].epochs) || [];
+  const q = eps.length ? `&epochs=${eps.join(",")}` : "";
+  const r = await fetch(
+    `/api/frames?run=${encodeURIComponent(run)}&sids=${sids.join(",")}${q}`);
   if (!r.ok) throw new Error("frames");
   const raw = new Uint16Array(await r.arrayBuffer());
   return {
-    epochs: S.runs[run] ? S.runs[run].epochs || [] : [],
+    epochs: eps.slice(),
     sids: new Map(sids.map((s, i) => [s, i])),
     raw,
   };
@@ -1057,8 +1101,11 @@ function half(u) {
 
 /* Draws a (20,40) mask into a canvas using the server's own LUT, so a cell looks
    identical whether the client painted it or the server rendered a PNG. */
-function drawMask(canvas, values, mode, truth) {
-  const { h, w, gamma, gain } = S.lut;
+function drawMask(canvas, values, mode, truth, shape) {
+  const { gamma, gain } = S.lut;
+  // Grid comes from the CALLER, not the global default: runs trained at different
+  // resolutions share one table, so each column draws at its own size.
+  const [h, w] = shape || [S.lut.h, S.lut.w];
   const n = w * h;
   const ctx = canvas.getContext("2d");
 
@@ -1066,7 +1113,9 @@ function drawMask(canvas, values, mode, truth) {
   const off = drawMask._off || (drawMask._off = document.createElement("canvas"));
   if (off.width !== w || off.height !== h) { off.width = w; off.height = h; }
   const octx = off.getContext("2d");
-  const img = drawMask._img && drawMask._img.width === w
+  // Height matters too now that columns differ in shape: a cached 16x16 buffer reused for
+  // a 30x30 cell would paint only the first 16 rows and leave the rest stale.
+  const img = drawMask._img && drawMask._img.width === w && drawMask._img.height === h
     ? drawMask._img : (drawMask._img = octx.createImageData(w, h));
   const px = img.data;
 
@@ -1117,14 +1166,21 @@ const scratchFor = (n) => (scratch.length >= n ? scratch : (scratch = new Float3
 function paintCanvas(cv, run, sid, epoch) {
   if (!S.lut) return;
   const store = S.frameData[run];
-  const cells = S.lut.h * S.lut.w;
+  const [rh, rw] = runShape(run);
+  const cells = rh * rw;
   // Every early return clears first. A canvas keeps its last drawing until something
   // overwrites it, and rows are RECYCLED, so leaving it alone shows the previous
   // occupant's prediction -- or, once a filter change brings in rows the current store
   // was not fetched for, a stale mask that never gets repainted.
-  const blank = () => cv.getContext("2d").clearRect(0, 0, S.lut.w, S.lut.h);
+  const blank = () => cv.getContext("2d").clearRect(0, 0, cv.width, cv.height);
   if (!store || !store.sids.has(sid)) { blank(); ensureFrames(run); return; }
   const eps = store.epochs;
+  // A store fetched before the run advanced does not contain the newer epochs, so asking
+  // for one has to trigger a refetch rather than paint blank. Without this a training
+  // run's current epoch stayed empty until some unrelated scroll happened to replace the
+  // store -- which is why scrolling appeared to "fix" it.
+  const live = (S.runs[run] && S.runs[run].epochs) || [];
+  if (eps.length && live.length > eps.length) { blank(); ensureFrames(run); return; }
   const ei = epoch == null ? eps.length - 1 : eps.indexOf(epoch);
   const si = store.sids.get(sid);
   if (ei < 0) { blank(); return; }
@@ -1136,9 +1192,12 @@ function paintCanvas(cv, run, sid, epoch) {
   // its own canvas below, so it needs no truth here.
   const mode = S.view.mode === "stacked" ? "pred" : S.view.mode;
   const wantTruth = mode === "diff" || needsTruth(mode);
-  const truth = wantTruth ? S.truthCache[sid] : null;
-  if (wantTruth && !truth) { blank(); ensureTruth(sid); return; }
-  drawMask(cv, buf, mode, truth);
+  // Truth is cached per (sample, grid): the same sample has a different target array at
+  // each resolution, so keying on sid alone would diff against the wrong-shaped mask.
+  const tkey = truthKey(sid, rh, rw);
+  const truth = wantTruth ? S.truthCache[tkey] : null;
+  if (wantTruth && !truth) { blank(); ensureTruth(sid, rh, rw); return; }
+  drawMask(cv, buf, mode, truth, [rh, rw]);
 }
 
 /* Fetch frames for whatever rows are on screen, once per run.
@@ -1172,15 +1231,19 @@ async function ensureFrames(run) {
 }
 
 const truthPending = new Set();
-async function ensureTruth(sid) {
-  if (truthPending.has(sid)) return;
-  truthPending.add(sid);
+async function ensureTruth(sid, h, w) {
+  const key = truthKey(sid, h, w);
+  if (truthPending.has(key)) return;
+  truthPending.add(key);
   try {
-    const d = await api(`/api/values?sid=${sid}`);
-    S.truthCache[sid] = d.v.flat();
+    // `shape` picks which resolution's target to return, so a 16x16 column and a 30x30
+    // column each diff against a mask of their own size.
+    const q = h ? `&shape=${h}x${w}` : "";
+    const d = await api(`/api/values?sid=${sid}${q}`);
+    S.truthCache[key] = d.v.flat();
     renderVisible();
   } finally {
-    truthPending.delete(sid);
+    truthPending.delete(key);
   }
 }
 
@@ -1337,7 +1400,15 @@ function fetchEpochMetrics() {
         return false;
       }
     });
-    if ((await Promise.all(jobs)).some(Boolean)) refresh();
+    if ((await Promise.all(jobs)).some(Boolean)) {
+      // Early-training metrics live on a completely different scale from final ones (at
+      // epoch 0 every mse here is ~0.25, while the trained run spans 0..0.09). The
+      // sliders were built from the latest epoch, so without widening them to admit the
+      // scrubbed values every row fails the range test and the whole table -- ground
+      // truth included -- empties out at epoch 0.
+      recomputeDomains({ preserve: true });
+      refresh();
+    }
   }, 250);
 }
 
@@ -1460,7 +1531,11 @@ function bindTooltip() {
     const img = ev.target.closest?.(".mask");
     if (!img || img.dataset.sid === undefined) { tip.hidden = true; cur = null; return; }
     const b = img.getBoundingClientRect();
-    const { h: mh, w: mw } = S.lut;
+    // The hovered cell's OWN grid: every cell is stretched to the same box, so a 30x30
+    // column and a 20x40 one need different divisors to turn a cursor position into
+    // [row, col]. Using the global default indexed the wrong cell on any run whose grid
+    // is not the default -- and out of bounds on a coarser one.
+    const [mh, mw] = img.dataset.run ? runShape(img.dataset.run) : [S.lut.h, S.lut.w];
     const col = Math.floor(((ev.clientX - b.left) / b.width) * mw);
     const row = Math.floor(((ev.clientY - b.top) / b.height) * mh);
     if (row < 0 || row >= mh || col < 0 || col >= mw) { tip.hidden = true; return; }
@@ -1488,6 +1563,8 @@ async function openModal(rank) {
   $("#m-prev").hidden = $("#m-next").hidden = false;
   const d = await api(`/api/detail/${s.i}`);
   $("#m-title").textContent = `Sample ${d.sample_id}`;
+  // Named by the server rather than hardcoded: the default grid is chosen from the data.
+  const grid = d.grid ? `${d.grid[0]}×${d.grid[1]}` : `${S.lut.h}×${S.lut.w}`;
   const coms = Object.entries(d.coms || {})
     .map(([k, v]) => `<dt>${k}</dt><dd>${fmt(v[0], 1)}, ${fmt(v[1], 1)}</dd>`).join("");
   const objs = Object.entries(d.objects || {})
@@ -1512,10 +1589,10 @@ async function openModal(rank) {
         <dl class="kv">
           ${coms}
           <dt>average</dt><dd>${d.avg_com ? `${fmt(d.avg_com[0], 1)}, ${fmt(d.avg_com[1], 1)}` : "–"}</dd>
-          <dt>on 20×40 grid</dt><dd>${d.com_gt_grid ? `${fmt(d.com_gt_grid[0], 2)}, ${fmt(d.com_gt_grid[1], 2)}` : "–"}</dd>
+          <dt>on ${grid} grid</dt><dd>${d.com_gt_grid ? `${fmt(d.com_gt_grid[0], 2)}, ${fmt(d.com_gt_grid[1], 2)}` : "–"}</dd>
         </dl>
         <p class="note">Per-object and average are full-resolution image coordinates (row, col);
-          the grid value is in 20×40 target space, as used by the table metrics.</p>
+          the grid value is in ${grid} target space, as used by the table metrics.</p>
       </div>
       <div class="msec">
         <h3>Audio</h3>
@@ -1646,6 +1723,11 @@ function bindUI() {
     };
   });
   $("#bg-toggle").onchange = (e) => { S.view.background = e.target.checked; renderVisible(); };
+  // Interpolate instead of showing hard cell edges. Purely visual -- metrics are always
+  // computed at each run's native grid -- but it is what makes a coarse column and a
+  // fine one comparable by eye when the table mixes resolutions.
+  $("#smooth-toggle").onchange = (e) =>
+    document.body.classList.toggle("smooth", e.target.checked);
 
   $("#epoch-slider").oninput = (e) => setEpochIdx(+e.target.value);
   $("#epoch-play").onclick = togglePlay;

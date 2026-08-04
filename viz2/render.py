@@ -237,10 +237,15 @@ def _cached(kind: str, run: str, sid: int, mode: str, background: bool, epoch: i
     rd = registry.run(run)
     row = rd.row_of[sid]
     values = rd.masks[row]
+    # Diff and overlay are elementwise, so the target must be at THIS run's grid -- the
+    # table mixes resolutions and gt.masks holds only the primary one.
+    truth = registry.gt.masks_at(rd.shape)
+    if truth is None:
+        return render_mask(values, mode if mode != "diff" else "pred", background, bd)
     if mode in ("overlay", "stacked"):
-        return render_both(values, registry.gt.masks[sid], background, bd)
+        return render_both(values, truth[sid], background, bd)
     if mode == "diff":
-        values = values - registry.gt.masks[sid]
+        values = values - truth[sid]
     return render_mask(values, mode, background, bd)
 
 

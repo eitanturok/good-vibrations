@@ -32,13 +32,27 @@ def main():
             sizes = ", ".join(f"{a}x{b}" for a, b in available)
             ap.error(f"{args.mask} not in {args.experiment}; available: {sizes}")
         config.set_mask_shape(h, w)
-    elif len(available) == 1:
-        # Only one size on disk: use it, so a dataset that ships just 30x30 needs no flag.
-        config.set_mask_shape(*available[0])
-    elif len(available) > 1:
-        sizes = ", ".join(f"{a}x{b}" for a, b in available)
-        print(f"[viz2] {len(available)} mask sizes available ({sizes}); using "
-              f"{config.MASK_H}x{config.MASK_W}. Pass --mask to pick another.")
+    else:
+        # Pick the default off the data instead of a hardcoded size. `usable` drops sizes
+        # whose masks carry no real mass -- the gastronorm 20x40 files are non-zero but
+        # ~300x too sparse, and defaulting to those scores every prediction against a
+        # near-empty target while looking like a working viz2.
+        usable = config.usable_mask_shapes(args.experiment / "samples")
+        # Among the usable sizes, prefer the one MOST RUNS were trained at. Resolution is
+        # the wrong tiebreak: experiment-25 ships both 20x40 and 30x30 targets but nearly
+        # all its runs are 20x40, so defaulting to the finer grid left 1 of 68 runs
+        # comparable. Other sizes still appear in the table, this only sets the default.
+        if usable:
+            from viz2 import data
+            best = data.most_trained_shape(args.runs, usable) or usable[0]
+            config.set_mask_shape(*best)
+        if len(available) > 1:
+            sizes = ", ".join(f"{a}x{b}" for a, b in available)
+            unusable = [f"{a}x{b}" for a, b in available if (a, b) not in usable]
+            note = f"; no usable masks at {', '.join(unusable)}" if unusable else ""
+            print(f"[viz2] mask sizes available: {sizes}{note}. Using "
+                  f"{config.MASK_H}x{config.MASK_W} as the default grid; runs trained at "
+                  f"another size are shown alongside it.")
 
     app_module.init(args.experiment, args.runs)
     print(f"[viz2] http://{args.host}:{args.port}")
