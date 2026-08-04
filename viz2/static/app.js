@@ -400,11 +400,107 @@ function epochLabel(run) {
   const eps = r.epochs || [];
   const last = eps.length ? eps[eps.length - 1] : r.epoch;
   const shown = epochFor(run);
-  // ep <current>/<last>. Only the last is clickable -- it is the run's endpoint, and
+  // <current>/<last> ep. Only the last is clickable -- it is the run's endpoint, and
   // jumping every column there is the useful move; the current epoch is already current.
   const cur = shown == null ? last : shown;
-  return `ep <b${cur === last ? "" : ` class="scrub"`}>${cur}</b><span class="k">/</span>` +
-    `<b class="goep" data-ep="${last}" title="Show every column at epoch ${last}">${last}</b>`;
+  return `<span class="epchip${cur === last ? "" : " scrub"}">` +
+    `<b>${cur}</b><span class="k">/</span>` +
+    `<b class="goep" data-ep="${last}" title="Show every column at epoch ${last}">${last}</b>` +
+    `<span class="k">ep</span></span>`;
+}
+
+/* Column reordering by dragging a header.
+
+   Only the grip starts a drag, so clicking the name still cycles the sort and the whole
+   header does not become an awkward click target. Position is a whole-column step --
+   round(dx / columnWidth) -- rather than a hit test against midpoints, because columns
+   are fixed-width and stepping keeps the dragged column locked to the slot it will land
+   in instead of drifting between two of them. */
+function moveRun(name, before) {
+  if (name === before) return;
+  const rest = S.runOrder.filter((n) => n !== name);
+  const at = before == null ? rest.length : rest.indexOf(before);
+  rest.splice(at < 0 ? rest.length : at, 0, name);
+  S.runOrder = rest;
+  // Frame stores are keyed by run name, not position, so they survive a reorder -- only
+  // the DOM order changes. refresh() rebuilds the header and repaints every row's cells.
+  refresh();
+}
+
+/* Pointer-events rather than HTML5 drag-and-drop.
+
+   The native API cannot work here: refresh() destroys and recreates the whole .hrow, and
+   any re-render mid-drag (the 15s poll, an epoch fetch) tore the dragstart element out of
+   the document, which silently cancels the drag and loses the drop. Pointer events with
+   setPointerCapture keep the gesture bound to the grip for its whole lifetime, so the
+   drop always lands. It also lets the ENTIRE column move, not just its header. */
+function makeDraggable(cell, name) {
+  const grip = cell.querySelector(".hgrip");
+  if (!grip) return;
+
+  grip.onpointerdown = (e) => {
+    if (e.button !== 0) return;
+    e.preventDefault();
+    grip.setPointerCapture(e.pointerId);
+
+    const startX = e.clientX;
+    const from = S.runOrder.indexOf(name);
+    const colW = cell.getBoundingClientRect().width;
+    let to = from;
+    let moved = false;
+
+    // Every cell of this column, header included, so the whole column travels together.
+    // Row cells come from the pool's own _runCells rather than a :nth-of-type selector,
+    // which would silently break if the fixed idx/gt cells before them ever changed.
+    const heads = document.querySelectorAll(".hrow .hcell.run");
+    const colCells = (i) => [heads[i], ...pool.map((r) => r._runCells[i])].filter(Boolean);
+
+    const dragged = colCells(from);
+    dragged.forEach((c) => c.classList.add("dragging"));
+    document.body.classList.add("dragging-col");
+
+    const onMove = (ev) => {
+      const dx = ev.clientX - startX;
+      if (!moved && Math.abs(dx) < 3) return;   // let a plain click through
+      moved = true;
+      // Which slot the pointer is over, as a whole-column step.
+      const next = Math.max(0, Math.min(S.runOrder.length - 1,
+        from + Math.round(dx / colW)));
+      if (next !== to) {
+        // Shift the columns the dragged one has passed over, so the gap opens up live.
+        to = next;
+        S.runOrder.forEach((_, i) => {
+          if (i === from) return;
+          const shift = (i > from && i <= to) ? -colW : (i < from && i >= to) ? colW : 0;
+          colCells(i).forEach((c) => { c.style.transform = shift ? `translateX(${shift}px)` : ""; });
+        });
+      }
+      dragged.forEach((c) => { c.style.transform = `translateX(${dx}px)`; });
+    };
+
+    const onUp = () => {
+      grip.releasePointerCapture?.(e.pointerId);
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+      window.removeEventListener("pointercancel", onUp);
+      document.body.classList.remove("dragging-col");
+      // Clear inline transforms before re-rendering, or a recycled row keeps the offset.
+      document.querySelectorAll(".hcell.run, .cell.run").forEach((c) => {
+        c.style.transform = "";
+        c.classList.remove("dragging");
+      });
+      if (moved && to !== from) {
+        const rest = S.runOrder.filter((n) => n !== name);
+        moveRun(name, rest[to] ?? null);
+      }
+    };
+
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+    // A cancelled pointer (browser gesture, window blur) must unwind exactly like a drop,
+    // or the column would stay lifted with a stale transform.
+    window.addEventListener("pointercancel", onUp);
+  };
 }
 
 function renderHeader() {
@@ -428,13 +524,18 @@ function renderHeader() {
     // a run that finishes or crashes while open must update its badge.
     const live = S.meta.runs.find((x) => x.name === name);
     const status = (live && live.status) || "unknown";
+    // Top line: name and its status read together on the left, epoch right-aligned. The
+    // sample count that used to sit here ("999/1024") was dropped -- it is a property of
+    // the dataloader's split, not something you compare columns on.
     cell.innerHTML = `
       <div class="htop">
+        <span class="hgrip" title="Drag to reorder this column">⠿</span>
         <div class="hname" title="${name} — click to cycle sort">${name}${warn}</div>
+        ${statusChip(status)}
         <span class="hep">${epochLabel(name)}</span>
         <button class="hclose" title="Remove this run">&times;</button>
       </div>
-      <div class="hmeta">${statusChip(status)} ${r.n}/${S.samples.length}${skipped}</div>
+      ${skipped ? `<div class="hmeta">${skipped.replace(/^ · /, "")}</div>` : ""}
       <div class="hstats">${METRICS.map((m) => {
         const s = st[m.key];
         return `<span><span class="k">${m.short}</span> <b>${s ? fmt(s.mean, 3) : "–"}</b>${
@@ -445,6 +546,8 @@ function renderHeader() {
           `<option value="${m.key}" ${sorted && S.sort.metric === m.key ? "selected" : ""}>${m.label}</option>`).join("")}</select>
         <button class="dir ${sorted ? "on" : ""}">${sorted ? (S.sort.dir === "worst" ? "↓ worst" : "↑ best") : "sort"}</button>
       </div>`;
+
+    makeDraggable(cell, name);
 
     cell.querySelector(".hclose").onclick = (e) => {
       e.stopPropagation();          // must not also cycle the column's sort
@@ -576,10 +679,14 @@ function paintRow(el, rank) {
     // easier -- a small cross-size gap is not evidence of a better model, so the reader
     // needs to see which size they are looking at.
     const gs = mixed ? `<span class="sp gsz" title="mask grid">${rh}x${rw}</span>` : "";
+    // Same shape as the column header: name (and its qualifiers) pack left, the epoch
+    // rides the right edge in its own chip so the epochs line up down the column and
+    // read as a state badge rather than as part of the run's name.
     head.innerHTML =
-      `<span class="t1 run"><span class="rn" title="${name}">${name}</span>` +
-      `<b class="ep${latest ? "" : " scrub"}">${shownEp ?? "–"}ep</b>${gs}` +
-      `${split ? `<span class="sp" title="${split}">${shortSplit(split)}</span>` : ""}</span>` +
+      `<span class="t1 run"><span class="rn" title="${name}">${name}</span>${gs}` +
+      `${split ? `<span class="sp" title="${split}">${shortSplit(split)}</span>` : ""}` +
+      `<span class="epchip${latest ? "" : " scrub"}"><b>${shownEp ?? "–"}</b>` +
+      `<span class="k">ep</span></span></span>` +
       `<span class="t2">${identity(s)}</span>`;
 
     if (!e) {
@@ -1436,6 +1543,10 @@ function togglePlay() {
 const POLL_MS = 15000;
 
 async function poll() {
+  // A refresh() mid-drag rebuilds the header under the pointer, which strands the
+  // dragged column's inline transforms and drops the gesture. The poll is a background
+  // nicety; skipping one tick costs nothing.
+  if (document.body.classList.contains("dragging-col")) return;
   let meta;
   try {
     meta = await api("/api/runs");

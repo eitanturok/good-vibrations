@@ -78,7 +78,7 @@ def get_parser():
     parser.add_argument("--out-w",                      type=int,   default=30)
     parser.add_argument("--n-laser-rows",               type=int,   default=10)
     parser.add_argument("--n-laser-cols",               type=int,   default=10)
-    parser.add_argument("--patch-size",                 type=int,   default=64)
+    parser.add_argument("--patch-size",                 type=int,   default=128)
 
     parser.add_argument("--signal-mode",                type=str,   default="magnitude", choices=["magnitude", "log_magnitude", "complex", "mag_phase"])
     parser.add_argument("--normalize-mode",             type=str,   default="std", help="Per-sample: std, z, per_laser_z. Train-split statistics: per_bin_z. Append '+token-mean' for token-level normalization.")
@@ -109,7 +109,7 @@ def get_parser():
     parser.add_argument("--compile",                    type=int,   default=1, choices=(0, 1), help="torch.compile-ing the model before training/eval.")
     parser.add_argument("--compile-mode",               type=str,   default="default", help="torch.compile mode, e.g. 'default', 'reduce-overhead', 'max-autotune'.")
     # train
-    parser.add_argument("--batch-size",                 type=int,   default=256)
+    parser.add_argument("--batch-size",                 type=int,   default=128)
     parser.add_argument("--lr",                         type=float, default=1e-4)
     parser.add_argument("--weight-decay",               type=float, default=1e-2)
     parser.add_argument("--scheduler",                  type=str,   default="cosine-warmup", choices=tuple(SCHEDULERS), help="LR schedule. 'constant' reproduces the old no-scheduler behavior.")
