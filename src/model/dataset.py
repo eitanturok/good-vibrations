@@ -102,7 +102,7 @@ def convert_to_mds(mds_dir: Path, samples: list[tuple[Path, dict]], out_h: int, 
                 com = meta.get("downsampled_com", [-1.0, -1.0])
                 sample = {
                     "X": X, "y": y,
-                    "sample_id": int(meta.get("sample_id", -1)), "position_id": int(meta.get('position_id', meta.get("output_id", -1))),
+                    "sample_id": int(meta.get("sample_id", -1)), "position_id": int(meta.get('position_id', meta.get("position_id", -1))),
                     "n_objects": int(meta.get("n_objects", -1)),
                     "speaker": int(meta.get("speaker", -1)),
                     "box": str(meta.get("box", "")),
@@ -344,9 +344,9 @@ def exp25_split(mds_path: str | Path, test_size: float = 0.20, unseen_pos_frac: 
     """Return {"train": [...], "eval/<name>": [...], "eval/<name>_speaker": [...], ...}: sample
     indices (into the mds_path metadata.jsonl / dataset) for each split, by object-type.
 
-    Each object-type (purple_cube, green_cube, purple_green_cubes) has an output_id (== image_id)
+    Each object-type (purple_cube, green_cube, purple_green_cubes) has an position_id (== image_id)
     range that is always train (its "grid-1" layout, or the train-side layout for the mixed type)
-    and one or more output_id ranges we may only draw eval samples from (its "grid-2" layout(s)).
+    and one or more position_id ranges we may only draw eval samples from (its "grid-2" layout(s)).
     empty-box is always train, no eval carve-out.
 
     For each type:
@@ -355,12 +355,12 @@ def exp25_split(mds_path: str | Path, test_size: float = 0.20, unseen_pos_frac: 
     - If the eval-range pool is smaller than target_eval, the *whole* eval-range pool becomes eval
       candidates (we never dip into the train range to make up the difference) -> this type ends up
       with < test_size eval, and all of its train-range samples stay in train.
-    - Otherwise, target_eval samples (whole output_ids) are drawn from the eval-range pool as eval
-      candidates, and the leftover eval-range output_ids fall back into train.
+    - Otherwise, target_eval samples (whole position_ids) are drawn from the eval-range pool as eval
+      candidates, and the leftover eval-range position_ids fall back into train.
     - The eval candidates are then split unseen_pos_frac / unseen_pos_speaker_frac (of the combined
       pool, not of the eval candidates) into:
-        - eval/{type}: whole held-out output_ids -> positions never seen in train, from any speaker.
-        - eval/{type}_speaker: individual samples from output_ids that DO appear in train -> this
+        - eval/{type}: whole held-out position_ids -> positions never seen in train, from any speaker.
+        - eval/{type}_speaker: individual samples from position_ids that DO appear in train -> this
           exact (position, speaker) pair is new, but the position was seen from other speakers.
       If the eval-range pool was capped smaller than target_eval, these two eval sets are scaled down
       proportionally to fit inside what's available.
@@ -372,7 +372,7 @@ def exp25_split(mds_path: str | Path, test_size: float = 0.20, unseen_pos_frac: 
     keep = [i for i, row in enumerate(index) if _matches(row, speakers, n_objects, box)]
     if n_samples is not None: keep = keep[:n_samples]
 
-    def in_range(i, lo, hi): return lo <= int(index[i]["output_id"]) <= hi
+    def in_range(i, lo, hi): return lo <= int(index[i]["position_id"]) <= hi
 
     train_idx = [i for i in keep if in_range(i, *EXP25_ALWAYS_TRAIN_RANGE)]
     evals = {}
@@ -382,34 +382,34 @@ def exp25_split(mds_path: str | Path, test_size: float = 0.20, unseen_pos_frac: 
         combined_n = len(train_range_idx) + len(eval_pool_idx)
 
         target_eval = test_size * combined_n
-        eval_pool_output_ids = sorted({index[i]["output_id"] for i in eval_pool_idx})
+        eval_pool_position_ids = sorted({index[i]["position_id"] for i in eval_pool_idx})
 
         if len(eval_pool_idx) <= target_eval:
             eval_candidate_idx = eval_pool_idx
             train_idx += train_range_idx
             scale = len(eval_pool_idx) / target_eval if target_eval > 0 else 0.0
         else:
-            n_output_ids = round(target_eval / len(eval_pool_idx) * len(eval_pool_output_ids))
-            n_output_ids = min(max(n_output_ids, 0), len(eval_pool_output_ids))
-            eval_candidate_output_ids, _ = train_test_split(
-                eval_pool_output_ids, train_size=n_output_ids, random_state=seed, shuffle=True)
-            eval_candidate_output_ids = set(eval_candidate_output_ids)
-            eval_candidate_idx = [i for i in eval_pool_idx if index[i]["output_id"] in eval_candidate_output_ids]
-            train_idx += train_range_idx + [i for i in eval_pool_idx if index[i]["output_id"] not in eval_candidate_output_ids]
+            n_position_ids = round(target_eval / len(eval_pool_idx) * len(eval_pool_position_ids))
+            n_position_ids = min(max(n_position_ids, 0), len(eval_pool_position_ids))
+            eval_candidate_position_ids, _ = train_test_split(
+                eval_pool_position_ids, train_size=n_position_ids, random_state=seed, shuffle=True)
+            eval_candidate_position_ids = set(eval_candidate_position_ids)
+            eval_candidate_idx = [i for i in eval_pool_idx if index[i]["position_id"] in eval_candidate_position_ids]
+            train_idx += train_range_idx + [i for i in eval_pool_idx if index[i]["position_id"] not in eval_candidate_position_ids]
             scale = 1.0
 
         pos_frac = min(unseen_pos_frac * scale, unseen_pos_frac + unseen_pos_speaker_frac)
-        eval_candidate_output_ids = sorted({index[i]["output_id"] for i in eval_candidate_idx})
-        n_unseen_pos = round(pos_frac / test_size * len(eval_candidate_output_ids)) if test_size > 0 else 0
-        n_unseen_pos = min(max(n_unseen_pos, 0), len(eval_candidate_output_ids))
-        unseen_pos_output_ids, speaker_pool_output_ids = train_test_split(
-            eval_candidate_output_ids, train_size=n_unseen_pos, random_state=seed, shuffle=True) if 0 < n_unseen_pos < len(eval_candidate_output_ids) \
-            else (eval_candidate_output_ids, []) if n_unseen_pos == len(eval_candidate_output_ids) \
-            else ([], eval_candidate_output_ids)
-        unseen_pos_output_ids = set(unseen_pos_output_ids)
-        evals[f"eval/{name}"] = [i for i in eval_candidate_idx if index[i]["output_id"] in unseen_pos_output_ids]
+        eval_candidate_position_ids = sorted({index[i]["position_id"] for i in eval_candidate_idx})
+        n_unseen_pos = round(pos_frac / test_size * len(eval_candidate_position_ids)) if test_size > 0 else 0
+        n_unseen_pos = min(max(n_unseen_pos, 0), len(eval_candidate_position_ids))
+        unseen_pos_position_ids, speaker_pool_position_ids = train_test_split(
+            eval_candidate_position_ids, train_size=n_unseen_pos, random_state=seed, shuffle=True) if 0 < n_unseen_pos < len(eval_candidate_position_ids) \
+            else (eval_candidate_position_ids, []) if n_unseen_pos == len(eval_candidate_position_ids) \
+            else ([], eval_candidate_position_ids)
+        unseen_pos_position_ids = set(unseen_pos_position_ids)
+        evals[f"eval/{name}"] = [i for i in eval_candidate_idx if index[i]["position_id"] in unseen_pos_position_ids]
 
-        speaker_pool_idx = [i for i in eval_candidate_idx if index[i]["output_id"] in set(speaker_pool_output_ids)]
+        speaker_pool_idx = [i for i in eval_candidate_idx if index[i]["position_id"] in set(speaker_pool_position_ids)]
         n_speaker = round(unseen_pos_speaker_frac * scale / test_size * combined_n) if test_size > 0 else 0
         n_speaker = min(max(n_speaker, 0), len(speaker_pool_idx))
         if n_speaker < len(speaker_pool_idx):
