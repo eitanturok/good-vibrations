@@ -81,7 +81,14 @@ def api_samples():
         m = gt.meta[i]
         com = gt.avg_com[i]
         out.append({
-            "i": i,
+            # The SAMPLE ID, not the row. Every route the client calls with this value
+            # (`/api/backdrop/{sid}`, `/api/gt_mask.png?sid=`, `/api/frames?sids=`) resolves
+            # it through gt.row_of, and `/api/run/{name}` keys its per-sample metrics by
+            # sample id too. Emitting the row here made both of those lookups wrong on any
+            # dataset whose ids do not start at zero: gastronorm starts at 000009, so the
+            # ground-truth column resolved row->row-9 while the prediction column matched
+            # the row against a raw sample_id, putting two DIFFERENT scenes side by side.
+            "i": int(sid),
             "sample_id": sid,
             # position_id is the gastronorm spelling of output_id: the scene identity
             # shared by the 8 samples that differ only in which speaker played.
@@ -264,7 +271,15 @@ def api_frames(run: str, sids: str, epochs: str = ""):
     Layout: float16[n_epochs][n_sids][H*W], C-order. Samples the run never predicted are
     filled with NaN so the client can show its "no prediction" state.
     """
-    ids = [registry.sample_index(s) for s in sids.split(",") if s.strip()]
+    # load_epoch_masks matches against the raw sample_id stored in each .pt, so `want`
+    # must hold SAMPLE IDS, not rows. sample_index is still called for its side effect of
+    # rejecting an id this dataset does not have -- resolving to a row and then looking
+    # that row up as an id silently returned another sample's prediction.
+    ids = []
+    for s in sids.split(","):
+        if s.strip():
+            registry.sample_index(s)
+            ids.append(int(s))
     if not ids:
         raise HTTPException(400, "no sids")
     eps = [int(e) for e in epochs.split(",") if e.strip()] or registry.epochs(run)
@@ -347,7 +362,9 @@ def api_neighbors(run: str, sid: int, k: int = 5):
 
     def pack(idx):
         m = gt.meta[idx]
-        return {"i": int(idx), "sample_id": gt.sample_ids[idx],
+        # "i" is the sample id, matching /api/samples: the client both requests
+        # /api/gt_mask.png?sid= with it and matches it against s.i to open the row.
+        return {"i": int(gt.sample_ids[idx]), "sample_id": gt.sample_ids[idx],
                 "output_id": m.get("output_id") or m.get("position_id"),
                 "speaker": m.get("speaker"),
                 "layout": m.get("layout"), "n_objects": m.get("n_objects"),
