@@ -32,7 +32,7 @@ from composer.callbacks.speed_monitor import GPU_AVAILABLE_FLOPS
 
 from icecream import install; install()
 
-from model.callbacks import VisualizeSMask, OutputSaver, OUTPUT_EXTRACTORS, DEFAULT_OUTPUT_KEYS
+from model.callbacks import VisualizeSMask, OutputSaver, AttributionSaver, OUTPUT_EXTRACTORS, DEFAULT_OUTPUT_KEYS
 from model.dataset import build_dataset
 from model.arch import VibrationTransformer, LOSSES
 from utils.helpers import cleanup
@@ -78,13 +78,13 @@ def get_parser():
     parser.add_argument("--out-w",                      type=int,   default=30)
     parser.add_argument("--n-laser-rows",               type=int,   default=10)
     parser.add_argument("--n-laser-cols",               type=int,   default=10)
-    parser.add_argument("--patch-size",                 type=int,   default=256)
+    parser.add_argument("--patch-size",                 type=int,   default=64)
 
-    parser.add_argument("--signal-mode",                type=str,   default="magnitude", choices=["magnitude", "complex", "mag_phase"])
-    parser.add_argument("--normalize-mode",             type=str,   default="std")
+    parser.add_argument("--signal-mode",                type=str,   default="magnitude", choices=["magnitude", "log_magnitude", "complex", "mag_phase"])
+    parser.add_argument("--normalize-mode",             type=str,   default="std", help="Per-sample: std, z, per_laser_z. Train-split statistics: per_bin_z. Append '+token-mean' for token-level normalization.")
     parser.add_argument("--augment-mask",               type=float, default=0.5, help="Probability a sample gets mask augmentation (blur+noise). 0 disables.")
     parser.add_argument("--augment-fft",                type=float, default=0.5, help="Probability a sample gets FFT frequency-gain augmentation. 0 disables.")
-    parser.add_argument("--subtract-speaker-mean",      type=int,   default=0, choices=(0, 1), nargs="?", const=1, help="Subtract each speaker's offline mean magnitude spectrum (computed over train samples only) after the magnitude and before normalization. Bare flag means 1. Requires --signal-mode magnitude.")
+    parser.add_argument("--subtract-speaker-mean",      type=int,   default=0, choices=(0, 1), nargs="?", const=1, help="Subtract each speaker's offline mean spectrum (computed over train samples only) after the magnitude and before normalization. Bare flag means 1. Requires --signal-mode magnitude or log_magnitude.")
     parser.add_argument("--force-rebuild-data",         type=int,   default=0, choices=(0, 1), nargs="?", const=1, help="Discard the cached MDS and rebuild it, re-running mask downsampling and fft precomputation. Bare flag means 1. Needed when the preprocessing code changes, since the cache key only covers the config, not the code.")
 
     # filter data
@@ -123,6 +123,8 @@ def get_parser():
     parser.add_argument("--eval-before-train",          type=int,   default=1, choices=(0, 1), help="Run the boundary eval pass before training starts.")
     parser.add_argument("--eval-after-train",           type=int,   default=1, choices=(0, 1), help="Run the boundary eval pass after training ends.")
     parser.add_argument("--output-keys",                type=str,   default=list(DEFAULT_OUTPUT_KEYS), nargs="*", choices=list(OUTPUT_EXTRACTORS), help="Payloads to dump per-batch as .pt in runs/<run>/outputs_history. Pass with no values to skip saving outputs entirely; 'fft' and 'mask_logits' are very large.")
+    parser.add_argument("--attribution",                type=int,   default=0, help="Save per-eval-batch laser/freq attribution (cls attention maps) to runs/<run>/attribution.")
+    parser.add_argument("--attribution-ablate",         type=int,   default=0, help="Also measure delta-MSE from zeroing each laser and freq patch. Costs n_lasers+n_patches extra forwards on the first eval batch; more trustworthy than attention.")
     # run
     parser.add_argument("--run-name",                   type=str,   default=None)
     parser.add_argument("--wandb-group",                type=str,   default="attn-lr-sweep", help="wandb group, for keeping sweep runs together.")
@@ -237,6 +239,7 @@ def run(**kwargs):
                  OOMObserver(folder=f"runs/{{run_name}}/torch_traces", remote_file_name=None), RuntimeEstimator(skip_batches=64, time_unit="minutes"),
                 OptimizerMonitor(log_optimizer_metrics=True, batch_log_interval=10)]
     if args.output_keys: callbacks.append(OutputSaver(args.eval_interval, f"runs/{{run_name}}/outputs_history", overwrite=True, output_keys=args.output_keys))
+    if args.attribution: callbacks.append(AttributionSaver(args.eval_interval, f"runs/{{run_name}}/attribution", overwrite=True, ablate=bool(args.attribution_ablate)))
 
     # optimizer + lr schedule
     optimizer = torch.optim.AdamW(model.parameters(), args.lr, weight_decay=args.weight_decay, fused=True) if not args.eval_only else None
