@@ -181,13 +181,22 @@ class FreqEncoder(nn.Module):
     def forward(self, x, speaker=None):
         # x.shape = (B_L,P,C,PS) = (batch_size * n_lasers, n_patches, n_coords, patch_size)
         B_L, P, _, _ = x.shape
-        x = self.embed(x.reshape(B_L, P, -1))   # (B_L,P,C,PS) -> (B_L,P,D)
+        x = self.embed(x.reshape(B_L, P, -1))                                   # (B_L,P,C,PS)          -> (B_L,P,D)
         # drop entire freq patches by setting them to zero, don't actually remove them
-        x, keep = dropout(x, (B_L, P), self.freq_dropout, self.training) # (B_L,P,D) -> (B_L,P,D), (B_L,P)
-        x = apply_rope(x, self.freqs_cis)       # (B_L,P,D) -> (B_L,P,D)
-        if speaker is not None: x += self.speakers_embed(speaker).unsqueeze(1)  # (B_L,P,D), (B_L,1,D) -> (B_L,P,D)
-        x = torch.cat((self.cls_token.expand(B_L, -1, -1), x), dim=1)           # (B_L,P,D) -> (B_L,P+1,D)
-        output = self.layers(x, src_key_padding_mask=pad_mask(keep, B_L)) # (B_L,P+1,D) -> (B_L,P+1,D)
+        x, keep = dropout(x, (B_L, P), self.freq_dropout, self.training)        # (B_L,P,D)             -> (B_L,P,D), (B_L,P)
+        x = apply_rope(x, self.freqs_cis)                                       # (B_L,P,D)             -> (B_L,P,D)
+        if speaker is not None: x += self.speakers_embed(speaker).unsqueeze(1)  # (B_L,P,D), (B_L,1,D)  -> (B_L,P,D)
+
+        # perm_idxs = [i for i in list(range(P))]
+        # i, j = 1, 5 # swap two patches
+        # tmp = perm_idxs[i]
+        # perm_idxs[i] = perm_idxs[j]
+        # perm_idxs[j] = tmp
+        # print(f'Permuted indices: {perm_idxs}')
+        # x = x[:, perm_idxs]  # (B_L,P,D) -> (B_L,P,D)
+        
+        x = torch.cat((self.cls_token.expand(B_L, -1, -1), x), dim=1)           # (B_L,P,D)             -> (B_L,P+1,D)
+        output = self.layers(x, src_key_padding_mask=pad_mask(keep, B_L))       # (B_L,P+1,D)           -> (B_L,P+1,D)
         return output[:, 0, :]  # (B_L,P+1,D) -> (B_L,D)
 
 #***** 5 model *****
