@@ -13,20 +13,6 @@ def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0) -> torch.Te
     freqs = torch.arange(end).unsqueeze(dim=1) * freqs.unsqueeze(dim=0)
     return torch.cat([freqs.cos(), freqs.sin()], dim=-1)
 
-# v1: not a rotation -- the h/w concat puts sines in the cosine slot, so cos^2+sin^2 != 1.
-# Still gives every position a distinct vector, so it trains (and beat v2 at 1000ep).
-# def precompute_freqs_cis_2d(dim: int, h: int, w: int, theta: float = 10000.0) -> torch.Tensor:
-#     freqs_h, freqs_w = precompute_freqs_cis(dim // 2, h, theta), precompute_freqs_cis(dim // 2, w, theta),
-#     freqs_h, freqs_w = freqs_h.reshape(h, 1, -1).repeat(1, w, 1), freqs_w.reshape(1, w, -1).repeat(h, 1, 1)
-#     return torch.cat([freqs_h, freqs_w], dim=-1).reshape(h * w, dim)
-
-# v2: a real rotation, but both axes reuse one frequency ladder so row/col angles stay proportional.
-# def precompute_freqs_cis_2d(dim: int, h: int, w: int, theta: float = 10000.0) -> torch.Tensor:
-#     freqs_h, freqs_w = precompute_freqs_cis(dim // 2, h, theta), precompute_freqs_cis(dim // 2, w, theta)
-#     cos_h, sin_h = (t.reshape(h, 1, -1).repeat(1, w, 1) for t in freqs_h.chunk(2, dim=-1))  # (h,w,dim//4)
-#     cos_w, sin_w = (t.reshape(1, w, -1).repeat(h, 1, 1) for t in freqs_w.chunk(2, dim=-1))  # (h,w,dim//4)
-#     return torch.cat([cos_h, cos_w, sin_h, sin_w], dim=-1).reshape(h * w, dim)
-
 def precompute_freqs_cis_2d(dim: int, h: int, w: int, theta: float = 10000.0) -> torch.Tensor:
     """2D RoPE (matches Pixtral/HF): rows take freqs[::2], cols freqs[1::2], so every channel gets a
     distinct rate. Returns [cos | sin] for apply_rope's half-split pairing of channel i with i+dim/2."""
