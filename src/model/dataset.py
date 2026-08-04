@@ -139,7 +139,7 @@ def downsample_samples(samples: list[tuple[Path, dict]], out_h: int, out_w: int,
     build_dataset's hashed mds_dir doesn't already exist, so no per-sample cache check here."""
     for sample_dir, _ in tqdm(samples, desc="downsampling masks", disable=not verbose):
         out_path = sample_dir / f"image/04_downsampled_smask_{out_h}h_{out_w}w"
-        mask = downsample_mask(Image.open(sample_dir / "image/04_smask.png"), out_h, out_w)
+        mask = downsample_mask(Image.open(sample_dir / "image/03_smask.png"), out_h, out_w)
         Image.fromarray((mask * 255).astype(np.uint8)).save(out_path.with_suffix(".png"))
         np.save(out_path.with_suffix(".npy"), mask)
 
@@ -276,7 +276,7 @@ def compute_speaker_means(samples: list[tuple[Path, dict]], keep_idxs: list[int]
     sums, counts = {}, {}
     for sample_dir, meta in tqdm(samples, desc="computing speaker means", disable=not verbose):
         speaker = int(meta.get("speaker", -1))
-        X = np.load(sample_dir / "vibration/03_fft.npz")["fft"]  # (1, L, F, C) complex64
+        X = np.load(sample_dir / "vibration/04_fft.npz")["fft"]  # (1, L, F, C) complex64
         X = np.squeeze(X, axis=0) if X.ndim == 4 and X.shape[0] == 1 else X
         mag = np.abs(X).astype(np.float64)  # float32 sums drift over many samples
         sums[speaker] = sums.get(speaker, 0) + mag
@@ -293,9 +293,9 @@ def load_speaker_means(path: Path) -> dict[int, torch.Tensor]:
     return {int(s): torch.from_numpy(d[s]).unsqueeze(0) for s in d.files}
 
 def precompute_vibration_samples(samples: list[tuple[Path, dict]], signal_mode: str, normalize_mode: str, patch_size: int, verbose: int = 1, speaker_means: dict[int, torch.Tensor] | None = None) -> None:
-    freqs = torch.from_numpy(np.load(samples[0][0] / "vibration/03_fft.npz")["freqs"])
+    freqs = torch.from_numpy(np.load(samples[0][0] / "vibration/04_fft.npz")["freqs"])
     for sample_dir, meta in tqdm(samples, desc="precomputing fft", disable=not verbose):
-        X = np.load(sample_dir / "vibration/03_fft.npz")["fft"]  # (1, L, F, C) complex64
+        X = np.load(sample_dir / "vibration/04_fft.npz")["fft"]  # (1, L, F, C) complex64
         X = np.squeeze(X, axis=0) if X.ndim == 4 and X.shape[0] == 1 else X
         X = torch.from_numpy(X).unsqueeze(0)
         speaker_mean = speaker_means[int(meta.get("speaker", -1))] if speaker_means is not None else None
