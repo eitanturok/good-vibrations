@@ -186,15 +186,6 @@ class FreqEncoder(nn.Module):
         x, keep = dropout(x, (B_L, P), self.freq_dropout, self.training)        # (B_L,P,D)             -> (B_L,P,D), (B_L,P)
         x = apply_rope(x, self.freqs_cis)                                       # (B_L,P,D)             -> (B_L,P,D)
         if speaker is not None: x += self.speakers_embed(speaker).unsqueeze(1)  # (B_L,P,D), (B_L,1,D)  -> (B_L,P,D)
-
-        # perm_idxs = [i for i in list(range(P))]
-        # i, j = 1, 5 # swap two patches
-        # tmp = perm_idxs[i]
-        # perm_idxs[i] = perm_idxs[j]
-        # perm_idxs[j] = tmp
-        # print(f'Permuted indices: {perm_idxs}')
-        # x = x[:, perm_idxs]  # (B_L,P,D) -> (B_L,P,D)
-        
         x = torch.cat((self.cls_token.expand(B_L, -1, -1), x), dim=1)           # (B_L,P,D)             -> (B_L,P+1,D)
         output = self.layers(x, src_key_padding_mask=pad_mask(keep, B_L))       # (B_L,P+1,D)           -> (B_L,P+1,D)
         return output[:, 0, :]  # (B_L,P+1,D) -> (B_L,D)
