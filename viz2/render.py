@@ -123,6 +123,28 @@ def _png(rgb: np.ndarray, alpha: np.ndarray | None, upscale: int) -> bytes:
 OVERLAY_GAIN = 0.85
 
 
+def canvas_size(h: int, w: int, backdrop: Image.Image | None) -> tuple[int, int]:
+    """Pixel size to composite an (h,w) mask over `backdrop`, in (W,H) order.
+
+    The mask grid is a uniform box-downsample of the whole cropped frame -- verified
+    corr=0.9998 against 03_smask.npy at both 20x40 and 30x30 -- so the two cover exactly
+    the same region and the PHOTO defines the geometry. Sizing the canvas from the mask
+    instead (w*up, h*up) forces the photo into the mask's aspect: 20x40 is 2.000 against
+    the frame's 2.197 (9% horizontal squeeze) and 30x30 is 1.000 (photo crushed to a
+    square). That is what made predictions sit off the scene.
+
+    So the canvas keeps the backdrop's own aspect and the MASK is stretched onto it --
+    anisotropic, but only undoing the anisotropic binning, which lands every cell back on
+    the pixels it averaged. Height is pinned to h*up so cell detail is preserved, and a
+    mask with no backdrop keeps the old square-cell geometry.
+    """
+    if backdrop is None:
+        return w * config.UPSCALE, h * config.UPSCALE
+    bw, bh = backdrop.size
+    height = h * config.UPSCALE
+    return max(1, round(height * bw / bh)), height
+
+
 def render_both(pred: np.ndarray, truth: np.ndarray, background: bool,
                 backdrop: Image.Image | None = None) -> bytes:
     """Ground truth and prediction in one panel: green truth underneath, blue prediction
@@ -131,9 +153,8 @@ def render_both(pred: np.ndarray, truth: np.ndarray, background: bool,
     Drawn as two successive alpha composites rather than by mixing colours, because a
     blend would put purple where the two agree -- a third hue that means neither.
     """
-    up = config.UPSCALE
     h, w = pred.shape
-    size = (w * up, h * up)
+    size = canvas_size(h, w, backdrop)
 
     if backdrop is not None:
         base = backdrop.convert("RGB").resize(size, Image.LANCZOS)
@@ -164,14 +185,14 @@ def render_mask(values: np.ndarray, mode: str, background: bool,
     if backdrop is None:
         return _png(rgb, None if background else alpha, config.UPSCALE)
 
-    up = config.UPSCALE
     h, w = values.shape
+    size = canvas_size(h, w, backdrop)
     # The mask is upscaled with NEAREST (crisp grid cells); the photo is a continuous
     # image and is resampled smoothly to the same size.
-    fg = Image.fromarray(rgb, mode="RGB").resize((w * up, h * up), Image.NEAREST)
+    fg = Image.fromarray(rgb, mode="RGB").resize(size, Image.NEAREST)
     a = Image.fromarray((np.clip(alpha, 0, 1) * OVERLAY_GAIN * 255).round().astype(np.uint8),
-                        mode="L").resize((w * up, h * up), Image.NEAREST)
-    bg = backdrop.convert("RGB").resize((w * up, h * up), Image.LANCZOS)
+                        mode="L").resize(size, Image.NEAREST)
+    bg = backdrop.convert("RGB").resize(size, Image.LANCZOS)
     out = Image.composite(fg, bg, a)
     buf = io.BytesIO()
     # A composited cell is a photograph, so JPEG is ~10x smaller than lossless PNG at
@@ -248,7 +269,9 @@ def cached_backdrop(sid: int) -> bytes | None:
     im = _backdrop(sid)
     if im is None:
         return None
-    im = im.resize((config.MASK_W * config.UPSCALE, config.MASK_H * config.UPSCALE), Image.LANCZOS)
+    # Same canvas as the composited cells: this is drawn behind mask layers, so sizing it
+    # any other way would reintroduce the misalignment at the boundary between the two.
+    im = im.resize(canvas_size(config.MASK_H, config.MASK_W, im), Image.LANCZOS)
     buf = io.BytesIO()
     im.save(buf, format="JPEG", quality=82, optimize=True)
     return buf.getvalue()

@@ -64,8 +64,39 @@ def mask_shapes(samples_dir) -> list[tuple[int, int]]:
 #
 # Every entry is a path RELATIVE TO A SAMPLE DIR. `{h}`/`{w}` are filled with MASK_H and
 # MASK_W so the mask name follows the configured target shape.
+# A layout entry names a FILENAME SCHEME, not a dataset. The two used to coincide, but the
+# current experiment-25 capture breaks that: it writes `06_..._20h_40w.npy` alongside
+# `04_..._30h_30w.npy`, so one dataset needs two entries because the numeric prefix varies
+# with the mask size. `dataset` therefore carries the data identity separately, and
+# EVAL_SPLITS is keyed on it -- without that split, selecting 30x30 would match this
+# capture against gastronorm's split whitelist and reject every experiment-25 run as
+# "different dataset".
 LAYOUTS = {
+    # The experiment-25 capture currently on disk, at 20x40. Same underlying data as
+    # "experiment-25" below, re-exported with shifted prefixes: `06_` mask (not `05_`) and
+    # the cropped overhead as backdrop rather than `01_cropped.png`. Nothing in the files
+    # declares the era, hence a separate entry probed ahead of the older one.
+    "experiment-25-v2": {
+        "dataset": "experiment-25",
+        "image_dir": "image",
+        "gt_mask": "image/06_downsampled_smask_{h}h_{w}w.npy",
+        "backdrop": "image/02_cropped_overhead.png",
+        "overhead": "image/06_overhead_speaker.png",  # detail modal (shows the speaker)
+        "audio": {"original": "audio.wav", "recovered": "recovered_audio.wav"},
+    },
+    # The same capture at 30x30, where the mask prefix is `04_` instead of `06_`. Listed
+    # ahead of "gastronorm", which uses the identical mask filename and backdrop and would
+    # otherwise absorb this dataset and apply the wrong split whitelist to its runs.
+    "experiment-25-v2-30h": {
+        "dataset": "experiment-25",
+        "image_dir": "image",
+        "gt_mask": "image/04_downsampled_smask_{h}h_{w}w.npy",
+        "backdrop": "image/02_cropped_overhead.png",
+        "overhead": "image/06_overhead_speaker.png",
+        "audio": {"original": "audio.wav", "recovered": "recovered_audio.wav"},
+    },
     "experiment-25": {
+        "dataset": "experiment-25",
         "image_dir": "image",
         "gt_mask": "image/05_downsampled_smask_{h}h_{w}w.npy",
         # The cropped frame is the one the masks were derived from: 02_smask.npy is
@@ -79,6 +110,7 @@ LAYOUTS = {
         "audio": {"original": "audio.wav", "recovered": "recovered_audio.wav"},
     },
     "gastronorm": {
+        "dataset": "gastronorm",
         "image_dir": "image",
         "gt_mask": "image/04_downsampled_smask_{h}h_{w}w.npy",
         "backdrop": "image/02_cropped_overhead.png",
@@ -93,7 +125,9 @@ LAYOUTS = {
 }
 
 # Probed in order; the first layout whose mask file exists in a sample dir wins.
-LAYOUT_ORDER = ["experiment-25", "gastronorm"]
+LAYOUT_ORDER = [
+    "experiment-25-v2", "experiment-25-v2-30h", "experiment-25", "gastronorm",
+]
 
 # Per-sample extras shown in the detail modal. The recovery laser index varies by
 # experiment (50 on experiment-25, 55 on gastronorm), and gastronorm drops the axis
@@ -120,6 +154,10 @@ class Layout:
     def __init__(self, name: str, spec: dict):
         fmt = {"h": MASK_H, "w": MASK_W}
         self.name = name
+        # Which data this is, independent of the filename scheme `name` identifies. Two
+        # layouts can share a dataset (the same capture at two mask sizes); run
+        # compatibility keys on this, never on `name`.
+        self.dataset = spec.get("dataset", name)
         self.image_dir = spec["image_dir"]
         self.gt_mask = spec["gt_mask"].format(**fmt)
         self.backdrop = spec["backdrop"].format(**fmt)

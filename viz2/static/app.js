@@ -106,6 +106,15 @@ async function boot() {
   const [runs, samples, lut] = await Promise.all([
     api("/api/runs"), api("/api/samples"), api("/api/lut")]);
   S.lut = lut;
+  // The cell box follows the SCENE's aspect, not the mask grid's. --mask-h is the fixed
+  // dimension; width derives from it so a 20x40 and a 30x30 grid over the same room draw
+  // the same shape and land on the same features. Set before readRowMetrics re-runs, and
+  // before any row is measured, since --mask-h/--mask-w drive the virtualizer's geometry.
+  if (lut.aspect) {
+    const mh = cssPx("--mask-h", 110);
+    document.documentElement.style.setProperty("--mask-w", `${Math.round(mh * lut.aspect)}px`);
+    readRowMetrics();
+  }
   S.meta = runs;
   S.renderVersion = runs.render_version ?? 0;
   S.samples = samples.samples;
@@ -471,9 +480,13 @@ function syncRowCells(el) {
     // over a CSS backdrop. Keeping a parallel server-PNG path meant two renderers that
     // had to agree on gamma, alpha and backdrop geometry -- and they drifted.
     // A second canvas for the ground-truth half, shown only in stacked mode.
+    // Canvas dims come from the server's mask shape, never hardcoded: the grid is 20x40
+    // on some datasets and 30x30 on others, and a fixed 40x20 buffer would letterbox the
+    // mask into the wrong cells entirely.
+    const { h: mh, w: mw } = S.lut;
     c.innerHTML = `<div class="ctitle run-head"></div>` +
-      `<canvas class="mask predmask" width="40" height="20"></canvas>` +
-      `<canvas class="mask truthmask" width="40" height="20" hidden></canvas>` +
+      `<canvas class="mask predmask" width="${mw}" height="${mh}"></canvas>` +
+      `<canvas class="mask truthmask" width="${mw}" height="${mh}" hidden></canvas>` +
       `<div class="tags subtags"></div>`;
     el.appendChild(c);
     el._runCells.push(c);
@@ -1096,7 +1109,10 @@ function drawMask(canvas, values, mode, truth) {
    box, stacked puts them in two. */
 const needsTruth = (m) => m === "overlay" || m === "stacked";
 
-const scratch = new Float32Array(20 * 40);   // reused across cells; avoids per-frame GC
+/* Reused across cells; avoids per-frame GC. Grown on demand rather than fixed at 20*40,
+   which silently truncated every cell on a larger grid (30x30 is 900 values). */
+let scratch = new Float32Array(20 * 40);
+const scratchFor = (n) => (scratch.length >= n ? scratch : (scratch = new Float32Array(n)));
 
 function paintCanvas(cv, run, sid, epoch) {
   if (!S.lut) return;
@@ -1113,15 +1129,16 @@ function paintCanvas(cv, run, sid, epoch) {
   const si = store.sids.get(sid);
   if (ei < 0) { blank(); return; }
   const off = (ei * store.sids.size + si) * cells;
-  for (let i = 0; i < cells; i++) scratch[i] = half(store.raw[off + i]);
-  if (Number.isNaN(scratch[0])) { blank(); return; }   // run has no prediction here
+  const buf = scratchFor(cells);
+  for (let i = 0; i < cells; i++) buf[i] = half(store.raw[off + i]);
+  if (Number.isNaN(buf[0])) { blank(); return; }   // run has no prediction here
   // In stacked mode this canvas is the prediction half only -- the target is drawn into
   // its own canvas below, so it needs no truth here.
   const mode = S.view.mode === "stacked" ? "pred" : S.view.mode;
   const wantTruth = mode === "diff" || needsTruth(mode);
   const truth = wantTruth ? S.truthCache[sid] : null;
   if (wantTruth && !truth) { blank(); ensureTruth(sid); return; }
-  drawMask(cv, scratch, mode, truth);
+  drawMask(cv, buf, mode, truth);
 }
 
 /* Fetch frames for whatever rows are on screen, once per run.
@@ -1443,9 +1460,10 @@ function bindTooltip() {
     const img = ev.target.closest?.(".mask");
     if (!img || img.dataset.sid === undefined) { tip.hidden = true; cur = null; return; }
     const b = img.getBoundingClientRect();
-    const col = Math.floor(((ev.clientX - b.left) / b.width) * 40);
-    const row = Math.floor(((ev.clientY - b.top) / b.height) * 20);
-    if (row < 0 || row > 19 || col < 0 || col > 39) { tip.hidden = true; return; }
+    const { h: mh, w: mw } = S.lut;
+    const col = Math.floor(((ev.clientX - b.left) / b.width) * mw);
+    const row = Math.floor(((ev.clientY - b.top) / b.height) * mh);
+    if (row < 0 || row >= mh || col < 0 || col >= mw) { tip.hidden = true; return; }
     // Ground truth has no prediction to diff against, so it always reports raw values.
     const mode = img.dataset.run ? S.view.mode : "pred";
     const key = `${img.dataset.run}|${img.dataset.sid}|${mode}`;

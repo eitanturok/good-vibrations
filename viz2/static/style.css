@@ -22,11 +22,15 @@
      The run column needs two chip lines (com, then the three metrics); the ground-truth
      column uses one, and simply has more headroom. */
   --row-h: 206px;
+  /* --mask-w is overwritten at boot from the scene's aspect (see app.js boot): the cell
+     box tracks the photo, not the mask grid. This literal is the 20x40 fallback used
+     until /api/lut answers. The column widths derive from it so they never clip a wider
+     box -- 20px is the cell's horizontal padding. */
   --mask-w: 220px;
   --mask-h: 110px;
-  --col-w: 240px;   /* same as --gt-w so masks align across the whole row */
+  --col-w: calc(var(--mask-w) + 20px);   /* same as --gt-w so masks align across the row */
   --idx-w: 52px;
-  --gt-w: 240px;
+  --gt-w: calc(var(--mask-w) + 20px);
 
   --r: 6px;
   --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
@@ -445,13 +449,15 @@ body.stacked .gtimg { margin-top: 114px; }
 /* mask images */
 .mask {
   width: var(--mask-w); height: var(--mask-h); display: block; border-radius: 3px;
-  image-rendering: pixelated;                 /* keep 20x40 grid cells crisp */
+  image-rendering: pixelated;                 /* keep mask grid cells crisp */
   background: var(--surface-2);
 }
 .mask.nobg { background: repeating-conic-gradient(var(--surface-2) 0% 25%, var(--surface-1) 0% 50%) 50%/12px 12px; }
-/* Ground truth renders the same 20x40 grid at the same size as every prediction cell,
-   so masks line up across the row and can be compared directly. */
-.gtimg { width: 220px; height: 110px; }
+/* Ground truth renders the same grid at the same size as every prediction cell, so masks
+   line up across the row and can be compared directly. Uses the same variables as .mask
+   rather than repeating the numbers -- --mask-w is set from the scene aspect at boot, and
+   a literal here would silently desync the GT column from every prediction beside it. */
+.gtimg { width: var(--mask-w); height: var(--mask-h); }
 
 .gtcell { cursor: pointer; }
 .gtcell:hover .gtimg { outline: 2px solid var(--accent); outline-offset: 1px; }

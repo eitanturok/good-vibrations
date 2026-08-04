@@ -245,24 +245,27 @@ def _classify(name: str, run_dir: Path, gt: GtIndex) -> RunEntry:
 
     # Sample ids collide across experiments, so a run from another dataset would join
     # cleanly against the loaded ground truth and produce silently wrong metrics.
-    # Where the layout declares its split names, that is the strongest available signal.
-    allowed = config.EVAL_SPLITS.get(gt.layout.name)
+    # Where the dataset declares its split names, that is the strongest available signal.
+    # Keyed on layout.dataset, NOT layout.name: one dataset can be read through several
+    # layouts (the same capture at two mask sizes), and keying on the filename scheme
+    # would apply the wrong whitelist and reject every run as "different dataset".
+    allowed = config.EVAL_SPLITS.get(gt.layout.dataset)
     if allowed is not None:
         if splits and not set(splits) <= allowed:
             preview = ", ".join(splits[:3])
             return RunEntry(name, False, f"different dataset (eval splits: {preview})",
                             eval_splits=splits)
     else:
-        # No whitelist for this layout: fall back to requiring that EVERY sample id in
+        # No whitelist for this dataset: fall back to requiring that EVERY sample id in
         # the probe exists here. Weaker than matching split names -- two datasets with
         # overlapping id ranges still pass -- so it is a backstop for a not-yet-declared
-        # layout, not a substitute for adding one to config.EVAL_SPLITS.
+        # dataset, not a substitute for adding one to config.EVAL_SPLITS.
         probe_ids = obj["sample_ids"]
         if probe_ids and not all(int(s) in gt.row_of for s in probe_ids):
             return RunEntry(name, False, "different dataset (sample ids not in this dataset)",
                             eval_splits=splits)
 
-    family = gt.layout.name if splits else "unknown"
+    family = gt.layout.dataset if splits else "unknown"
     # Recency comes from the highest-epoch file rather than a stat() of every .pt: epochs
     # are written in order, so it ranks runs identically at a fraction of the cost.
     newest = files[0]

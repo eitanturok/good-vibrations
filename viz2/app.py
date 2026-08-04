@@ -235,7 +235,22 @@ def api_lut():
     return {"pred": render.SEQ_LUT.tolist(), "truth": render.TRUE_SEQ_LUT.tolist(),
             "diff": render.DIV_LUT.tolist(), "gamma": render.GAMMA,
             "gain": render.OVERLAY_GAIN,   # alpha scale when drawn over the backdrop
-            "h": config.MASK_H, "w": config.MASK_W}
+            "h": config.MASK_H, "w": config.MASK_W,
+            # Width/height of the cropped frame the masks were downsampled from. The mask
+            # grid tiles that frame uniformly, so the CELL BOX must use this aspect, not
+            # w/h -- a 30x30 grid over a 2.2-aspect scene is not square, and drawing it in
+            # a square box slides every prediction off the features it refers to.
+            "aspect": _backdrop_aspect()}
+
+
+def _backdrop_aspect() -> float:
+    """Aspect of the layout's backdrop, from a real sample; falls back to the mask's own
+    ratio if no backdrop is on disk (masks then render as they always did)."""
+    for sid in registry.gt.sample_ids[:25]:
+        im = render._backdrop(int(sid))
+        if im is not None:
+            return im.size[0] / im.size[1]
+    return config.MASK_W / config.MASK_H
 
 
 @app.get("/api/frames")
