@@ -1,134 +1,469 @@
-"""Vibrations dashboard server.
+"""FastAPI routes for viz.
 
-    python -m viz                # http://localhost:8501
-    python viz                   # same thing
-    python viz/app.py            # same thing
-
-Run from the repo root, or with PYTHONPATH=. so data.py can import utils.metrics.
-The launcher itself lives in viz/__main__.py.
-
-Everything is read live from data/ and runs/ — new samples or runs appear
-without a restart (the frontend polls /api/version).
+The server does only what the browser cannot: decode .pt files, compute metrics once
+per run, and render PNGs. Sorting and filtering are entirely client-side -- the whole
+dataset is a few hundred KB and already in memory there, so a round-trip per slider
+frame would only add latency.
 """
+
+import json
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException
+import numpy as np
+from fastapi import FastAPI, HTTPException, Query, Response
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-import data
+from viz import config, data, render
+from viz.data import Registry
 
-STATIC = Path(__file__).resolve().parent / "static"
-app = FastAPI(title="good-vibrations dashboard")
+app = FastAPI(title="viz")
+registry: Registry = None  # set by init()
+
+STATIC = Path(__file__).parent / "static"
+IMMUTABLE = {"Cache-Control": "public, max-age=31536000, immutable"}
 
 
-@app.middleware("http")
-async def no_cache(request, call_next):
-    resp = await call_next(request)
-    resp.headers["Cache-Control"] = "no-cache"
-    return resp
+def init(experiment_dir: Path = None, runs_dir: Path = None) -> Registry:
+    global registry
+    registry = Registry(experiment_dir or config.EXPERIMENT_DIR, runs_dir or config.RUNS_DIR)
+    for name in registry.defaults():  # warm so the first paint has data
+        registry.run(name)
+    return registry
+
+
+@app.on_event("startup")
+def _startup():
+    if registry is None:
+        init()
+
+
+def _sid(sid) -> int:
+    try:
+        return registry.sample_index(sid)
+    except (KeyError, ValueError, TypeError):
+        raise HTTPException(404, "unknown sample")
+
+
+def _parse_shape(s: str) -> tuple[int, int]:
+    """"30x30" -> (30, 30). Untrusted input, so a malformed value is a 400 rather than
+    something that reaches a filename or an array index."""
+    try:
+        h, w = (int(v) for v in s.lower().split("x", 1))
+    except ValueError:
+        raise HTTPException(400, f"bad shape {s!r}, expected HxW")
+    return h, w
+
+
+def _run(name: str):
+    try:
+        return registry.run(name)
+    except KeyError:
+        raise HTTPException(404, "unknown or incompatible run")
+
+
+def _clean(v):
+    """NaN/Inf are not valid JSON; emit null so the client can treat them as missing."""
+    f = float(v)
+    return None if not np.isfinite(f) else round(f, 6)
+
+
+# ***** metadata *****
+
+
+@app.get("/api/runs")
+def api_runs():
+    # Picks up runs that appeared since startup, so a model that finishes training while
+    # viz is open shows up in the picker on its own.
+    registry.maybe_rescan()
+    runs = [{"name": e.name, "compatible": e.compatible, "reason": e.reason,
+             "mtime": e.mtime, "epoch": e.epoch, "eval_splits": e.eval_splits,
+             "family": e.family, "status": e.status,
+             "shape": list(e.shape) if e.shape else None} for e in registry.entries]
+    return {"runs": runs, "default_selected": registry.defaults(),
+            "n_samples": len(registry.gt), "render_version": config.RENDER_VERSION}
+
+
+@app.get("/api/samples")
+def api_samples():
+    gt = registry.gt
+    out = []
+    for i, sid in enumerate(gt.sample_ids):
+        m = gt.meta[i]
+        com = gt.avg_com[i]
+        out.append({
+            # The SAMPLE ID, not the row. Every route the client calls with this value
+            # (`/api/backdrop/{sid}`, `/api/gt_mask.png?sid=`, `/api/frames?sids=`) resolves
+            # it through gt.row_of, and `/api/run/{name}` keys its per-sample metrics by
+            # sample id too. Emitting the row here made both of those lookups wrong on any
+            # dataset whose ids do not start at zero: gastronorm starts at 000009, so the
+            # ground-truth column resolved row->row-9 while the prediction column matched
+            # the row against a raw sample_id, putting two DIFFERENT scenes side by side.
+            "i": int(sid),
+            "sample_id": sid,
+            # position_id is the gastronorm spelling of output_id: the scene identity
+            # shared by the 8 samples that differ only in which speaker played.
+            "output_id": m.get("output_id") or m.get("position_id"),
+            "layout": m.get("layout"),
+            "n_objects": m.get("n_objects"),
+            # Object types present, independent of layout: lets the UI ask "contains a
+            # cylinder?" once the dataset holds more than cubes.
+            "objects": sorted(m.get("objects") or {}),
+            # The enclosure the scene sits in. Experiment-25 is entirely "metal", so the
+            # filter shows a single chip today; it populates itself if other boxes appear.
+            "box": m.get("box"),
+            "speaker": m.get("speaker"),
+            "is_empty_box": bool(m.get("is_empty_box")),
+            # full-resolution image coords, for the position scatter; [-1,-1] sentinel
+            # on empty-box samples means "no position"
+            "avg_com": [_clean(com[0]), _clean(com[1])],
+            "com_gt": [_clean(gt.com_gt[i][0]), _clean(gt.com_gt[i][1])],
+        })
+    return {"samples": out}
+
+
+@app.get("/api/run/{name}")
+def api_run(name: str, reload: int = 0, epoch: int | None = None):
+    """Per-sample metrics for one run. `epoch` scores that saved epoch instead of the
+    latest, so the numbers and sorting match the masks on screen while scrubbing."""
+    # reload=1 re-reads the run's prediction files, picking up epochs written since it
+    # was first loaded (a run still training keeps producing them).
+    if reload:
+        registry.rescan()
+    try:
+        rd = registry.run(name, reload=bool(reload), epoch=epoch)
+    except KeyError:
+        raise HTTPException(404, "unknown or incompatible run")
+    samples = {}
+    for i, sid in enumerate(rd.sample_ids):
+        samples[int(sid)] = {
+            "split": rd.splits[i],
+            "mse": _clean(rd.mse[i]),
+            "iou": _clean(rd.iou[i]),
+            "comdist": _clean(rd.comdist[i]),
+            "com": [_clean(rd.com_pred[i][0]), _clean(rd.com_pred[i][1])],
+        }
+    return {"name": rd.name, "epoch": rd.epoch, "family": rd.family,
+            # The grid this run predicts at. The client sizes the column's canvas from it,
+            # so a 16x16 run and a 30x30 run render correctly in the same table.
+            "h": rd.shape[0], "w": rd.shape[1],
+            "skipped_files": rd.skipped_files, "n": len(rd.sample_ids),
+            "epochs": registry.epochs(name),   # drives the epoch slider
+            "samples": samples}
+
+
+# ***** mask images *****
+
+
+@app.get("/api/mask.png")
+def api_mask(run: str, sid: int, mode: str = "pred", bg: int = 1):
+    i = _sid(sid)
+    rd = _run(run)
+    if i not in rd.row_of:
+        raise HTTPException(404, "no prediction for this sample")
+    mode = mode if mode in ("diff", "overlay", "stacked") else "pred"
+    img = render.cached_mask("run", run, i, mode, bool(bg))
+    return Response(img, media_type=render.media_type(img), headers=IMMUTABLE)
+
+
+@app.get("/api/gt_mask.png")
+def api_gt_mask(sid: int, bg: int = 1):
+    img = render.cached_mask("gt", "", _sid(sid), "pred", bool(bg))
+    return Response(img, media_type=render.media_type(img), headers=IMMUTABLE)
+
+
+@app.get("/api/backdrop/{sid}.jpg")
+def api_backdrop(sid: int):
+    """The overhead frame at cell size, shown behind canvas-drawn masks. Fetched once per
+    sample and reused across every epoch, so scrubbing never re-downloads it."""
+    img = render.cached_backdrop(_sid(sid))
+    if img is None:
+        raise HTTPException(404, "no backdrop")
+    return Response(img, media_type="image/jpeg", headers=IMMUTABLE)
+
+
+@app.get("/api/colorbar/{mode}.png")
+def api_colorbar(mode: str):
+    mode = mode if mode in ("diff", "truth") else "pred"
+    return Response(render.cached_colorbar(mode), media_type="image/png", headers=IMMUTABLE)
+
+
+@app.get("/api/values")
+def api_values(sid: int, run: str = "", mode: str = "pred", shape: str = ""):
+    """Grid values behind one cell, for the hover tooltip. Fetched on first hover and
+    memoized client-side -- never prefetched.
+
+    `shape` ("30x30") selects which resolution's ground truth to return, for the
+    truth/diff overlays of a run trained at a non-default grid.
+    """
+    i = _sid(sid)
+    if not run:
+        values = registry.gt.masks[i]
+        if shape:
+            alt = registry.gt.masks_at(_parse_shape(shape))
+            if alt is None:
+                raise HTTPException(404, f"no ground truth at {shape}")
+            values = alt[i]
+    else:
+        rd = _run(run)
+        if i not in rd.row_of:
+            raise HTTPException(404, "no prediction for this sample")
+        values = rd.masks[rd.row_of[i]]
+        # Ground truth at this run's grid, since diff/overlay are elementwise and the
+        # table can hold runs at several resolutions at once.
+        gt_masks = registry.gt.masks_at(rd.shape)
+        if gt_masks is None:
+            return JSONResponse({"v": np.round(values.astype(np.float64), 4).tolist()},
+                                headers=IMMUTABLE)
+        if mode == "diff":
+            values = values - gt_masks[i]
+        elif mode in ("overlay", "stacked"):
+            # Two masks are on screen, so report both rather than leaving the reader to
+            # guess which one a single number belongs to.
+            return JSONResponse(
+                {"v": np.round(values.astype(np.float64), 4).tolist(),
+                 "t": np.round(gt_masks[i].astype(np.float64), 4).tolist()},
+                headers=IMMUTABLE)
+    return JSONResponse({"v": np.round(values.astype(np.float64), 4).tolist()},
+                        headers=IMMUTABLE)
+
+
+# ***** per-sample media + detail *****
+
+
+@app.get("/api/overhead/{sid}.png")
+def api_overhead(sid: int):
+    p = registry.sample_dir(_sid(sid)) / registry.gt.layout.overhead
+    if not p.exists():
+        raise HTTPException(404, "no overhead image")
+    return FileResponse(p, media_type="image/png", headers=IMMUTABLE)
+
+
+@app.get("/api/vibration/{sid}/{which}.png")
+def api_vibration(sid: int, which: str):
+    pat = config.VIBRATION_GLOB.get(which)
+    if pat is None:
+        raise HTTPException(404, "unknown image")
+    hits = sorted(registry.sample_dir(_sid(sid)).glob(pat))
+    if not hits:
+        raise HTTPException(404, "not generated for this sample")
+    return FileResponse(hits[0], media_type="image/png", headers=IMMUTABLE)
+
+
+@app.get("/api/audio/{sid}/{which}")
+def api_audio(sid: int, which: str):
+    rel = registry.gt.layout.audio.get(which)
+    if rel is None:
+        # Either an unknown name or a track this layout never produces (the gastronorm
+        # captures ship no source audio, only the recovered waveform).
+        raise HTTPException(404, "unknown audio")
+    p = registry.sample_dir(_sid(sid)) / rel
+    if not p.exists():
+        raise HTTPException(404, "not generated for this sample")
+    # FileResponse handles Range requests, which <audio> needs in order to seek.
+    return FileResponse(p, media_type="audio/wav")
+
+
+@app.get("/api/lut")
+def api_lut():
+    """The colormaps, so the client draws cells with exactly the colours the server uses
+    for the modal and ground-truth images. One source of truth for colour."""
+    return {"pred": render.SEQ_LUT.tolist(), "truth": render.TRUE_SEQ_LUT.tolist(),
+            "diff": render.DIV_LUT.tolist(), "gamma": render.GAMMA,
+            "gain": render.OVERLAY_GAIN,   # alpha scale when drawn over the backdrop
+            "h": config.MASK_H, "w": config.MASK_W,
+            # Width/height of the cropped frame the masks were downsampled from. The mask
+            # grid tiles that frame uniformly, so the CELL BOX must use this aspect, not
+            # w/h -- a 30x30 grid over a 2.2-aspect scene is not square, and drawing it in
+            # a square box slides every prediction off the features it refers to.
+            "aspect": _backdrop_aspect()}
+
+
+def _backdrop_aspect() -> float:
+    """Aspect of the layout's backdrop, from a real sample; falls back to the mask's own
+    ratio if no backdrop is on disk (masks then render as they always did)."""
+    for sid in registry.gt.sample_ids[:25]:
+        im = render._backdrop(int(sid))
+        if im is not None:
+            return im.size[0] / im.size[1]
+    return config.MASK_W / config.MASK_H
+
+
+@app.get("/api/frames")
+def api_frames(run: str, sids: str, epochs: str = ""):
+    """Raw mask values for a set of samples across a set of epochs, as one fp16 blob.
+
+    A 20x40 mask is 1600 bytes -- usually smaller than a PNG of it -- so shipping values
+    and drawing them on the client is both lighter than per-frame images and fast enough
+    to scrub and animate without touching the network again.
+
+    Layout: float16[n_epochs][n_sids][H*W], C-order. Samples the run never predicted are
+    filled with NaN so the client can show its "no prediction" state.
+    """
+    # load_epoch_masks matches against the raw sample_id stored in each .pt, so `want`
+    # must hold SAMPLE IDS, not rows. sample_index is still called for its side effect of
+    # rejecting an id this dataset does not have -- resolving to a row and then looking
+    # that row up as an id silently returned another sample's prediction.
+    ids = []
+    for s in sids.split(","):
+        if s.strip():
+            registry.sample_index(s)
+            ids.append(int(s))
+    if not ids:
+        raise HTTPException(400, "no sids")
+    eps = [int(e) for e in epochs.split(",") if e.strip()] or registry.epochs(run)
+    if not eps:
+        raise HTTPException(404, "run has no saved epochs")
+
+    if run not in registry.by_name or not registry.by_name[run].compatible:
+        raise HTTPException(404, "unknown or incompatible run")
+
+    # Sized from THIS run's grid, not the global default: the table mixes resolutions, so
+    # a fixed cell count would truncate a finer run's mask or pad a coarser one. A
+    # compatible entry always carries a shape (_classify sets it), and the guard above
+    # already rejected anything else.
+    h, w = registry.by_name[run].shape
+    want = set(ids)
+    out = np.full((len(eps), len(ids), h * w), np.nan, dtype=np.float16)
+    for ei, ep in enumerate(eps):
+        masks = data.load_epoch_masks(run, registry.runs_dir, ep, want)
+        for si, i in enumerate(ids):
+            m = masks.get(i)
+            if m is not None:
+                out[ei, si] = m.reshape(-1)
+    return Response(out.tobytes(), media_type="application/octet-stream", headers=IMMUTABLE)
+
+
+@app.get("/api/neighbors")
+def api_neighbors(run: str, sid: int, k: int = 5):
+    """Ground-truth samples whose center of mass is closest to / furthest from what this
+    run predicted for `sid`.
+
+    Answers "the model put the mass here -- which real scenes actually look like that?",
+    so a prediction that resembles a different sample than its own target is visible.
+    """
+    i = _sid(sid)
+    rd = _run(run)
+    if i not in rd.row_of:
+        raise HTTPException(404, "no prediction for this sample")
+    pred = np.asarray(rd.com_pred[rd.row_of[i]], dtype=np.float64)
+
+    gt = registry.gt
+    # Grid cells are not square (20 rows x 40 cols over the same scene), so normalise to
+    # [0,1] on each axis before measuring -- otherwise a column offset counts double.
+    # Scale by THIS RUN's grid, and compare against targets measured on that same grid:
+    # com_pred is in the run's coordinates, so using the global default would divide a
+    # 30x30 prediction by 20x40 and rank neighbours in a mixed coordinate system.
+    scale = np.array([rd.shape[0] - 1, rd.shape[1] - 1], dtype=np.float64)
+    com_gt = gt.com_at(rd.shape)
+    if com_gt is None:
+        raise HTTPException(404, "no ground truth at this run's mask size")
+    target = pred / scale
+    coms = com_gt / scale
+
+    # Empty boxes carry a (-1,-1) sentinel rather than a position; ranking them would
+    # fill the "least similar" list with samples that have no center of mass at all.
+    valid = np.array([not m.get("is_empty_box") and com_gt[j][0] >= 0
+                      for j, m in enumerate(gt.meta)])
+    d = np.linalg.norm(coms - target, axis=-1)
+    d[~valid] = np.nan
+
+    order = np.argsort(np.where(np.isnan(d), np.inf, d))
+    order = [j for j in order if not np.isnan(d[j])]
+    k = max(1, min(int(k), 25))
+
+    def position_key(m: dict):
+        """What identifies a physical scene, independent of which speaker played.
+
+        experiment-25 calls it output_id, the gastronorm captures call it position_id.
+        Falling back to the sample id when neither is present keeps every candidate
+        distinct -- a key of None for every sample would otherwise collapse the whole
+        list to a single entry rather than merely failing to dedupe.
+        """
+        for key in ("output_id", "position_id"):
+            if m.get(key) is not None:
+                return (key, m[key])
+        return ("sample_id", m.get("sample_id"))
+
+    def distinct(seq):
+        """One entry per physical position: 8 samples share each position (one per
+        speaker) with identical ground-truth COM, so without this every slot in the list
+        would be the same scene repeated."""
+        seen, out = set(), []
+        for j in seq:
+            key = position_key(gt.meta[j])
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(j)
+            if len(out) == k:
+                break
+        return out
+
+    def pack(idx):
+        m = gt.meta[idx]
+        # "i" is the sample id, matching /api/samples: the client both requests
+        # /api/gt_mask.png?sid= with it and matches it against s.i to open the row.
+        return {"i": int(gt.sample_ids[idx]), "sample_id": gt.sample_ids[idx],
+                "output_id": m.get("output_id") or m.get("position_id"),
+                "speaker": m.get("speaker"),
+                "layout": m.get("layout"), "n_objects": m.get("n_objects"),
+                "com": [_clean(com_gt[idx][0]), _clean(com_gt[idx][1])],
+                "distance": _clean(d[idx])}
+
+    # Every coordinate in this payload is in the run's grid, so the modal can print
+    # pred_com and gt_com side by side without them meaning different things.
+    return {"run": run, "sample_id": gt.sample_ids[i],
+            "shape": [rd.shape[0], rd.shape[1]],
+            "pred_com": [_clean(pred[0]), _clean(pred[1])],
+            "gt_com": [_clean(com_gt[i][0]), _clean(com_gt[i][1])],
+            "n_candidates": len(order),
+            "most_similar": [pack(j) for j in distinct(order)],
+            "least_similar": [pack(j) for j in distinct(order[::-1])]}
+
+
+@app.get("/api/detail/{sid}")
+def api_detail(sid: int):
+    i = _sid(sid)
+    m = registry.gt.meta[i]
+    d = registry.sample_dir(i)
+    # Union of both eras' metadata: experiment-25 writes output_id/n_lasers, the
+    # gastronorm captures write position_id/laser_idx/timestamp/n_rows/n_cols. Missing
+    # keys come back null and the modal omits them, so one list serves both.
+    keys = ["sample_id", "output_id", "position_id", "description", "layout",
+            "n_objects", "objects", "coms", "avg_com", "box", "is_empty_box", "speaker",
+            "min_freq", "max_freq", "n_lasers", "n_rows", "n_cols", "laser_idx",
+            "fps", "n_capture_seconds", "timestamp"]
+    out = {k: m.get(k) for k in keys}
+    # coms/avg_com are numpy reprs on the gastronorm layout; normalise the one the UI
+    # actually plots so the modal never prints a raw "[603.1 901.2]" string.
+    out["avg_com"] = data.parse_com(m.get("avg_com"))
+    out["com_gt_grid"] = [_clean(registry.gt.com_gt[i][0]), _clean(registry.gt.com_gt[i][1])]
+    # The grid those coordinates are in. The modal used to hardcode "20x40", which became
+    # a lie the moment the default shape was picked from the data.
+    out["grid"] = [config.MASK_H, config.MASK_W]
+    audio = registry.gt.layout.audio
+    out["has"] = {
+        # A track the layout does not define is simply absent, so the modal hides it
+        # rather than offering a control that 404s.
+        "original": bool(audio.get("original")) and (d / audio["original"]).exists(),
+        "recovered": bool(audio.get("recovered")) and (d / audio["recovered"]).exists(),
+        "spectrogram": bool(list(d.glob(config.VIBRATION_GLOB["spectrogram"]))),
+        "fft": bool(list(d.glob(config.VIBRATION_GLOB["fft"]))),
+    }
+    return out
 
 
 @app.get("/")
 def index():
-    return FileResponse(STATIC / "index.html")
+    """Serve index.html with the asset URLs stamped by file mtime, so an edited app.js
+    or style.css can never be served from a stale browser cache."""
+    html = (STATIC / "index.html").read_text()
+    for asset in ("app.js", "style.css"):
+        v = int((STATIC / asset).stat().st_mtime)
+        html = html.replace(f"/{asset}", f"/{asset}?v={v}")
+    return Response(html, media_type="text/html",
+                    headers={"Cache-Control": "no-cache, must-revalidate"})
 
 
-@app.get("/api/manifest")
-def manifest(dataset: str | None = None, run: str | None = None):
-    # a run implies its dataset, so the sample list always matches the selected run
-    if dataset is None:
-        dataset = data.dataset_for_run(run) if run else data.DEFAULT_DATASET
-    man = data.build_manifest(dataset)
-    man["version"] = data.data_version()
-    return JSONResponse(man)
-
-
-@app.get("/api/version")
-def version():
-    return {"version": data.data_version()}
-
-
-@app.get("/api/fft")
-def fft(ids: str, lasers: str = "all", dirs: str = "xy", norm: bool = False,
-        dataset: str | None = None, run: str | None = None):
-    ds = dataset or (data.dataset_for_run(run) if run else data.DEFAULT_DATASET)
-    laser_idx = None if lasers == "all" else [int(i) for i in lasers.split(",") if i != ""]
-    if laser_idx == []:
-        laser_idx = None
-    curves, freqs = {}, None
-    for sid in [int(i) for i in ids.split(",") if i != ""]:
-        try:
-            curve, freqs = data.fft_curve(sid, laser_idx, dirs, norm, ds)
-        except (FileNotFoundError, KeyError):
-            continue
-        curves[str(sid)] = [round(float(v), 4) for v in curve]
-    if freqs is None:
-        raise HTTPException(404, "no fft found for requested ids")
-    return {"freqs": [round(float(f), 2) for f in freqs], "curves": curves}
-
-
-@app.get("/api/run/{run}")
-def run_info(run: str, epoch: int | None = None):
-    if run not in data.list_runs():
-        raise HTTPException(404, f"unknown run: {run}")
-    return data.run_payload(run, epoch)
-
-
-@app.get("/api/run/{run}/masks")
-def masks(run: str, ids: str, epoch: int | None = None):
-    if run not in data.list_runs():
-        raise HTTPException(404, f"unknown run: {run}")
-    return data.run_masks(run, [int(i) for i in ids.split(",") if i != ""], epoch)
-
-
-@app.get("/api/gt_masks")
-def gt_masks(ids: str, dataset: str | None = None, run: str | None = None):
-    ds = dataset or (data.dataset_for_run(run) if run else data.DEFAULT_DATASET)
-    out = {}
-    for sid in [int(i) for i in ids.split(",") if i != ""]:
-        try:
-            out[str(sid)] = data.gt_mask(sid, ds)
-        except (FileNotFoundError, KeyError):
-            pass
-    return out
-
-
-MEDIA = {
-    "overhead": "image/04_overhead_scored.png",  # masks + boxes + confidence drawn on
-    "thumb": "image/01_cropped.png",             # plain cropped overhead
-    "smask": "image/02_smask.png",
-    "audio": "audio.wav",
-    "recovered": "recovered_audio.wav",
-}
-
-
-@app.get("/media/{sample_id}/{kind}")
-def media(sample_id: int, kind: str):
-    """Per-sample images/audio live in the raw capture dirs, not in the MDS dataset (which
-    only carries X/y). Served only when a raw sample dir is configured and still on disk."""
-    if kind not in MEDIA:
-        raise HTTPException(404, f"unknown media kind: {kind}")
-    base = data.raw_sample_dir(sample_id)
-    if base is None:
-        raise HTTPException(404, f"no raw sample dir for {sample_id}")
-    path = base / MEDIA[kind]
-    if not path.exists():
-        raise HTTPException(404, str(path))
-    return FileResponse(path)
-
-
-app.mount("/static", StaticFiles(directory=STATIC), name="static")
-
-
-if __name__ == "__main__":
-    # The launcher lives in __main__.py so `python -m viz` and `python viz` share it.
-    # It can't be imported as `__main__` (that name is this file, right now), so load it
-    # from its path.
-    import importlib.util
-
-    spec = importlib.util.spec_from_file_location(
-        "viz_launcher", Path(__file__).resolve().parent / "__main__.py")
-    launcher = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(launcher)
-    launcher.main()
+app.mount("/", StaticFiles(directory=STATIC, html=True), name="static")

@@ -1,7 +1,7 @@
-"""Paths, constants and the sys.path bootstrap for viz2.
+"""Paths, constants and the sys.path bootstrap for viz.
 
-Importing this module (directly or via any other viz2 module) puts the repo root on
-sys.path, so `from utils.metrics import ...` resolves no matter what cwd viz2 is
+Importing this module (directly or via any other viz module) puts the repo root on
+sys.path, so `from utils.metrics import ...` resolves no matter what cwd viz is
 launched from. The repo is not pip-installed; imports resolve by path.
 """
 
@@ -29,7 +29,7 @@ N_SAMPLES = 1024
 
 
 def set_mask_shape(h: int, w: int) -> None:
-    """Point viz2 at a different target grid, before anything reads the constants.
+    """Point viz at a different target grid, before anything reads the constants.
 
     Layout paths embed {h}/{w}, and Layout instances are built after this runs, so the
     ground-truth filename follows automatically.
@@ -102,7 +102,7 @@ def usable_mask_shapes(samples_dir) -> list[tuple[int, int]]:
 # images in `image/`, but the filenames inside differ: experiment-25 uses a `05_` mask
 # prefix, the gastronorm experiments a `04_` prefix and a differently named crop. Nothing
 # in the files themselves declares which era they belong to, so `Layout.detect` probes a
-# real sample directory rather than making viz2 depend on one hardcoded set of names.
+# real sample directory rather than making viz depend on one hardcoded set of names.
 #
 # Every entry is a path RELATIVE TO A SAMPLE DIR. `{h}`/`{w}` are filled with MASK_H and
 # MASK_W so the mask name follows the configured target shape.
@@ -211,7 +211,7 @@ class Layout:
         """The ground-truth filename at an arbitrary grid, not just the default one.
 
         A dataset ships several downsample sizes side by side and different runs are
-        trained on different ones, so viz2 has to be able to name any of them -- not only
+        trained on different ones, so viz has to be able to name any of them -- not only
         the size that happened to be current when this Layout was built.
         """
         return self._gt_mask_spec.format(h=h, w=w)
@@ -246,10 +246,10 @@ class Layout:
                         return layout
         known = ", ".join(LAYOUT_ORDER)
         raise SystemExit(
-            f"[viz2] no known sample layout under {samples_dir}.\n"
+            f"[viz] no known sample layout under {samples_dir}.\n"
             f"       tried: {known}. Expected one of "
             + ", ".join(cls(n, LAYOUTS[n]).gt_mask for n in LAYOUT_ORDER)
-            + "\n       Add a new entry to LAYOUTS in viz2/config.py if this is a new "
+            + "\n       Add a new entry to LAYOUTS in viz/config.py if this is a new "
               "dataset format."
         )
 
@@ -281,7 +281,7 @@ EVAL_SPLITS = {
 N_DEFAULT_RUNS = 3  # auto-loaded on first open, most recently modified first
 
 # The runs directory is re-scanned at most this often, so runs that appear or keep
-# training while viz2 is open show up without a restart. A scan is ~0.15s.
+# training while viz is open show up without a restart. A scan is ~0.15s.
 RESCAN_SECONDS = 10.0
 
 # How many scrubbed-epoch RunData objects to keep. Each is ~5MB, so this bounds the

@@ -1,1363 +1,1931 @@
-/* good-vibrations dashboard */
-"use strict";
+/* viz — client.
+ *
+ * Everything the table needs is fetched once (~190KB of samples + ~95KB per run) and
+ * kept in memory, so filtering and sorting are local array ops measured in tenths of a
+ * millisecond. The server is only asked for things the browser cannot make: decoded
+ * predictions, computed metrics, and rendered PNGs.
+ *
+ * Rows are virtualized against a fixed row height: only the ~10 visible rows exist in
+ * the DOM at any time, which is what keeps 1024 rows x N runs smooth. */
 
-// ===== palette (validated reference set, dark mode) =====
-const CAT = ["#3987e5", "#199e70", "#c98500", "#008300", "#9085e9", "#e66767", "#d55181", "#d95926"];
-const SPK_COLOR = i => CAT[(i - 1) % 8];          // speakers 1..8 -> fixed slots
-const GT_COLOR = "#0ca30c", PRED_COLOR = "#d03b3b";
-const INK = "#c3c2b7", MUTED = "#898781", GRID = "#2c2c2a", BASE = "#383835", SURFACE = "#1a1a19";
-const GOOD = "#0ca30c", WARN = "#fab219", BAD = "#d03b3b";
-// physical speaker placement: (x_frac, y_frac), y=0 at bottom (src3/overhead_pipeline.py)
-const SPEAKER_POSITION = { 1: [1, 0], 2: [1, 0.7], 3: [0.8, 1], 4: [0.6, 1], 5: [0.4, 1], 6: [0.2, 1], 7: [0, 0.7], 8: [0, 0] };
-const SPLITS = ["train", "unseen_pos", "unseen_pos_speaker", "unseen_layout"];
-const run_cat = ["#3987e5", "#c98500", "#9085e9", "#d55181", "#d95926", "#199e70", "#e66767", "#008300"];
-const runColor = name => run_cat[S.runs.indexOf(name) % 8];
+const $ = (s) => document.querySelector(s);
+/* Row height. Stacked mode adds a second mask box per cell, so rows grow by one mask
+   plus its gap; the virtualizer, the spacer and the scroll anchoring all read this.
 
-// ===== state =====
+   Read from the stylesheet rather than duplicated here. These two numbers have to agree
+   exactly -- the virtualizer positions rows at k*rowH() while CSS gives them their real
+   height, so any drift makes every row overlap its neighbour by the difference. */
+const cssPx = (name, fallback) => {
+  const v = parseFloat(getComputedStyle(document.documentElement).getPropertyValue(name));
+  return Number.isFinite(v) ? v : fallback;
+};
+let ROW_H_BASE = 206, MASK_BOX = 114;
+function readRowMetrics() {
+  ROW_H_BASE = cssPx("--row-h", ROW_H_BASE);
+  MASK_BOX = cssPx("--mask-h", 110) + 4;   // mask box plus the gap above it
+}
+const rowH = () => (S.view.mode === "stacked" ? ROW_H_BASE + MASK_BOX : ROW_H_BASE);
+const METRICS = [
+  { key: "mse",     label: "MSE",      short: "mse", worst: "high" },
+  { key: "iou",     label: "Soft IoU", short: "iou", worst: "low"  },
+  { key: "comdist", label: "COM dist", short: "cd",  worst: "high" },
+];
+
 const S = {
-  man: null,
-  filters: {},                     // facet -> Set of active values; live-filters what's shown from the pool
-  numFilters: {                    // range filters, persistent & reversible like S.filters, checked by numFilterPasses
-    mse: null,                       // {lo, hi} | null — checked against any loaded run's record for the sample
-    com_dist: null,                  // {lo, hi} | null — same, run-agnostic ("passes if any loaded run passes")
-    com_row: null,                   // {lo, hi} | null — on the sample itself, not run-scoped
-    com_col: null,                   // {lo, hi} | null
+  samples: [], runs: {}, order: [], runOrder: [], meta: null,
+  filters: {
+    splits: new Set(), speakers: new Set(), layouts: new Set(), nObjects: new Set(),
+    objects: new Set(),          // object TYPES present, independent of layout
+    boxes: new Set(),            // enclosure the scene sits in
+    positions: null, ranges: {},
+    // Explicit lookups. Empty means "no restriction"; any entry narrows the table to
+    // exactly those samples/positions, unioned so both searches can be used at once.
+    findSamples: new Set(), findPositions: new Set(),
   },
-  pool: new Map(),                 // sample_id -> sample — drives the table only
-  bench: new Map(),                // sample_id -> sample — drives the box + fft viewers only, added to explicitly
-  cursor: null,                    // output_id cursor on the position map (keyboard nav + mouse hover)
-  lasers: new Set([...Array(100).keys()]),
-  dirs: "xy", logy: true, norm: true, avgSpeaker: false, diffEmpty: false, emptyBaseline: null,
-  colorBy: "speaker",
-  runs: [],                        // active run names, in order
-  runData: {},                     // run -> payload {epoch, epochs, samples, aggregates}
-  runMasks: {},                    // run -> {sample_id -> mask}
-  gtMasks: {},                     // sample_id -> mask
-  fftCache: new Map(),             // `${key}|${id}` -> curve
-  freqs: null,
-  sort: { key: "sample_id", dir: 1 },
-  contours: false,
-  version: null,
-  fftZoom: null,                   // {x:[lo,hi], y:[lo,hi]} preserved across redraws
+  sort: { run: null, metric: "comdist", dir: "worst" },
+  view: { mode: "pred", background: true },
+  domain: {}, positions: [], activePos: -1, modalRow: -1,
+  renderVersion: 0,   // from /api/runs; part of image URLs to defeat immutable caching
+  lut: null,          // colormaps from the server, so client and server agree on colour
+  epochIdx: null,     // null = each run's latest; otherwise an index into the epoch list
+  playing: false,
+  frozenOrder: null,  // sid -> rank, pinned while scrubbing so rows hold their places
+  frameData: {},      // run -> fp16 masks for the visible rows, all epochs
+  truthCache: {},     // sid -> ground-truth values, for client-side diff
 };
 
-const $ = s => document.querySelector(s);
-const jget = async url => { const r = await fetch(url); if (!r.ok) throw new Error(url + " -> " + r.status); return r.json(); };
-const debounce = (fn, ms) => { let t; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); }; };
-const fmt = (v, d = 4) => v == null ? "—" : (+v).toFixed(d);
+const fmt = (v, n = 4) => (v == null || !isFinite(v) ? "–" : v.toFixed(n));
 
-let GROUPS = new Map();   // output_id -> samples
-let EMPTY_GROUPS = [];    // [{output_id, sample_ids}]
-const SAMPLE = new Map(); // sample_id -> sample
-
-function candidatePasses(s, skipFacet = null) {
-  for (const [f, set] of Object.entries(S.filters)) {
-    if (f === skipFacet || !set) continue;
-    if (f === "split") {
-      // splits are assigned per training run, so check every loaded run's record for this sample
-      for (const run of S.runs) {
-        const rec = S.runData[run] && S.runData[run].samples[s.sample_id];
-        if (rec && !set.has(rec.split)) return false;
-      }
-      continue;
-    }
-    if (!set.has(s[f])) return false;
-  }
-  return numFilterPasses(s);
-}
-// checks S.numFilters ranges against a sample. mse/com_dist live on run records, not the sample
-// itself, so they're checked as "passes for at least one loaded run" -- with no run loaded (or no
-// runs matching) a set mse/com_dist filter rejects everything, which is the honest behavior since
-// there's no data to filter on yet, rather than silently ignoring the filter.
-function numFilterPasses(s) {
-  const { mse, com_dist, com_row, com_col } = S.numFilters;
-  const inRange = (v, r) => v != null && v >= r.lo && v <= r.hi;
-  if (com_row && !inRange(s.com_row, com_row)) return false;
-  if (com_col && !inRange(s.com_col, com_col)) return false;
-  if (mse || com_dist) {
-    const runs = S.runs.filter(r => S.runData[r]);
-    const passesAnyRun = runs.some(r => {
-      const rec = S.runData[r].samples[s.sample_id];
-      if (!rec) return false;
-      if (mse && !inRange(rec.mse, mse)) return false;
-      if (com_dist && !inRange(rec.com_dist, com_dist)) return false;
-      return true;
-    });
-    if (!passesAnyRun) return false;
-  }
-  return true;
-}
-function matchingCandidates() {
-  return S.man.samples.filter(s => candidatePasses(s));
-}
-function colorFor(s) {
-  if (S.colorBy === "speaker") return SPK_COLOR(s.speaker);
-  if (S.colorBy === "layout") return CAT[S.man.facets.layout.indexOf(s.layout) % 8];
-  if (S.colorBy === "output_id") {
-    const h = (s.com_col / S.man.out_w) * 300, l = 42 + (s.com_row / S.man.out_h) * 30;
-    return `hsl(${h.toFixed(0)},62%,${l.toFixed(0)}%)`;
-  }
-  if (S.colorBy === "split") {
-    const rd = S.runData[S.runs[0]], rec = rd && rd.samples[s.sample_id];
-    return rec ? CAT[SPLITS.indexOf(rec.split) % 8] : MUTED;
-  }
-  return CAT[0];
-}
-const colorKey = s => S.colorBy === "speaker" ? `spk ${s.speaker}`
-  : S.colorBy === "layout" ? s.layout
-  : S.colorBy === "output_id" ? `pos ${s.output_id}`
-  : (S.runData[S.runs[0]]?.samples[s.sample_id]?.split || "?");
-const label = s => `#${s.sample_id} · p${(+s.output_id).toString()} · spk${s.speaker}`;
-// richer two-line title for the detail modal/panels: "Mask: Sample #id Run run-id" then
-// "box, n object(s), spk N | mse=…, com_dist=…" -- the modal title (no run) just omits the Run
-// clause and the metrics clause, since a gt-only view has no prediction to report metrics for.
-const detailTitle = (s, run, rec) => {
-  const head = run ? `Mask: Sample #${s.sample_id} Run ${run}` : `Mask: Sample #${s.sample_id}`;
-  const objects = `${s.n_objects} ${s.object}${s.n_objects === 1 ? "" : "s"}`;
-  let meta = `${s.box} box, ${objects}, spk ${s.speaker}`;
-  if (rec) meta += ` | mse=${fmt(rec.mse, 5)}, com_dist=${fmt(rec.com_dist)}`;
-  return { head, meta };
+/* Run state, styled like a CI/W&B badge: green while training, blue once finished,
+   red if it died. Colours carry a text label too -- never colour alone. */
+const STATUS = {
+  running:  { label: "running",  title: "Training now — predictions update automatically" },
+  finished: { label: "done",     title: "Training completed cleanly" },
+  crashed:  { label: "crashed",  title: "Training ended in a traceback" },
+  stopped:  { label: "stopped",  title: "Log ends with no clean exit and no error — killed, preempted, or the node went away" },
+  unknown:  { label: "unknown",  title: "No training log found" },
 };
-const runBadgeColor = v => v == null ? MUTED : v < 0.05 ? GOOD : v < 0.15 ? WARN : BAD;
 
-// ===== plotly base =====
-const LAYOUT = extra => Object.assign({
-  paper_bgcolor: "rgba(0,0,0,0)", plot_bgcolor: "rgba(0,0,0,0)",
-  font: { color: MUTED, size: 11, family: "system-ui, sans-serif" },
-  margin: { l: 44, r: 10, t: 8, b: 34 },
-  showlegend: true,
-  legend: { orientation: "h", y: 1.02, yanchor: "bottom", font: { color: INK } },
-  hoverlabel: { bgcolor: "#232322", bordercolor: GRID, font: { color: INK, size: 11 } },
-}, extra);
-const AXIS = extra => Object.assign({ gridcolor: GRID, zerolinecolor: BASE, linecolor: BASE, ticks: "" }, extra);
-const CONFIG = { displayModeBar: false, responsive: true };
-const emptyLayout = msg => LAYOUT({
-  xaxis: { visible: false }, yaxis: { visible: false }, showlegend: false,
-  annotations: [{ text: msg, showarrow: false, font: { color: MUTED, size: 13 } }],
-});
+function statusChip(status) {
+  const s = STATUS[status] || STATUS.unknown;
+  return `<span class="status ${status}" title="${s.title}"><i></i>${s.label}</span>`;
+}
 
-// ===== boot =====
-// sample-scoped endpoints resolve their dataset from the loaded run; no run = server default
-const runQ = () => (S.runs[0] ? `&run=${encodeURIComponent(S.runs[0])}` : "");
+/* Layout names run long too (purple-cube-green-cube); keep the colours, drop the noun.
+   Full value stays in the chip's title. */
+/* The identity line both column types carry: where the capture happened, which speaker
+   played, and the sample it belongs to. Shared so the two titles cannot drift apart. */
+function identity(s) {
+  const pos = s.output_id == null ? "–" : +s.output_id;
+  return `Pos ${pos}, Spk ${s.speaker} (${+s.sample_id})`;
+}
 
-let _bootedOnce = false;
+function shortLayout(s) {
+  if (!s) return "–";
+  if (s === "empty-box") return "empty";
+  return s.split("-").filter((w) => w !== "cube" && w !== "cubes").join("+") || s;
+}
+
+/* Split names run long (purple_green_cubes_speaker). Abbreviate the words but keep the
+   distinctions that matter -- which cubes, and whether it is the held-out-speaker
+   variant. The full name stays in the chip's title attribute. */
+function shortSplit(s) {
+  if (!s) return "–";
+  if (s === "train") return "train";
+  const spk = s.endsWith("_speaker");
+  const base = spk ? s.slice(0, -8) : s;
+  const abbr = base.split("_").map((w) => (w === "cubes" || w === "cube" ? "" : w[0])).join("");
+  return (abbr || base) + (spk ? "+spk" : "");
+}
+const api = (u) => fetch(u).then((r) => { if (!r.ok) throw new Error(u); return r.json(); });
+
+/* ***** boot ***** */
+
 async function boot() {
-  // the loaded run picks the dataset (samples/fft/gt must come from what it trained on)
-  S.man = await jget("/api/manifest" + (S.runs[0] ? `?run=${encodeURIComponent(S.runs[0])}` : ""));
-  S.version = S.man.version;
-  GROUPS = new Map();
-  for (const s of S.man.samples) { if (!GROUPS.has(s.output_id)) GROUPS.set(s.output_id, []); GROUPS.get(s.output_id).push(s); }
-  EMPTY_GROUPS = S.man.empty_box_groups || [];
-  SAMPLE.clear();
-  for (const s of S.man.samples) SAMPLE.set(s.sample_id, s);
-  for (const f of Object.keys(S.man.facets))
-    if (!S.filters[f]) S.filters[f] = new Set(S.man.facets[f]);
-  // drop pool members whose sample no longer exists (data changed underneath us)
-  for (const id of [...S.pool.keys()]) if (!SAMPLE.has(id)) S.pool.delete(id);
-  buildLaserGrid(); buildRunSelect(); buildEmptySelect(); renderRunChips();
-
-  // first load only: default to the whole dataset, so there's something useful on screen
-  // without manual setup. Runs are still opt-in via the run search box. Later re-boots
-  // (triggered by the live-update poll picking up a data change) must not repopulate on top
-  // of the user's own pool.
-  if (!_bootedOnce) {
-    _bootedOnce = true;
-    for (const s of S.man.samples) S.pool.set(s.sample_id, s);
+  readRowMetrics();          // before anything measures or positions a row
+  const [runs, samples, lut] = await Promise.all([
+    api("/api/runs"), api("/api/samples"), api("/api/lut")]);
+  S.lut = lut;
+  // The cell box follows the SCENE's aspect, not the mask grid's. --mask-h is the fixed
+  // dimension; width derives from it so a 20x40 and a 30x30 grid over the same room draw
+  // the same shape and land on the same features. Set before readRowMetrics re-runs, and
+  // before any row is measured, since --mask-h/--mask-w drive the virtualizer's geometry.
+  if (lut.aspect) {
+    const mh = cssPx("--mask-h", 110);
+    document.documentElement.style.setProperty("--mask-w", `${Math.round(mh * lut.aspect)}px`);
+    readRowMetrics();
   }
-
-  renderAll();
+  S.meta = runs;
+  S.renderVersion = runs.render_version ?? 0;
+  S.samples = samples.samples;
+  buildPositions();
+  initFilters();
+  bindFind();
+  buildSpeakerDiagram();
+  buildScatter();
+  buildSliders();
+  bindUI();
+  for (const name of runs.default_selected) await addRun(name);
+  $("#subtitle").textContent =
+    `${S.samples.length} samples · ${runs.runs.filter((r) => r.compatible).length} runs available`;
+  refresh();
 }
 
-function renderAll() {
-  renderFacets(); renderPosmap(); renderPoolCount(); renderBenchCount(); renderBenchStrip(); renderEmptyChips();
-  updateFFT(); updateBox(); renderSamplesView();
-}
-
-// ===== pool =====
-function addToPool(samples) {
-  for (const s of samples) S.pool.set(s.sample_id, s);
-  renderAll();
-}
-function removeFromPool(ids) {
-  for (const id of ids) S.pool.delete(id);
-  renderAll();
-}
-function clearPool() { S.pool.clear(); renderAll(); }
-function removeFilteredOut() {
-  for (const [id, s] of S.pool) if (!candidatePasses(s)) S.pool.delete(id);
-  renderAll();
-}
-// facet chips live-filter the table's view of the pool: toggling a chip off immediately hides
-// matching pooled samples from the table; toggling it back on brings them right back, since pool
-// membership itself (S.pool) is never touched here -- only what's shown. This applies to every
-// facet, not just split; "remove filtered-out" is the separate, deliberate, non-reversible action
-// for when you actually want to drop samples from the pool for good. The table's filters do NOT
-// affect the bench (box/fft) pool below -- that's a separate, explicitly-curated selection.
-function poolSamples() { return [...S.pool.values()].filter(s => candidatePasses(s)); }
-
-function renderPoolCount() {
-  const shown = poolSamples().length;
-  $("#pool-count").textContent = shown === S.pool.size
-    ? `${S.pool.size} sample${S.pool.size === 1 ? "" : "s"}`
-    : `${shown} of ${S.pool.size} samples shown`;
-}
-$("#pool-clear").onclick = clearPool;
-
-// ===== bench (box + fft viewer selection, independent of the table's pool/filters) =====
-function addToBench(samples) { for (const s of samples) S.bench.set(s.sample_id, s); renderAll(); }
-function removeFromBench(ids) { for (const id of ids) S.bench.delete(id); renderAll(); }
-function clearBench() { S.bench.clear(); renderAll(); }
-function benchSamples() { return [...S.bench.values()]; }
-function renderBenchCount() { $("#bench-count").textContent = `${S.bench.size} sample${S.bench.size === 1 ? "" : "s"}`; }
-$("#bench-clear").onclick = clearBench;
-$("#bench-add-filtered").onclick = () => addToBench(poolSamples());
-
-// simple thumbnail-card strip: this is the single, unambiguous place to see exactly what's
-// currently feeding the box + fft viewers below, so it's never a mystery why those plots show
-// what they show. Kept deliberately plain (id + photo + remove) -- no metrics, no masks, no
-// per-run detail -- richer inspection stays in the existing per-sample modal (click a table thumb).
-function renderBenchStrip() {
-  const strip = $("#bench-strip");
-  strip.innerHTML = benchSamples().map(s => `
-    <div class="bench-card" data-id="${s.sample_id}">
-      <span class="bench-card-x" title="remove from workbench">✕</span>
-      <img loading="lazy" src="/media/${s.sample_id}/thumb" alt="">
-      <span class="bench-card-id">#${s.sample_id} · p${+s.output_id}</span>
-    </div>`).join("");
-  strip.querySelectorAll(".bench-card-x").forEach(x => x.onclick = () =>
-    removeFromBench([+x.closest(".bench-card").dataset.id]));
-}
-$("#pool-remove-filtered").onclick = removeFilteredOut;
-
-// ===== facet chips ("add matching" candidate narrowing only) =====
-function renderFacets() {
-  for (const holder of document.querySelectorAll(".chips[data-facet]")) {
-    const f = holder.dataset.facet;
-    if (f === "split") continue; // handled separately below
-    if (!S.man.facets[f]) continue;
-    holder.innerHTML = "";
-    for (const v of S.man.facets[f]) {
-      const alive = S.man.samples.some(s => s[f] === v && candidatePasses(s, f));
-      const n = S.man.samples.filter(s => s[f] === v && candidatePasses(s, f)).length;
-      const chip = document.createElement("span");
-      chip.className = "chip" + (S.filters[f].has(v) ? " active" : "") + (alive ? "" : " faded");
-      chip.innerHTML = `${v} <span class="count">${n}</span>`;
-      chip.onclick = () => toggleFilter(f, v);
-      holder.appendChild(chip);
-    }
-  }
-  renderSplitFacet();
-  $("#match-count").textContent = matchingCandidates().length;
-  const activeCount = Object.entries(S.filters).filter(([f, set]) => set.size < (S.man.facets[f] || []).length).length;
-  $("#filters-summary").textContent = activeCount ? `${activeCount} facet${activeCount === 1 ? "" : "s"} narrowed` : "";
-}
-function renderSplitFacet() {
-  const runsLoaded = S.runs.some(r => S.runData[r]);
-  $("#split-facet-label").hidden = !runsLoaded;
-  const holder = document.querySelector('.chips[data-facet="split"]');
-  holder.hidden = !runsLoaded;
-  if (!runsLoaded) return;
-  if (!S.filters.split) S.filters.split = new Set(SPLITS);
-  holder.innerHTML = "";
-  for (const v of SPLITS) {
-    const chip = document.createElement("span");
-    chip.className = "chip" + (S.filters.split.has(v) ? " active" : "");
-    chip.textContent = v.replace("unseen_", "u-");
-    chip.onclick = () => toggleFilter("split", v);
-    holder.appendChild(chip);
-  }
-}
-function toggleFilter(f, v) {
-  S.filters[f].has(v) ? S.filters[f].delete(v) : S.filters[f].add(v);
-  renderAll();
-}
-$("#add-matching").onclick = () => addToPool(matchingCandidates());
-
-// ===== numeric range filters (S.numFilters) =====
-const applyRangeFilters = debounce(renderAll, 200);
-document.querySelectorAll("#range-filters .range-row").forEach(row => {
-  const field = row.dataset.field, loEl = row.querySelector(".range-lo"), hiEl = row.querySelector(".range-hi");
-  const sync = () => {
-    const lo = loEl.value === "" ? -Infinity : +loEl.value, hi = hiEl.value === "" ? Infinity : +hiEl.value;
-    S.numFilters[field] = (loEl.value === "" && hiEl.value === "") ? null : { lo, hi };
-    applyRangeFilters();
-  };
-  loEl.addEventListener("input", sync);
-  hiEl.addEventListener("input", sync);
-});
-
-// ===== search / add-by-id box =====
-$("#sample-add").addEventListener("keydown", e => {
-  if (e.key !== "Enter") return;
-  const input = e.target;
-  const found = parseAddInput(input.value);
-  if (!found.length) { input.classList.add("bad"); return; }
-  input.classList.remove("bad");
-  addToPool(found);
-  input.value = "";
-});
-// numeric comparator token, e.g. "mse<0.05", "com_dist>=0.02", "com_row:10-20"
-const NUM_TOKEN_RE = /^(mse|com_dist|com_row|com_col)(<=|>=|<|>|:)(-?\d+\.?\d*)(?:-(-?\d+\.?\d*))?$/;
-
-// resolves one search-box query (comma-separated tokens) to a concrete, one-shot list of samples
-// to add now -- NOT a persistent filter (that's S.numFilters, set via the sidebar range inputs).
-// "run:" sets scope for any mse/com_dist tokens later in the SAME call; "spk:" narrows to samples
-// with that speaker among whatever the rest of the query already resolved (applied last).
-function parseAddInput(text) {
-  const out = new Map();
-  let scopeRun = null, spkFilter = null, sawResolvingToken = false;
-  for (let tok of text.split(",").map(t => t.trim()).filter(Boolean)) {
-    const runTok = tok.match(/^run:(.+)$/i);
-    if (runTok) { scopeRun = runTok[1]; continue; }
-    const spkTok = tok.match(/^spk:?(\d+)$/i);
-    if (spkTok) { spkFilter = +spkTok[1]; continue; }
-    sawResolvingToken = true;
-    const numTok = tok.match(NUM_TOKEN_RE);
-    if (numTok) {
-      const [, field, cmp, a, b] = numTok;
-      const runScoped = field === "mse" || field === "com_dist";
-      const runs = runScoped ? (scopeRun ? [scopeRun] : (S.runs.length === 1 ? S.runs : null)) : null;
-      if (runScoped && !runs) continue;   // ambiguous run scope (0 or 2+ runs loaded, no run: given) -- skip token
-      for (const s of S.man.samples) {
-        const v = runScoped ? null : s[field];
-        let val = v;
-        if (runScoped) {
-          const rec = S.runData[runs[0]] && S.runData[runs[0]].samples[s.sample_id];
-          val = rec ? rec[field] : null;
-        }
-        if (val == null) continue;
-        const passes = cmp === "<" ? val < +a : cmp === "<=" ? val <= +a : cmp === ">" ? val > +a
-          : cmp === ">=" ? val >= +a : (val >= +a && val <= +b);
-        if (passes) out.set(s.sample_id, s);
-      }
-      continue;
-    }
-    if (/^[po]/i.test(tok) && /^[po]0*\d+$/i.test(tok)) {
-      const oid = tok.slice(1).padStart(6, "0");
-      for (const s of GROUPS.get(oid) || []) out.set(s.sample_id, s);
-      continue;
-    }
-    const range = tok.match(/^(\d+)\s*-\s*(\d+)$/);
-    if (range) {
-      for (let i = +range[1]; i <= +range[2]; i++) if (SAMPLE.has(i)) out.set(i, SAMPLE.get(i));
-      continue;
-    }
-    if (/^\d+$/.test(tok) && SAMPLE.has(+tok)) out.set(+tok, SAMPLE.get(+tok));
-  }
-  // "spk:3" with nothing else to narrow means "all samples with that speaker", not "narrow an
-  // empty set down to nothing" -- fall back to the whole dataset as the base in that case.
-  let result = sawResolvingToken ? [...out.values()] : S.man.samples;
-  if (spkFilter != null) result = result.filter(s => s.speaker === spkFilter);
-  return result;
-}
-
-// ===== merged speaker + position map =====
-const PM = { pad: 34, dots: [] };
-function posXY(cv, s) {
-  const w = cv.clientWidth - 2 * PM.pad, h = cv.clientHeight - 2 * PM.pad;
-  return [PM.pad + (s.com_col / (S.man.out_w - 1)) * w, PM.pad + (s.com_row / (S.man.out_h - 1)) * h];
-}
-function renderPosmap() {
-  const cv = $("#posmap");
-  const cssW = cv.parentElement.clientWidth;
-  const cssH = Math.max(260, Math.round((cssW - 2 * PM.pad) * (S.man.out_h / S.man.out_w)) + 2 * PM.pad);
-  cv.style.height = cssH + "px";
-  const dpr = window.devicePixelRatio || 1;
-  cv.width = cssW * dpr; cv.height = cssH * dpr;
-  const g = cv.getContext("2d");
-  g.scale(dpr, dpr);
-  g.clearRect(0, 0, cssW, cssH);
-
-  // box outline (the position field)
-  g.strokeStyle = BASE;
-  g.strokeRect(PM.pad, PM.pad, cssW - 2 * PM.pad, cssH - 2 * PM.pad);
-
-  // speakers outside the box outline, at their physical positions
-  const speakerXY = v => {
-    const [xf, yf] = SPEAKER_POSITION[v] || [0.5, 0.5];
-    const px = xf === 0 ? PM.pad - 18 : xf === 1 ? cssW - PM.pad + 18 : PM.pad + xf * (cssW - 2 * PM.pad);
-    const py = (xf === 0 || xf === 1) ? PM.pad + (1 - yf) * (cssH - 2 * PM.pad) : (yf === 1 ? PM.pad - 18 : cssH - PM.pad + 18);
-    return [px, py];
-  };
-  PM.speakerHits = (S.man.facets.speaker || []).map(v => { const [x, y] = speakerXY(v); return { v, x, y }; });
-  for (const v of S.man.facets.speaker || []) {
-    const [px, py] = speakerXY(v);
-    g.beginPath(); g.arc(px, py, 11, 0, 7);
-    g.fillStyle = S.filters.speaker.has(v) ? SPK_COLOR(v) : BASE;
-    g.fill();
-    g.fillStyle = "#0d0d0d"; g.font = "bold 10px system-ui"; g.textAlign = "center"; g.textBaseline = "middle";
-    g.fillText(v, px, py + 1);
-  }
-
-  // position dots
-  PM.dots = [];
-  for (const [oid, samples] of GROUPS) {
-    const s = samples[0];
-    if (s.com_row < 0) continue;
-    const [x, y] = posXY(cv, s);
-    const inPool = samples.some(s2 => S.pool.has(s2.sample_id));
-    const alive = samples.some(s2 => candidatePasses(s2));
-    const highlighted = oid === S.cursor;
-    g.beginPath(); g.arc(x, y, inPool ? 5 : 3.5, 0, 7);
-    g.globalAlpha = alive ? 1 : 0.22;
-    g.fillStyle = inPool ? colorFor(s) : (highlighted ? INK : MUTED);
-    g.fill();
-    if (inPool || highlighted) { g.strokeStyle = "#fff"; g.lineWidth = 1.2; g.stroke(); }
-    g.globalAlpha = 1;
-    PM.dots.push({ oid, x, y, alive });
-  }
-}
-function nearestDot(x, y, maxD = 12) {
-  let best = null, bd = maxD * maxD;
-  for (const d of PM.dots) {
-    const dd = (d.x - x) ** 2 + (d.y - y) ** 2;
-    if (dd < bd && d.alive) { bd = dd; best = d; }
-  }
-  return best;
-}
-function nearestSpeaker(x, y, maxD = 16) {
-  let best = null, bd = maxD * maxD;
-  for (const h of PM.speakerHits || []) {
-    const dd = (h.x - x) ** 2 + (h.y - y) ** 2;
-    if (dd < bd) { bd = dd; best = h; }
-  }
-  return best;
-}
-{
-  const cv = $("#posmap");
-  const pos = e => { const r = cv.getBoundingClientRect(); return [e.clientX - r.left, e.clientY - r.top]; };
-  cv.addEventListener("mousemove", e => {
-    const [x, y] = pos(e);
-    const d = nearestDot(x, y);
-    const next = d ? d.oid : null;
-    if (next === S.cursor) return;
-    S.cursor = next;
-    renderPosmap();
+/* Samples 8-at-a-time share a physical position (one per speaker), so the scatter
+   plots ~125 distinct points rather than 1000 overlapping ones. */
+function buildPositions() {
+  const byKey = new Map();
+  S.samples.forEach((s) => {
+    const [r, c] = s.avg_com;
+    if (r == null || r < 0) { s.pos = -1; return; }   // empty-box sentinel
+    const k = `${r.toFixed(2)},${c.toFixed(2)}`;
+    if (!byKey.has(k)) byKey.set(k, { i: byKey.size, r, c, n: 0 });
+    const p = byKey.get(k);
+    p.n++; s.pos = p.i;
   });
-  cv.addEventListener("click", e => {
-    const [x, y] = pos(e);
-    const spk = nearestSpeaker(x, y);
-    if (spk) { toggleFilter("speaker", spk.v); return; }
-    const d = nearestDot(x, y);
-    if (d) { toggleGroupInPool(d.oid); S.cursor = d.oid; cv.focus(); }
-  });
-  cv.addEventListener("keydown", e => {
-    if (e.key === "Enter") { if (S.cursor) toggleGroupInPool(S.cursor); e.preventDefault(); return; }
-    const dirs = { ArrowLeft: [-1, 0], ArrowRight: [1, 0], ArrowUp: [0, -1], ArrowDown: [0, 1] };
-    if (!dirs[e.key]) return;
-    e.preventDefault();
-    const [dx, dy] = dirs[e.key];
-    const cur = PM.dots.find(d => d.oid === S.cursor) || PM.dots[0];
-    if (!cur) return;
-    let best = null, bd = 1e9;
-    for (const d of PM.dots) {
-      if (d === cur || !d.alive) continue;
-      const vx = d.x - cur.x, vy = d.y - cur.y;
-      if (vx * dx + vy * dy <= 0) continue;
-      const dist = vx * vx + vy * vy + 2 * (dx ? vy * vy : vx * vx);
-      if (dist < bd) { bd = dist; best = d; }
+  S.positions = [...byKey.values()];
+}
+
+/* ***** runs ***** */
+
+/* The grid a run predicts at, as [h, w]. Runs in one table can be trained at different
+   resolutions, so this -- not the global S.lut -- sizes canvases, frame buffers and
+   truth lookups. Falls back to the dataset default for a run not loaded yet. */
+function runShape(name) {
+  const r = S.runs[name];
+  if (r && r.h) return [r.h, r.w];
+  const e = S.meta && S.meta.runs && S.meta.runs.find((x) => x.name === name);
+  if (e && e.shape) return e.shape;
+  return [S.lut.h, S.lut.w];
+}
+
+const truthKey = (sid, h, w) => (h ? `${sid}@${h}x${w}` : String(sid));
+
+/* Whether the loaded columns disagree on grid size, so the header only spends space on
+   the size when it actually disambiguates something. */
+function mixedShapes() {
+  const seen = new Set(S.runOrder.map((n) => runShape(n).join("x")));
+  return seen.size > 1;
+}
+
+/* Membership at the run's latest epoch: which samples it covers and their splits. This is
+   the run's identity for filtering, and it must survive the epoch scrubber swapping
+   `samples` -- see predictedSplit. */
+function indexMembership(d) {
+  d.splits = new Set(Object.values(d.samples).map((x) => x.split));
+  d.splitOf = Object.fromEntries(Object.entries(d.samples).map(([k, v]) => [k, v.split]));
+}
+
+async function addRun(name, reload = false) {
+  if (S.runs[name] && !reload) return;
+  const d = await api(`/api/run/${encodeURIComponent(name)}${reload ? "?reload=1" : ""}`);
+  d.entry = S.meta.runs.find((r) => r.name === name);
+  d.metricsEpoch = null;        // /api/run without ?epoch scores the latest
+  indexMembership(d);
+  if (reload) {
+    // Refresh in place: keep column order and, crucially, leave the filters alone. A new
+    // epoch must not silently re-check splits the user turned off or move their sliders.
+    const prev = S.runs[name];
+    for (const sp of d.splits) {
+      if (!prev || !prev.splits.has(sp)) S.filters.splits.add(sp);   // genuinely new only
     }
-    if (best) { S.cursor = best.oid; renderPosmap(); }
-  });
-}
-function toggleGroupInPool(oid) {
-  const samples = (GROUPS.get(oid) || []).filter(s => candidatePasses(s));
-  const allIn = samples.length > 0 && samples.every(s => S.pool.has(s.sample_id));
-  allIn ? removeFromPool(samples.map(s => s.sample_id)) : addToPool(samples);
-}
-function setAllSpeakers(on) { S.filters.speaker = new Set(on ? S.man.facets.speaker : []); renderAll(); }
-function addAllPositions() {
-  addToPool([...GROUPS.values()].flatMap(g => g.filter(s => s.com_row >= 0 && candidatePasses(s))));
-}
-function removeAllPositions() {
-  // only drops samples that came from a real position (not empty-box, not a bare run/search add) —
-  // scoped removal, mirroring what "all" would have added, not a blanket pool clear
-  removeFromPool([...S.pool.values()].filter(s => s.com_row >= 0).map(s => s.sample_id));
-}
-
-// empty-box chip row
-function renderEmptyChips() {
-  const holder = $("#empty-chips");
-  holder.innerHTML = "";
-  EMPTY_GROUPS.forEach((g, i) => {
-    const chip = document.createElement("span");
-    const inPool = g.sample_ids.some(id => S.pool.has(id));
-    chip.className = "chip" + (inPool ? " active" : "");
-    chip.textContent = `empty-${i + 1}`;
-    chip.onclick = () => addToPool(g.sample_ids.map(id => SAMPLE.get(id)).filter(Boolean));
-    holder.appendChild(chip);
-  });
-}
-function buildEmptySelect() {
-  const sel = $("#empty-select");
-  sel.innerHTML = "";
-  EMPTY_GROUPS.forEach((g, i) => sel.appendChild(Object.assign(document.createElement("option"), { value: g.output_id, textContent: `empty-${i + 1}` })));
-  if (!S.emptyBaseline && EMPTY_GROUPS.length) S.emptyBaseline = EMPTY_GROUPS[0].output_id;
-  sel.value = S.emptyBaseline || "";
-}
-$("#empty-select").onchange = e => { S.emptyBaseline = e.target.value; updateFFT(); };
-$("#pos-all").onclick = addAllPositions;
-$("#pos-none").onclick = removeAllPositions;
-$("#spk-all").onclick = () => setAllSpeakers(true);
-$("#spk-none").onclick = () => setAllSpeakers(false);
-
-$("#color-by").onchange = e => { S.colorBy = e.target.value; renderAll(); };
-
-// ===== laser grid + fft controls =====
-function buildLaserGrid() {
-  const g = $("#laser-grid");
-  g.innerHTML = "";
-  for (let i = 0; i < 100; i++) {
-    const c = document.createElement("div");
-    c.title = `laser ${i} (row ${Math.floor(i / 10)}, col ${i % 10})`;
-    c.classList.toggle("on", S.lasers.has(i));
-    c.onclick = () => { S.lasers.has(i) ? S.lasers.delete(i) : S.lasers.add(i); laserChanged(); };
-    g.appendChild(c);
-  }
-}
-function laserChanged() {
-  $("#laser-count").textContent = `${S.lasers.size}/100`;
-  for (let i = 0; i < 100; i++) $("#laser-grid").children[i].classList.toggle("on", S.lasers.has(i));
-  S.fftCache.clear();
-  updateFFT();
-}
-$("#laser-all").onclick = () => { S.lasers = new Set([...Array(100).keys()]); laserChanged(); };
-$("#laser-none").onclick = () => { S.lasers = new Set(); laserChanged(); };
-$("#dir-seg").onclick = e => {
-  if (!e.target.dataset.dir) return;
-  S.dirs = e.target.dataset.dir;
-  for (const b of $("#dir-seg").children) b.classList.toggle("active", b === e.target);
-  S.fftCache.clear(); updateFFT();
-};
-$("#logy-seg").onclick = e => {
-  if (!e.target.dataset.log) return;
-  S.logy = e.target.dataset.log === "log";
-  for (const b of $("#logy-seg").children) b.classList.toggle("active", b === e.target);
-  updateFFT();
-};
-$("#norm-check").onchange = e => { S.norm = e.target.checked; S.fftCache.clear(); updateFFT(); };
-$("#avg-speaker-check").onchange = e => { S.avgSpeaker = e.target.checked; updateFFT(); };
-$("#diff-empty-check").onchange = e => {
-  S.diffEmpty = e.target.checked;
-  $("#empty-select-line").hidden = !S.diffEmpty;
-  updateFFT();
-};
-
-// ===== fft view =====
-const fftKey = () => `${S.lasers.size === 100 ? "all" : [...S.lasers].sort((a, b) => a - b).join(",")}|${S.dirs}|${S.norm ? "n" : "r"}`;
-
-async function fetchCurves(ids) {
-  const key = fftKey();
-  const missing = ids.filter(id => !S.fftCache.has(key + "|" + id));
-  if (missing.length) {
-    const lasers = S.lasers.size === 100 ? "all" : [...S.lasers].sort((a, b) => a - b).join(",");
-    const r = await jget(`/api/fft?ids=${missing.join(",")}&lasers=${lasers}&dirs=${S.dirs}&norm=${S.norm}${runQ()}`);
-    S.freqs = r.freqs;
-    for (const [id, c] of Object.entries(r.curves)) S.fftCache.set(key + "|" + id, c);
-  }
-  return key;
-}
-
-function captureZoom(gd) {
-  if (!gd || !gd.layout) return;
-  const xr = gd.layout.xaxis && gd.layout.xaxis.range, yr = gd.layout.yaxis && gd.layout.yaxis.range;
-  if (xr && yr && !gd.layout.xaxis.autorange) S.fftZoom = { x: xr.slice(), y: yr.slice(), logy: S.logy };
-}
-
-const updateFFT = debounce(async () => {
-  const emptyMode = S.diffEmpty;
-  if (emptyMode && !EMPTY_GROUPS.length) {
-    Plotly.react("fft-plot", [], emptyLayout("no empty-box sample available in this dataset"));
+    S.runs[name] = d;
+    invalidateEpochs();
+    recomputeDomains({ preserve: true });
     return;
   }
-  const pooled = benchSamples();
-  const ids = pooled.map(s => s.sample_id);
-  if (S.lasers.size === 0) { Plotly.react("fft-plot", [], emptyLayout("select at least one laser")); return; }
-  if (!ids.length) { Plotly.react("fft-plot", [], emptyLayout("add samples to the workbench (+bench in the table, or \"add filtered to bench\")")); return; }
+  S.runs[name] = d;
+  S.runOrder.push(name);
+  invalidateEpochs();
+  for (const sp of d.splits) S.filters.splits.add(sp);
+  recomputeDomains();
+  refresh();
+}
 
-  let key;
-  try {
-    const emptyIds = emptyMode ? (EMPTY_GROUPS.find(g => g.output_id === S.emptyBaseline)?.sample_ids || []) : [];
-    key = await fetchCurves([...new Set([...ids, ...emptyIds])]);
-  } catch (e) { console.error(e); return; }
-  if (key !== fftKey()) return;
+function removeRun(name) {
+  delete S.runs[name];
+  S.runOrder = S.runOrder.filter((n) => n !== name);
+  invalidateEpochs();
+  if (S.sort.run === name) S.sort.run = null;
+  recomputeDomains();
+  refresh();
+}
 
-  const gd = $("#fft-plot");
-  captureZoom(gd);
+/* Slider bounds track the loaded runs so the handles always span real data. */
+/* `preserve` is set when a run reloads with a new epoch: the slider bounds still track
+   the data, but a range the user is looking through must not be widened underneath them
+   just because the numbers moved. Adding or removing a run is different -- there the
+   untouched sliders should span whatever is now loaded. */
+function recomputeDomains({ preserve = false } = {}) {
+  for (const m of METRICS) {
+    let lo = Infinity, hi = -Infinity;
+    for (const n of S.runOrder)
+      for (const v of Object.values(S.runs[n].samples)) {
+        const x = v[m.key];
+        if (x != null && isFinite(x)) { if (x < lo) lo = x; if (x > hi) hi = x; }
+      }
+    if (!isFinite(lo)) { lo = 0; hi = 1; }
+    if (hi - lo < 1e-9) hi = lo + 1e-9;
+    const prev = S.domain[m.key], cur = S.filters.ranges[m.key];
+    // Never shrink the domain on a reload, or a selection sitting near the old edge
+    // would get clamped away as the run improves.
+    if (preserve && prev) { lo = Math.min(lo, prev[0]); hi = Math.max(hi, prev[1]); }
+    S.domain[m.key] = [lo, hi];
 
-  let emptyMean = null;
-  if (emptyMode) {
-    const emptyIds = EMPTY_GROUPS.find(g => g.output_id === S.emptyBaseline)?.sample_ids || [];
-    const curves = emptyIds.map(id => S.fftCache.get(key + "|" + id)).filter(Boolean);
-    if (curves.length) emptyMean = curves[0].map((_, i) => curves.reduce((a, c) => a + c[i], 0) / curves.length);
+    if (!cur) { S.filters.ranges[m.key] = [lo, hi]; continue; }
+    const untouched = prev && cur[0] <= prev[0] + 1e-12 && cur[1] >= prev[1] - 1e-12;
+    if (preserve) S.filters.ranges[m.key] = untouched ? [lo, hi] : cur;
+    else if (!prev || untouched) S.filters.ranges[m.key] = [lo, hi];
+    else S.filters.ranges[m.key] = [Math.max(lo, cur[0]), Math.min(hi, cur[1])];
+  }
+  syncSliders();
+}
+
+/* ***** filters ***** */
+
+function initFilters() {
+  const f = S.filters;
+  S.samples.forEach((s) => {
+    if (s.layout) f.layouts.add(s.layout);
+    if (s.n_objects != null) f.nObjects.add(s.n_objects);
+    if (s.box) f.boxes.add(s.box);
+    (s.objects && s.objects.length ? s.objects : ["(none)"]).forEach((o) => f.objects.add(o));
+  });
+  // Speaker 1 only. The 8 speakers at a position capture the same scene, so showing all
+  // of them makes the table eight rows deep per position; starting on one keeps the
+  // opening view one row per position, and "all" is a click away.
+  f.speakers.add(1);
+}
+
+function uniq(get) {
+  const m = new Map();
+  S.samples.forEach((s) => { const v = get(s); if (v != null) m.set(v, (m.get(v) || 0) + 1); });
+  return [...m.entries()].sort((a, b) => (a[0] > b[0] ? 1 : -1));
+}
+
+/* A sample is in the table if any loaded run predicted it.
+
+   Read from `splitOf`, the run's membership at its LATEST epoch, not from `samples`,
+   which the epoch scrubber swaps out. A run does not save every sample at every epoch
+   (early epochs in particular cover a different subset), and a sample missing from one
+   epoch has not left the run -- its ground truth certainly has not changed. Keying the
+   filter on the swapped table made those rows fail `passes` and vanish from the table
+   entirely, taking the ground-truth column with them. */
+function predictedSplit(sampleIdx) {
+  for (const n of S.runOrder) {
+    const sp = S.runs[n].splitOf && S.runs[n].splitOf[sampleIdx];
+    if (sp) return sp;
+  }
+  return null;
+}
+
+function passes(s) {
+  const f = S.filters;
+  // An explicit ID search overrides the browsing filters: when you ask for a sample by
+  // number you want to see it, not have it hidden by a speaker chip you set earlier.
+  if (f.findSamples.size || f.findPositions.size) {
+    return f.findSamples.has(+s.sample_id) || f.findPositions.has(+s.output_id);
+  }
+  if (!f.speakers.has(s.speaker)) return false;
+  if (!f.layouts.has(s.layout)) return false;
+  if (!f.nObjects.has(s.n_objects)) return false;
+  if (!f.boxes.has(s.box)) return false;
+  // Contains-any: a scene passes if any object in it is selected. Empty boxes have no
+  // objects, so they ride on the "empty" pseudo-entry rather than never matching.
+  const objs = s.objects && s.objects.length ? s.objects : ["(none)"];
+  if (!objs.some((o) => f.objects.has(o))) return false;
+  if (f.positions && !(s.pos >= 0 && f.positions.has(s.pos))) return false;
+
+  // With no runs loaded the table is a ground-truth browser, so every sample qualifies;
+  // the split filter only applies once some run has assigned splits.
+  if (S.runOrder.length) {
+    const sp = predictedSplit(s.i);
+    if (sp == null) return false;               // no loaded run predicted this sample
+    if (!f.splits.has(sp)) return false;
   }
 
-  const traces = [];
-  if (S.avgSpeaker) {
-    // one line per speaker, averaged over every pooled position that has that speaker —
-    // colored by speaker regardless of the color-by setting, since that's the whole axis here
-    const bySpeaker = new Map();
-    for (const s of pooled) { if (!bySpeaker.has(s.speaker)) bySpeaker.set(s.speaker, []); bySpeaker.get(s.speaker).push(s); }
-    for (const spk of [...bySpeaker.keys()].sort((a, b) => a - b)) {
-      const samples = bySpeaker.get(spk);
-      const curves = samples.map(s => S.fftCache.get(key + "|" + s.sample_id)).filter(Boolean);
-      if (!curves.length) continue;
-      let avg = curves[0].map((_, i) => curves.reduce((a, c) => a + c[i], 0) / curves.length);
-      if (emptyMean) avg = avg.map((v, i) => v - emptyMean[i]);
-      traces.push({ type: "scattergl", mode: "lines", x: S.freqs, y: avg, name: `spk ${spk} avg`, showlegend: true,
-        line: { width: 2, color: SPK_COLOR(spk) },
-        hovertemplate: `speaker ${spk} · avg of ${samples.length} positions<br>%{x:.0f} Hz · %{y:.4f}<extra></extra>` });
+  // Metric ranges read the sorted run when one is chosen, else any loaded run may
+  // satisfy them (union) — the intuitive reading of "show me samples where MSE is high".
+  const names = S.sort.run && S.runs[S.sort.run] ? [S.sort.run] : S.runOrder;
+  if (!names.length) return true;
+  let any = false;
+  for (const n of names) {
+    const r = S.runs[n];
+    const e = r.samples[s.i];
+    // Covered by the run but not saved at the epoch being viewed: keep the row (its
+    // cell shows "no prediction" for this frame) rather than dropping it from the table.
+    if (!e) { if (r.splitOf && r.splitOf[s.i]) any = true; continue; }
+    let ok = true;
+    for (const m of METRICS) {
+      const [lo, hi] = f.ranges[m.key] || [-Infinity, Infinity];
+      const v = e[m.key];
+      if (v == null) continue;                  // undefined metric doesn't veto a sample
+      if (v < lo - 1e-12 || v > hi + 1e-12) { ok = false; break; }
     }
-  } else {
-    const seen = new Set();
-    for (const id of ids) {
-      let curve = S.fftCache.get(key + "|" + id);
-      const s = SAMPLE.get(id);
-      if (!curve || !s) continue;
-      if (emptyMean) curve = curve.map((v, i) => v - emptyMean[i]);
-      const ck = colorKey(s);
-      traces.push({
-        type: "scattergl", mode: "lines", x: S.freqs, y: curve,
-        name: ck, legendgroup: ck, showlegend: !seen.has(ck),
-        line: { width: 1.6, color: colorFor(s) },
-        opacity: 0.9,
-        hovertemplate: `${label(s)} · ${s.layout}<br>%{x:.0f} Hz · %{y:.4f}<extra></extra>`,
+    if (ok) { any = true; break; }
+  }
+  return any;
+}
+
+function applyFilters() {
+  const rows = S.samples.filter(passes);
+  const { run, metric, dir } = S.sort;
+
+  // While scrubbing epochs the metrics underneath are changing, and re-sorting on them
+  // would shuffle rows out from under the cursor -- you would be watching a different
+  // sample than the one you were looking at. Hold the order captured when the scrub
+  // began; filters still apply, so rows can leave, but survivors keep their positions.
+  if (S.frozenOrder) {
+    // Anything not in the pinned order (a sample a filter change just admitted) sorts to
+    // the end by sample id, rather than jumping into the middle of the frozen sequence.
+    const rank = S.frozenOrder;
+    const at = (s) => (rank.has(s.i) ? rank.get(s.i) : Number.MAX_SAFE_INTEGER);
+    rows.sort((a, b) => at(a) - at(b) || a.i - b.i);
+    S.order = rows;
+    return;
+  }
+
+  if (run && S.runs[run]) {
+    const m = METRICS.find((x) => x.key === metric);
+    // "worst" means high for MSE/COM-distance but LOW for IoU; the direction button is
+    // labelled semantically so this inversion never lands on the user.
+    const desc = (m.worst === "high") === (dir === "worst");
+    const tbl = S.runs[run].samples;
+    rows.sort((a, b) => {
+      const x = tbl[a.i], y = tbl[b.i];
+      // A missing prediction, or a metric that is undefined for this sample (COM
+      // distance on an empty box), sinks to the end in BOTH directions -- neither is
+      // "best", and letting them float to the top would bury the real failures.
+      const xv = x && x[metric] != null ? x[metric] : null;
+      const yv = y && y[metric] != null ? y[metric] : null;
+      if (xv == null && yv == null) return a.i - b.i;
+      if (xv == null) return 1;
+      if (yv == null) return -1;
+      const d = (yv - xv) * (desc ? 1 : -1);
+      return d || a.i - b.i;
+    });
+  }
+  S.order = rows;
+}
+
+/* ***** table ***** */
+
+function statsFor(name) {
+  const tbl = S.runs[name].samples, out = {};
+  for (const m of METRICS) {
+    const vals = [];
+    for (const s of S.order) {
+      const e = tbl[s.i];
+      // COM distance is null on empty-GT samples (see data.load_run), so skipping
+      // nulls here reproduces the training metric's own exclusion and keeps these
+      // aggregates comparable with the numbers in the run's logs.
+      if (!e || e[m.key] == null) continue;
+      vals.push(e[m.key]);
+    }
+    if (!vals.length) { out[m.key] = null; continue; }
+    const mean = vals.reduce((a, b) => a + b, 0) / vals.length;
+    const sd = Math.sqrt(vals.reduce((a, b) => a + (b - mean) ** 2, 0) / vals.length);
+    out[m.key] = { mean, sd, n: vals.length };
+  }
+  return out;
+}
+
+/* How far the run has trained: just that number, not "current/last". The two only differ
+   while the epoch slider is scrubbed back, so the second number is shown only then --
+   otherwise it is the same value twice and costs header width the run name needs.
+   The epoch number is a control: clicking it pins every column to this run's last epoch,
+   which is how you line the table up on one run's endpoint. */
+function epochLabel(run) {
+  const r = S.runs[run];
+  const eps = r.epochs || [];
+  const last = eps.length ? eps[eps.length - 1] : r.epoch;
+  const shown = epochFor(run);
+  const goep = `<b class="goep" data-ep="${last}" title="Show every column at epoch ${last}">${last}</b>`;
+  const scrubbed = shown != null && shown !== last;
+  return `<span class="epchip${scrubbed ? " scrub" : ""}">` +
+    (scrubbed ? `<b>${shown}</b><span class="k">/</span>${goep}` : goep) +
+    `<span class="k">ep</span></span>`;
+}
+
+/* Column reordering by dragging a header.
+
+   Only the grip starts a drag, so clicking the name still cycles the sort and the whole
+   header does not become an awkward click target. Position is a whole-column step --
+   round(dx / columnWidth) -- rather than a hit test against midpoints, because columns
+   are fixed-width and stepping keeps the dragged column locked to the slot it will land
+   in instead of drifting between two of them. */
+function moveRun(name, before) {
+  if (name === before) return;
+  const rest = S.runOrder.filter((n) => n !== name);
+  const at = before == null ? rest.length : rest.indexOf(before);
+  rest.splice(at < 0 ? rest.length : at, 0, name);
+  S.runOrder = rest;
+  // Frame stores are keyed by run name, not position, so they survive a reorder -- only
+  // the DOM order changes. refresh() rebuilds the header and repaints every row's cells.
+  refresh();
+}
+
+/* Pointer-events rather than HTML5 drag-and-drop.
+
+   The native API cannot work here: refresh() destroys and recreates the whole .hrow, and
+   any re-render mid-drag (the 15s poll, an epoch fetch) tore the dragstart element out of
+   the document, which silently cancels the drag and loses the drop. Pointer events with
+   setPointerCapture keep the gesture bound to the grip for its whole lifetime, so the
+   drop always lands. It also lets the ENTIRE column move, not just its header. */
+function makeDraggable(cell, name) {
+  const grip = cell.querySelector(".hgrip");
+  if (!grip) return;
+
+  grip.onpointerdown = (e) => {
+    if (e.button !== 0) return;
+    e.preventDefault();
+    grip.setPointerCapture(e.pointerId);
+
+    const startX = e.clientX;
+    const from = S.runOrder.indexOf(name);
+    const colW = cell.getBoundingClientRect().width;
+    let to = from;
+    let moved = false;
+
+    // Every cell of this column, header included, so the whole column travels together.
+    // Row cells come from the pool's own _runCells rather than a :nth-of-type selector,
+    // which would silently break if the fixed idx/gt cells before them ever changed.
+    const heads = document.querySelectorAll(".hrow .hcell.run");
+    const colCells = (i) => [heads[i], ...pool.map((r) => r._runCells[i])].filter(Boolean);
+
+    const dragged = colCells(from);
+    dragged.forEach((c) => c.classList.add("dragging"));
+    document.body.classList.add("dragging-col");
+
+    const onMove = (ev) => {
+      const dx = ev.clientX - startX;
+      if (!moved && Math.abs(dx) < 3) return;   // let a plain click through
+      moved = true;
+      // Which slot the pointer is over, as a whole-column step.
+      const next = Math.max(0, Math.min(S.runOrder.length - 1,
+        from + Math.round(dx / colW)));
+      if (next !== to) {
+        // Shift the columns the dragged one has passed over, so the gap opens up live.
+        to = next;
+        S.runOrder.forEach((_, i) => {
+          if (i === from) return;
+          const shift = (i > from && i <= to) ? -colW : (i < from && i >= to) ? colW : 0;
+          colCells(i).forEach((c) => { c.style.transform = shift ? `translateX(${shift}px)` : ""; });
+        });
+      }
+      dragged.forEach((c) => { c.style.transform = `translateX(${dx}px)`; });
+    };
+
+    const onUp = () => {
+      grip.releasePointerCapture?.(e.pointerId);
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+      window.removeEventListener("pointercancel", onUp);
+      document.body.classList.remove("dragging-col");
+      // Clear inline transforms before re-rendering, or a recycled row keeps the offset.
+      document.querySelectorAll(".hcell.run, .cell.run").forEach((c) => {
+        c.style.transform = "";
+        c.classList.remove("dragging");
       });
-      seen.add(ck);
-    }
-  }
-
-  const useLog = S.logy && !S.diffEmpty; // diffs can go negative
-  const keepZoom = S.fftZoom && S.fftZoom.logy === useLog;
-  const layout = LAYOUT({
-    xaxis: AXIS({ title: { text: "frequency (Hz)", font: { size: 11 } }, ...(keepZoom ? { range: S.fftZoom.x, autorange: false } : {}) }),
-    yaxis: AXIS({
-      type: useLog ? "log" : "linear",
-      title: { text: `|fft|${S.norm ? " (normalized)" : ""} mean (${S.lasers.size} lasers, ${S.dirs})${S.diffEmpty ? " − empty" : ""}${S.avgSpeaker ? " · avg by speaker" : ""}`, font: { size: 11 } },
-      ...(keepZoom ? { range: S.fftZoom.y, autorange: false } : {}),
-    }),
-  });
-  Plotly.react("fft-plot", traces, traces.length ? layout : emptyLayout("nothing to plot"), CONFIG);
-}, 120);
-
-// ===== runs =====
-// A native <select> only typeahead-matches the *first* letter, which is useless for run names
-// that are long timestamp-prefixed slugs (1785245258-gleaming-kagu). This is a small combobox
-// instead: substring match anywhere in the name, already-selected runs stay listed and marked
-// so the dropdown always shows what's loaded rather than hiding it.
-let _runHi = 0;   // index of the keyboard-highlighted option
-
-function runMatches() {
-  const q = $("#run-search").value.trim().toLowerCase();
-  const all = S.man ? S.man.runs : [];
-  return q ? all.filter(r => r.toLowerCase().includes(q)) : all;
-}
-function renderRunOptions(open = true) {
-  const box = $("#run-options"), matches = runMatches();
-  if (!open) { box.hidden = true; return; }
-  _runHi = Math.max(0, Math.min(_runHi, matches.length - 1));
-  box.innerHTML = matches.length
-    ? matches.map((r, i) => {
-        const on = S.runs.includes(r);
-        return `<div class="run-opt${on ? " selected" : ""}${i === _runHi ? " hi" : ""}" data-run="${r}">
-          <span class="run-opt-mark" style="color:${on ? runColor(r) : "transparent"}">✓</span>
-          <span class="run-opt-name">${r}</span>
-        </div>`;
-      }).join("")
-    : `<div class="run-opt empty">no run matches</div>`;
-  box.hidden = false;
-  box.querySelectorAll(".run-opt[data-run]").forEach(el => el.onmousedown = e => {
-    e.preventDefault();            // keep focus in the input so the list stays open
-    toggleRun(el.dataset.run);
-  });
-  const hi = box.querySelector(".run-opt.hi");
-  if (hi) hi.scrollIntoView({ block: "nearest" });
-}
-// clicking an already-loaded run removes it, so the list is a single toggle surface
-function toggleRun(name) {
-  S.runs.includes(name) ? dropRun(name) : addRun(name);
-  renderRunOptions(true);
-}
-function buildRunSelect() { if (!$("#run-options").hidden) renderRunOptions(true); }
-
-$("#run-search").oninput = () => { _runHi = 0; renderRunOptions(true); };
-$("#run-search").onfocus = () => renderRunOptions(true);
-$("#run-search").onblur = () => setTimeout(() => renderRunOptions(false), 120);
-$("#run-search").onkeydown = e => {
-  const matches = runMatches();
-  if (e.key === "ArrowDown" || e.key === "ArrowUp") {
-    e.preventDefault();
-    _runHi = (_runHi + (e.key === "ArrowDown" ? 1 : -1) + matches.length) % Math.max(matches.length, 1);
-    renderRunOptions(true);
-  } else if (e.key === "Enter") {
-    e.preventDefault();
-    if (matches[_runHi]) toggleRun(matches[_runHi]);
-  } else if (e.key === "Escape") {
-    $("#run-search").value = ""; renderRunOptions(false); $("#run-search").blur();
-  }
-};
-
-async function addRun(name, silent = false) {
-  if (S.runs.includes(name)) return;
-  const isFirst = S.runs.length === 0;
-  S.runs.push(name);
-  if (!silent) renderRunChips();
-  try {
-    S.runData[name] = await jget(`/api/run/${name}`);
-    // the first run decides the dataset, so reload the manifest before mapping its sample ids
-    if (isFirst) {
-      const man = await jget(`/api/manifest?run=${encodeURIComponent(name)}`);
-      if (man.dataset !== S.man.dataset) {
-        S.man = man;
-        SAMPLE.clear();
-        for (const s of man.samples) SAMPLE.set(s.sample_id, s);
-        GROUPS = new Map();
-        for (const s of man.samples) { if (!GROUPS.has(s.output_id)) GROUPS.set(s.output_id, []); GROUPS.get(s.output_id).push(s); }
-        EMPTY_GROUPS = man.empty_box_groups || [];
-        S.fftCache.clear(); S.gtMasks = {};
-        for (const s of [...S.pool.keys()]) if (!SAMPLE.has(s)) S.pool.delete(s);
-        for (const f of Object.keys(man.facets)) S.filters[f] = new Set(man.facets[f]);
-        buildLaserGrid(); buildEmptySelect();
+      if (moved && to !== from) {
+        const rest = S.runOrder.filter((n) => n !== name);
+        moveRun(name, rest[to] ?? null);
       }
-    }
-    // bulk-populate the pool with every sample in this run (all splits, including train)
-    const samples = Object.keys(S.runData[name].samples).map(id => SAMPLE.get(+id)).filter(Boolean);
-    for (const s of samples) S.pool.set(s.sample_id, s);
-  } catch (err) {
-    console.error(err); S.runs = S.runs.filter(r => r !== name);
-  }
-  if (silent) return;
-  renderRunChips(); buildRunSelect();
-  renderAll();
-}
-function dropRun(name) {
-  S.runs = S.runs.filter(r => r !== name);
-  delete S.runData[name]; delete S.runMasks[name];
-  renderRunChips(); buildRunSelect(); renderAll();
-}
-function renderRunChips() {
-  const holder = $("#run-chips");
-  holder.innerHTML = "";
-  for (const name of S.runs) {
-    const d = S.runData[name];
-    const chip = document.createElement("span");
-    chip.className = "chip active run-chip" + (d ? "" : " loading");
-    chip.style.borderColor = runColor(name);
-    const upos = d && d.aggregates.unseen_pos;
-    const badge = upos ? `<span class="badge" style="background:${runBadgeColor(upos.com_dist)}22;color:${runBadgeColor(upos.com_dist)}">${upos.com_dist.toFixed(3)}</span>` : "";
-    chip.innerHTML = `${name} ${badge} <span class="x">✕</span>`;
-    chip.title = d ? "unseen_pos com_dist (mean, headline metric)\n\n" + Object.entries(d.aggregates).map(([k, v]) => `${k}: mse ${v.mse} · com ${v.com_dist} · n=${v.n}`).join("\n") : "extracting…";
-    chip.querySelector(".x").onclick = () => dropRun(name);
-    holder.appendChild(chip);
-  }
+    };
+
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+    // A cancelled pointer (browser gesture, window blur) must unwind exactly like a drop,
+    // or the column would stay lifted with a stale transform.
+    window.addEventListener("pointercancel", onUp);
+  };
 }
 
-// ===== masks =====
-async function ensureGtMasks(ids) {
-  const missing = ids.filter(id => !(id in S.gtMasks));
-  if (!missing.length) return;
-  Object.entries(await jget(`/api/gt_masks?ids=${missing.join(",")}${runQ()}`)).forEach(([id, m]) => S.gtMasks[+id] = m);
-}
-async function ensureRunMasks(run, ids) {
-  S.runMasks[run] = S.runMasks[run] || {};
-  const missing = ids.filter(id => !(id in S.runMasks[run]));
-  if (!missing.length) return;
-  Object.entries(await jget(`/api/run/${run}/masks?ids=${missing.join(",")}`)).forEach(([id, m]) => S.runMasks[run][+id] = m);
-}
+function renderHeader() {
+  const h = document.createElement("div");
+  h.className = "hrow";
+  h.style.height = "auto";
+  h.innerHTML = `<div class="hcell idx sticky-1"></div>
+    <div class="hcell gt sticky-2"><div class="hname" style="cursor:default">Ground truth</div>
+      <div class="hmeta">sample · overhead + mask</div></div>`;
 
-function maskCanvas(mask, mode, cls = "") {
-  const h = mask.length, w = mask[0].length;
-  const cv = document.createElement("canvas");
-  cv.width = w; cv.height = h; cv.className = cls;
-  const g = cv.getContext("2d"), img = g.createImageData(w, h);
-  const mix = (a, b, t) => a.map((v, i) => Math.round(v + (b[i] - v) * t));
-  const SURF = [26, 26, 25], RED = [224, 82, 82], GREEN = [24, 178, 24];
-  for (let r = 0; r < h; r++) for (let c = 0; c < w; c++) {
-    let rgb, v = mask[r][c];
-    if (mode === "diff") rgb = v >= 0 ? mix([56, 56, 53], RED, Math.min(v, 1)) : mix([56, 56, 53], GREEN, Math.min(-v, 1));
-    else rgb = mix(SURF, mode === "gt" ? GREEN : RED, Math.min(Math.max(v, 0), 1));
-    const o = (r * w + c) * 4;
-    [img.data[o], img.data[o + 1], img.data[o + 2], img.data[o + 3]] = [...rgb, 255];
-  }
-  g.putImageData(img, 0, 0);
-  return cv;
-}
-
-// ===== box viewer =====
-const updateBox = debounce(async () => {
-  const pooled = benchSamples();
-  const traces = [];
-  const bg = [...GROUPS.values()].map(g => g[0]).filter(s => s.com_row >= 0);
-  traces.push({ type: "scatter", mode: "markers", showlegend: false, hoverinfo: "skip",
-    x: bg.map(s => s.com_col), y: bg.map(s => s.com_row), marker: { size: 4, color: BASE } });
-
-  const seen = new Set(), byGroup = new Map();
-  for (const s of pooled) { if (!byGroup.has(s.output_id)) byGroup.set(s.output_id, []); byGroup.get(s.output_id).push(s); }
-  for (const [oid, samples] of byGroup) {
-    if (samples[0].com_row < 0) continue;
-    const s = samples[0], ck = colorKey(s);
-    traces.push({
-      type: "scatter", mode: "markers", name: ck, legendgroup: ck, showlegend: !seen.has(ck),
-      x: [s.com_col], y: [s.com_row],
-      marker: { size: 11, color: colorFor(s), line: { width: 2, color: SURFACE } },
-      hovertemplate: `p${+oid} · ${s.layout} · gt com (${s.com_row.toFixed(1)}, ${s.com_col.toFixed(1)})<extra></extra>`,
-    });
-    seen.add(ck);
-  }
-  for (const run of S.runs) {
-    const rd = S.runData[run];
-    if (!rd) continue;
-    const xs = [], ys = [], texts = [];
-    for (const s of pooled) {
-      if (s.com_row < 0) continue;   // empty-box has no real gt position — skip, don't draw a line to (-1,-1)
-      const rec = rd.samples[s.sample_id];
-      if (!rec) continue;
-      traces.push({ type: "scatter", mode: "lines", showlegend: false, hoverinfo: "skip",
-        x: [s.com_col, rec.pred_col], y: [s.com_row, rec.pred_row], line: { width: 1, color: runColor(run) }, opacity: 0.4 });
-      xs.push(rec.pred_col); ys.push(rec.pred_row);
-      texts.push(`${label(s)}<br>${run} pred com (${rec.pred_row.toFixed(1)}, ${rec.pred_col.toFixed(1)})<br>com_dist ${fmt(rec.com_dist)} · mse ${fmt(rec.mse, 5)}`);
-    }
-    if (xs.length) traces.push({ type: "scatter", mode: "markers", name: run, legendgroup: "run:" + run,
-      x: xs, y: ys, text: texts, hovertemplate: "%{text}<extra></extra>",
-      marker: { symbol: "x", size: 7, color: runColor(run), line: { width: 1, color: SURFACE } } });
-  }
-  // empty-box samples have no real (row, col) to plot spatially — surface them as a compact
-  // per-run mean-mse line instead of silently dropping them or drawing a line to (-1,-1)
-  const emptyPooled = pooled.filter(s => s.com_row < 0);
-  const stripEl = $("#empty-box-strip");
-  if (emptyPooled.length && S.runs.some(r => S.runData[r])) {
-    const parts = S.runs.filter(r => S.runData[r]).map(r => {
-      const vals = emptyPooled.map(s => S.runData[r].samples[s.sample_id]?.mse).filter(v => v != null);
-      const avg = vals.length ? vals.reduce((a, b) => a + b, 0) / vals.length : null;
-      return `<span style="color:${runColor(r)}">${r}</span> ${fmt(avg, 5)}`;
-    });
-    stripEl.innerHTML = `${emptyPooled.length} empty-box sample${emptyPooled.length === 1 ? "" : "s"} (not plotted — no position) · mean mse: ${parts.join(" · ")}`;
-  } else if (emptyPooled.length) {
-    stripEl.textContent = `${emptyPooled.length} empty-box sample${emptyPooled.length === 1 ? "" : "s"} in pool (not plotted — no position; add a run to see mse)`;
-  } else {
-    stripEl.textContent = "";
-  }
-
-  if (S.contours && pooled.length) {
-    const gtIds = [...new Map(pooled.map(s => [s.output_id, s.sample_id])).values()];
-    try {
-      await ensureGtMasks(gtIds);
-      for (const run of S.runs) await ensureRunMasks(run, pooled.map(s => s.sample_id));
-    } catch (e) { console.error(e); }
-    for (const id of gtIds) if (S.gtMasks[id]) traces.push(contourTrace(S.gtMasks[id], GT_COLOR));
-    for (const run of S.runs)
-      for (const s of pooled) {
-        const m = S.runMasks[run] && S.runMasks[run][s.sample_id];
-        if (m) traces.push(contourTrace(m, runColor(run)));
-      }
-  }
-  Plotly.react("box-plot", traces, LAYOUT({
-    margin: { l: 30, r: 6, t: 6, b: 24 },
-    legend: { orientation: "h", y: -0.12, yanchor: "top" },
-    xaxis: AXIS({ range: [-0.8, S.man.out_w - 0.2], constrain: "domain" }),
-    yaxis: AXIS({ range: [S.man.out_h - 0.2, -0.8], scaleanchor: "x", scaleratio: 1 }),
-  }), CONFIG);
-}, 120);
-
-const contourTrace = (mask, color, ghost = false) => ({
-  type: "contour", z: mask, showscale: false, showlegend: false, hoverinfo: "skip",
-  contours: { start: 0.5, end: 0.5, size: 1, coloring: "none" },
-  line: { color, width: ghost ? 1.8 : 1.4, dash: ghost ? "dot" : "solid" },
-  opacity: ghost ? 0.85 : 1,
-});
-$("#contours-toggle").onchange = e => { S.contours = e.target.checked; updateBox(); };
-
-// ===== compact table: one view, sortable by clicking column headers =====
-// first column = ground truth/sample thumbnail, sortable by sample_id or position (output_id);
-// each following column = one active run's prediction thumbnail, sortable by that run's mse/com_dist.
-const GT_SORT_COLS = [["sample_id", "id"], ["output_id_num", "position"]];
-const RUN_SORT_COLS = [["mse", "mse"], ["com_dist", "com dist"]];
-
-function sortVal(s, key) {
-  if (key.startsWith("run:")) {
-    const [, run, field] = key.split(":");
-    const rec = S.runData[run] && S.runData[run].samples[s.sample_id];
-    return rec ? rec[field] : null;
-  }
-  if (key === "output_id_num") return +s.output_id;
-  return s[key];
-}
-function sortedPool() {
-  const rows = poolSamples();
-  const { key, dir } = S.sort;
-  return rows.sort((a, b) => {
-    const va = sortVal(a, key), vb = sortVal(b, key);
-    if (va == null && vb == null) return 0;
-    if (va == null) return 1;   // nulls (e.g. empty-box com_dist) always sort last
-    if (vb == null) return -1;
-    return (va > vb ? 1 : va < vb ? -1 : 0) * dir;
-  });
-}
-function setSort(key) {
-  S.sort = { key, dir: S.sort.key === key ? -S.sort.dir : 1 };
-  renderCompact();
-}
-
-function renderSamplesView() { renderCompact(); }
-
-let currentAudio = null, currentAudioBtn = null;
-function stopCurrentAudio() {
-  if (currentAudio) currentAudio.pause();
-  if (currentAudioBtn) currentAudioBtn.classList.remove("playing");
-  currentAudio = null; currentAudioBtn = null;
-}
-function wirePlayButtons(root) {
-  root.querySelectorAll(".play").forEach(b => b.onclick = e => {
-    e.stopPropagation();
-    const sameButton = currentAudioBtn === b;
-    stopCurrentAudio();
-    if (sameButton) return;   // second click on the playing button: pause and stop, don't restart
-    currentAudio = new Audio(b.dataset.src);   // fresh Audio each time -> always starts at 0
-    currentAudioBtn = b;
-    b.classList.add("playing");
-    currentAudio.addEventListener("ended", stopCurrentAudio);
-    currentAudio.play();
-  });
-}
-// small white cross at the ground-truth center of mass, drawn directly on an overlay canvas
-function drawComCross(cv, s) {
-  if (!s || s.com_row < 0) return;
-  const g = cv.getContext("2d");
-  const x = (s.com_col + 0.5) / S.man.out_w * cv.width, y = (s.com_row + 0.5) / S.man.out_h * cv.height;
-  const r = Math.max(4, cv.width * 0.02);
-  g.strokeStyle = "#fff"; g.lineWidth = 2;
-  g.beginPath(); g.moveTo(x - r, y); g.lineTo(x + r, y); g.moveTo(x, y - r); g.lineTo(x, y + r); g.stroke();
-}
-
-function rowHtml(s, activeRuns, idx) {
-  const gtCell = `<span class="overlay-slot" data-id="${s.sample_id}" data-kind="gt"></span>`;
-  const predCells = activeRuns.map(r => {
-    const rec = S.runData[r] && S.runData[r].samples[s.sample_id];
-    const cap = rec
-      ? `${rec.split.replace("unseen_", "u-")} · mse ${fmt(rec.mse, 5)} · com ${fmt(rec.com_dist)}`
-      : `not in run`;
-    return `<td class="run-col">
-    <div class="compact-cell" data-run="${r}">
-      <div class="compact-cap"><span class="swatch" style="background:${colorFor(s)}"></span><span class="compact-id">#${s.sample_id}</span></div>
-      <div class="compact-cap" style="color:${runColor(r)}">${cap}</div>
-      <span class="overlay-slot" data-id="${s.sample_id}" data-run="${r}" data-kind="pred"></span>
-    </div></td>`;
-  }).join("");
-  const inBench = S.bench.has(s.sample_id);
-  return `<tr data-id="${s.sample_id}">
-    <td class="idx-col">
-      ${idx}
-      <span class="row-bench${inBench ? " active" : ""}" title="${inBench ? "remove from workbench" : "add to workbench (box + fft viewers)"}">${inBench ? "✓" : "+"} bench</span>
-    </td>
-    <td>
-      <span class="row-x" title="remove from table">✕</span>
-      <div class="compact-cell">
-        <div class="compact-cap"><span class="swatch" style="background:${colorFor(s)}"></span><span class="compact-id">#${s.sample_id}</span> · p${+s.output_id} · spk${s.speaker} · ${s.layout} · com (${s.com_row.toFixed(1)}, ${s.com_col.toFixed(1)})</div>
-        ${gtCell}
+  for (const name of S.runOrder) {
+    const r = S.runs[name], st = statsFor(name);
+    const sorted = S.sort.run === name;
+    const cell = document.createElement("div");
+    cell.className = "hcell run" + (sorted ? " sorted" : S.sort.run ? " dim" : "");
+    const warn = r.entry && r.entry.family === "unknown"
+      ? `<span class="warnbadge" title="No eval split directories; dataset identity unconfirmed">?</span>` : "";
+    const skipped = r.skipped_files.length
+      ? ` · <span title="${r.skipped_files.join(", ")}">${r.skipped_files.length} file(s) skipped</span>` : "";
+    // Read status from the latest poll, not the snapshot taken when the run was added --
+    // a run that finishes or crashes while open must update its badge.
+    const live = S.meta.runs.find((x) => x.name === name);
+    const status = (live && live.status) || "unknown";
+    // Two lines: the name owns the first one (it is the column's identity and the longest
+    // string), the epoch and status chips sit together on the second. They shared a line
+    // with the name until the column narrowed to the sample image's width, where the chips
+    // ate the name down to "norm-4-...". Grip and close ride the top-right corner.
+    cell.innerHTML = `
+      <div class="htop">
+        <div class="hname" title="${name} — click to cycle sort">${name}${warn}</div>
+        <span class="hgrip" title="Drag to reorder this column">⠿</span>
+        <button class="hclose" title="Remove this run">&times;</button>
       </div>
-    </td>
-    ${predCells}</tr>`;
-}
+      <div class="hchips">
+        <span class="hep">${epochLabel(name)}</span>
+        ${statusChip(status)}
+      </div>
+      ${skipped ? `<div class="hmeta">${skipped.replace(/^ · /, "")}</div>` : ""}
+      <div class="hstats">${METRICS.map((m) => {
+        const s = st[m.key];
+        return `<span><span class="k">${m.short}</span> <b>${s ? fmt(s.mean, 3) : "–"}</b>${
+          s ? `<span class="k">±${fmt(s.sd, 3)}</span>` : ""}</span>`;
+      }).join("")}</div>
+      <div class="hsort">
+        <select>${METRICS.map((m) =>
+          `<option value="${m.key}" ${sorted && S.sort.metric === m.key ? "selected" : ""}>${m.label}</option>`).join("")}</select>
+        <button class="dir ${sorted ? "on" : ""}">${sorted ? (S.sort.dir === "worst" ? "↓ worst" : "↑ best") : "sort"}</button>
+      </div>`;
 
-let _compactRenderGen = 0;
-async function renderCompact() {
-  // guards a stale render (started before a newer one) from clobbering live DOM/listeners --
-  // same race the old table view hit from hover/live-poll re-entrancy.
-  const gen = ++_compactRenderGen;
-  const wrap = $("#compact-wrap");
-  const rows = sortedPool();
-  if (!rows.length) {
-    if (gen !== _compactRenderGen) return;
-    wrap.innerHTML = `<div class="hint" style="padding:12px">add samples — pick a run above, click a position, or use "add matching" / the search box in dataset filters</div>`;
-    return;
-  }
-  const activeRuns = S.runs.filter(r => S.runData[r]);
-  if (gen !== _compactRenderGen) return;
+    makeDraggable(cell, name);
 
-  // the active sort column needs to be unmistakable, not just an arrow buried in dense header
-  // text -- give it its own pill (accent bg + arrow) so it reads at a glance which column/run
-  // and metric the table is currently ordered by
-  const sortSpan = (k, l) => S.sort.key === k
-    ? `<span data-sort-key="${k}" class="sort-active">${l} ${S.sort.dir > 0 ? "↑" : "↓"}</span>`
-    : `<span data-sort-key="${k}">${l}</span>`;
-  const thead = `<thead><tr>
-    <th class="idx-col">index</th>
-    <th>${GT_SORT_COLS.map(([k, l]) => sortSpan(k, l)).join(" · ")} — ground truth</th>
-    ${activeRuns.map(r => `<th class="run-col" style="color:${runColor(r)}">${r}
-      <span style="color:${INK};font-weight:400"> — ${RUN_SORT_COLS.map(([k, l]) => sortSpan(`run:${r}:${k}`, l)).join(" · ")}</span>
-    </th>`).join("")}
-  </tr></thead>`;
-
-  const tb = rows.map((s, i) => rowHtml(s, activeRuns, i + 1)).join("");
-  if (gen !== _compactRenderGen) return;
-  wrap.innerHTML = `<table class="compact-table">${thead}<tbody>${tb}</tbody></table>`;
-
-  observeRowsForFill(wrap);   // lazy: only paint overlay canvases for rows scrolled into view
-  if (gen !== _compactRenderGen) return;
-  wrap.querySelectorAll("[data-sort-key]").forEach(el => el.onclick = e => { e.stopPropagation(); setSort(el.dataset.sortKey); });
-  wrap.querySelectorAll(".row-x").forEach(x => x.onclick = e => {
-    e.stopPropagation();
-    removeFromPool([+e.target.closest("tr").dataset.id]);
-  });
-  wrap.querySelectorAll(".row-bench").forEach(x => x.onclick = e => {
-    e.stopPropagation();
-    const id = +e.target.closest("tr").dataset.id;
-    S.bench.has(id) ? removeFromBench([id]) : addToBench([SAMPLE.get(id)]);
-  });
-  wrap.querySelectorAll("img.thumb").forEach(img => img.onclick = () => openLightbox(img.src));
-  wirePlayButtons(wrap);
-}
-
-// with the whole dataset + several runs loaded by default, painting every overlay canvas eagerly
-// means thousands of serial thumbnail fetches before anything is visible. Instead, only fill a
-// row's overlay slots once it's scrolled near the viewport -- the table stays responsive
-// immediately and fills in as you scroll, same data, no eager cost for off-screen rows.
-let _rowObserver = null;
-function observeRowsForFill(root) {
-  if (_rowObserver) _rowObserver.disconnect();
-  _rowObserver = new IntersectionObserver(entries => {
-    for (const e of entries) {
-      if (!e.isIntersecting) continue;
-      _rowObserver.unobserve(e.target);
-      fillOverlayStacks(e.target).catch(console.error);
-    }
-  // ~130px per row (220px-wide thumbnail + captions) -> 1300px covers ~10 rows of prefetch
-  // ahead of/behind the visible viewport in each scroll direction, so scrolling doesn't outrun fills
-  }, { root: root, rootMargin: "1300px 0px" });
-  root.querySelectorAll("tbody tr").forEach(tr => _rowObserver.observe(tr));
-}
-
-// fills every ".overlay-slot" in root: kind="gt" -> overhead + gt mask + com cross, opens the
-// metadata+mask detail modal in gt mode; kind="pred" (data-run set) -> overhead + that run's
-// predicted mask + pred com cross, opens the detail modal in prediction mode for that run
-async function fillOverlayStacks(root) {
-  const slots = [...root.querySelectorAll(".overlay-slot")];
-  if (!slots.length) return;
-  const gtIds = [...new Set(slots.filter(sl => sl.dataset.kind === "gt").map(sl => +sl.dataset.id))];
-  if (gtIds.length) await ensureGtMasks(gtIds).catch(console.error);
-  const byRun = new Map();
-  for (const sl of slots) if (sl.dataset.kind === "pred") {
-    if (!byRun.has(sl.dataset.run)) byRun.set(sl.dataset.run, new Set());
-    byRun.get(sl.dataset.run).add(+sl.dataset.id);
-  }
-  for (const [run, ids] of byRun) await ensureRunMasks(run, [...ids]).catch(console.error);
-
-  for (const sl of slots) {
-    const id = +sl.dataset.id;
-    const s = SAMPLE.get(id);
-    let cv;
-    if (sl.dataset.kind === "gt") {
-      const gt = S.gtMasks[id];
-      if (!gt) continue;
-      cv = await maskOverlayCanvas(id, gt, [24, 178, 24], "ground truth");
-      cv.onclick = () => openDetail(id, null);
-    } else {
-      const run = sl.dataset.run;
-      const pred = S.runMasks[run] && S.runMasks[run][id];
-      if (!pred) continue;
-      cv = await maskOverlayCanvas(id, pred, [224, 82, 82], run);
-      cv.onclick = () => openDetail(id, run);
-    }
-    drawComCross(cv, s);
-    cv.className = "thumb";
-    if (sl.isConnected) sl.replaceWith(cv);   // view may have re-rendered while this awaited
-  }
-}
-
-// accepts a plain image URL (bare overhead photo) or a canvas (e.g. an overlay already showing
-// the mask) -- clicking a mask-overlay thumbnail should enlarge with the mask still visible,
-// not silently fall back to the bare photo
-function openLightbox(srcOrCanvas) {
-  const img = $("#lightbox-img");
-  if (srcOrCanvas instanceof HTMLCanvasElement) {
-    img.src = srcOrCanvas.toDataURL();
-  } else {
-    img.src = srcOrCanvas;
-  }
-  $("#lightbox").classList.add("open");
-}
-$("#lightbox").onclick = () => $("#lightbox").classList.remove("open");
-
-// ===== detail modal (mask comparison) =====
-// two separate tables so it's unambiguous which facts are fixed dataset properties of the
-// sample vs which come from this run's prediction of it
-function sampleMetaRows(s) {
-  const rows = [
-    ["id", `#${s.sample_id}`], ["speaker", s.speaker], ["layout", s.layout], ["n objects", s.n_objects],
-    ["gt com", `(${s.com_row.toFixed(1)}, ${s.com_col.toFixed(1)})`],
-    ["audio", `<button class="play" data-src="/media/${s.sample_id}/audio">in ▶</button> <button class="play" data-src="/media/${s.sample_id}/recovered">rec ▶</button>`],
-  ];
-  return rows.map(([k, v]) => `<tr><td>${k}</td><td>${v}</td></tr>`).join("");
-}
-function predMetaRows(run, rec) {
-  const rows = [
-    ["run", run], ["split", rec?.split.replace("unseen_", "u-") ?? "?"],
-    ["mse", fmt(rec?.mse, 6)], ["com_dist", fmt(rec?.com_dist)],
-    ["pred com", `(${fmt(rec?.pred_row, 1)}, ${fmt(rec?.pred_col, 1)})`],
-  ];
-  return rows.map(([k, v]) => `<tr><td>${k}</td><td>${v}</td></tr>`).join("");
-}
-
-// fixed pixel size every detail-modal image renders at, regardless of view -- overhead photos
-// are natively 256x104 (checked across the dataset); scaling every image/heatmap to the same
-// width keeps gt/pred/diff/overlay visually comparable and never squished relative to each other
-const DETAIL_IMG_W = 460;
-
-// gt com = light green cross, pred com = light red cross -- consistent everywhere in the modal
-// so the two marks are distinguishable at a glance without reading a legend
-const GT_COM_MARK = "#8fe08f", PRED_COM_MARK = "#f09a9a";
-
-async function openDetail(sampleId, run) {
-  const s = SAMPLE.get(sampleId);
-  await ensureGtMasks([sampleId]);
-  const gt = S.gtMasks[sampleId];
-  if (!gt) return;
-  const rec = run ? S.runData[run]?.samples[sampleId] : null;
-  let pred = null;
-  if (run) { await ensureRunMasks(run, [sampleId]); pred = S.runMasks[run][sampleId]; if (!pred) return; }
-
-  const t = detailTitle(s, run, rec);
-  $("#modal-title").textContent = t.head;
-  $("#modal-subtitle").textContent = t.meta;
-  $("#modal-meta-sample").innerHTML = sampleMetaRows(s);
-  $("#modal-meta-pred-group").hidden = !run;
-  if (run) $("#modal-meta-pred").innerHTML = predMetaRows(run, rec);
-  $("#modal").classList.add("open");
-  wirePlayButtons($("#modal"));
-
-  const side = $("#m-side"), combined = $("#m-combined"), diff = $("#m-diff");
-  side.innerHTML = ""; combined.innerHTML = ""; diff.innerHTML = "";
-
-  const drawCross = (cv, row, col, color) => {
-    const g = cv.getContext("2d");
-    const x = (col + 0.5) / S.man.out_w * cv.width, y = (row + 0.5) / S.man.out_h * cv.height;
-    const r = Math.max(4, cv.width * 0.02);
-    g.strokeStyle = color; g.lineWidth = 2;
-    g.beginPath(); g.moveTo(x - r, y); g.lineTo(x + r, y); g.moveTo(x, y - r); g.lineTo(x, y + r); g.stroke();
-  };
-  // small red/green legend watermark burned directly into the canvas corner -- replaces a
-  // separate caption line, so the panel header can stay a single line (title + toggle only)
-  const drawLegend = (cv, ...words) => {
-    const g = cv.getContext("2d");
-    g.font = `${Math.round(cv.width * 0.032)}px system-ui`; g.textBaseline = "top";
-    let x = 8;
-    for (const [text, color] of words) {
-      g.fillStyle = "rgba(0,0,0,0.55)"; g.fillRect(x - 3, 5, g.measureText(text).width + 6, cv.width * 0.045);
-      g.fillStyle = color; g.fillText(text, x, 7);
-      x += g.measureText(text).width + 14;
-    }
-  };
-  // each panel's own caption repeats the full identifying info (sample/run/box/object/spk/mse/
-  // com_dist) rather than just a bare kind label -- so a screenshot of a single panel is
-  // self-identifying without needing the modal's shared header to be in frame too.
-  const panelHead = (kind, checked) => `<div class="sub m-panel-head">
-    <span><b>${kind}</b> — ${t.head}<br><span class="m-panel-meta">${t.meta}</span></span>
-    <label class="check-line"><input type="checkbox" class="m-photo-toggle" ${checked ? "checked" : ""}> show overhead</label>
-  </div>`;
-  // build the whole canvas (incl. crosses + legend) before touching the DOM, then swap it in with
-  // one replaceChildren call -- writing innerHTML="" first and appending later (after the photo
-  // finishes loading) left a visible blank gap on every toggle click, which read as a screen flicker
-  const swapSlot = (slot, cv) => slot.replaceChildren(cv);
-
-  if (!run) {
-    // gt-only mode: a single panel, its own overhead toggle, nothing else to show
-    side.innerHTML = `${panelHead("ground truth", true)}<div class="m-side-row"></div>`;
-    const slot = side.querySelector(".m-side-row");
-    const renderGt = async withPhoto => {
-      const cv = await layeredMaskCanvas(sampleId, [{ mask: gt, rgb: [24, 178, 24], label: "ground truth" }], withPhoto);
-      drawCross(cv, s.com_row, s.com_col, GT_COM_MARK);
-      drawLegend(cv, ["ground truth", "#8fe08f"]);
-      cv.style.cssText = `width:${DETAIL_IMG_W}px;border-radius:6px;display:block`;
-      swapSlot(slot, cv);
+    cell.querySelector(".hclose").onclick = (e) => {
+      e.stopPropagation();          // must not also cycle the column's sort
+      removeRun(name);
     };
-    side.querySelector(".m-photo-toggle").onchange = e => renderGt(e.target.checked);
-    renderGt(true);
-    return;
+    cell.querySelector(".hname").onclick = () => {
+      if (S.sort.run !== name) S.sort = { run: name, metric: S.sort.metric, dir: "worst" };
+      else if (S.sort.dir === "worst") S.sort.dir = "best";
+      else S.sort = { run: null, metric: S.sort.metric, dir: "worst" };
+      refresh(true);
+    };
+    cell.querySelector("select").onchange = (e) => {
+      S.sort = { run: name, metric: e.target.value, dir: S.sort.run === name ? S.sort.dir : "worst" };
+      refresh(true);
+    };
+    cell.querySelector(".dir").onclick = () => {
+      if (S.sort.run !== name) S.sort = { run: name, metric: S.sort.metric, dir: "worst" };
+      else S.sort.dir = S.sort.dir === "worst" ? "best" : "worst";
+      refresh(true);
+    };
+    h.appendChild(cell);
   }
+  return h;
+}
 
-  // panel 1: side by side, each with its own overhead toggle
-  side.innerHTML = `${panelHead("side by side", true)}<div style="display:flex;gap:8px" class="m-side-row"></div>`;
-  const sideRow = side.querySelector(".m-side-row");
-  const renderSide = async withPhoto => {
-    const [gtCv, predCv] = await Promise.all([
-      layeredMaskCanvas(sampleId, [{ mask: gt, rgb: [24, 178, 24], label: "ground truth" }], withPhoto),
-      layeredMaskCanvas(sampleId, [{ mask: pred, rgb: [224, 82, 82], label: "prediction" }], withPhoto),
-    ]);
-    drawCross(gtCv, s.com_row, s.com_col, GT_COM_MARK);
-    drawCross(predCv, rec.pred_row, rec.pred_col, PRED_COM_MARK);
-    drawLegend(gtCv, ["ground truth", "#8fe08f"]);
-    drawLegend(predCv, ["predicted", "#f09a9a"]);
-    for (const cv of [gtCv, predCv]) cv.style.cssText = `width:${DETAIL_IMG_W}px;border-radius:6px;display:block`;
-    sideRow.replaceChildren(gtCv, predCv);
-  };
-  side.querySelector(".m-photo-toggle").onchange = e => renderSide(e.target.checked);
-  renderSide(true);
+/* Images are cached `immutable`, so the render version is part of the URL: bumping
+   config.RENDER_VERSION is what lets a changed rendering reach browsers that already
+   cached the old one. Table prediction cells no longer use images -- they are canvases
+   drawn from /api/frames -- so this covers the ground-truth column and the modals. */
+function gtMaskURL(sid) {
+  return `/api/gt_mask.png?sid=${sid}&bg=${S.view.background ? 1 : 0}&v=${S.renderVersion}`;
+}
 
-  // panel 2: both masks combined on one plot, pred layered on top of gt
-  combined.innerHTML = `${panelHead("combined", true)}<div class="m-combined-slot"></div>`;
-  const combinedSlot = combined.querySelector(".m-combined-slot");
-  const renderCombined = async withPhoto => {
-    const cv = await layeredMaskCanvas(sampleId, [
-      { mask: gt, rgb: [24, 178, 24], label: "ground truth" },
-      { mask: pred, rgb: [224, 82, 82], label: "prediction" },
-    ], withPhoto);
-    drawCross(cv, s.com_row, s.com_col, GT_COM_MARK);
-    drawCross(cv, rec.pred_row, rec.pred_col, PRED_COM_MARK);
-    drawLegend(cv, ["predicted", "#f09a9a"], ["ground truth", "#8fe08f"]);
-    cv.style.cssText = `width:${DETAIL_IMG_W}px;border-radius:6px;display:block`;
-    swapSlot(combinedSlot, cv);
-  };
-  combined.querySelector(".m-photo-toggle").onchange = e => renderCombined(e.target.checked);
-  renderCombined(true);
-
-  // panel 3: diff -- canvas-based (not plotly heatmap) so it can share the same overhead-photo
-  // toggle as the other two panels; defaults OFF since the diff coloring is usually clearer on
-  // its own plain background, but it's there if you want to see it in physical context. Still
-  // gets a real colorbar (drawn alongside, not part of the photo canvas) for the 0..1 alpha scale.
-  const diffMask = pred.map((row, r) => row.map((v, c) => v - gt[r][c]));
-  diff.innerHTML = `${panelHead("diff", false)}
-    <div style="display:flex;align-items:flex-start;gap:10px">
-      <div class="m-diff-slot"></div>
-      <canvas class="m-diff-colorbar" width="34" height="200" title="red = pred extra · green = gt missed"></canvas>
+function buildRow() {
+  const el = document.createElement("div");
+  el.className = "row";
+  el.innerHTML = `<div class="cell idx sticky-1"><span class="idxn"></span></div>
+    <div class="cell gt sticky-2 gtcell">
+      <div class="ctitle gt-head"></div>
+      <img class="mask gtimg" loading="lazy" decoding="async" alt="">
+      <div class="tags gt-foot"></div>
     </div>`;
-  const diffSlot = diff.querySelector(".m-diff-slot");
-  drawDiffColorbar(diff.querySelector(".m-diff-colorbar"));
-  const renderDiff = async withPhoto => {
-    // two-layer diff render: positive (pred extra) in red, negative (gt missed) in green
-    const posMask = diffMask.map(row => row.map(v => Math.max(v, 0)));
-    const negMask = diffMask.map(row => row.map(v => Math.max(-v, 0)));
-    const cv = await layeredMaskCanvas(sampleId, [
-      { mask: negMask, rgb: [24, 178, 24], label: "gt missed" },
-      { mask: posMask, rgb: [224, 82, 82], label: "pred extra" },
-    ], withPhoto);
-    drawCross(cv, s.com_row, s.com_col, GT_COM_MARK);
-    drawCross(cv, rec.pred_row, rec.pred_col, PRED_COM_MARK);
-    drawLegend(cv, ["predicted", "#f09a9a"], ["ground truth", "#8fe08f"]);
-    cv.style.cssText = `width:${DETAIL_IMG_W}px;border-radius:6px;display:block`;
-    swapSlot(diffSlot, cv);
+  el._runCells = [];
+  return el;
+}
+
+function syncRowCells(el) {
+  while (el._runCells.length > S.runOrder.length) el.removeChild(el._runCells.pop());
+  while (el._runCells.length < S.runOrder.length) {
+    const c = document.createElement("div");
+    c.className = "cell run";
+    // One rendering path: every prediction cell is a canvas drawn from local mask values
+    // over a CSS backdrop. Keeping a parallel server-PNG path meant two renderers that
+    // had to agree on gamma, alpha and backdrop geometry -- and they drifted.
+    // A second canvas for the ground-truth half, shown only in stacked mode.
+    // Canvas dims come from the server's mask shape, never hardcoded: the grid is 20x40
+    // on some datasets and 30x30 on others, and a fixed 40x20 buffer would letterbox the
+    // mask into the wrong cells entirely.
+    // Sized per column in paintRow, since each run may predict at its own grid; these
+    // are just starting dimensions for a canvas that has not been painted yet.
+    const { h: mh, w: mw } = S.lut;
+    c.innerHTML = `<div class="ctitle run-head"></div>` +
+      `<canvas class="mask predmask" width="${mw}" height="${mh}"></canvas>` +
+      `<canvas class="mask truthmask" width="${mw}" height="${mh}" hidden></canvas>` +
+      `<div class="tags subtags"></div>`;
+    el.appendChild(c);
+    el._runCells.push(c);
+  }
+}
+
+function paintRow(el, rank) {
+  const s = S.order[rank];
+  el.style.transform = `translateY(${rank * rowH()}px)`;
+  el.querySelector(".idxn").textContent = rank + 1;
+  // Identity line: which sample, where it was captured, which speaker played. The 8
+  // samples sharing a position differ only by speaker, so all three belong together.
+  el.querySelector(".gt-head").innerHTML =
+    `<span class="t1">Ground truth</span><span class="t2">${identity(s)}</span>`;
+
+  // The ground-truth cell shows the same 20x40 target the runs predict, over the same
+  // backdrop, so it is directly comparable with every prediction column. The speaker
+  // view lives in the detail modal instead.
+  const img = el.querySelector(".gtimg");
+  img.className = "mask gtimg" + (S.view.background ? "" : " nobg");
+  const src = gtMaskURL(s.i);
+  if (img.getAttribute("src") !== src) img.setAttribute("src", src);
+  img.dataset.run = ""; img.dataset.sid = s.i;
+
+  // Split is a property of each run's dataloader, not of the sample, so it is shown per
+  // run column rather than here.
+  const com = s.com_gt && s.com_gt[0] != null && s.com_gt[0] >= 0
+    ? `${fmt(s.com_gt[0], 1)}, ${fmt(s.com_gt[1], 1)}` : "–";
+  // Four chips have to share 224px without wrapping -- a second line would overflow the
+  // fixed row height the virtualizer depends on. "com" is dropped from the label (the
+  // value reads as a coordinate pair, and the modal spells it out) to buy that room.
+  el.querySelector(".gt-foot").innerHTML =
+    `<span class="tag" title="center of mass (row, col) in grid coords">${com}</span>` +
+    `<span class="tag" title="${s.layout}">${shortLayout(s.layout)}</span>` +
+    `<span class="tag">${s.n_objects} obj</span>` +
+    (s.box ? `<span class="tag" title="box: ${s.box}">${s.box}</span>` : "");
+  el.querySelector(".gtcell").onclick = () => openModal(rank);
+
+  syncRowCells(el);
+  // Hoisted: depends only on S.runOrder, so computing it per cell rebuilt a Set ~140
+  // times per repaint (28 pooled rows x 5 columns) at scroll frame rate.
+  const mixed = mixedShapes();
+  S.runOrder.forEach((name, k) => {
+    const c = el._runCells[k];
+    const e = S.runs[name].samples[s.i];
+    const head = c.querySelector(".run-head");
+    const m = c.querySelector(".mask");
+    const chips = c.querySelector(".subtags");
+    const [rh, rw] = runShape(name);
+
+    // Title line 1 identifies the frame: which run, which epoch it is showing, and the
+    // split THIS run put the sample in (dataloaders decide that independently, so the
+    // same sample can be train in one run and eval in another). Runs also save on
+    // different cadences, so at one slider position two columns can legitimately show
+    // different epochs -- hence the epoch belongs per cell, not just in the header.
+    const cellEp = epochFor(name);
+    const shownEp = cellEp == null ? (S.runs[name].epochs || []).slice(-1)[0] : cellEp;
+    const latest = cellEp == null;
+    const split = e ? e.split : (S.runs[name].splitOf || {})[s.i];
+    // Only the run name truncates. Epoch and split are always legible -- they say which
+    // frame you are looking at, so losing them to an ellipsis would make the cell
+    // ambiguous, whereas a shortened run name is still recognisable.
+    // The grid is shown only when columns disagree on it. Both metrics are
+    // grid-normalized so the numbers share a scale, but a coarser grid is systematically
+    // easier -- a small cross-size gap is not evidence of a better model, so the reader
+    // needs to see which size they are looking at.
+    const gs = mixed ? `<span class="sp gsz" title="mask grid">${rh}x${rw}</span>` : "";
+    // Same shape as the column header: name (and its qualifiers) pack left, the epoch
+    // rides the right edge in its own chip so the epochs line up down the column and
+    // read as a state badge rather than as part of the run's name.
+    head.innerHTML =
+      `<span class="t1 run"><span class="rn" title="${name}">${name}</span>${gs}` +
+      `${split ? `<span class="sp" title="${split}">${shortSplit(split)}</span>` : ""}` +
+      `<span class="epchip${latest ? "" : " scrub"}"><b>${shownEp ?? "–"}</b>` +
+      `<span class="k">ep</span></span></span>` +
+      `<span class="t2">${identity(s)}</span>`;
+
+    if (!e) {
+      chips.innerHTML = "";
+      m.hidden = true;
+      m.style.backgroundImage = "";
+      if (!c._np) { c._np = document.createElement("div"); c._np.className = "nopred"; c._np.textContent = "no prediction"; c.appendChild(c._np); }
+      c._np.hidden = false;
+      return;
+    }
+    if (c._np) c._np.hidden = true;
+    // Predicted centre of mass on its own line, then the three metrics on the next. All
+    // four at full size do not fit 224px on one line, and shrinking them to fit made the
+    // numbers hard to scan -- which is the one thing this column exists for. Splitting
+    // keeps the metrics aligned across every run column at a readable size.
+    chips.innerHTML =
+      `<span class="tag com" title="predicted center of mass (row, col) in grid coords">${
+        fmt(e.com[0], 1)}, ${fmt(e.com[1], 1)}</span><i class="brk"></i>` +
+      METRICS.map((mm) => {
+        const v = e[mm.key];
+        return `<span class="tag"><span class="k">${mm.short}</span> <b>${
+          v == null ? "–" : fmt(v, mm.key === "mse" ? 4 : 3)}</b></span>`;
+      }).join("");
+    m.hidden = false;
+    // Match the canvas buffer to THIS run's grid. Rows are recycled across runs, so a
+    // pooled cell can arrive still sized for a column of a different resolution.
+    if (m.width !== rw || m.height !== rh) { m.width = rw; m.height = rh; }
+    m.dataset.run = name; m.dataset.sid = s.i;
+    m.onclick = () => openNeighbors(name, s.i);
+    m.className = "mask predmask" + (S.view.background ? " bg" : " nobg");
+    // The backdrop is a CSS background behind the canvas rather than baked into the
+    // pixels: it is fetched once per sample and reused for every run and every epoch,
+    // which is most of why scrubbing costs no bandwidth.
+    const want = S.view.background ? `url(/api/backdrop/${s.i}.jpg)` : "";
+    if (m.style.backgroundImage !== want) m.style.backgroundImage = want;
+    paintCanvas(m, name, s.i, epochFor(name));
+
+    // Stacked: the target gets its own box directly below the prediction, so the two are
+    // adjacent instead of the ground truth being columns away in the leftmost cell.
+    const tm = c.querySelector(".truthmask");
+    tm.hidden = S.view.mode !== "stacked";
+    if (!tm.hidden) {
+      tm.className = "mask truthmask" + (S.view.background ? " bg" : " nobg");
+      if (tm.style.backgroundImage !== want) tm.style.backgroundImage = want;
+      if (tm.width !== rw || tm.height !== rh) { tm.width = rw; tm.height = rh; }
+      const truth = S.truthCache[truthKey(s.i, rh, rw)];
+      if (truth) drawMask(tm, truth, "truth", null, [rh, rw]);
+      else ensureTruth(s.i, rh, rw);
+    }
+  });
+}
+
+/* Which rows are on screen. Row k occupies [hh + k*rowH(), hh + (k+1)*rowH()) in scroll
+   space, so the sticky header's height comes off before dividing. Shared with the frame
+   prefetch: if the two disagreed, it would fetch data for rows it never paints. */
+function visibleRange(pad = 3) {
+  const sc = $("#scroller");
+  const hdr = sc.querySelector(".hrow");
+  const top = Math.max(0, sc.scrollTop - (hdr ? hdr.offsetHeight : 0));
+  return {
+    first: Math.max(0, Math.floor(top / rowH()) - pad),
+    last: Math.min(S.order.length, Math.ceil((top + sc.clientHeight) / rowH()) + pad),
   };
-  diff.querySelector(".m-photo-toggle").onchange = e => renderDiff(e.target.checked);
-  renderDiff(false);
 }
 
-// vertical diverging colorbar for the diff panel: green (gt missed) -> surface -> red (pred extra)
-function drawDiffColorbar(cv) {
-  const g = cv.getContext("2d");
-  const grad = g.createLinearGradient(0, 0, 0, cv.height);
-  grad.addColorStop(0, "#e05252"); grad.addColorStop(0.5, SURFACE); grad.addColorStop(1, "#18b218");
-  g.fillStyle = grad; g.fillRect(0, 0, 18, cv.height);
-  g.fillStyle = MUTED; g.font = "10px system-ui"; g.textBaseline = "middle";
-  g.fillText("1", 22, 6); g.fillText("0", 22, cv.height / 2); g.fillText("-1", 22, cv.height - 6);
+const pool = [];
+function renderVisible() {
+  const { first, last } = visibleRange();
+  const need = Math.max(0, last - first);
+  const rowsEl = $("#rows");
+  while (pool.length < need) { const r = buildRow(); pool.push(r); rowsEl.appendChild(r); }
+  pool.forEach((el, k) => {
+    const rank = first + k;
+    if (rank < last) { el.hidden = false; paintRow(el, rank); }
+    else el.hidden = true;
+  });
 }
 
-// overhead photo with the predicted mask painted on top in translucent red — this is the
-// default thumbnail in table/panel views once a run is loaded, since seeing the prediction
-// against the real photo is the main thing being looked at, not the bare photo
-function overlayCanvas(sampleId, pred, label = "prediction") {
-  return maskOverlayCanvas(sampleId, pred, [224, 82, 82], label);
+let raf = 0;
+function onScroll() {
+  if (raf) return;
+  raf = requestAnimationFrame(() => { raf = 0; renderVisible(); });
 }
 
-// generic overhead + translucent-mask overlay, with a live hover tooltip reporting the exact
-// mask value under the cursor (native <title>, cheap and works everywhere a canvas can go)
-function maskOverlayCanvas(sampleId, mask, rgb, label = "") {
-  return layeredMaskCanvas(sampleId, [{ mask, rgb, label }], true);
+function refresh(toTop = false) {
+  // toTop is passed exactly by the sort controls, which is also the signal that the user
+  // asked for a new order -- so it releases any pin the epoch scrubber holds.
+  if (toTop) thawOrder();
+  applyFilters();
+  // Re-sorting puts different samples at rank 1, so keeping the old scroll offset would
+  // strand the user mid-list; jump back to the top whenever the order itself changes.
+  if (toTop) $("#scroller").scrollTop = 0;
+  const head = $("#scroller").querySelector(".hrow");
+  if (head) head.remove();
+  const hdr = renderHeader();
+  $("#scroller").insertBefore(hdr, $("#spacer"));
+
+  // Rows are absolutely positioned, so they must start below the sticky header --
+  // otherwise row 1 sits underneath it and cannot be scrolled into view. The header
+  // grows with the number of run columns, so measure it rather than assume a height.
+  const hh = hdr.offsetHeight;
+  $("#rows").style.top = `${hh}px`;
+  $("#spacer").style.height = `${hh + S.order.length * rowH()}px`;
+  const nRuns = S.runOrder.length;
+  $("#rowcount").innerHTML =
+    `<b>${S.order.length}</b> of ${S.samples.length} samples` +
+    ` · <b>${nRuns}</b> run${nRuns === 1 ? "" : "s"}`;
+  $("#empty").hidden = S.order.length > 0;
+  renderChips();
+  renderScatter();
+  renderSpeakers();
+  renderEpochPanel();
+  renderVisible();
 }
 
-// fast cursor-following readout for mask-canvas hover -- native <title> tooltips have a ~1s
-// delay and vanish on any mouse move, which reads as "hover doesn't work" when scrubbing across
-// a mask to compare values. A single reused floating div instead shows instantly and tracks the cursor.
-let _hoverReadout = null;
-function showHoverReadout(x, y, text) {
-  if (!_hoverReadout) {
-    _hoverReadout = document.createElement("div");
-    _hoverReadout.className = "hover-readout";
-    document.body.appendChild(_hoverReadout);
+/* ***** sidebar: chips ***** */
+
+function chipRow(host, values, set, labelFn) {
+  host.innerHTML = "";
+  values.forEach(([v, n]) => {
+    const b = document.createElement("button");
+    b.className = "chip" + (set.has(v) ? "" : " off");
+    b.innerHTML = `${labelFn(v)}<span class="n">${n}</span>`;
+    b.onclick = () => { set.has(v) ? set.delete(v) : set.add(v); refresh(); };
+    host.appendChild(b);
+  });
+}
+
+/* ***** explicit id search *****
+   Each accepted id becomes its own removable chip, so a list can be built up and pruned
+   one entry at a time rather than re-typing the whole query. */
+
+function renderFindChips() {
+  const f = S.filters;
+  const host = $("#find-chips");
+  host.innerHTML = "";
+  const add = (kind, set, val) => {
+    const b = document.createElement("button");
+    b.className = "chip find";
+    // Terse prefixes: these chips stack up, so "s871" beats "sample 871" for width.
+    b.innerHTML = `${kind === "sample" ? "s" : "p"}${val}<span class="x">&times;</span>`;
+    b.title = "Remove";
+    b.onclick = () => { set.delete(val); renderFindChips(); refresh(); };
+    host.appendChild(b);
+  };
+  [...f.findSamples].sort((a, b) => a - b).forEach((v) => add("sample", f.findSamples, v));
+  [...f.findPositions].sort((a, b) => a - b).forEach((v) => add("pos", f.findPositions, v));
+
+  const n = f.findSamples.size + f.findPositions.size;
+  $("#find-count").textContent = n ? `${n} active` : "";
+  // The browsing filters are bypassed while a search is active; say so rather than
+  // leaving the sidebar looking like it is lying.
+  $("#sidebar").classList.toggle("searching", n > 0);
+}
+
+function bindFind() {
+  const commit = (input, set, valid) => {
+    // Accept a list, so pasting "871, 502 33" works as well as typing one at a time.
+    const ids = input.value.split(/[^0-9]+/).filter(Boolean).map(Number);
+    let added = 0;
+    for (const id of ids) if (valid(id)) { set.add(id); added++; }
+    if (added) { input.value = ""; renderFindChips(); refresh(true); }
+    else if (ids.length) { input.classList.add("bad"); setTimeout(() => input.classList.remove("bad"), 600); }
+  };
+  const sampleIds = new Set(S.samples.map((s) => +s.sample_id));
+  const posIds = new Set(S.samples.map((s) => +s.output_id));
+  $("#find-sample").onkeydown = (e) => {
+    if (e.key === "Enter") commit($("#find-sample"), S.filters.findSamples, (i) => sampleIds.has(i));
+  };
+  $("#find-pos").onkeydown = (e) => {
+    if (e.key === "Enter") commit($("#find-pos"), S.filters.findPositions, (i) => posIds.has(i));
+  };
+  $("#find-clear").onclick = () => {
+    S.filters.findSamples.clear();
+    S.filters.findPositions.clear();
+    renderFindChips();
+    refresh();
+  };
+}
+
+function renderChips() {
+  const f = S.filters;
+  renderFindChips();
+  const splits = new Set();
+  S.runOrder.forEach((n) => S.runs[n].splits.forEach((s) => splits.add(s)));
+  const counts = new Map();
+  S.samples.forEach((s) => { const sp = predictedSplit(s.i); if (sp) counts.set(sp, (counts.get(sp) || 0) + 1); });
+  chipRow($("#split-chips"), [...splits].sort().map((s) => [s, counts.get(s) || 0]), f.splits, (v) => v);
+  chipRow($("#layout-chips"), uniq((s) => s.layout), f.layouts, (v) => v);
+  chipRow($("#nobj-chips"), uniq((s) => s.n_objects), f.nObjects, (v) => `${v}`);
+  chipRow($("#box-chips"), uniq((s) => s.box), f.boxes, (v) => v);
+  // Contains-object: one chip per object TYPE, counted across every layout it appears
+  // in, so "purple-cube" covers both the solo and the two-object scenes.
+  const objCounts = new Map();
+  S.samples.forEach((s) => {
+    (s.objects && s.objects.length ? s.objects : ["(none)"])
+      .forEach((o) => objCounts.set(o, (objCounts.get(o) || 0) + 1));
+  });
+  const objVals = [...objCounts.entries()].sort((a, b) => (a[0] > b[0] ? 1 : -1));
+  chipRow($("#obj-chips"), objVals, f.objects, (v) => (v === "(none)" ? "empty" : shortLayout(v)));
+  $("#obj-count").textContent = `${f.objects.size}/${objVals.length}`;
+  $("#split-count").textContent = `${f.splits.size}/${splits.size}`;
+  $("#layout-count").textContent = `${f.layouts.size}/${uniq((s) => s.layout).length}`;
+  $("#nobj-count").textContent = `${f.nObjects.size}/${uniq((s) => s.n_objects).length}`;
+  $("#box-count").textContent = `${f.boxes.size}/${uniq((s) => s.box).length}`;
+  $("#spk-count").textContent = `${f.speakers.size}/8`;
+  $("#metric-scope").textContent = S.sort.run ? `range applies to ${S.sort.run}` : "any loaded run in range";
+}
+
+/* ***** sidebar: speaker diagram *****
+   Positions are the SPEAKER_POSITION constants that also draw the speaker into
+   05_overhead_speaker.png, so this diagram and the photos agree exactly. */
+
+const SPEAKERS = { 1: [1, 0], 2: [1, 0.7], 3: [0.8, 1], 4: [0.6, 1], 5: [0.4, 1], 6: [0.2, 1], 7: [0, 0.7], 8: [0, 0] };
+
+function buildSpeakerDiagram() {
+  const svg = $("#speakers");
+  // Speakers sit OUTSIDE the box, so the margin has to clear the push-out distance plus
+  // the circle radius (OFF + R), or every edge speaker is clipped by the viewport.
+  const W = 236, H = 116, OFF = 14, R = 10, M = OFF + R + 1;
+  svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
+  const bw = W - 2 * M, bh = H - 2 * M;
+  let out = `<rect class="box-outline" x="${M}" y="${M}" width="${bw}" height="${bh}" rx="4"/>
+             <text class="box-label" x="${W / 2}" y="${H / 2 + 3}">box</text>`;
+  for (const [id, [xf, yf]] of Object.entries(SPEAKERS)) {
+    // y_frac has 0 at the BOTTOM (draw_speaker flips it), so invert for SVG coords.
+    let cx = M + xf * bw, cy = M + (1 - yf) * bh;
+    cx += (xf === 1 ? OFF : xf === 0 ? -OFF : 0);
+    cy += (yf === 0 ? OFF : yf === 1 ? -OFF : 0);
+    out += `<g class="spk" data-spk="${id}"><circle cx="${cx}" cy="${cy}" r="${R}"/><text x="${cx}" y="${cy}">${id}</text></g>`;
   }
-  _hoverReadout.textContent = "";
-  for (const line of text.split("\n")) {
-    _hoverReadout.appendChild(document.createTextNode(line));
-    _hoverReadout.appendChild(document.createElement("br"));
-  }
-  _hoverReadout.lastChild.remove();
-  _hoverReadout.style.left = `${x + 14}px`;
-  _hoverReadout.style.top = `${y + 14}px`;
-  _hoverReadout.style.display = "block";
-}
-function hideHoverReadout() {
-  if (_hoverReadout) _hoverReadout.style.display = "none";
+  svg.innerHTML = out;
+  svg.querySelectorAll(".spk").forEach((g) => {
+    g.onclick = () => {
+      const id = +g.dataset.spk, set = S.filters.speakers;
+      set.has(id) ? set.delete(id) : set.add(id);
+      refresh();
+    };
+  });
 }
 
-// draws one or more mask layers (each own color, painted in order so later layers sit on top),
-// either over the real overhead photo or over a plain surface-colored background. Used by the
-// detail modal's side-by-side / combined panels so the same renderer handles both the
-// "with overhead" and "without overhead" toggle states, and by maskOverlayCanvas for the
-// always-with-overhead thumbnails elsewhere. Hover reports every layer's value at that cell.
-function layeredMaskCanvas(sampleId, layers, withPhoto) {
-  const H = layers[0].mask.length, W = layers[0].mask[0].length;
-  const paint = img => {
-    const cv = document.createElement("canvas");
-    cv.width = img ? img.naturalWidth : W * 8; cv.height = img ? img.naturalHeight : H * 8;
-    const g = cv.getContext("2d");
-    if (img) g.drawImage(img, 0, 0);
-    else { g.fillStyle = SURFACE; g.fillRect(0, 0, cv.width, cv.height); }
-    const cw = cv.width / W, ch = cv.height / H;
-    for (const { mask, rgb } of layers) {
-      for (let r = 0; r < H; r++) for (let c = 0; c < W; c++) {
-        const v = mask[r][c];
-        if (v > 0.05) {
-          g.fillStyle = `rgba(${rgb[0]},${rgb[1]},${rgb[2]},${Math.min(v * 0.65, 0.75)})`;
-          g.fillRect(c * cw, r * ch, cw + 0.5, ch + 0.5);
+function renderSpeakers() {
+  $("#speakers").querySelectorAll(".spk").forEach((g) => {
+    g.classList.toggle("off", !S.filters.speakers.has(+g.dataset.spk));
+  });
+}
+
+/* ***** sidebar: position scatter *****
+   Points are avg_com in full-resolution image coords (row, col). Column maps to x and
+   row to y so the plot is oriented like the overhead photo. */
+
+// Rendered at 2x the sidebar's CSS width and scaled down by the SVG viewBox, which
+// buys real separation between neighbouring positions without widening the panel.
+const SC = { W: 472, H: 132, pad: 12, r: 3.4 };
+
+/* The box is ~4.3x wider than it is deep. Stretching that to fill a square would
+   collapse the horizontal spacing and make neighbouring positions unclickable, so the
+   true aspect ratio is preserved and the plot is centred in whatever space is left. */
+function scaleP() {
+  const rs = S.positions.map((p) => p.r), cs = S.positions.map((p) => p.c);
+  const r0 = Math.min(...rs), r1 = Math.max(...rs), c0 = Math.min(...cs), c1 = Math.max(...cs);
+  const dr = r1 - r0 || 1, dc = c1 - c0 || 1;
+  const { W, H, pad } = SC;
+  const k = Math.min((W - 2 * pad) / dc, (H - 2 * pad) / dr);
+  const ox = (W - dc * k) / 2, oy = (H - dr * k) / 2;
+  return { x: (c) => ox + (c - c0) * k, y: (r) => oy + (r - r0) * k };
+}
+
+function buildScatter() {
+  const svg = $("#scatter");
+  svg.setAttribute("viewBox", `0 0 ${SC.W} ${SC.H}`);
+  const sc = scaleP();
+  svg.innerHTML = S.positions.map((p) =>
+    `<circle class="pt" data-p="${p.i}" cx="${sc.x(p.c).toFixed(1)}" cy="${sc.y(p.r).toFixed(1)}" r="${SC.r}"/>`).join("")
+    + `<circle class="pt-hot" r="${SC.r + 2.5}" hidden></circle>`
+    // Two marks for the drag: a filled polygon previewing the region that will be
+    // captured, and a polyline tracing the exact path drawn so far (a polygon alone
+    // would silently close the shape and hide where the cursor actually went).
+    + `<polygon class="lasso-fill" points="" hidden></polygon>`
+    + `<polyline class="lasso-line" points="" hidden></polyline>`;
+
+  let drag = null;
+  const pt = (ev) => {
+    const b = svg.getBoundingClientRect();
+    return [((ev.clientX - b.left) / b.width) * SC.W, ((ev.clientY - b.top) / b.height) * SC.H];
+  };
+
+  // Positions sit close together, so the click target is the nearest point within a
+  // generous radius rather than the dot itself, and a ring shows which one is armed.
+  const nearest = (x, y) => {
+    const s2 = scaleP();
+    let best = -1, bd = 1e9;
+    S.positions.forEach((p) => {
+      const d = Math.hypot(s2.x(p.c) - x, s2.y(p.r) - y);
+      if (d < bd) { bd = d; best = p.i; }
+    });
+    return bd < 14 ? best : -1;
+  };
+
+  /* `el.hidden = x` only reflects to the hidden ATTRIBUTE on HTML elements. On SVG
+     elements it just sets a stray JS property, leaving the attribute -- and so the
+     `[hidden] { display: none }` rule -- in place, which is why these never appeared.
+     Toggle the attribute directly instead. */
+  const show = (el, on) => (on ? el.removeAttribute("hidden") : el.setAttribute("hidden", ""));
+
+  const drawLasso = (pts, closed) => {
+    const s = pts.map((q) => `${q[0].toFixed(1)},${q[1].toFixed(1)}`).join(" ");
+    const line = svg.querySelector(".lasso-line"), fill = svg.querySelector(".lasso-fill");
+    line.setAttribute("points", s); show(line, true);
+    if (closed) fill.setAttribute("points", s);
+    show(fill, closed);
+  };
+  const clearLasso = () => {
+    for (const c of [".lasso-line", ".lasso-fill"]) {
+      const e = svg.querySelector(c);
+      show(e, false); e.setAttribute("points", "");
+    }
+  };
+
+  svg.addEventListener("pointerdown", (ev) => {
+    svg.focus();
+    svg.setPointerCapture(ev.pointerId);
+    drag = { pts: [pt(ev)], add: ev.shiftKey, moved: false };
+    show(svg.querySelector(".pt-hot"), false);
+    drawLasso(drag.pts, false);              // show the trail from the first pixel
+  });
+  svg.addEventListener("pointermove", (ev) => {
+    if (!drag) {
+      const [x, y] = pt(ev), i = nearest(x, y), hot = svg.querySelector(".pt-hot");
+      const p = i >= 0 ? S.positions[i] : null;
+      if (p) { const s2 = scaleP(); hot.setAttribute("cx", s2.x(p.c)); hot.setAttribute("cy", s2.y(p.r)); }
+      show(hot, !!p);
+      return;
+    }
+    const p = pt(ev), last = drag.pts[drag.pts.length - 1];
+    if (Math.hypot(p[0] - last[0], p[1] - last[1]) < 1.5) return;
+    drag.pts.push(p); drag.moved = true;
+    // Fill as soon as the path can enclose anything (3 points), so the region being
+    // captured is visible while the lasso grows rather than only at the end.
+    drawLasso(drag.pts, drag.pts.length >= 3);
+    // Preview which points the current path would capture, so the selection is visible
+    // before releasing rather than only after.
+    if (drag.pts.length > 2) {
+      const s2 = scaleP();
+      svg.querySelectorAll(".pt").forEach((c) => {
+        const q = S.positions[+c.dataset.p];
+        c.classList.toggle("lassoed", inPoly(s2.x(q.c), s2.y(q.r), drag.pts));
+      });
+    }
+  });
+  svg.addEventListener("pointerleave", () => show(svg.querySelector(".pt-hot"), false));
+  // A cancelled gesture (pointer leaves the window, touch interrupted) must not leave
+  // the trail painted on screen.
+  svg.addEventListener("pointercancel", () => {
+    drag = null;
+    clearLasso();
+    svg.querySelectorAll(".pt.lassoed").forEach((c) => c.classList.remove("lassoed"));
+  });
+  svg.addEventListener("pointerup", (ev) => {
+    if (!drag) return;
+    clearLasso();
+    svg.querySelectorAll(".pt.lassoed").forEach((c) => c.classList.remove("lassoed"));
+    if (drag.moved && drag.pts.length > 2) {
+      const hit = new Set(drag.add && S.filters.positions ? S.filters.positions : []);
+      const sc2 = scaleP();
+      S.positions.forEach((p) => { if (inPoly(sc2.x(p.c), sc2.y(p.r), drag.pts)) hit.add(p.i); });
+      S.filters.positions = hit.size ? hit : null;
+      S.activePos = hit.size ? [...hit][0] : -1;
+    } else {
+      const [x, y] = pt(ev);
+      const best = nearest(x, y);
+      if (best >= 0) {
+        const cur = S.filters.positions;
+        if (ev.ctrlKey || ev.metaKey) {
+          const set = new Set(cur || []);
+          set.has(best) ? set.delete(best) : set.add(best);
+          S.filters.positions = set.size ? set : null;
+        } else {
+          S.filters.positions = new Set([best]);
         }
+        S.activePos = best;
       }
     }
-    cv.onmousemove = e => {
-      const rect = cv.getBoundingClientRect();
-      const c = Math.min(W - 1, Math.max(0, Math.floor((e.clientX - rect.left) / rect.width * W)));
-      const r = Math.min(H - 1, Math.max(0, Math.floor((e.clientY - rect.top) / rect.height * H)));
-      const varName = { "ground truth": "mask_true", "prediction": "mask_pred", "gt missed": "mask_true", "pred extra": "mask_pred" };
-      const lines = layers.map(({ mask, label }) => `${varName[label] || label || "mask"}[${c},${r}] = ${mask[r][c].toFixed(3)}`);
-      showHoverReadout(e.clientX, e.clientY, lines.join("\n"));
+    drag = null;
+    refresh();
+  });
+
+  // Arrow keys walk to the nearest point in that direction; points sit on an irregular
+  // grid, so this uses an angular cone rather than a strict axis match.
+  svg.addEventListener("keydown", (ev) => {
+    const dirs = { ArrowLeft: [-1, 0], ArrowRight: [1, 0], ArrowUp: [0, -1], ArrowDown: [0, 1] };
+    const d = dirs[ev.key];
+    if (!d) return;
+    ev.preventDefault();
+    const sc2 = scaleP();
+    if (S.activePos < 0) { S.activePos = S.positions.length ? 0 : -1; }
+    else {
+      const a = S.positions[S.activePos];
+      const ax = sc2.x(a.c), ay = sc2.y(a.r);
+      let best = -1, bs = 1e9;
+      S.positions.forEach((p) => {
+        if (p.i === a.i) return;
+        const dx = sc2.x(p.c) - ax, dy = sc2.y(p.r) - ay;
+        const proj = dx * d[0] + dy * d[1];
+        if (proj <= 0.5) return;
+        const perp = Math.abs(dx * d[1] - dy * d[0]);
+        if (perp > proj * 1.2) return;              // stay within a ~50 degree cone
+        const score = proj + perp * 2;
+        if (score < bs) { bs = score; best = p.i; }
+      });
+      if (best >= 0) S.activePos = best;
+    }
+    if (S.activePos >= 0) S.filters.positions = new Set([S.activePos]);
+    refresh();
+  });
+
+  $("#pos-clear").onclick = () => { S.filters.positions = null; S.activePos = -1; refresh(); };
+}
+
+function inPoly(x, y, poly) {
+  let inside = false;
+  for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+    const [xi, yi] = poly[i], [xj, yj] = poly[j];
+    if ((yi > y) !== (yj > y) && x < ((xj - xi) * (y - yi)) / (yj - yi) + xi) inside = !inside;
+  }
+  return inside;
+}
+
+function renderScatter() {
+  const sel = S.filters.positions;
+  $("#scatter").querySelectorAll(".pt").forEach((c) => {
+    const i = +c.dataset.p;
+    c.classList.toggle("off", !!sel && !sel.has(i));
+    c.classList.toggle("active", i === S.activePos);
+  });
+  const n = sel ? sel.size : S.positions.length;
+  $("#pos-status").textContent = sel
+    ? `${n} of ${S.positions.length} position${n === 1 ? "" : "s"} selected`
+    : `all ${S.positions.length} positions`;
+}
+
+/* ***** sidebar: metric sliders ***** */
+
+function buildSliders() {
+  $("#sliders").innerHTML = METRICS.map((m) => `
+    <div class="slider" data-k="${m.key}">
+      <div class="top"><span class="nm">${m.label}</span><span class="val"></span></div>
+      <div class="pair"><div class="track"></div><div class="fill"></div>
+        <input type="range" class="lo" min="0" max="1000" value="0">
+        <input type="range" class="hi" min="0" max="1000" value="1000"></div>
+    </div>`).join("");
+  $("#sliders").querySelectorAll(".slider").forEach((el) => {
+    const k = el.dataset.k;
+    const lo = el.querySelector(".lo"), hi = el.querySelector(".hi");
+    const on = () => {
+      let a = +lo.value, b = +hi.value;
+      if (a > b) { [a, b] = [b, a]; }
+      const [d0, d1] = S.domain[k];
+      S.filters.ranges[k] = [d0 + (a / 1000) * (d1 - d0), d0 + (b / 1000) * (d1 - d0)];
+      syncSliders();
+      refresh();
     };
-    cv.onmouseleave = hideHoverReadout;
-    return cv;
+    lo.oninput = on; hi.oninput = on;
+  });
+  $("#metric-reset").onclick = () => {
+    for (const m of METRICS) S.filters.ranges[m.key] = [...S.domain[m.key]];
+    syncSliders(); refresh();
   };
-  if (!withPhoto) return Promise.resolve(paint(null));
-  return new Promise(resolve => {
-    const img = new Image();
-    img.src = `/media/${sampleId}/thumb`;
-    img.onload = () => resolve(paint(img));
+}
+
+function syncSliders() {
+  $("#sliders")?.querySelectorAll(".slider").forEach((el) => {
+    const k = el.dataset.k, d = S.domain[k], r = S.filters.ranges[k];
+    if (!d || !r) return;
+    const f = (v) => Math.round(((v - d[0]) / (d[1] - d[0] || 1)) * 1000);
+    const a = f(r[0]), b = f(r[1]);
+    el.querySelector(".lo").value = a;
+    el.querySelector(".hi").value = b;
+    el.querySelector(".val").textContent = `${fmt(r[0], 3)} – ${fmt(r[1], 3)}`;
+    const fill = el.querySelector(".fill");
+    fill.style.left = `${a / 10}%`;
+    fill.style.width = `${(b - a) / 10}%`;
   });
 }
-document.addEventListener("keydown", e => {
-  if (e.key === "Escape") { $("#modal").classList.remove("open"); $("#lightbox").classList.remove("open"); }
-});
-$("#modal").onclick = e => { if (e.target.id === "modal") $("#modal").classList.remove("open"); };
 
-// ===== filters panel collapse =====
-// whole sidebar slides horizontally off/on screen — collapsing it hides the filters entirely
-// (not just visually shrinking them) to hand that width to box/table/fft
-$("#sidebar-toggle").onclick = () => {
-  const shell = $("#shell");
-  shell.classList.toggle("sidebar-hidden");
-  $("#sidebar-toggle").textContent = shell.classList.contains("sidebar-hidden") ? "›" : "‹";
-  if (!shell.classList.contains("sidebar-hidden")) setTimeout(renderPosmap, 190); // zero width while hidden; repaint once the slide-in transition finishes
-};
+/* ***** epoch frames *****
+   Mask values are fetched as one fp16 blob per run (1600 bytes per cell per epoch --
+   usually smaller than a PNG of the same cell) and drawn to <canvas> on the client. That
+   makes scrubbing the epoch slider and playing the animation pure local work: no network
+   round-trip and no server render per frame. */
 
-// ===== live updates =====
-setInterval(async () => {
-  try {
-    const { version } = await jget("/api/version");
-    if (version !== S.version) {
-      S.version = version;
-      S.fftCache.clear(); S.gtMasks = {}; S.runMasks = {};
-      for (const r of S.runs) S.runData[r] = await jget(`/api/run/${r}`).catch(() => S.runData[r]);
-      await boot();
+async function fetchFrames(run, sids) {
+  // Ask for an EXPLICIT epoch list rather than letting the server default to its own.
+  // The blob is indexed by epoch position, so the labels must describe the bytes that
+  // came back. Defaulting server-side meant a still-training run answered with more
+  // epochs than the client had cached at load time: the client then indexed an 11-epoch
+  // blob as if it held 5, so `epoch == null` read epoch 200 as "latest" and every newer
+  // epoch fell off the end as index -1 and painted blank.
+  const eps = (S.runs[run] && S.runs[run].epochs) || [];
+  const q = eps.length ? `&epochs=${eps.join(",")}` : "";
+  const r = await fetch(
+    `/api/frames?run=${encodeURIComponent(run)}&sids=${sids.join(",")}${q}`);
+  if (!r.ok) throw new Error("frames");
+  const raw = new Uint16Array(await r.arrayBuffer());
+  return {
+    epochs: eps.slice(),
+    sids: new Map(sids.map((s, i) => [s, i])),
+    raw,
+  };
+}
+
+/* Minimal IEEE half -> float. Only needed because DataView has no float16 reader. */
+function half(u) {
+  const s = (u & 0x8000) ? -1 : 1, e = (u >> 10) & 0x1f, m = u & 0x3ff;
+  if (e === 0) return s * m * 5.9604644775390625e-8;
+  if (e === 31) return m ? NaN : s * Infinity;
+  return s * Math.pow(2, e - 15) * (1 + m / 1024);
+}
+
+/* Draws a (20,40) mask into a canvas using the server's own LUT, so a cell looks
+   identical whether the client painted it or the server rendered a PNG. */
+function drawMask(canvas, values, mode, truth, shape) {
+  const { gamma, gain } = S.lut;
+  // Grid comes from the CALLER, not the global default: runs trained at different
+  // resolutions share one table, so each column draws at its own size.
+  const [h, w] = shape || [S.lut.h, S.lut.w];
+  const n = w * h;
+  const ctx = canvas.getContext("2d");
+
+  // Reused buffers: at ~36 cells x 5 fps a fresh ImageData per cell is pure GC churn.
+  const off = drawMask._off || (drawMask._off = document.createElement("canvas"));
+  if (off.width !== w || off.height !== h) { off.width = w; off.height = h; }
+  const octx = off.getContext("2d");
+  // Height matters too now that columns differ in shape: a cached 16x16 buffer reused for
+  // a 30x30 cell would paint only the first 16 rows and leave the rest stale.
+  const img = drawMask._img && drawMask._img.width === w && drawMask._img.height === h
+    ? drawMask._img : (drawMask._img = octx.createImageData(w, h));
+  const px = img.data;
+
+  // Overlay draws the target underneath and the prediction over it, in one box; stacked
+  // draws them as two boxes (handled by the caller, which paints each half).
+  const soloLut = mode === "diff" ? S.lut.diff : mode === "truth" ? S.lut.truth : S.lut.pred;
+  const layers = mode === "overlay"
+    ? [{ v: truth, lut: S.lut.truth, k: 0.72 }, { v: values, lut: S.lut.pred, k: 0.82 }]
+    : [{ v: values, lut: soloLut, k: gain }];
+
+  ctx.clearRect(0, 0, w, h);
+  for (const { v, lut, k } of layers) {
+    for (let i = 0; i < n; i++) {
+      let t, a;
+      if (mode === "diff") {
+        const d = Math.max(-1, Math.min(1, v[i] - truth[i]));
+        const mag = Math.pow(Math.abs(d), gamma);
+        t = 0.5 + 0.5 * Math.sign(d) * mag;
+        a = mag;
+      } else {
+        t = Math.pow(Math.max(0, Math.min(1, v[i])), gamma);
+        a = t;
+      }
+      const c = lut[Math.round(t * (lut.length - 1))] || [0, 0, 0];
+      px[i * 4] = c[0]; px[i * 4 + 1] = c[1]; px[i * 4 + 2] = c[2];
+      // Alpha-weighted so the backdrop photo shows through faint cells; k matches the
+      // server's gain constants so a canvas cell composites identically to a server PNG.
+      px[i * 4 + 3] = Math.round(a * k * 255);
     }
-  } catch { /* transient: retried on the next tick */ }
-}, 3000);
+    // putImageData ignores compositing and would overwrite the layer beneath, so stage
+    // on the offscreen canvas and drawImage, which composites.
+    octx.putImageData(img, 0, 0);
+    ctx.drawImage(off, 0, 0);
+  }
+}
 
-window.addEventListener("resize", debounce(() => { renderPosmap(); }, 150));
+/* Paints one cell from locally-held frame data, fetching the run's frames for the
+   visible rows the first time they are needed. */
+/* Modes that draw the target as well as the prediction: overlay composites them in one
+   box, stacked puts them in two. */
+const needsTruth = (m) => m === "overlay" || m === "stacked";
 
-boot().catch(err => {
-  document.body.innerHTML = `<pre style="color:#e66767;padding:24px">failed to load manifest:\n${err}</pre>`;
-});
+/* Reused across cells; avoids per-frame GC. Grown on demand rather than fixed at 20*40,
+   which silently truncated every cell on a larger grid (30x30 is 900 values). */
+let scratch = new Float32Array(20 * 40);
+const scratchFor = (n) => (scratch.length >= n ? scratch : (scratch = new Float32Array(n)));
+
+function paintCanvas(cv, run, sid, epoch) {
+  if (!S.lut) return;
+  const store = S.frameData[run];
+  const [rh, rw] = runShape(run);
+  const cells = rh * rw;
+  // Every early return clears first. A canvas keeps its last drawing until something
+  // overwrites it, and rows are RECYCLED, so leaving it alone shows the previous
+  // occupant's prediction -- or, once a filter change brings in rows the current store
+  // was not fetched for, a stale mask that never gets repainted.
+  const blank = () => cv.getContext("2d").clearRect(0, 0, cv.width, cv.height);
+  if (!store || !store.sids.has(sid)) { blank(); ensureFrames(run); return; }
+  const eps = store.epochs;
+  // A store fetched before the run advanced does not contain the newer epochs, so asking
+  // for one has to trigger a refetch rather than paint blank. Without this a training
+  // run's current epoch stayed empty until some unrelated scroll happened to replace the
+  // store -- which is why scrolling appeared to "fix" it.
+  const live = (S.runs[run] && S.runs[run].epochs) || [];
+  if (eps.length && live.length > eps.length) { blank(); ensureFrames(run); return; }
+  const ei = epoch == null ? eps.length - 1 : eps.indexOf(epoch);
+  const si = store.sids.get(sid);
+  if (ei < 0) { blank(); return; }
+  const off = (ei * store.sids.size + si) * cells;
+  const buf = scratchFor(cells);
+  for (let i = 0; i < cells; i++) buf[i] = half(store.raw[off + i]);
+  if (Number.isNaN(buf[0])) { blank(); return; }   // run has no prediction here
+  // In stacked mode this canvas is the prediction half only -- the target is drawn into
+  // its own canvas below, so it needs no truth here.
+  const mode = S.view.mode === "stacked" ? "pred" : S.view.mode;
+  const wantTruth = mode === "diff" || needsTruth(mode);
+  // Truth is cached per (sample, grid): the same sample has a different target array at
+  // each resolution, so keying on sid alone would diff against the wrong-shaped mask.
+  const tkey = truthKey(sid, rh, rw);
+  const truth = wantTruth ? S.truthCache[tkey] : null;
+  if (wantTruth && !truth) { blank(); ensureTruth(sid, rh, rw); return; }
+  drawMask(cv, buf, mode, truth, [rh, rw]);
+}
+
+/* Fetch frames for whatever rows are on screen, once per run.
+
+   The window is recomputed from the CURRENT scroll position each time, and a second call
+   is allowed to queue while one is in flight: scrolling fast, or jumping to an epoch whose
+   sample set differs, moves the visible rows out from under the request that is already
+   running. Without the re-check those rows would stay blank, because paintCanvas asks for
+   frames and the pending flag would swallow the request. */
+const framesPending = new Set();
+const framesStale = new Set();
+async function ensureFrames(run) {
+  if (framesPending.has(run)) { framesStale.add(run); return; }
+  framesPending.add(run);
+  try {
+    do {
+      framesStale.delete(run);
+      const first = Math.max(0, Math.floor(Math.max(0, $("#scroller").scrollTop) / rowH()) - 4);
+      const sids = S.order.slice(first, first + 24).map((s) => s.i);
+      if (!sids.length) return;
+      const d = await fetchFrames(run, sids);
+      // Replace rather than merge: a store holds one contiguous window, and its raw blob
+      // is indexed by position, so windows cannot be concatenated without re-laying it out.
+      S.frameData[run] = d;
+      renderVisible();
+    } while (framesStale.has(run));
+  } finally {
+    framesPending.delete(run);
+    framesStale.delete(run);
+  }
+}
+
+const truthPending = new Set();
+async function ensureTruth(sid, h, w) {
+  const key = truthKey(sid, h, w);
+  if (truthPending.has(key)) return;
+  truthPending.add(key);
+  try {
+    // `shape` picks which resolution's target to return, so a 16x16 column and a 30x30
+    // column each diff against a mask of their own size.
+    const q = h ? `&shape=${h}x${w}` : "";
+    const d = await api(`/api/values?sid=${sid}${q}`);
+    S.truthCache[key] = d.v.flat();
+    renderVisible();
+  } finally {
+    truthPending.delete(key);
+  }
+}
+
+/* ***** epoch slider + playback *****
+   The union of every loaded run's epochs, so one slider drives all columns. A run
+   without that exact epoch falls back to its nearest earlier one. */
+
+/* Memoized: epochFor() calls this once per run per cell, so during playback an
+   un-cached version rebuilt and sorted the union ~36 times a frame. */
+let epochsCache = null;
+function allEpochs() {
+  if (epochsCache) return epochsCache;
+  const set = new Set();
+  S.runOrder.forEach((n) => (S.runs[n].epochs || []).forEach((e) => set.add(e)));
+  return (epochsCache = [...set].sort((a, b) => a - b));
+}
+const invalidateEpochs = () => { epochsCache = null; };
+
+function epochFor(run) {
+  const eps = allEpochs();
+  if (S.epochIdx == null || !eps.length) return null;      // null = the run's latest
+  const want = eps[Math.min(S.epochIdx, eps.length - 1)];
+  const mine = S.runs[run].epochs || [];
+  let best = null;
+  for (const e of mine) if (e <= want) best = e;
+  return best == null ? (mine[0] ?? null) : best;
+}
+
+function renderEpochPanel() {
+  const eps = allEpochs();
+  $("#epoch-panel").hidden = eps.length < 2;
+  if (eps.length < 2) return;
+  const sl = $("#epoch-slider");
+  sl.max = eps.length - 1;
+  if (S.epochIdx != null) sl.value = Math.min(S.epochIdx, eps.length - 1);
+  else sl.value = eps.length - 1;
+  const i = S.epochIdx == null ? eps.length - 1 : +sl.value;
+  const latest = S.epochIdx == null || i === eps.length - 1;
+  $("#epoch-label").innerHTML =
+    `<b>ep ${eps[i]}</b>` + (latest ? ` <span class="k">latest</span>` : "");
+  // The slider's right end is the furthest epoch any loaded run reached, which is what
+  // the track is scaled to.
+  $("#epoch-max").textContent = eps[eps.length - 1];
+  $("#epoch-play").textContent = S.playing ? "❚❚" : "▶";
+  $("#epoch-play").title = S.playing ? "Pause" : "Play through all epochs";
+  // Greyed at the ends so the control says where you are without you having to test it.
+  $("#epoch-prev").disabled = i <= 0;
+  $("#epoch-next").disabled = i >= eps.length - 1;
+}
+
+/* One epoch at a time, because the slider is far too coarse to land on a specific epoch
+   when a run has dozens of them. Stepping stops playback: the two controls both drive
+   epochIdx, and letting the timer keep firing would yank the frame back. */
+function stepEpoch(delta) {
+  const eps = allEpochs();
+  if (eps.length < 2) return;
+  S.playing = false;
+  clearInterval(playTimer);
+  // null means "pinned to latest", which is the last index for stepping purposes.
+  const cur = S.epochIdx == null ? eps.length - 1 : S.epochIdx;
+  setEpochIdx(cur + delta);
+}
+
+/* Press-and-hold on the epoch arrows, matching a keyboard key's auto-repeat: one step on
+   press, a pause to keep single clicks single, then a steady stream.
+
+   Repeat is driven by requestAnimationFrame rather than setInterval so it cannot outrun
+   the display or pile up work in a background tab. Each step only repaints canvases from
+   frame data already in memory; the metrics fetch behind it is debounced at 250ms, so
+   holding the button costs one request when you let go, not one per epoch. */
+const HOLD_DELAY = 350;   // before repeat begins
+const HOLD_EVERY = 60;    // ~16 epochs/sec while held
+
+function holdToRepeat(btn, step) {
+  let raf = 0, timer = 0;
+  const stop = () => {
+    cancelAnimationFrame(raf); clearTimeout(timer); raf = timer = 0;
+  };
+  btn.addEventListener("pointerdown", (e) => {
+    if (e.button !== 0 || btn.disabled) return;
+    e.preventDefault();
+    btn.setPointerCapture(e.pointerId);   // keep repeating if the cursor slides off
+    step();
+    timer = setTimeout(() => {
+      let last = 0;
+      const tick = (t) => {
+        // A disabled button means we hit the first or last epoch -- stop there rather
+        // than spinning against the clamp.
+        if (btn.disabled) return stop();
+        if (t - last >= HOLD_EVERY) { last = t; step(); }
+        raf = requestAnimationFrame(tick);
+      };
+      raf = requestAnimationFrame(tick);
+    }, HOLD_DELAY);
+  });
+  ["pointerup", "pointercancel", "pointerleave"].forEach((ev) => btn.addEventListener(ev, stop));
+}
+
+/* Jump the whole table to one epoch, from a cell that is already showing it. The value
+   comes from a run's own epoch list, which may not be in the union at that exact number
+   if that run saves on a different cadence -- so snap to the nearest union entry at or
+   below it, the same rule epochFor uses to pick a run's frame. */
+function gotoEpoch(ep) {
+  const eps = allEpochs();
+  if (!eps.length) return;
+  let idx = -1;
+  for (let k = 0; k < eps.length; k++) if (eps[k] <= ep) idx = k;
+  if (idx < 0) idx = 0;
+  S.playing = false;
+  clearInterval(playTimer);
+  setEpochIdx(idx);
+}
+
+/* Every epoch change -- slider, steppers, playback -- goes through here, so this is the
+   one place the order needs pinning. */
+function setEpochIdx(i) {
+  const eps = allEpochs();
+  // Pin on entering a scrub; i == null is the un-scrubbed "latest" view, which sorts on
+  // real metrics again.
+  if (i == null) S.frozenOrder = null;
+  else if (!S.frozenOrder) S.frozenOrder = new Map(S.order.map((s, k) => [s.i, k]));
+  S.epochIdx = i == null ? null : Math.max(0, Math.min(i, eps.length - 1));
+  renderEpochPanel();
+  renderVisible();          // masks repaint immediately from local frame data
+  fetchEpochMetrics();      // metrics/sort catch up when the server answers
+}
+
+/* Re-sorting or re-filtering is an explicit request for a new order, so it releases the
+   pin the epoch scrubber put on it. */
+const thawOrder = () => { S.frozenOrder = null; };
+
+/* Metrics belong to an epoch as much as the masks do. Without this the table would show
+   early-training masks captioned with final-epoch mse/iou and sorted by them -- the most
+   misleading state the scrubber can produce. Debounced so dragging the slider or playing
+   does not fire a request per frame. */
+let metricsTimer = 0;
+function fetchEpochMetrics() {
+  clearTimeout(metricsTimer);
+  metricsTimer = setTimeout(async () => {
+    const jobs = S.runOrder.map(async (name) => {
+      const ep = epochFor(name);
+      const cur = S.runs[name];
+      if (cur.metricsEpoch === ep) return false;
+      const q = ep == null ? "" : `?epoch=${ep}`;
+      try {
+        const d = await api(`/api/run/${encodeURIComponent(name)}${q}`);
+        // Only the per-epoch metrics move. splitOf/splits describe which samples the run
+        // covers, which is epoch-independent -- overwriting them here would make rows
+        // disappear at epochs that saved a different subset.
+        cur.samples = d.samples;
+        cur.metricsEpoch = ep;
+        return true;
+      } catch {
+        return false;
+      }
+    });
+    if ((await Promise.all(jobs)).some(Boolean)) {
+      // Early-training metrics live on a completely different scale from final ones (at
+      // epoch 0 every mse here is ~0.25, while the trained run spans 0..0.09). The
+      // sliders were built from the latest epoch, so without widening them to admit the
+      // scrubbed values every row fails the range test and the whole table -- ground
+      // truth included -- empties out at epoch 0.
+      recomputeDomains({ preserve: true });
+      refresh();
+    }
+  }, 250);
+}
+
+let playTimer = 0;
+function togglePlay() {
+  S.playing = !S.playing;
+  clearInterval(playTimer);
+  if (S.playing) {
+    const eps = allEpochs();
+    if (S.epochIdx == null || S.epochIdx >= eps.length - 1) S.epochIdx = 0;
+    // Frames are already local, so this is just an index advance -- no fetch per step.
+    playTimer = setInterval(() => {
+      const n = allEpochs().length;
+      if (S.epochIdx >= n - 1) { S.playing = false; clearInterval(playTimer); renderEpochPanel(); return; }
+      setEpochIdx(S.epochIdx + 1);
+    }, 220);
+  }
+  renderEpochPanel();
+}
+
+/* ***** live updates *****
+   Runs keep training while viz is open. Poll the (cheap, server-throttled) run list;
+   when a loaded run's epoch advances, refetch its metrics and re-render its masks. */
+
+const POLL_MS = 15000;
+
+async function poll() {
+  // A refresh() mid-drag rebuilds the header under the pointer, which strands the
+  // dragged column's inline transforms and drops the gesture. The poll is a background
+  // nicety; skipping one tick costs nothing.
+  if (document.body.classList.contains("dragging-col")) return;
+  let meta;
+  try {
+    meta = await api("/api/runs");
+  } catch {
+    return;                            // server restarting; try again next tick
+  }
+  const prevNames = new Set(S.meta.runs.map((r) => r.name));
+  const prevStatus = new Map(S.meta.runs.map((r) => [r.name, r.status]));
+  S.meta = meta;
+  // A loaded run going running -> done/crashed only shows in its column header.
+  const statusChanged = S.runOrder.some((n) => {
+    const cur = meta.runs.find((r) => r.name === n);
+    return cur && prevStatus.get(n) !== cur.status;
+  });
+
+  const advanced = [];
+  for (const name of S.runOrder) {
+    const cur = meta.runs.find((r) => r.name === name);
+    if (cur && S.runs[name] && cur.epoch != null && cur.epoch !== S.runs[name].epoch) {
+      advanced.push(name);
+    }
+  }
+  for (const name of advanced) await addRun(name, true);
+
+  if (advanced.length) {
+    S.frameData = {};   // new epochs exist; refetch mask values
+    // Mask URLs are cached immutable, so a new epoch needs a new URL to be fetched.
+    S.epochTag = (S.epochTag || 0) + 1;
+    // New metrics can reorder a sorted table. Keep whichever sample is at the top of the
+    // viewport in view, so rows don't slide out from under the user mid-read.
+    const sc = $("#scroller");
+    const hdr = sc.querySelector(".hrow");
+    const anchorRank = Math.floor(Math.max(0, sc.scrollTop - (hdr ? hdr.offsetHeight : 0)) / rowH());
+    const anchor = S.order[anchorRank];
+    refresh();
+    if (anchor) {
+      const next = S.order.indexOf(anchor);
+      if (next >= 0 && next !== anchorRank) {
+        sc.scrollTop += (next - anchorRank) * rowH();
+        renderVisible();
+      }
+    }
+  }
+  const added = meta.runs.filter((r) => r.compatible && !prevNames.has(r.name));
+  if (added.length && !$("#runpicker").hidden) openPicker();   // keep an open picker live
+  if (!advanced.length && statusChanged) refresh();
+}
+
+/* ***** run picker *****
+   Loaded runs are their own columns, so there is no separate list of them: each column
+   header carries its own close button. */
+
+function openPicker() {
+  const list = $("#run-list"), q = $("#run-search");
+  const draw = () => {
+    const term = q.value.trim().toLowerCase();
+    list.innerHTML = "";
+    S.meta.runs
+      .filter((r) => !term || r.name.toLowerCase().includes(term))
+      .forEach((r) => {
+        const added = !!S.runs[r.name];
+        const d = document.createElement("div");
+        d.className = "ritem" + (r.compatible ? (added ? " added" : "") : " bad");
+        d.innerHTML = `<div><div class="nm">${r.name}</div>
+          <div class="sub">${statusChip(r.status)} ${r.compatible
+            ? `ep ${r.epoch ?? "?"} · ${r.eval_splits.length} eval splits` : r.reason}</div></div>
+          <span class="badge">${added ? "added" : r.compatible ? "add" : "unavailable"}</span>`;
+        if (r.compatible && !added) d.onclick = async () => { $("#runpicker").hidden = true; await addRun(r.name); };
+        list.appendChild(d);
+      });
+  };
+  q.value = ""; q.oninput = draw; draw();
+  $("#runpicker").hidden = false;
+  q.focus();
+}
+
+/* ***** hover tooltip *****
+   Grid values are fetched on first hover for a cell and memoized; never prefetched. */
+
+const valueCache = new Map();
+async function valuesFor(run, sid, mode) {
+  const k = `${run}|${sid}|${mode}`;
+  if (!valueCache.has(k))
+    valueCache.set(k, api(`/api/values?sid=${sid}&run=${encodeURIComponent(run)}&mode=${mode}`));
+  return valueCache.get(k);   // {v} or, in overlay/stacked mode, {v, t}
+}
+
+function bindTooltip() {
+  const tip = $("#tooltip");
+  let cur = null;
+  $("#scroller").addEventListener("mousemove", async (ev) => {
+    // dataset.run is "" on the ground-truth cell, which still has values to show.
+    const img = ev.target.closest?.(".mask");
+    if (!img || img.dataset.sid === undefined) { tip.hidden = true; cur = null; return; }
+    const b = img.getBoundingClientRect();
+    // The hovered cell's OWN grid: every cell is stretched to the same box, so a 30x30
+    // column and a 20x40 one need different divisors to turn a cursor position into
+    // [row, col]. Using the global default indexed the wrong cell on any run whose grid
+    // is not the default -- and out of bounds on a coarser one.
+    const [mh, mw] = img.dataset.run ? runShape(img.dataset.run) : [S.lut.h, S.lut.w];
+    // Clamp rather than index straight from the ratio. Under browser zoom the rect is
+    // fractional while `pixelated` snaps the painted cells to whole device pixels, so the
+    // two disagree by up to a cell at the edges -- which read as a shifted mask.
+    const frac = (p, lo, size) => Math.min(0.999999, Math.max(0, (p - lo) / size));
+    const col = Math.floor(frac(ev.clientX, b.left, b.width) * mw);
+    const row = Math.floor(frac(ev.clientY, b.top, b.height) * mh);
+    if (ev.clientX < b.left || ev.clientX > b.right ||
+        ev.clientY < b.top || ev.clientY > b.bottom) { tip.hidden = true; return; }
+    // Ground truth has no prediction to diff against, so it always reports raw values.
+    const mode = img.dataset.run ? S.view.mode : "pred";
+    const key = `${img.dataset.run}|${img.dataset.sid}|${mode}`;
+    if (cur !== key) { cur = key; tip._v = await valuesFor(img.dataset.run, img.dataset.sid, mode); }
+    const v = tip._v?.v?.[row]?.[col];
+    const t = tip._v?.t?.[row]?.[col];
+    tip.hidden = false;
+    tip.textContent = `[${row},${col}] ` + (v == null ? "–" : v.toFixed(3)) +
+      (t == null ? "" : ` pred · ${t.toFixed(3)} true`);
+    tip.style.left = `${ev.clientX + 12}px`;
+    tip.style.top = `${ev.clientY + 14}px`;
+  });
+  $("#scroller").addEventListener("mouseleave", () => { tip.hidden = true; });
+}
+
+/* ***** detail modal ***** */
+
+async function openModal(rank) {
+  S.modalRow = rank;
+  const s = S.order[rank];
+  if (!s) return;
+  $("#m-prev").hidden = $("#m-next").hidden = false;
+  const d = await api(`/api/detail/${s.i}`);
+  $("#m-title").textContent = `Sample ${d.sample_id}`;
+  // Named by the server rather than hardcoded: the default grid is chosen from the data.
+  const grid = d.grid ? `${d.grid[0]}×${d.grid[1]}` : `${S.lut.h}×${S.lut.w}`;
+  const coms = Object.entries(d.coms || {})
+    .map(([k, v]) => `<dt>${k}</dt><dd>${fmt(v[0], 1)}, ${fmt(v[1], 1)}</dd>`).join("");
+  const objs = Object.entries(d.objects || {})
+    .map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join("") || `<dt>—</dt><dd>empty</dd>`;
+
+  $("#m-body").innerHTML = `
+    <div class="msec">
+      <h3>Overhead — mask, center of mass, speaker</h3>
+      <img class="hero" src="/api/overhead/${s.i}.png" alt="overhead view of sample ${d.sample_id}">
+      <p class="note">${d.description || ""}</p>
+    </div>
+    <div class="mgrid">
+      <div class="msec">
+        <h3>Object</h3>
+        <dl class="kv">
+          ${objs}
+          <dt>count</dt><dd>${d.n_objects}</dd>
+          <dt>layout</dt><dd>${d.layout}</dd>
+          <dt>box</dt><dd>${d.box}</dd>
+        </dl>
+        <h3 style="margin-top:14px">Center of mass</h3>
+        <dl class="kv">
+          ${coms}
+          <dt>average</dt><dd>${d.avg_com ? `${fmt(d.avg_com[0], 1)}, ${fmt(d.avg_com[1], 1)}` : "–"}</dd>
+          <dt>on ${grid} grid</dt><dd>${d.com_gt_grid ? `${fmt(d.com_gt_grid[0], 2)}, ${fmt(d.com_gt_grid[1], 2)}` : "–"}</dd>
+        </dl>
+        <p class="note">Per-object and average are full-resolution image coordinates (row, col);
+          the grid value is in ${grid} target space, as used by the table metrics.</p>
+      </div>
+      <div class="msec">
+        <h3>Audio</h3>
+        <div class="audio"><label>Original — played chirp</label>
+          ${d.has.original ? `<audio controls preload="none" src="/api/audio/${s.i}/original"></audio>` : `<p class="note">not available</p>`}</div>
+        <div class="audio"><label>Recovered — from laser vibration</label>
+          ${d.has.recovered ? `<audio controls preload="none" src="/api/audio/${s.i}/recovered"></audio>` : `<p class="note">not available</p>`}</div>
+        <dl class="kv">
+          <dt>speaker</dt><dd>${d.speaker}</dd>
+          <dt>min freq</dt><dd>${d.min_freq} Hz</dd>
+          <dt>max freq</dt><dd>${d.max_freq} Hz</dd>
+        </dl>
+        ${d.has.spectrogram ? `<img class="specimg" src="/api/vibration/${s.i}/spectrogram.png" alt="spectrogram">` : ""}
+        ${d.has.fft ? `<img class="specimg" src="/api/vibration/${s.i}/fft.png" alt="FFT">` : ""}
+      </div>
+    </div>`;
+  $("#modal").hidden = false;
+}
+
+/* ***** predicted-mask modal *****
+   Ranks ground-truth samples by how close their center of mass is to what this run
+   predicted, which shows whether a prediction looks like a different scene than its own
+   target. Positions are deduped: 8 samples share each one, differing only by speaker. */
+
+async function openNeighbors(run, sid) {
+  const d = await api(`/api/neighbors?run=${encodeURIComponent(run)}&sid=${sid}&k=5`);
+  const dc = (a, b) => `${fmt(a, 1)}, ${fmt(b, 1)}`;
+  const off = Math.hypot(d.pred_com[0] - d.gt_com[0], d.pred_com[1] - d.gt_com[1]);
+
+  const list = (rows, cls) => rows.map((x) => `
+    <li class="nb ${cls}" data-i="${x.i}">
+      <img src="/api/gt_mask.png?sid=${x.i}&bg=1&v=${S.renderVersion}" loading="lazy" alt="">
+      <div class="nbmeta">
+        <div class="nbtop"><b>${+x.sample_id}</b> <span class="tag">pos ${+x.output_id}</span></div>
+        <div class="nbsub">d ${fmt(x.distance, 3)} · com ${dc(x.com[0], x.com[1])}</div>
+        <div class="nbsub">${shortLayout(x.layout)} · ${x.n_objects} obj</div>
+      </div>
+    </li>`).join("");
+
+  const v = `v=${S.renderVersion}`;
+  const ep = S.runs[run] ? `&ep=${S.runs[run].epoch}` : "";
+  const e = S.runs[run] && S.runs[run].samples[sid];
+
+  $("#m-title").innerHTML = `Sample ${+d.sample_id} — <span class="mrun">${run}</span>`;
+  $("#m-body").innerHTML = `
+    <div class="msec">
+      <h3>This prediction</h3>
+      <div class="nbviews">
+        <figure><img src="/api/mask.png?run=${encodeURIComponent(run)}&sid=${sid}&mode=pred&bg=1&${v}${ep}" alt="">
+          <figcaption>predicted</figcaption></figure>
+        <figure><img src="/api/gt_mask.png?sid=${sid}&bg=1&${v}" alt="">
+          <figcaption>ground truth</figcaption></figure>
+        <figure><img src="/api/mask.png?run=${encodeURIComponent(run)}&sid=${sid}&mode=diff&bg=1&${v}${ep}" alt="">
+          <figcaption>difference</figcaption></figure>
+      </div>
+      <div class="nbhead">
+        <div><span class="k">predicted com</span><b>${dc(d.pred_com[0], d.pred_com[1])}</b></div>
+        <div><span class="k">ground truth</span><b>${dc(d.gt_com[0], d.gt_com[1])}</b></div>
+        <div><span class="k">offset</span><b>${fmt(off, 2)} cells</b></div>
+        ${e ? `<div><span class="k">mse</span><b>${fmt(e.mse, 4)}</b></div>
+               <div><span class="k">soft iou</span><b>${fmt(e.iou, 3)}</b></div>
+               <div><span class="k">com dist</span><b>${e.comdist == null ? "–" : fmt(e.comdist, 3)}</b></div>` : ""}
+      </div>
+      <p class="note">Ground-truth scenes ranked by distance from this run's predicted
+        center of mass, over ${d.n_candidates} samples with an object (empty boxes
+        excluded). One entry per physical position.</p>
+    </div>
+    <div class="mgrid">
+      <div class="msec"><h3>Most similar to the prediction</h3><ul class="nblist">${list(d.most_similar, "near")}</ul></div>
+      <div class="msec"><h3>Least similar</h3><ul class="nblist">${list(d.least_similar, "far")}</ul></div>
+    </div>`;
+
+  // Each neighbour opens its own ground-truth detail, if it is on screen.
+  $("#m-body").querySelectorAll(".nb").forEach((li) => {
+    li.onclick = () => {
+      const rank = S.order.findIndex((s) => s.i === +li.dataset.i);
+      if (rank >= 0) openModal(rank);
+    };
+  });
+  S.modalRow = -1;                       // arrow-key stepping applies to GT modals only
+  $("#m-prev").hidden = $("#m-next").hidden = true;
+  $("#modal").hidden = false;
+}
+
+function stepModal(delta) {
+  if (S.modalRow < 0) return;            // neighbour modal has no position in the table
+  const next = S.modalRow + delta;
+  if (next >= 0 && next < S.order.length) openModal(next);
+}
+
+/* ***** wiring ***** */
+
+function bindUI() {
+  $("#scroller").addEventListener("scroll", onScroll, { passive: true });
+
+  /* Clicking a column header's epoch pins every column there. Delegated on the scroller
+     because renderHeader rebuilds the header row on every refresh. */
+  $("#scroller").addEventListener("click", (e) => {
+    const b = e.target.closest("b.goep[data-ep]");
+    if (!b) return;
+    e.stopPropagation();          // must not also cycle that column's sort
+    gotoEpoch(+b.dataset.ep);
+  });
+
+  window.addEventListener("resize", renderVisible);
+
+  /* Collapsing the sidebar hands its 268px to the table, which matters when comparing
+     several runs side by side. Purely a CSS width change: the virtualizer keys off
+     viewport HEIGHT, so no rows need recomputing. */
+  const setSidebar = (open) => {
+    document.body.classList.toggle("nosidebar", !open);
+    $("#sidebar-show").hidden = open;
+    try { localStorage.setItem("viz.sidebar", open ? "1" : "0"); } catch (_) {}
+  };
+  $("#sidebar-hide").onclick = () => setSidebar(false);
+  $("#sidebar-show").onclick = () => setSidebar(true);
+  try { if (localStorage.getItem("viz.sidebar") === "0") setSidebar(false); } catch (_) {}
+
+  $("#mode-seg").querySelectorAll("button").forEach((b) => {
+    b.onclick = () => {
+      S.view.mode = b.dataset.mode;
+      $("#mode-seg").querySelectorAll("button").forEach((x) => x.classList.toggle("on", x === b));
+      document.body.classList.toggle("stacked", S.view.mode === "stacked");
+      renderLegend();
+      // Stacked changes the row height, so the spacer and row offsets must be rebuilt --
+      // a repaint alone would leave rows overlapping.
+      refresh();
+    };
+  });
+  $("#bg-toggle").onchange = (e) => { S.view.background = e.target.checked; renderVisible(); };
+
+  $("#epoch-slider").oninput = (e) => setEpochIdx(+e.target.value);
+  $("#epoch-play").onclick = togglePlay;
+  holdToRepeat($("#epoch-prev"), () => stepEpoch(-1));
+  holdToRepeat($("#epoch-next"), () => stepEpoch(1));
+  $("#epoch-latest").onclick = () => {
+    S.playing = false; clearInterval(playTimer);
+    S.frameData = {};                 // drop frames so the latest epoch refetches cleanly
+    setEpochIdx(null);
+  };
+
+  document.querySelectorAll("[data-all]").forEach((b) => {
+    b.onclick = () => {
+      const k = b.dataset.all;
+      if (k === "speakers") S.filters.speakers = new Set([1, 2, 3, 4, 5, 6, 7, 8]);
+      if (k === "layouts") S.filters.layouts = new Set(uniq((s) => s.layout).map((x) => x[0]));
+      if (k === "nObjects") S.filters.nObjects = new Set(uniq((s) => s.n_objects).map((x) => x[0]));
+      if (k === "boxes") S.filters.boxes = new Set(uniq((s) => s.box).map((x) => x[0]));
+      if (k === "objects") {
+        const all = new Set();
+        S.samples.forEach((s) => (s.objects && s.objects.length ? s.objects : ["(none)"]).forEach((o) => all.add(o)));
+        S.filters.objects = all;
+      }
+      if (k === "splits") { const a = new Set(); S.runOrder.forEach((n) => S.runs[n].splits.forEach((x) => a.add(x))); S.filters.splits = a; }
+      refresh();
+    };
+  });
+  document.querySelectorAll("[data-none]").forEach((b) => {
+    b.onclick = () => { S.filters[b.dataset.none] = new Set(); refresh(); };
+  });
+
+  $("#add-run").onclick = openPicker;
+  document.querySelectorAll("[data-close]").forEach((b) => {
+    b.onclick = () => { b.closest(".overlay").hidden = true; };
+  });
+  document.querySelectorAll(".overlay").forEach((o) => {
+    o.onclick = (e) => { if (e.target === o) o.hidden = true; };
+  });
+  $("#m-prev").onclick = () => stepModal(-1);
+  $("#m-next").onclick = () => stepModal(1);
+
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") document.querySelectorAll(".overlay").forEach((o) => (o.hidden = true));
+    if (!$("#modal").hidden) {
+      if (e.key === "ArrowLeft") { e.preventDefault(); stepModal(-1); }
+      if (e.key === "ArrowRight") { e.preventDefault(); stepModal(1); }
+      return;
+    }
+    // Bare "f" toggles the filter panel -- but not while typing in the id searches, and
+    // not when it is a browser/OS chord.
+    const typing = /^(INPUT|TEXTAREA|SELECT)$/.test(e.target.tagName);
+    if (e.key === "f" && !typing && !e.ctrlKey && !e.metaKey && !e.altKey) {
+      e.preventDefault();
+      setSidebar(document.body.classList.contains("nosidebar"));
+    }
+  });
+
+  bindTooltip();
+  renderLegend();
+  setInterval(poll, POLL_MS);   // pick up new runs and new epochs of training ones
+}
+
+/* Blue is always the prediction and green always the ground truth, in every view, so the
+   overlay and difference explain each other rather than needing separate keys.
+   Colorbars are served `immutable`, so they carry the render version too -- without it a
+   palette change never reaches a browser that cached the old ramp. */
+const colorbarURL = (mode) => `/api/colorbar/${mode}.png?v=${S.renderVersion}`;
+
+function renderLegend() {
+  const m = S.view.mode;
+  if (m === "overlay" || m === "stacked") {
+    // Two ramps rather than flat swatches: both layers carry magnitude, so the key has
+    // to show the light-to-dark range each one spans.
+    $("#legend").innerHTML =
+      `<div class="dualbar">
+         <div><img src="${colorbarURL("pred")}" alt=""><span>prediction</span></div>
+         <div><img src="${colorbarURL("truth")}" alt=""><span>ground truth</span></div>
+       </div>`;
+    return;
+  }
+  const diff = m === "diff";
+  $("#legend").innerHTML =
+    `<img src="${colorbarURL(diff ? "diff" : "pred")}" alt="">
+     <div class="lbl">${diff
+       ? `<span>missed truth</span><span>0</span><span>excess pred</span>`
+       : `<span>0</span><span>mask value</span><span>1</span>`}</div>`;
+}
+
+boot().catch((e) => { $("#subtitle").textContent = "failed to load"; console.error(e); });

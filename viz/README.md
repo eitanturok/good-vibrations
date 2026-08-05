@@ -1,11 +1,11 @@
-# viz2
+# viz
 
 Compare predicted segmentation masks across training runs, sample by sample.
 
 ```bash
-python -m viz2                 # http://127.0.0.1:8503
-python -m viz2 --port 9000 --experiment experiments/experiment-25 --runs runs
-python -m viz2 --experiment experiments/31_07_2026_gastronorm_exp1 --mask 30x30
+python -m viz                 # http://127.0.0.1:8503
+python -m viz --port 9000 --experiment experiments/experiment-25 --runs runs
+python -m viz --experiment experiments/31_07_2026_gastronorm_exp1 --mask 30x30
 ```
 
 Startup is ~0.5 s. No inference runs: ground-truth masks are read from the per-sample
@@ -14,7 +14,7 @@ wrote during training.
 
 ## Watching a remote training run
 
-`src/run.py` starts viz2 for you, in a detached tmux session named `viz2-<port>` (default
+`src/run.py` starts viz for you, in a detached tmux session named `viz-<port>` (default
 8504), pointed at the run's own `--data-dir`. It survives the training job ending, and later
 runs reuse the same session rather than starting a second one — so one server covers every
 run against that experiment. Training on a **different** `--data-dir` relaunches it on the
@@ -27,19 +27,19 @@ On the laptop, hold an SSH tunnel and open it:
 ./scripts/connect_to_batman.sh          # tmux + ssh -L 8504:localhost:8504 batman
 ```
 
-Then browse http://localhost:8504. Order doesn't matter — viz2 outlives any single run, and
+Then browse http://localhost:8504. Order doesn't matter — viz outlives any single run, and
 new runs appear within ~10 s without a restart. The tunnel retries on drops, so it survives
 laptop sleep and wifi changes.
 
 On the remote:
 
 ```bash
-tmux attach -t viz2-8504          # logs (the pane stays open if viz2 crashes)
-tmux kill-session -t viz2-8504    # stop it
+tmux attach -t viz-8504          # logs (the pane stays open if viz crashes)
+tmux kill-session -t viz-8504    # stop it
 python src/run.py --no-viz ...    # don't launch it; --viz-port to move it
 ```
 
-viz2 stays bound to `127.0.0.1`, so the tunnel is what makes it reachable — it is never
+viz stays bound to `127.0.0.1`, so the tunnel is what makes it reachable — it is never
 exposed on the network.
 
 ## Dataset layouts
@@ -64,7 +64,7 @@ dataset can be missing a sample whose mask was never written, so every id → ro
 goes through `GtIndex.row_of`.
 
 **`--mask HxW`** picks the target grid. A dataset may ship several sizes side by side
-(gastronorm has both `20x40` and `30x30`); viz2 uses the only size on disk when there is
+(gastronorm has both `20x40` and `30x30`); viz uses the only size on disk when there is
 one, otherwise defaults to `20x40` and says so. Runs trained on a different size are
 listed as incompatible, with the shape mismatch as the reason — so if a run you expect is
 missing, check the mask size first.

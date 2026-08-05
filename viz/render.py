@@ -16,7 +16,7 @@ from functools import lru_cache
 import numpy as np
 from PIL import Image
 
-from viz2 import config
+from viz import config
 
 # Sequential ramps, light->dark, one hue each (never a rainbow). The lightest step is
 # allowed to recede toward the surface -- that is the intended reading of "near zero".
@@ -219,7 +219,7 @@ def colorbar(mode: str, width: int = 256, height: int = 14) -> bytes:
 def _backdrop(sid: int) -> Image.Image | None:
     """The cropped overhead frame the masks are aligned to, kept decoded so repeated
     composites for the same sample don't re-read the file."""
-    from viz2.app import registry
+    from viz.app import registry
     p = registry.sample_dir(sid) / registry.gt.layout.backdrop
     if not p.exists():
         return None
@@ -230,7 +230,7 @@ def _backdrop(sid: int) -> Image.Image | None:
 
 @lru_cache(maxsize=200_000)
 def _cached(kind: str, run: str, sid: int, mode: str, background: bool, epoch: int) -> bytes:
-    from viz2.app import registry  # set at startup
+    from viz.app import registry  # set at startup
     bd = _backdrop(sid) if background else None
     if kind == "gt":
         return render_mask(registry.gt.masks[sid], "truth", background, bd)
@@ -252,7 +252,7 @@ def _cached(kind: str, run: str, sid: int, mode: str, background: bool, epoch: i
 def cached_mask(kind: str, run: str, sid: int, mode: str, background: bool) -> bytes:
     # The run's loaded epoch is part of the cache key: a run that is still training gets
     # reloaded with new predictions, and a fixed key would keep serving the old render.
-    from viz2.app import registry
+    from viz.app import registry
     epoch = registry.run(run).epoch if kind != "gt" else 0
     return _cached(kind, run, sid, mode, background, epoch)
 
