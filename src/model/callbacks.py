@@ -62,7 +62,7 @@ class VisualizeSMask(Callback):
     def _render_batch(self, mask_pred: torch.Tensor, mask_true: torch.Tensor, info: dict) -> list[np.ndarray]:
         com_dists = com_distances(mask_pred, mask_true, epsilon=1e-6, normalize=True).numpy()
         mse_vals = mses(mask_pred, mask_true).numpy()
-        captions = [f"id={info['sample_id'][i]}  pos={info['position_id'][i]}  spk={info['speaker'][i]}  objs={info['n_objects'][i]}  "
+        captions = [f"pos {info['position_id'][i]}  spk {info['speaker'][i]} (smp {info['sample_id'][i]})  objs={info['n_objects'][i]}  "
                     f"com=({info['x_com'][i]:.1f},{info['y_com'][i]:.1f})  mse={mse_vals[i]:.4f}  com_dist={com_dists[i]:.4f}"
                     for i in range(len(mask_pred))]
         return [self._render(p, t, c) for p, t, c in zip(mask_pred.numpy(), mask_true.numpy(), captions)]

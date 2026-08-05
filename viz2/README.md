@@ -12,6 +12,33 @@ Startup is ~0.5 s. No inference runs: ground-truth masks are read from the per-s
 `.npy` on disk and predictions from the `.pt` files the `OutputSaver` callback already
 wrote during training.
 
+## Watching a remote training run
+
+`src/run.py` starts viz2 for you, in a detached tmux session named `viz2-<port>` (default
+8504). It survives the training job ending, and later runs reuse the same session rather
+than starting a second one — so one server covers every run against that experiment.
+
+On the laptop, hold an SSH tunnel and open it:
+
+```bash
+./scripts/connect_to_batman.sh          # tmux + ssh -L 8504:localhost:8504 batman
+```
+
+Then browse http://localhost:8504. Order doesn't matter — viz2 outlives any single run, and
+new runs appear within ~10 s without a restart. The tunnel retries on drops, so it survives
+laptop sleep and wifi changes.
+
+On the remote:
+
+```bash
+tmux attach -t viz2-8504          # logs (the pane stays open if viz2 crashes)
+tmux kill-session -t viz2-8504    # stop it
+python src/run.py --no-viz ...    # don't launch it; --viz-port to move it
+```
+
+viz2 stays bound to `127.0.0.1`, so the tunnel is what makes it reachable — it is never
+exposed on the network.
+
 ## Dataset layouts
 
 Sample directories are not laid out the same way across experiments, so the filenames
