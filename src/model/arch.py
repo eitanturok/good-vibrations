@@ -90,15 +90,15 @@ def create_metrics(data_info): return {
 #***** 2 losses *****
 
 # mse is averaged over (B,H,W) so the error is independent of the out_h out_w we choose
-def mse_loss(mask_pred, mask_true): return F.mse_loss(mask_pred, mask_true)
-def iou_loss(mask_pred, mask_true): return 1 - soft_iou(mask_pred, mask_true).mean()
-def dice_loss(mask_pred, mask_true): return 1 - soft_dice(mask_pred, mask_true).mean()
-def mse_iou_loss(mask_pred, mask_true, theta=0.5):
-    return theta * mse_loss(mask_pred, mask_true) + (1 - theta) * iou_loss(mask_pred, mask_true)
-def mse_dice_loss(mask_pred, mask_true, theta=0.5):
-    return theta * mse_loss(mask_pred, mask_true) + (1 - theta) * dice_loss(mask_pred, mask_true)
+def mse_loss(mask_logits, mask_pred, mask_true): return F.mse_loss(mask_pred, mask_true)
+# ce reads logits not preds: sigmoid-then-log saturates to log(0) once the model gets confident
+def ce_loss(mask_logits, mask_pred, mask_true): return F.binary_cross_entropy_with_logits(mask_logits, mask_true)
+def iou_loss(mask_logits, mask_pred, mask_true): return 1 - soft_iou(mask_pred, mask_true).mean()
+def dice_loss(mask_logits, mask_pred, mask_true): return 1 - soft_dice(mask_pred, mask_true).mean()
+def mse_iou_loss(mask_logits, mask_pred, mask_true, theta=0.5): return theta * mse_loss(mask_logits, mask_pred, mask_true) + (1 - theta) * iou_loss(mask_logits, mask_pred, mask_true)
+def mse_dice_loss(mask_logits, mask_pred, mask_true, theta=0.5): return theta * mse_loss(mask_logits, mask_pred, mask_true) + (1 - theta) * dice_loss(mask_logits, mask_pred, mask_true)
 
-LOSSES = {'mse': mse_loss, 'iou': iou_loss, 'dice': dice_loss, 'mse+iou': mse_iou_loss, 'mse+dice': mse_dice_loss}
+LOSSES = {'mse': mse_loss, 'iou': iou_loss, 'dice': dice_loss, 'mse+iou': mse_iou_loss, 'mse+dice': mse_dice_loss, 'ce': ce_loss}
 
 #***** 3 decoder *****
 
@@ -237,7 +237,7 @@ class VibrationTransformer(ComposerModel):
         return dict(mask_pred=mask_pred, mask_logits=mask_logits)
 
     def loss(self, outputs, batch):
-        return self.loss_fn(outputs['mask_pred'], batch['mask_true'])
+        return self.loss_fn(outputs['mask_logits'], outputs['mask_pred'], batch['mask_true'])
 
     def get_metrics(self, is_train=False):
         return self.train_metrics if is_train else self.val_metrics
