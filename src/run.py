@@ -36,7 +36,7 @@ from model.callbacks import VisualizeSMask, OutputSaver, AttributionSaver, OUTPU
 from model.dataset import build_dataset
 from model.arch import VibrationTransformer, LOSSES
 from utils.helpers import cleanup
-from viz_server import ensure_viz
+from viz import ensure_viz
 
 BASE_DATA_DIR = Path("/home/ethantu/workspace/good-vibrations/experiments")
 
@@ -129,8 +129,8 @@ def get_parser():
     # run
     parser.add_argument("--run-name",                   type=str,   default=None)
     parser.add_argument("--wandb-group",                type=str,   default="attn-lr-sweep", help="wandb group, for keeping sweep runs together.")
-    parser.add_argument("--viz-port",                   type=int,   default=8504, help="Port for the auto-launched viz2 dashboard.")
-    parser.add_argument("--no-viz",                     action="store_true", help="Don't auto-launch the viz2 dashboard.")
+    parser.add_argument("--viz-port",                   type=int,   default=8504, help="Port for the auto-launched viz dashboard.")
+    parser.add_argument("--no-viz",                     action="store_true", help="Don't auto-launch the viz dashboard.")
     # checkpointing
     parser.add_argument("--checkpoint-path",            type=str,   default=None, help="Checkpoint to load for eval. If not set, defaults to the run's latest checkpoint.")
     parser.add_argument("--checkpoint-interval",        type=str,   default="500ep")
