@@ -15,8 +15,11 @@ wrote during training.
 ## Watching a remote training run
 
 `src/run.py` starts viz2 for you, in a detached tmux session named `viz2-<port>` (default
-8504). It survives the training job ending, and later runs reuse the same session rather
-than starting a second one — so one server covers every run against that experiment.
+8504), pointed at the run's own `--data-dir`. It survives the training job ending, and later
+runs reuse the same session rather than starting a second one — so one server covers every
+run against that experiment. Training on a **different** `--data-dir` relaunches it on the
+same port, so the dashboard follows what you're training instead of quietly showing the
+previous dataset; your tunnel and browser tab keep working across the swap.
 
 On the laptop, hold an SSH tunnel and open it:
 

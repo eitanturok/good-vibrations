@@ -390,22 +390,20 @@ function statsFor(name) {
   return out;
 }
 
-/* "which epoch am I looking at, out of how many the run trained for" -- the two are
-   easy to confuse once the slider exists, so the header always shows both and calls out
-   when you are looking at anything other than the newest predictions. */
-/* The epoch number is a control: clicking it pins every column to this run's last epoch,
+/* How far the run has trained: just that number, not "current/last". The two only differ
+   while the epoch slider is scrubbed back, so the second number is shown only then --
+   otherwise it is the same value twice and costs header width the run name needs.
+   The epoch number is a control: clicking it pins every column to this run's last epoch,
    which is how you line the table up on one run's endpoint. */
 function epochLabel(run) {
   const r = S.runs[run];
   const eps = r.epochs || [];
   const last = eps.length ? eps[eps.length - 1] : r.epoch;
   const shown = epochFor(run);
-  // <current>/<last> ep. Only the last is clickable -- it is the run's endpoint, and
-  // jumping every column there is the useful move; the current epoch is already current.
-  const cur = shown == null ? last : shown;
-  return `<span class="epchip${cur === last ? "" : " scrub"}">` +
-    `<b>${cur}</b><span class="k">/</span>` +
-    `<b class="goep" data-ep="${last}" title="Show every column at epoch ${last}">${last}</b>` +
+  const goep = `<b class="goep" data-ep="${last}" title="Show every column at epoch ${last}">${last}</b>`;
+  const scrubbed = shown != null && shown !== last;
+  return `<span class="epchip${scrubbed ? " scrub" : ""}">` +
+    (scrubbed ? `<b>${shown}</b><span class="k">/</span>${goep}` : goep) +
     `<span class="k">ep</span></span>`;
 }
 
@@ -524,16 +522,19 @@ function renderHeader() {
     // a run that finishes or crashes while open must update its badge.
     const live = S.meta.runs.find((x) => x.name === name);
     const status = (live && live.status) || "unknown";
-    // Top line: name and its status read together on the left, epoch right-aligned. The
-    // sample count that used to sit here ("999/1024") was dropped -- it is a property of
-    // the dataloader's split, not something you compare columns on.
+    // Two lines: the name owns the first one (it is the column's identity and the longest
+    // string), the epoch and status chips sit together on the second. They shared a line
+    // with the name until the column narrowed to the sample image's width, where the chips
+    // ate the name down to "norm-4-...". Grip and close ride the top-right corner.
     cell.innerHTML = `
       <div class="htop">
-        <span class="hgrip" title="Drag to reorder this column">⠿</span>
         <div class="hname" title="${name} — click to cycle sort">${name}${warn}</div>
-        ${statusChip(status)}
-        <span class="hep">${epochLabel(name)}</span>
+        <span class="hgrip" title="Drag to reorder this column">⠿</span>
         <button class="hclose" title="Remove this run">&times;</button>
+      </div>
+      <div class="hchips">
+        <span class="hep">${epochLabel(name)}</span>
+        ${statusChip(status)}
       </div>
       ${skipped ? `<div class="hmeta">${skipped.replace(/^ · /, "")}</div>` : ""}
       <div class="hstats">${METRICS.map((m) => {
@@ -1647,9 +1648,14 @@ function bindTooltip() {
     // [row, col]. Using the global default indexed the wrong cell on any run whose grid
     // is not the default -- and out of bounds on a coarser one.
     const [mh, mw] = img.dataset.run ? runShape(img.dataset.run) : [S.lut.h, S.lut.w];
-    const col = Math.floor(((ev.clientX - b.left) / b.width) * mw);
-    const row = Math.floor(((ev.clientY - b.top) / b.height) * mh);
-    if (row < 0 || row >= mh || col < 0 || col >= mw) { tip.hidden = true; return; }
+    // Clamp rather than index straight from the ratio. Under browser zoom the rect is
+    // fractional while `pixelated` snaps the painted cells to whole device pixels, so the
+    // two disagree by up to a cell at the edges -- which read as a shifted mask.
+    const frac = (p, lo, size) => Math.min(0.999999, Math.max(0, (p - lo) / size));
+    const col = Math.floor(frac(ev.clientX, b.left, b.width) * mw);
+    const row = Math.floor(frac(ev.clientY, b.top, b.height) * mh);
+    if (ev.clientX < b.left || ev.clientX > b.right ||
+        ev.clientY < b.top || ev.clientY > b.bottom) { tip.hidden = true; return; }
     // Ground truth has no prediction to diff against, so it always reports raw values.
     const mode = img.dataset.run ? S.view.mode : "pred";
     const key = `${img.dataset.run}|${img.dataset.sid}|${mode}`;
@@ -1834,11 +1840,6 @@ function bindUI() {
     };
   });
   $("#bg-toggle").onchange = (e) => { S.view.background = e.target.checked; renderVisible(); };
-  // Interpolate instead of showing hard cell edges. Purely visual -- metrics are always
-  // computed at each run's native grid -- but it is what makes a coarse column and a
-  // fine one comparable by eye when the table mixes resolutions.
-  $("#smooth-toggle").onchange = (e) =>
-    document.body.classList.toggle("smooth", e.target.checked);
 
   $("#epoch-slider").oninput = (e) => setEpochIdx(+e.target.value);
   $("#epoch-play").onclick = togglePlay;

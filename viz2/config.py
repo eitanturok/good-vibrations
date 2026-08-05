@@ -224,15 +224,26 @@ class Layout:
         its mask entirely (000009 in the gastronorm run has no downsampled mask), and
         probing only the first directory would then fall through to the wrong layout --
         or to none at all -- for an otherwise healthy 3000-sample dataset.
+
+        The mask alone does not always identify a layout: `experiment-25-v2-30h` and
+        `gastronorm` name the same `04_downsampled_smask_{h}h_{w}w.npy`, so both match
+        either dataset and LAYOUT_ORDER alone would always hand gastronorm to the
+        experiment-25 entry -- which then applies the wrong EVAL_SPLITS whitelist and
+        rejects every gastronorm run as "different dataset". So require the layout's own
+        `overhead` file too, which does differ (06_overhead_speaker.png on experiment-25,
+        02_cropped_overhead.png on gastronorm), and only fall back to a mask-only match if
+        nothing matches on both.
         """
         try:
             probes = sorted(p for p in samples_dir.iterdir() if p.is_dir())[:25]
         except OSError:
             probes = []
-        for name in LAYOUT_ORDER:
-            layout = cls(name, LAYOUTS[name])
-            if any((d / layout.gt_mask).exists() for d in probes):
-                return layout
+        layouts = [cls(name, LAYOUTS[name]) for name in LAYOUT_ORDER]
+        for strict in (True, False):
+            for layout in layouts:
+                for d in probes:
+                    if (d / layout.gt_mask).exists() and (not strict or (d / layout.overhead).exists()):
+                        return layout
         known = ", ".join(LAYOUT_ORDER)
         raise SystemExit(
             f"[viz2] no known sample layout under {samples_dir}.\n"

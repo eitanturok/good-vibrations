@@ -28,9 +28,12 @@
      box -- 20px is the cell's horizontal padding. */
   --mask-w: 220px;
   --mask-h: 110px;
-  --col-w: calc(var(--mask-w) + 20px);   /* same as --gt-w so masks align across the row */
+  /* Sized to the sample image. The metrics row wraps to fit (.hstats), so the column does
+     not have to be wide enough to lay all three out end to end; the 200px floor just keeps
+     a very narrow scene from squeezing the header chips into nothing. */
+  --col-w: max(200px, calc(var(--mask-w) + 20px));   /* same as --gt-w so masks align across the row */
   --idx-w: 52px;
-  --gt-w: calc(var(--mask-w) + 20px);
+  --gt-w: max(200px, calc(var(--mask-w) + 20px));
 
   --r: 6px;
   --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
@@ -210,11 +213,8 @@ body.nosidebar #sidebar {
 
    Every canvas is stretched to the same --mask-w/--mask-h box regardless of its buffer
    size, so a 16x16 and a 30x30 column already align over the same backdrop. `pixelated`
-   is the default because the cell grid is real -- the hover tooltip reads one value per
-   cell -- but body.smooth interpolates instead, which makes columns of different
-   resolutions directly comparable by eye. */
+   because the cell grid is real -- the hover tooltip reads one value per cell. */
 canvas.mask { image-rendering: pixelated; }
-body.smooth canvas.mask { image-rendering: auto; }
 canvas.mask.bg { background-size: 100% 100%; background-repeat: no-repeat; background-color: var(--surface-2); }
 
 .check { display: flex; align-items: center; gap: 7px; margin-top: 10px; font-size: 11.5px; cursor: pointer; }
@@ -365,29 +365,36 @@ body.stacked .gtimg { margin-top: 114px; }
 .hcell { flex: none; padding: 8px 10px; border-right: 1px solid var(--line); }
 .hcell.idx { width: var(--idx-w); }
 .hcell.gt { width: var(--gt-w); }
-.hcell.run { width: var(--col-w); border-left: 3px solid transparent; }
+.hcell.run { width: var(--col-w); border-left: 3px solid transparent; position: relative; }
 .hcell.run.sorted { border-left-color: var(--accent); background: var(--accent-sf); }
 .hcell.run.dim { opacity: .62; }
 
-.htop { display: flex; align-items: center; gap: 5px; }
-/* Only the name gives way: the status chip rides beside it, the epoch is pushed to the
-   right edge by the name's flex, and the close button holds the far corner. A long run
-   name ellipsises rather than shoving any of them out of the header. */
+/* The name's line. Grip and close sit at the right end as a pair, so the name gets the
+   whole width minus those two controls. */
+.htop { display: flex; align-items: center; gap: 4px; overflow: hidden; }
+/* Epoch and status on their own line: at a column sized to the sample image there is not
+   room for both chips beside the name, and the name is what identifies the column. */
+.hchips { display: flex; align-items: center; gap: 5px; margin-top: 3px; overflow: hidden; }
+/* Takes the whole line except the grip and close button. Run names differ at the END
+   ("norm-4-lr3"), so ellipsising is a real loss -- which is why the chips moved off this
+   line rather than the name giving way to them. */
 .hname {
-  flex: 0 1 auto; min-width: 0;
+  flex: 1 1 auto; min-width: 0;
   font-size: 11.5px; font-weight: 700; white-space: nowrap;
   overflow: hidden; text-overflow: ellipsis; cursor: pointer;
 }
-/* margin-left:auto is what right-aligns the epoch: everything before it packs left. */
-.hep { flex: none; margin-left: auto; }
-/* The chip sits on the name's line now, so it must not stretch to the row's height. */
-.htop .status { flex: none; align-self: center; }
+/* First on the chip line, so it starts at the cell's text edge like the name above it. */
+.hep { flex: none; white-space: nowrap; }
+.hchips .status { flex: none; align-self: center; }
 
 /* Drag handle. Faint until the column is hovered, like .hclose -- always-on grips on
-   every column would compete with the run names for attention. */
+   every column would compete with the run names for attention.
+
+   margin-left:auto pins it and the close button to the right end of the name's line, so
+   the name still starts at the cell's text edge, aligned with the mse/iou/cd row below. */
 .hgrip {
-  flex: none; cursor: grab; user-select: none;
-  font-size: 11px; line-height: 1; color: var(--ink-3);
+  flex: none; margin-left: auto; cursor: grab; user-select: none;
+  font-size: 12px; line-height: 1; color: var(--ink-3);
   opacity: .35; transition: opacity .12s;
   /* Without this a touch drag scrolls the table instead of moving the column. */
   touch-action: none;
@@ -422,7 +429,14 @@ body.dragging-col .hgrip { cursor: grabbing; }
 .hmeta .k { color: var(--ink-3); font-weight: 400; }
 #epoch-label b { font-weight: 600; color: var(--ink-2); }
 #epoch-label .k { color: var(--accent); }
-.hstats { display: flex; gap: 9px; margin-top: 5px; font-size: 10px; font-family: var(--mono); color: var(--ink-2); }
+/* Wraps rather than overflowing into the next column: the column is sized to the sample
+   image, which is narrower than the three metrics laid end to end. */
+.hstats {
+  display: flex; flex-wrap: wrap; gap: 2px 9px; margin-top: 5px;
+  font-size: 10px; font-family: var(--mono); color: var(--ink-2);
+  overflow: hidden;
+}
+.hstats > span { white-space: nowrap; }
 .hstats b { font-weight: 600; color: var(--ink); }
 .hstats .k { color: var(--ink-3); }
 .hsort { display: flex; gap: 5px; margin-top: 6px; align-items: center; }
@@ -677,8 +691,10 @@ body.dragging-col .hgrip { cursor: grabbing; }
    views the table offers, so the offset can be seen and not just read as a number. */
 .nbviews { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-bottom: 14px; }
 .nbviews figure { margin: 0; }
+/* Same aspect as the table's cells: --mask-w/--mask-h are set at boot from the scene, so
+   a hardcoded ratio here stretched the modal's panels (1.20 scene shown at 2:1). */
 .nbviews img {
-  width: 100%; aspect-ratio: 2 / 1; display: block;
+  width: 100%; aspect-ratio: var(--mask-w) / var(--mask-h); display: block;
   border-radius: 4px; image-rendering: pixelated; background: var(--surface-2);
 }
 .nbviews figcaption {
