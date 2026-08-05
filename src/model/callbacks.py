@@ -9,6 +9,7 @@ from composer.utils import format_name_with_dist
 from composer.loggers import WandBLogger
 
 from model.arch import com_distances, mses
+from model.attribution import capture_attention, ablate_lasers, ablate_freq_patches
 
 
 MAX_WANDB_IMAGES = 108  # wandb.Image caps any single log_images call at this many items
@@ -111,3 +112,91 @@ class OutputSaver(Callback):
 
     def after_forward(self, state, logger): self.save_outputs(state, logger, state.dataloader_label, state.timestamp.batch.value)
     def eval_after_forward(self, state, logger): self.save_outputs(state, logger, f'{state.dataloader_label or "eval"}', state.eval_timestamp.batch.value)
+
+# ***** AttributionSaver *****
+
+
+class AttributionSaver(Callback):
+    """Save which lasers / frequency bands the model relies on, per eval batch.
+
+    Two measures (see model/attribution.py for the full argument):
+    - cls-row attention over lasers and over freq patches, free with the forward pass;
+    - optionally, delta-MSE from zeroing each laser / freq patch, which costs
+      n_lasers + n_patches extra forwards and is the metric to actually trust.
+
+    Eval only, deliberately. At train time the 0.3 structured dropout is active, so
+    key_padding_mask is non-None and attention rows over dropped tokens are meaningless.
+    """
+
+    def __init__(self, save_interval, folder, filename='ep{epoch:04d}-ba{batch:06d}.pt', overwrite: bool = False, ablate: bool = False, max_ablate_batches: int = 1):
+        self.save_interval, self.folder, self.filename, self.overwrite = Time.from_input(save_interval, TimeUnit.EPOCH), folder, filename, overwrite
+        self.ablate, self.max_ablate_batches = ablate, max_ablate_batches
+        self._attn_cm = self._attn = None
+        self._n_ablated = 0
+        # see OutputSaver.force_save
+        self.force_save = False
+
+    def init(self, state: State, logger: Logger):
+        del logger
+        self.folder = format_name_with_dist(self.folder, state.run_name)
+        os.makedirs(self.folder, exist_ok=True)
+        # hooks must be attached here, not in __init__: callbacks are constructed before the
+        # Trainer compiles the model, so __init__ would hook a module the compiled wrapper skips.
+        # (Forward hooks do survive torch.compile -- dynamo just graph-breaks around them.)
+        self._attn_cm = capture_attention(self._module(state))
+        self._attn = self._attn_cm.__enter__()
+
+    def close(self, state: State, logger: Logger):
+        del state, logger
+        if self._attn_cm is not None:
+            self._attn_cm.__exit__(None, None, None)
+            self._attn_cm = self._attn = None
+
+    @staticmethod
+    def _module(state: State):
+        """The raw VibrationTransformer, unwrapping Composer's/compile's wrappers."""
+        m = state.model
+        for attr in ('_orig_mod', 'module'):
+            while hasattr(m, attr): m = getattr(m, attr)
+        return m
+
+    def save_attribution(self, state: State, logger: Logger, data_name: str, batch: int):
+        if not _is_due(self.save_interval, state, self.force_save) or not self._attn: return
+
+        n_lasers = state.batch['fft'].shape[1]
+        out = {}
+        # reduce on GPU before the copy: the un-reduced freq map is ~2.4M floats per sample.
+        # do this *before* any ablation, whose extra forwards overwrite the captured maps.
+        for axis, w in self._attn.items():
+            w = torch.stack([w[i] for i in sorted(w)], dim=1)  # (B_,n_layers,H,S-1)
+            if axis == 'freq': w = w.reshape(-1, n_lasers, *w.shape[1:]).mean(dim=1)  # mean over lasers
+            out[f'attn_{axis}'] = _to_cpu(w.mean(dim=0))  # (n_layers,H,S-1), keep layer/head split
+
+        if self.ablate and self._n_ablated < self.max_ablate_batches:
+            model, X, y = self._module(state), state.batch['fft'], state.batch['mask_true']
+            out['ablate_laser'] = torch.from_numpy(ablate_lasers(model, X, y))
+            out['ablate_freq'] = torch.from_numpy(ablate_freq_patches(model, X, y))
+            self._n_ablated += 1
+
+        path = os.path.join(self.folder, data_name, self.filename.format(epoch=state.timestamp.epoch.value, batch=batch))
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        if os.path.exists(path):
+            if not self.overwrite: raise FileExistsError(f'AttributionSaver: file already exists: {path}\nSet overwrite=True to overwrite.')
+            os.remove(path)
+        torch.save(out, path)
+
+        # scalars are wandb-safe (unlike the raw maps), so log the headline rankings there
+        scalars = {}
+        for axis in ('laser', 'freq'):
+            if (a := out.get(f'attn_{axis}')) is not None:
+                for i, v in enumerate(a.mean(dim=(0, 1)).tolist()): scalars[f'{data_name}/attn_{axis}/{i:03d}'] = v
+            if (b := out.get(f'ablate_{axis}')) is not None:
+                for i, v in enumerate(b.tolist()): scalars[f'{data_name}/ablate_{axis}/{i:03d}'] = v
+        if scalars: logger.log_metrics(scalars)
+
+    def eval_start(self, state, logger):
+        del state, logger
+        self._n_ablated = 0
+
+    def eval_after_forward(self, state, logger):
+        self.save_attribution(state, logger, state.dataloader_label or "eval", state.eval_timestamp.batch.value)

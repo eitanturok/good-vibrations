@@ -13,20 +13,6 @@ def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0) -> torch.Te
     freqs = torch.arange(end).unsqueeze(dim=1) * freqs.unsqueeze(dim=0)
     return torch.cat([freqs.cos(), freqs.sin()], dim=-1)
 
-# v1: not a rotation -- the h/w concat puts sines in the cosine slot, so cos^2+sin^2 != 1.
-# Still gives every position a distinct vector, so it trains (and beat v2 at 1000ep).
-# def precompute_freqs_cis_2d(dim: int, h: int, w: int, theta: float = 10000.0) -> torch.Tensor:
-#     freqs_h, freqs_w = precompute_freqs_cis(dim // 2, h, theta), precompute_freqs_cis(dim // 2, w, theta),
-#     freqs_h, freqs_w = freqs_h.reshape(h, 1, -1).repeat(1, w, 1), freqs_w.reshape(1, w, -1).repeat(h, 1, 1)
-#     return torch.cat([freqs_h, freqs_w], dim=-1).reshape(h * w, dim)
-
-# v2: a real rotation, but both axes reuse one frequency ladder so row/col angles stay proportional.
-# def precompute_freqs_cis_2d(dim: int, h: int, w: int, theta: float = 10000.0) -> torch.Tensor:
-#     freqs_h, freqs_w = precompute_freqs_cis(dim // 2, h, theta), precompute_freqs_cis(dim // 2, w, theta)
-#     cos_h, sin_h = (t.reshape(h, 1, -1).repeat(1, w, 1) for t in freqs_h.chunk(2, dim=-1))  # (h,w,dim//4)
-#     cos_w, sin_w = (t.reshape(1, w, -1).repeat(h, 1, 1) for t in freqs_w.chunk(2, dim=-1))  # (h,w,dim//4)
-#     return torch.cat([cos_h, cos_w, sin_h, sin_w], dim=-1).reshape(h * w, dim)
-
 def precompute_freqs_cis_2d(dim: int, h: int, w: int, theta: float = 10000.0) -> torch.Tensor:
     """2D RoPE (matches Pixtral/HF): rows take freqs[::2], cols freqs[1::2], so every channel gets a
     distinct rate. Returns [cos | sin] for apply_rope's half-split pairing of channel i with i+dim/2."""
@@ -195,13 +181,13 @@ class FreqEncoder(nn.Module):
     def forward(self, x, speaker=None):
         # x.shape = (B_L,P,C,PS) = (batch_size * n_lasers, n_patches, n_coords, patch_size)
         B_L, P, _, _ = x.shape
-        x = self.embed(x.reshape(B_L, P, -1))   # (B_L,P,C,PS) -> (B_L,P,D)
+        x = self.embed(x.reshape(B_L, P, -1))                                   # (B_L,P,C,PS)          -> (B_L,P,D)
         # drop entire freq patches by setting them to zero, don't actually remove them
-        x, keep = dropout(x, (B_L, P), self.freq_dropout, self.training) # (B_L,P,D) -> (B_L,P,D), (B_L,P)
-        x = apply_rope(x, self.freqs_cis)       # (B_L,P,D) -> (B_L,P,D)
-        if speaker is not None: x += self.speakers_embed(speaker).unsqueeze(1)  # (B_L,P,D), (B_L,1,D) -> (B_L,P,D)
-        x = torch.cat((self.cls_token.expand(B_L, -1, -1), x), dim=1)           # (B_L,P,D) -> (B_L,P+1,D)
-        output = self.layers(x, src_key_padding_mask=pad_mask(keep, B_L)) # (B_L,P+1,D) -> (B_L,P+1,D)
+        x, keep = dropout(x, (B_L, P), self.freq_dropout, self.training)        # (B_L,P,D)             -> (B_L,P,D), (B_L,P)
+        x = apply_rope(x, self.freqs_cis)                                       # (B_L,P,D)             -> (B_L,P,D)
+        if speaker is not None: x += self.speakers_embed(speaker).unsqueeze(1)  # (B_L,P,D), (B_L,1,D)  -> (B_L,P,D)
+        x = torch.cat((self.cls_token.expand(B_L, -1, -1), x), dim=1)           # (B_L,P,D)             -> (B_L,P+1,D)
+        output = self.layers(x, src_key_padding_mask=pad_mask(keep, B_L))       # (B_L,P+1,D)           -> (B_L,P+1,D)
         return output[:, 0, :]  # (B_L,P+1,D) -> (B_L,D)
 
 #***** 5 model *****

@@ -22,11 +22,15 @@
      The run column needs two chip lines (com, then the three metrics); the ground-truth
      column uses one, and simply has more headroom. */
   --row-h: 206px;
+  /* --mask-w is overwritten at boot from the scene's aspect (see app.js boot): the cell
+     box tracks the photo, not the mask grid. This literal is the 20x40 fallback used
+     until /api/lut answers. The column widths derive from it so they never clip a wider
+     box -- 20px is the cell's horizontal padding. */
   --mask-w: 220px;
   --mask-h: 110px;
-  --col-w: 240px;   /* same as --gt-w so masks align across the whole row */
+  --col-w: calc(var(--mask-w) + 20px);   /* same as --gt-w so masks align across the row */
   --idx-w: 52px;
-  --gt-w: 240px;
+  --gt-w: calc(var(--mask-w) + 20px);
 
   --r: 6px;
   --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
@@ -202,8 +206,15 @@ body.nosidebar #sidebar {
 #epoch-slider { flex: 1; accent-color: var(--accent); min-width: 0; }
 #epoch-max { flex: none; }
 
-/* Canvas cells render the mask client-side while scrubbing epochs. */
+/* Canvas cells render the mask client-side while scrubbing epochs.
+
+   Every canvas is stretched to the same --mask-w/--mask-h box regardless of its buffer
+   size, so a 16x16 and a 30x30 column already align over the same backdrop. `pixelated`
+   is the default because the cell grid is real -- the hover tooltip reads one value per
+   cell -- but body.smooth interpolates instead, which makes columns of different
+   resolutions directly comparable by eye. */
 canvas.mask { image-rendering: pixelated; }
+body.smooth canvas.mask { image-rendering: auto; }
 canvas.mask.bg { background-size: 100% 100%; background-repeat: no-repeat; background-color: var(--surface-2); }
 
 .check { display: flex; align-items: center; gap: 7px; margin-top: 10px; font-size: 11.5px; cursor: pointer; }
@@ -358,25 +369,42 @@ body.stacked .gtimg { margin-top: 114px; }
 .hcell.run.sorted { border-left-color: var(--accent); background: var(--accent-sf); }
 .hcell.run.dim { opacity: .62; }
 
-.htop { display: flex; align-items: baseline; gap: 4px; }
-/* Only the name gives way: the epoch sits beside it and the close button holds the far
-   edge, so a long run name ellipsises rather than pushing them out of the header. This
-   mirrors the run cells, where the same three parts share one line. */
+.htop { display: flex; align-items: center; gap: 5px; }
+/* Only the name gives way: the status chip rides beside it, the epoch is pushed to the
+   right edge by the name's flex, and the close button holds the far corner. A long run
+   name ellipsises rather than shoving any of them out of the header. */
 .hname {
   flex: 0 1 auto; min-width: 0;
-  font-size: 11.5px; font-weight: 600; white-space: nowrap;
+  font-size: 11.5px; font-weight: 700; white-space: nowrap;
   overflow: hidden; text-overflow: ellipsis; cursor: pointer;
 }
-.hep {
-  flex: none; margin-right: auto;
-  font-size: 10px; color: var(--ink-3); font-variant-numeric: tabular-nums;
+/* margin-left:auto is what right-aligns the epoch: everything before it packs left. */
+.hep { flex: none; margin-left: auto; }
+/* The chip sits on the name's line now, so it must not stretch to the row's height. */
+.htop .status { flex: none; align-self: center; }
+
+/* Drag handle. Faint until the column is hovered, like .hclose -- always-on grips on
+   every column would compete with the run names for attention. */
+.hgrip {
+  flex: none; cursor: grab; user-select: none;
+  font-size: 11px; line-height: 1; color: var(--ink-3);
+  opacity: .35; transition: opacity .12s;
+  /* Without this a touch drag scrolls the table instead of moving the column. */
+  touch-action: none;
 }
-.hep b { font-weight: 600; color: var(--ink-2); }
-.hep b.scrub { color: var(--accent); }
-/* In "ep x/y" only y is a control: clicking it pins every column to this run's endpoint. */
-.hep b.goep { cursor: pointer; text-decoration: underline dotted; text-underline-offset: 2px; }
-.hep b.goep:hover { color: var(--accent); }
-.hep .k { color: var(--ink-3); font-weight: 400; }
+.hcell.run:hover .hgrip { opacity: .9; }
+.hgrip:active { cursor: grabbing; }
+/* The dragged column lifts above its neighbours and follows the pointer 1:1; the columns
+   it displaces slide by one width. Only the displaced cells animate -- transitioning the
+   dragged one would make it lag the cursor. */
+.hcell.run.dragging, .cell.run.dragging {
+  position: relative; z-index: 50; opacity: .92;
+  box-shadow: 0 0 0 1px var(--accent), 0 6px 18px rgba(0, 0, 0, .18);
+}
+.hcell.run:not(.dragging), .cell.run:not(.dragging) { transition: transform .14s ease; }
+/* Kill text selection and the browser's own touch panning for the whole gesture. */
+body.dragging-col { user-select: none; cursor: grabbing; }
+body.dragging-col .hgrip { cursor: grabbing; }
 .hname:hover { color: var(--accent); }
 .hclose {
   flex: none; width: 16px; height: 16px; padding: 0; line-height: 1;
@@ -428,6 +456,29 @@ body.stacked .gtimg { margin-top: 114px; }
 .status.running i { animation: pulse 1.6s ease-in-out infinite; }
 @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: .25; } }
 
+/* Epoch badge. Deliberately the same pill as .status -- the two sit on the same line in
+   the header and the same line in every run cell, so a different shape would read as a
+   different kind of thing. Muted by default; it only takes colour while scrubbing, when
+   "which frame am I looking at" is the question being asked. */
+.epchip {
+  display: inline-flex; align-items: center; gap: 2px;
+  font-size: 9.5px; padding: 1px 6px; border-radius: 999px;
+  border: 1px solid var(--line-firm); white-space: nowrap; vertical-align: middle;
+  color: var(--ink-2); background: var(--surface-2);
+  font-variant-numeric: tabular-nums;
+}
+.epchip b { font-weight: 600; color: var(--ink-2); }
+.epchip .k { color: var(--ink-3); font-weight: 400; }
+/* Scrubbed off the latest epoch: the whole chip lights up, so a cell showing older
+   predictions is obvious at a glance. */
+.epchip.scrub {
+  border-color: var(--accent); background: var(--accent-sf);
+}
+.epchip.scrub b, .epchip.scrub .k { color: var(--accent); }
+/* In "x/y ep" only y is a control: clicking it pins every column to this run's endpoint. */
+.epchip b.goep { cursor: pointer; text-decoration: underline dotted; text-underline-offset: 2px; }
+.epchip b.goep:hover { color: var(--accent); }
+
 @media (prefers-color-scheme: dark) {
   .status.running  { color: #6cc292; background: #102a1d; }
   .status.finished { color: #7fb0ee; background: var(--accent-sf); }
@@ -445,13 +496,15 @@ body.stacked .gtimg { margin-top: 114px; }
 /* mask images */
 .mask {
   width: var(--mask-w); height: var(--mask-h); display: block; border-radius: 3px;
-  image-rendering: pixelated;                 /* keep 20x40 grid cells crisp */
+  image-rendering: pixelated;                 /* keep mask grid cells crisp */
   background: var(--surface-2);
 }
 .mask.nobg { background: repeating-conic-gradient(var(--surface-2) 0% 25%, var(--surface-1) 0% 50%) 50%/12px 12px; }
-/* Ground truth renders the same 20x40 grid at the same size as every prediction cell,
-   so masks line up across the row and can be compared directly. */
-.gtimg { width: 220px; height: 110px; }
+/* Ground truth renders the same grid at the same size as every prediction cell, so masks
+   line up across the row and can be compared directly. Uses the same variables as .mask
+   rather than repeating the numbers -- --mask-w is set from the scene aspect at boot, and
+   a literal here would silently desync the GT column from every prediction beside it. */
+.gtimg { width: var(--mask-w); height: var(--mask-h); }
 
 .gtcell { cursor: pointer; }
 .gtcell:hover .gtimg { outline: 2px solid var(--accent); outline-offset: 1px; }
@@ -480,10 +533,17 @@ body.stacked .gtimg { margin-top: 114px; }
    the 13px the title budget allows. */
 .ctitle .t1.run { display: flex; align-items: center; gap: 4px; }
 .ctitle .rn { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.ctitle .t1 b, .ctitle .t1 .sp { flex: none; }
-.ctitle .t1 b { font-weight: 600; color: var(--ink-3); font-variant-numeric: tabular-nums; }
-.ctitle .t1 b.scrub { color: var(--accent); }
-.ctitle .t1 .sp { font-weight: 400; color: var(--ink-3); }
+.ctitle .t1 .sp { flex: none; font-weight: 400; color: var(--ink-3); }
+/* The epoch chip holds the right edge, so epochs line up down the column and the run
+   name is the only part that ellipsises. */
+.ctitle .t1 .epchip { flex: none; margin-left: auto; }
+/* The title line budget is 13px and a pill is taller than its text. Trim the padding and
+   let it overflow its line box symmetrically rather than growing the row -- .ctitle
+   clips, and the virtualizer depends on that fixed height. */
+.ctitle .epchip {
+  font-size: 9px; padding: 0 5px; line-height: 12px;
+  height: 13px; box-sizing: border-box;
+}
 
 /* One chip style for every field in the grid -- metrics, COM, layout -- so the columns
    read as one system. */
@@ -512,8 +572,6 @@ body.stacked .gtimg { margin-top: 114px; }
 .subtags .tag { font-family: var(--mono); padding: 1px 4px; }
 .subtags .k { color: var(--ink-3); }
 .subtags b { font-weight: 600; color: var(--ink); }
-/* Epoch chip: accented while scrubbing so a cell showing older predictions is obvious. */
-.tag.ep.scrub { border-color: var(--accent); color: var(--accent); background: var(--accent-sf); }
 
 .nopred {
   width: var(--mask-w); height: var(--mask-h);

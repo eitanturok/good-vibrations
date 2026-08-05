@@ -56,6 +56,48 @@ def mask_shapes(samples_dir) -> list[tuple[int, int]]:
             break
     return sorted(out)
 
+
+def usable_mask_shapes(samples_dir) -> list[tuple[int, int]]:
+    """mask_shapes(), minus sizes with no usable masks, best first.
+
+    A dataset can ship a size that was written but never properly filled in: the
+    gastronorm 20x40 masks are non-zero yet carry ~300x less mass than the 16x16 and
+    30x30 masks of the same scenes, so anything scored against them reads as ~0 IoU.
+    Ranking on COVERAGE (mean mask value) rather than a non-empty count is what separates
+    those from a real target -- by count all three sizes tie, since the same 2952 samples
+    are non-empty at every size.
+    """
+    import numpy as np
+    try:
+        dirs = sorted(p for p in samples_dir.iterdir() if p.is_dir())
+    except OSError:
+        return []
+    # Spread the probes over the WHOLE dataset rather than taking the first N. Empty-box
+    # samples are not scattered at random -- the gastronorm captures open with a run of
+    # them, so probing the head finds every size empty and declares the dataset unusable.
+    step = max(1, len(dirs) // 60)
+    probes = dirs[::step][:60]
+    scored = []
+    for h, w in mask_shapes(samples_dir):
+        cov = []
+        for d in probes:
+            for f in (d / "image").glob(f"*_downsampled_smask_{h}h_{w}w.npy"):
+                try:
+                    cov.append(float(np.asarray(np.load(f), dtype=np.float64).mean()))
+                except Exception:
+                    pass
+        # A real target covers ~1% of the frame. The threshold only has to separate that
+        # from the degenerate sizes, which sit three orders of magnitude below it.
+        if cov and float(np.mean(cov)) > 1e-3:
+            scored.append((h, w))
+    # Finest grid first. Coverage decides only WHICH sizes are usable, never their order:
+    # the same scenes at two resolutions have near-identical coverage (16x16 and 30x30
+    # here agree to six decimals), so ranking on it would pick a default out of
+    # floating-point noise. Resolution is a real, stable preference.
+    scored.sort(key=lambda t: -(t[0] * t[1]))
+    return scored
+
+
 # Sample-directory layout is NOT fixed across experiments. Both eras keep their per-sample
 # images in `image/`, but the filenames inside differ: experiment-25 uses a `05_` mask
 # prefix, the gastronorm experiments a `04_` prefix and a differently named crop. Nothing
@@ -64,8 +106,39 @@ def mask_shapes(samples_dir) -> list[tuple[int, int]]:
 #
 # Every entry is a path RELATIVE TO A SAMPLE DIR. `{h}`/`{w}` are filled with MASK_H and
 # MASK_W so the mask name follows the configured target shape.
+# A layout entry names a FILENAME SCHEME, not a dataset. The two used to coincide, but the
+# current experiment-25 capture breaks that: it writes `06_..._20h_40w.npy` alongside
+# `04_..._30h_30w.npy`, so one dataset needs two entries because the numeric prefix varies
+# with the mask size. `dataset` therefore carries the data identity separately, and
+# EVAL_SPLITS is keyed on it -- without that split, selecting 30x30 would match this
+# capture against gastronorm's split whitelist and reject every experiment-25 run as
+# "different dataset".
 LAYOUTS = {
+    # The experiment-25 capture currently on disk, at 20x40. Same underlying data as
+    # "experiment-25" below, re-exported with shifted prefixes: `06_` mask (not `05_`) and
+    # the cropped overhead as backdrop rather than `01_cropped.png`. Nothing in the files
+    # declares the era, hence a separate entry probed ahead of the older one.
+    "experiment-25-v2": {
+        "dataset": "experiment-25",
+        "image_dir": "image",
+        "gt_mask": "image/06_downsampled_smask_{h}h_{w}w.npy",
+        "backdrop": "image/02_cropped_overhead.png",
+        "overhead": "image/06_overhead_speaker.png",  # detail modal (shows the speaker)
+        "audio": {"original": "audio.wav", "recovered": "recovered_audio.wav"},
+    },
+    # The same capture at 30x30, where the mask prefix is `04_` instead of `06_`. Listed
+    # ahead of "gastronorm", which uses the identical mask filename and backdrop and would
+    # otherwise absorb this dataset and apply the wrong split whitelist to its runs.
+    "experiment-25-v2-30h": {
+        "dataset": "experiment-25",
+        "image_dir": "image",
+        "gt_mask": "image/04_downsampled_smask_{h}h_{w}w.npy",
+        "backdrop": "image/02_cropped_overhead.png",
+        "overhead": "image/06_overhead_speaker.png",
+        "audio": {"original": "audio.wav", "recovered": "recovered_audio.wav"},
+    },
     "experiment-25": {
+        "dataset": "experiment-25",
         "image_dir": "image",
         "gt_mask": "image/05_downsampled_smask_{h}h_{w}w.npy",
         # The cropped frame is the one the masks were derived from: 02_smask.npy is
@@ -79,6 +152,7 @@ LAYOUTS = {
         "audio": {"original": "audio.wav", "recovered": "recovered_audio.wav"},
     },
     "gastronorm": {
+        "dataset": "gastronorm",
         "image_dir": "image",
         "gt_mask": "image/04_downsampled_smask_{h}h_{w}w.npy",
         "backdrop": "image/02_cropped_overhead.png",
@@ -93,7 +167,9 @@ LAYOUTS = {
 }
 
 # Probed in order; the first layout whose mask file exists in a sample dir wins.
-LAYOUT_ORDER = ["experiment-25", "gastronorm"]
+LAYOUT_ORDER = [
+    "experiment-25-v2", "experiment-25-v2-30h", "experiment-25", "gastronorm",
+]
 
 # Per-sample extras shown in the detail modal. The recovery laser index varies by
 # experiment (50 on experiment-25, 55 on gastronorm), and gastronorm drops the axis
@@ -120,11 +196,25 @@ class Layout:
     def __init__(self, name: str, spec: dict):
         fmt = {"h": MASK_H, "w": MASK_W}
         self.name = name
+        self._gt_mask_spec = spec["gt_mask"]
+        # Which data this is, independent of the filename scheme `name` identifies. Two
+        # layouts can share a dataset (the same capture at two mask sizes); run
+        # compatibility keys on this, never on `name`.
+        self.dataset = spec.get("dataset", name)
         self.image_dir = spec["image_dir"]
         self.gt_mask = spec["gt_mask"].format(**fmt)
         self.backdrop = spec["backdrop"].format(**fmt)
         self.overhead = spec["overhead"].format(**fmt)
         self.audio = dict(spec["audio"])
+
+    def gt_mask_for(self, h: int, w: int) -> str:
+        """The ground-truth filename at an arbitrary grid, not just the default one.
+
+        A dataset ships several downsample sizes side by side and different runs are
+        trained on different ones, so viz2 has to be able to name any of them -- not only
+        the size that happened to be current when this Layout was built.
+        """
+        return self._gt_mask_spec.format(h=h, w=w)
 
     @classmethod
     def detect(cls, samples_dir) -> "Layout":

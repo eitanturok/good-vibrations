@@ -63,9 +63,77 @@ class GtIndex:
     # dataset starts at 000009, and any dataset can be missing a sample whose mask was
     # never written. Every id->row lookup must go through this.
     row_of: dict[int, int] = field(default_factory=dict)
+    # Ground truth at OTHER grid sizes, loaded on demand: {(h,w): (N,h,w)}. Runs are
+    # trained at different resolutions and each must be scored against its own target,
+    # so the table can hold a 16x16 column beside a 30x30 one. Same rows, same order as
+    # `masks`, so gt.row_of indexes every entry here too.
+    # None is cached for a shape this dataset has no masks at, so a missing size is
+    # probed once rather than re-walking 3000 sample dirs on every request.
+    by_shape: dict[tuple[int, int], np.ndarray | None] = field(default_factory=dict)
+    experiment_dir: Path | None = None
+    _shapes: list[tuple[int, int]] | None = None   # memo for disk_shapes()
+    _com: dict[tuple[int, int], np.ndarray | None] = field(default_factory=dict)
 
     def __len__(self) -> int:
         return len(self.sample_ids)
+
+    def masks_at(self, shape: tuple[int, int]) -> np.ndarray | None:
+        """Targets at `shape`, or None if this dataset has no usable masks that size.
+
+        Rows are aligned with `sample_ids`: a sample missing its mask at this size gets
+        zeros rather than being dropped, because dropping it would shift every later row
+        out of step with `masks` and silently mis-pair predictions with targets.
+        """
+        if shape == (self.masks.shape[1], self.masks.shape[2]):
+            return self.masks
+        if shape in self.by_shape:
+            return self.by_shape[shape]
+        if self.experiment_dir is None:
+            return None
+        h, w = shape
+        rel = self.layout.gt_mask_for(h, w)
+        out = np.zeros((len(self.sample_ids), h, w), dtype=np.float32)
+        found = False
+        for i, sid in enumerate(self.sample_ids):
+            p = self.experiment_dir / "samples" / sid / rel
+            try:
+                m = np.asarray(np.load(p), dtype=np.float32)
+            except Exception:
+                continue
+            if m.shape == shape:
+                out[i] = m
+                found = True
+        self.by_shape[shape] = out if found else None
+        return self.by_shape[shape]
+
+    def com_at(self, shape: tuple[int, int]) -> np.ndarray | None:
+        """Target centers of mass in `shape`'s grid coordinates, memoized.
+
+        com_gt is the primary shape only; a run at another grid must be compared against
+        targets measured on ITS grid, or the comparison mixes two coordinate systems.
+        """
+        if shape not in self._com:
+            m = self.masks_at(shape)
+            self._com[shape] = (None if m is None
+                                else np.asarray(center_of_mass(m), dtype=np.float64))
+        return self._com[shape]
+
+    def disk_shapes(self) -> list[tuple[int, int]]:
+        """Every grid size this dataset ships masks at, cheaply and cached.
+
+        Only reads filenames, so it stays usable from _classify's rejection path -- which
+        runs once per incompatible run on every rescan, i.e. every 10s.
+        """
+        if self._shapes is None:
+            self._shapes = (
+                [(self.masks.shape[1], self.masks.shape[2])]
+                if self.experiment_dir is None
+                else config.mask_shapes(self.experiment_dir / "samples"))
+        return self._shapes
+
+    def has_shape(self, shape) -> bool:
+        """Whether targets exist at `shape`, without decoding them."""
+        return tuple(shape) in {tuple(s) for s in self.disk_shapes()}
 
 
 def load_gt(experiment_dir: Path) -> GtIndex:
@@ -95,7 +163,8 @@ def load_gt(experiment_dir: Path) -> GtIndex:
     com_gt = np.asarray(center_of_mass(masks), dtype=np.float64)
     avg_com = np.asarray([parse_com(m.get("avg_com")) for m in meta], dtype=np.float64)
     row_of = {int(s): i for i, s in enumerate(ids)}
-    return GtIndex(ids, masks, meta, com_gt, avg_com, layout, row_of)
+    return GtIndex(ids, masks, meta, com_gt, avg_com, layout, row_of,
+                   experiment_dir=experiment_dir)
 
 
 # ***** run scanning *****
@@ -111,6 +180,7 @@ class RunEntry:
     eval_splits: list[str] = field(default_factory=list)
     family: str = "unknown"
     status: str = "unknown"     # running | finished | crashed | unknown
+    shape: tuple[int, int] | None = None   # grid this run was trained at
 
 
 def _epoch_of(p: Path) -> int:
@@ -235,8 +305,20 @@ def _classify(name: str, run_dir: Path, gt: GtIndex) -> RunEntry:
     shape = obj["shape"]
     if shape is None:
         return RunEntry(name, False, "no mask_pred in payload")
-    if shape != (config.MASK_H, config.MASK_W):
-        return RunEntry(name, False, f"mask shape {shape}, expected {(config.MASK_H, config.MASK_W)}")
+    # A run is comparable at whatever grid it was trained on, as long as this dataset
+    # ships targets that size -- runs at different resolutions can sit in one table.
+    # Both metrics are grid-normalized (soft-IoU is a ratio, mse averages over cells), so
+    # the columns share a scale; the header labels the size because a coarser grid is
+    # systematically easier, not because the numbers are in different units.
+    # has_shape(), not masks_at(): classification only needs to know whether targets that
+    # size EXIST, and masks_at decodes all 3000 of them to answer that -- ~13MB per shape
+    # allocated during a scan for columns the user may never open. The full array loads
+    # lazily on the first request that renders one. Note this is deliberately every shape
+    # on disk, not usable_mask_shapes(): that one drops degenerate sizes because they make
+    # a bad DEFAULT, but a run trained on one is still legitimately comparable against it.
+    if not gt.has_shape(shape):
+        have = ", ".join(f"{a}x{b}" for a, b in gt.disk_shapes()) or "none"
+        return RunEntry(name, False, f"mask shape {shape}, no ground truth that size (have: {have})")
 
     if not {"sample_id", "x_com"} <= obj["info_keys"]:
         return RunEntry(name, False, "legacy info schema")
@@ -245,28 +327,61 @@ def _classify(name: str, run_dir: Path, gt: GtIndex) -> RunEntry:
 
     # Sample ids collide across experiments, so a run from another dataset would join
     # cleanly against the loaded ground truth and produce silently wrong metrics.
-    # Where the layout declares its split names, that is the strongest available signal.
-    allowed = config.EVAL_SPLITS.get(gt.layout.name)
+    # Where the dataset declares its split names, that is the strongest available signal.
+    # Keyed on layout.dataset, NOT layout.name: one dataset can be read through several
+    # layouts (the same capture at two mask sizes), and keying on the filename scheme
+    # would apply the wrong whitelist and reject every run as "different dataset".
+    allowed = config.EVAL_SPLITS.get(gt.layout.dataset)
     if allowed is not None:
         if splits and not set(splits) <= allowed:
             preview = ", ".join(splits[:3])
             return RunEntry(name, False, f"different dataset (eval splits: {preview})",
                             eval_splits=splits)
     else:
-        # No whitelist for this layout: fall back to requiring that EVERY sample id in
+        # No whitelist for this dataset: fall back to requiring that EVERY sample id in
         # the probe exists here. Weaker than matching split names -- two datasets with
         # overlapping id ranges still pass -- so it is a backstop for a not-yet-declared
-        # layout, not a substitute for adding one to config.EVAL_SPLITS.
+        # dataset, not a substitute for adding one to config.EVAL_SPLITS.
         probe_ids = obj["sample_ids"]
         if probe_ids and not all(int(s) in gt.row_of for s in probe_ids):
             return RunEntry(name, False, "different dataset (sample ids not in this dataset)",
                             eval_splits=splits)
 
-    family = gt.layout.name if splits else "unknown"
+    family = gt.layout.dataset if splits else "unknown"
     # Recency comes from the highest-epoch file rather than a stat() of every .pt: epochs
     # are written in order, so it ranks runs identically at a fraction of the cost.
     newest = files[0]
-    return RunEntry(name, True, None, newest.stat().st_mtime, _epoch_of(newest), splits, family)
+    return RunEntry(name, True, None, newest.stat().st_mtime, _epoch_of(newest), splits,
+                    family, shape=shape)
+
+
+def most_trained_shape(runs_dir: Path, allowed, sample: int = 40) -> tuple[int, int] | None:
+    """The grid most runs under `runs_dir` were trained at, restricted to `allowed`.
+
+    Which size to default to is a property of the RUNS, not of the dataset: an experiment
+    can ship targets at several sizes while its runs overwhelmingly use one of them.
+
+    Lives here rather than in config so it can reuse _pred_files (scandir, ~8x faster
+    than glob over the same tree) and _probe (cached in _PROBE_CACHE, so the .pt reads
+    are shared with the scan_runs that follows moments later instead of paid twice).
+    Only the newest `sample` runs are probed -- they are both what is being compared and
+    the best predictor of the current grid, and this only picks a default --mask overrides.
+    """
+    from collections import Counter
+    allowed = {tuple(a) for a in allowed}
+    counts: Counter = Counter()
+    try:
+        dirs = [p for p in runs_dir.iterdir() if (p / config.OUTPUTS_SUBDIR).is_dir()]
+    except OSError:
+        return None
+    # Newest first, so a long tail of abandoned runs cannot outvote current work.
+    dirs.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    for d in dirs[:sample]:
+        files = sorted(_pred_files(d / config.OUTPUTS_SUBDIR), key=_epoch_of, reverse=True)
+        obj, _ = _probe(files)
+        if obj and obj["shape"] and tuple(obj["shape"]) in allowed:
+            counts[tuple(obj["shape"])] += 1
+    return counts.most_common(1)[0][0] if counts else None
 
 
 def scan_runs(runs_dir: Path, gt: GtIndex) -> list[RunEntry]:
@@ -298,6 +413,10 @@ class RunData:
     row_of: dict[int, int]
     skipped_files: list[str]
     family: str = "unknown"
+    # Grid this run predicts at. Required, not defaulted: the table mixes resolutions, so
+    # there is no sensible fallback, and a default evaluated at import time would freeze
+    # config.MASK_H/W from before --mask ran.
+    shape: tuple[int, int] = (0, 0)
 
 
 def _split_dirs(outputs: Path) -> list[tuple[str, Path]]:
@@ -352,9 +471,14 @@ def run_epochs(name: str, runs_dir: Path) -> list[int]:
     # The newest epoch is the one at risk: a run killed mid-write leaves a truncated .pt
     # that still names a valid epoch. Verify only that one -- the cost is a single load,
     # and older epochs were completed before the next began.
-    while eps and (name, eps[-1]) not in _DEAD_EPOCHS:
+    while eps:
         newest = eps[-1]
+        # A previously-dead epoch gets ANOTHER look rather than being trusted forever.
+        # For a run that is still training, the newest .pt is routinely caught mid-write;
+        # a permanent blacklist meant that one transient failure hid every epoch from
+        # then on, which is why a live run appeared frozen at an old epoch until reload.
         if any(_loadable(p) for p in files if _epoch_of(p) == newest):
+            _DEAD_EPOCHS.discard((name, newest))
             break
         _DEAD_EPOCHS.add((name, newest))
         eps.pop()
@@ -363,14 +487,28 @@ def run_epochs(name: str, runs_dir: Path) -> list[int]:
 
 
 @lru_cache(maxsize=4096)
-def _loadable(path: Path) -> bool:
-    """Whether a prediction file can actually be read. Cached: a file that parsed once
-    will not stop parsing, and a truncated one will not start."""
+def _loadable_at(path: Path, mtime: float, size: int) -> bool:
+    """Whether a prediction file can be read, keyed on its identity ON DISK.
+
+    A file that parsed once will not stop parsing, but a file that FAILED can very much
+    start working: a run writing ep0500 right now yields a truncated read, and moments
+    later the same path is a complete tensor. Keying the cache on (mtime, size) means the
+    finished file is a different key from the half-written one, so the failure expires by
+    itself instead of blacklisting a live run's newest epoch for the process lifetime.
+    """
     try:
         torch.load(path, map_location="cpu", weights_only=False)
         return True
     except Exception:
         return False
+
+
+def _loadable(path: Path) -> bool:
+    try:
+        st = path.stat()
+    except OSError:
+        return False
+    return _loadable_at(path, st.st_mtime, st.st_size)
 
 
 def load_run(name: str, runs_dir: Path, gt: GtIndex, family: str = "unknown",
@@ -461,10 +599,23 @@ def load_run(name: str, runs_dir: Path, gt: GtIndex, family: str = "unknown",
     if len(sample_ids) == 0:
         empty_f = np.zeros(0, dtype=np.float64)
         return RunData(name, epoch, sample_ids, preds, splits, empty_f, empty_f,
-                       empty_f, np.zeros((0, 2)), {}, skipped, family)
+                       empty_f, np.zeros((0, 2)), {}, skipped, family,
+                       (preds.shape[-2], preds.shape[-1]))
+
+    # Score against ground truth AT THIS RUN'S GRID. Runs trained at different
+    # resolutions each get their own targets, so a 16x16 and a 30x30 column can sit side
+    # by side; scoring both against one fixed size would broadcast-error or, worse,
+    # compare a prediction to a target of a different shape.
+    shape = (preds.shape[-2], preds.shape[-1])
+    gt_masks = gt.masks_at(shape)
+    if gt_masks is None:
+        empty_f = np.zeros(0, dtype=np.float64)
+        return RunData(name, epoch, np.zeros(0, dtype=np.int64),
+                       np.zeros((0, *shape), dtype=np.float32), [], empty_f, empty_f,
+                       empty_f, np.zeros((0, 2)), {}, skipped, family, shape)
 
     pred = torch.from_numpy(preds)
-    truth = torch.from_numpy(gt.masks[gt_rows])
+    truth = torch.from_numpy(gt_masks[gt_rows])
 
     # mask_pred is already sigmoid probabilities -- do not re-sigmoid.
     mse = (pred - truth).square().mean(dim=(-2, -1)).numpy()
@@ -483,7 +634,7 @@ def load_run(name: str, runs_dir: Path, gt: GtIndex, family: str = "unknown",
 
     row_of = {int(s): i for i, s in enumerate(sample_ids)}
     return RunData(name, epoch, sample_ids, pred.numpy(), splits,
-                   mse, iou, comdist, com_pred, row_of, skipped, family)
+                   mse, iou, comdist, com_pred, row_of, skipped, family, shape)
 
 
 # ***** registry *****
