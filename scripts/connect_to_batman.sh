@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Run on the LAPTOP: hold an SSH tunnel to batman's viz2 dashboard in tmux, then open localhost.
+# Run on the LAPTOP: hold an SSH tunnel to batman's viz dashboard in tmux, then open localhost.
 #   ./connect_to_batman.sh        tunnel on 8504, attach
 #   ./connect_to_batman.sh 8504 -d   set up in the background
 set -u
