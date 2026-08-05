@@ -156,19 +156,22 @@ def api_run(name: str, reload: int = 0, epoch: int | None = None):
 
 
 @app.get("/api/mask.png")
-def api_mask(run: str, sid: int, mode: str = "pred", bg: int = 1):
+def api_mask(run: str, sid: int, mode: str = "pred", bg: int = 1, rel: int = 0):
     i = _sid(sid)
     rd = _run(run)
     if i not in rd.row_of:
         raise HTTPException(404, "no prediction for this sample")
     mode = mode if mode in ("diff", "overlay", "stacked") else "pred"
-    img = render.cached_mask("run", run, i, mode, bool(bg))
+    # `rel` is in the URL, not just the cache key: these responses are immutable for a
+    # year, so a colour scale that did not change the URL would keep serving the browser
+    # its previously-cached rendering after the checkbox is toggled.
+    img = render.cached_mask("run", run, i, mode, bool(bg), bool(rel))
     return Response(img, media_type=render.media_type(img), headers=IMMUTABLE)
 
 
 @app.get("/api/gt_mask.png")
-def api_gt_mask(sid: int, bg: int = 1):
-    img = render.cached_mask("gt", "", _sid(sid), "pred", bool(bg))
+def api_gt_mask(sid: int, bg: int = 1, rel: int = 0):
+    img = render.cached_mask("gt", "", _sid(sid), "pred", bool(bg), bool(rel))
     return Response(img, media_type=render.media_type(img), headers=IMMUTABLE)
 
 

@@ -43,7 +43,9 @@ const S = {
     findSamples: new Set(), findPositions: new Set(),
   },
   sort: { run: null, metric: "comdist", dir: "worst" },
-  view: { mode: "pred", background: true },
+  // relative=false is the default on purpose: a fixed [0,1] domain is the only scale
+  // under which two cells mean the same thing, which is the point of a comparison table.
+  view: { mode: "pred", background: true, relative: false },
   domain: {}, positions: [], activePos: -1, modalRow: -1,
   renderVersion: 0,   // from /api/runs; part of image URLs to defeat immutable caching
   lut: null,          // colormaps from the server, so client and server agree on colour
@@ -390,20 +392,19 @@ function statsFor(name) {
   return out;
 }
 
-/* How far the run has trained: just that number, not "current/last". The two only differ
-   while the epoch slider is scrubbed back, so the second number is shown only then --
-   otherwise it is the same value twice and costs header width the run name needs.
-   The epoch number is a control: clicking it pins every column to this run's last epoch,
-   which is how you line the table up on one run's endpoint. */
+/* "which epoch am I looking at, out of how many the run trained for" -- always both, so
+   the column says where it is without the reader having to remember whether the slider is
+   scrubbed. The chip is also a control: clicking the second number pins every column to
+   this run's last epoch, which is how you line the table up on one run's endpoint. */
 function epochLabel(run) {
   const r = S.runs[run];
   const eps = r.epochs || [];
   const last = eps.length ? eps[eps.length - 1] : r.epoch;
   const shown = epochFor(run);
-  const goep = `<b class="goep" data-ep="${last}" title="Show every column at epoch ${last}">${last}</b>`;
-  const scrubbed = shown != null && shown !== last;
-  return `<span class="epchip${scrubbed ? " scrub" : ""}">` +
-    (scrubbed ? `<b>${shown}</b><span class="k">/</span>${goep}` : goep) +
+  const cur = shown == null ? last : shown;
+  return `<span class="epchip${cur === last ? "" : " scrub"}">` +
+    `<b>${cur}</b><span class="k">/</span>` +
+    `<b class="goep" data-ep="${last}" title="Show every column at epoch ${last}">${last}</b>` +
     `<span class="k">ep</span></span>`;
 }
 
@@ -539,8 +540,11 @@ function renderHeader() {
       ${skipped ? `<div class="hmeta">${skipped.replace(/^ · /, "")}</div>` : ""}
       <div class="hstats">${METRICS.map((m) => {
         const s = st[m.key];
-        return `<span><span class="k">${m.short}</span> <b>${s ? fmt(s.mean, 3) : "–"}</b>${
-          s ? `<span class="k">±${fmt(s.sd, 3)}</span>` : ""}</span>`;
+        // mse runs two orders of magnitude smaller than the others (3e-4 on a good run vs
+        // 4e-2 on a poor one), so 3dp collapses the good ones to "0.000±0.001".
+        const dp = m.key === "mse" ? 5 : 3;
+        return `<span><span class="k">${m.short}</span> <b>${s ? fmt(s.mean, dp) : "–"}</b>${
+          s ? `<span class="k">±${fmt(s.sd, dp)}</span>` : ""}</span>`;
       }).join("")}</div>
       <div class="hsort">
         <select>${METRICS.map((m) =>
@@ -579,7 +583,8 @@ function renderHeader() {
    cached the old one. Table prediction cells no longer use images -- they are canvases
    drawn from /api/frames -- so this covers the ground-truth column and the modals. */
 function gtMaskURL(sid) {
-  return `/api/gt_mask.png?sid=${sid}&bg=${S.view.background ? 1 : 0}&v=${S.renderVersion}`;
+  return `/api/gt_mask.png?sid=${sid}&bg=${S.view.background ? 1 : 0}` +
+         `&rel=${S.view.relative ? 1 : 0}&v=${S.renderVersion}`;
 }
 
 function buildRow() {
@@ -694,7 +699,21 @@ function paintRow(el, rank) {
       chips.innerHTML = "";
       m.hidden = true;
       m.style.backgroundImage = "";
-      if (!c._np) { c._np = document.createElement("div"); c._np.className = "nopred"; c._np.textContent = "no prediction"; c.appendChild(c._np); }
+      if (!c._np) { c._np = document.createElement("div"); c._np.className = "nopred"; c.appendChild(c._np); }
+      // Three different situations used to read "no prediction" alike, which made a
+      // 250ms debounce look identical to data that was never written:
+      //   loading  -- metrics for this epoch are in flight
+      //   not saved -- the run covers this sample, but this epoch did not save it. The
+      //               train loader uses drop_last + shuffle, so each epoch discards a
+      //               different remainder (see src/model/dataset.py build_dataset).
+      //   not in run -- the sample is outside this run's split entirely.
+      const covered = (S.runs[name].splitOf || {})[s.i];
+      const st = S.runs[name].metricsPending !== undefined ? ["loading", "loading…", "fetching metrics for this epoch"]
+        : covered ? ["unsaved", "not saved", `this run covers this sample, but epoch ${shownEp ?? "?"} saved no prediction for it`]
+        : ["nopred", "not in run", "this sample is not in this run's split"];
+      c._np.className = "nopred " + st[0];
+      c._np.textContent = st[1];
+      c._np.title = st[2];
       c._np.hidden = false;
       return;
     }
@@ -709,7 +728,7 @@ function paintRow(el, rank) {
       METRICS.map((mm) => {
         const v = e[mm.key];
         return `<span class="tag"><span class="k">${mm.short}</span> <b>${
-          v == null ? "–" : fmt(v, mm.key === "mse" ? 4 : 3)}</b></span>`;
+          v == null ? "–" : fmt(v, mm.key === "mse" ? 5 : 3)}</b></span>`;
       }).join("");
     m.hidden = false;
     // Match the canvas buffer to THIS run's grid. Rows are recycled across runs, so a
@@ -1207,6 +1226,22 @@ function half(u) {
   return s * Math.pow(2, e - 15) * (1 + m / 1024);
 }
 
+/* This mask's own value range, for the relative colour view. Mirrors render.domain_of so
+   a canvas cell and a server-rendered PNG of the same mask agree. Diff needs only the
+   half-span, since its domain is symmetric about zero. */
+function sampleDomain(v, truth, mode, n) {
+  let lo = Infinity, hi = -Infinity, span = 0;
+  for (let i = 0; i < n; i++) {
+    const x = mode === "diff" ? v[i] - truth[i] : v[i];
+    if (!Number.isFinite(x)) continue;
+    if (x < lo) lo = x;
+    if (x > hi) hi = x;
+  }
+  if (lo === Infinity) return null;
+  span = Math.max(Math.abs(lo), Math.abs(hi), 1e-6);
+  return { lo, hi, span };
+}
+
 /* Draws a (20,40) mask into a canvas using the server's own LUT, so a cell looks
    identical whether the client painted it or the server rendered a PNG. */
 function drawMask(canvas, values, mode, truth, shape) {
@@ -1236,15 +1271,23 @@ function drawMask(canvas, values, mode, truth, shape) {
 
   ctx.clearRect(0, 0, w, h);
   for (const { v, lut, k } of layers) {
+    // Per-sample domain, matching render.domain_of on the server. Computed per LAYER so
+    // overlay scales truth and prediction independently, as the server does.
+    const dom = S.view.relative ? sampleDomain(v, truth, mode, n) : null;
     for (let i = 0; i < n; i++) {
       let t, a;
       if (mode === "diff") {
-        const d = Math.max(-1, Math.min(1, v[i] - truth[i]));
+        let d = Math.max(-1, Math.min(1, v[i] - truth[i]));
+        // Magnitude only: the midpoint stays "no difference", so rescaling can never
+        // move a cell onto the opposite arm of the diverging ramp.
+        if (dom) d = Math.max(-1, Math.min(1, d / dom.span));
         const mag = Math.pow(Math.abs(d), gamma);
         t = 0.5 + 0.5 * Math.sign(d) * mag;
         a = mag;
       } else {
-        t = Math.pow(Math.max(0, Math.min(1, v[i])), gamma);
+        let x = Math.max(0, Math.min(1, v[i]));
+        if (dom) x = dom.hi - dom.lo > 1e-6 ? Math.max(0, Math.min(1, (x - dom.lo) / (dom.hi - dom.lo))) : 0;
+        t = Math.pow(x, gamma);
         a = t;
       }
       const c = lut[Math.round(t * (lut.length - 1))] || [0, 0, 0];
@@ -1425,14 +1468,19 @@ function stepEpoch(delta) {
 const HOLD_DELAY = 350;   // before repeat begins
 const HOLD_EVERY = 60;    // ~16 epochs/sec while held
 
-function holdToRepeat(btn, step) {
+function holdToRepeat(btn, step, focusTarget) {
   let raf = 0, timer = 0;
   const stop = () => {
     cancelAnimationFrame(raf); clearTimeout(timer); raf = timer = 0;
   };
   btn.addEventListener("pointerdown", (e) => {
     if (e.button !== 0 || btn.disabled) return;
+    // preventDefault stops the drag-select that a hold would otherwise start, but it also
+    // suppresses the focus the click would have given us -- which left focus on <body>, so
+    // the arrow keys did nothing after clicking these buttons. Hand focus to the slider
+    // instead, so keyboard stepping continues from wherever the buttons left off.
     e.preventDefault();
+    if (focusTarget && !focusTarget.disabled) focusTarget.focus();
     btn.setPointerCapture(e.pointerId);   // keep repeating if the cursor slides off
     step();
     timer = setTimeout(() => {
@@ -1496,6 +1544,9 @@ function fetchEpochMetrics() {
       const cur = S.runs[name];
       if (cur.metricsEpoch === ep) return false;
       const q = ep == null ? "" : `?epoch=${ep}`;
+      // Marked BEFORE the await so cells repainting mid-flight can say "loading" instead
+      // of reading the previous epoch's `samples` and calling the sample unsaved.
+      cur.metricsPending = ep;
       try {
         const d = await api(`/api/run/${encodeURIComponent(name)}${q}`);
         // Only the per-epoch metrics move. splitOf/splits describe which samples the run
@@ -1506,6 +1557,10 @@ function fetchEpochMetrics() {
         return true;
       } catch {
         return false;
+      } finally {
+        // Only clear if no newer request overtook this one, or the last drag frame would
+        // wipe the pending marker belonging to the request still in flight.
+        if (cur.metricsPending === ep) cur.metricsPending = undefined;
       }
     });
     if ((await Promise.all(jobs)).some(Boolean)) {
@@ -1753,23 +1808,24 @@ async function openNeighbors(run, sid) {
   const ep = S.runs[run] ? `&ep=${S.runs[run].epoch}` : "";
   const e = S.runs[run] && S.runs[run].samples[sid];
 
+  const rel = S.view.relative ? 1 : 0;
   $("#m-title").innerHTML = `Sample ${+d.sample_id} — <span class="mrun">${run}</span>`;
   $("#m-body").innerHTML = `
     <div class="msec">
       <h3>This prediction</h3>
       <div class="nbviews">
-        <figure><img src="/api/mask.png?run=${encodeURIComponent(run)}&sid=${sid}&mode=pred&bg=1&${v}${ep}" alt="">
+        <figure><img src="/api/mask.png?run=${encodeURIComponent(run)}&sid=${sid}&mode=pred&bg=1&rel=${rel}&${v}${ep}" alt="">
           <figcaption>predicted</figcaption></figure>
-        <figure><img src="/api/gt_mask.png?sid=${sid}&bg=1&${v}" alt="">
+        <figure><img src="/api/gt_mask.png?sid=${sid}&bg=1&rel=${rel}&${v}" alt="">
           <figcaption>ground truth</figcaption></figure>
-        <figure><img src="/api/mask.png?run=${encodeURIComponent(run)}&sid=${sid}&mode=diff&bg=1&${v}${ep}" alt="">
+        <figure><img src="/api/mask.png?run=${encodeURIComponent(run)}&sid=${sid}&mode=diff&bg=1&rel=${rel}&${v}${ep}" alt="">
           <figcaption>difference</figcaption></figure>
       </div>
       <div class="nbhead">
         <div><span class="k">predicted com</span><b>${dc(d.pred_com[0], d.pred_com[1])}</b></div>
         <div><span class="k">ground truth</span><b>${dc(d.gt_com[0], d.gt_com[1])}</b></div>
         <div><span class="k">offset</span><b>${fmt(off, 2)} cells</b></div>
-        ${e ? `<div><span class="k">mse</span><b>${fmt(e.mse, 4)}</b></div>
+        ${e ? `<div><span class="k">mse</span><b>${fmt(e.mse, 5)}</b></div>
                <div><span class="k">soft iou</span><b>${fmt(e.iou, 3)}</b></div>
                <div><span class="k">com dist</span><b>${e.comdist == null ? "–" : fmt(e.comdist, 3)}</b></div>` : ""}
       </div>
@@ -1840,11 +1896,12 @@ function bindUI() {
     };
   });
   $("#bg-toggle").onchange = (e) => { S.view.background = e.target.checked; renderVisible(); };
+  $("#rel-toggle").onchange = (e) => { S.view.relative = e.target.checked; renderVisible(); };
 
   $("#epoch-slider").oninput = (e) => setEpochIdx(+e.target.value);
   $("#epoch-play").onclick = togglePlay;
-  holdToRepeat($("#epoch-prev"), () => stepEpoch(-1));
-  holdToRepeat($("#epoch-next"), () => stepEpoch(1));
+  holdToRepeat($("#epoch-prev"), () => stepEpoch(-1), $("#epoch-slider"));
+  holdToRepeat($("#epoch-next"), () => stepEpoch(1), $("#epoch-slider"));
   $("#epoch-latest").onclick = () => {
     S.playing = false; clearInterval(playTimer);
     S.frameData = {};                 // drop frames so the latest epoch refetches cleanly

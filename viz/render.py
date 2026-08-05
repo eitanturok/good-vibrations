@@ -71,31 +71,51 @@ TRUE_SEQ_LUT = _ramp(TRUE_SEQ_HEX)
 DIV_LUT = _ramp([DIV_NEG_HEX, DIV_MID_HEX, DIV_POS_HEX])
 
 
-# Display gamma. Predictions from an undertrained run can top out around 0.4-0.7 while a
-# converged run reaches 1.0, so on a linear [0,1] ramp the weak run renders almost
-# entirely in the palest steps and its structure is invisible. Raising values to a power
-# < 1 expands the low end where the data actually lives. This is a DISPLAY transform
-# only: the domain stays fixed at [0,1] so cells remain comparable across runs, and
-# hover tooltips and all metrics continue to report the true values.
-GAMMA = 0.6
+# Display gamma. A gamma < 1 expands the low end of the ramp, so an undertrained run
+# that tops out around 0.4 still shows structure instead of rendering in the palest few
+# steps. It pays for that at the TOP: at 0.6, the 0.9-1.0 decile got 6.1% of the ramp
+# while 0.0-0.1 got 25.1%, which is why a 0.99 cell and a 0.5 cell looked alike once the
+# backdrop was composited under them (deltaE 0.68 between 0.99 and 1.0 -- far below the
+# ~2.3 just-noticeable threshold -- against 27.9 across the whole 0.5-1.0 span).
+#
+# 0.85 keeps most of the low-end lift while leaving the top decile legible. This is a
+# DISPLAY transform only: hover tooltips and every metric report the true values.
+GAMMA = 0.85
 
 
-def colorize(values: np.ndarray, mode: str, gamma: float = GAMMA) -> tuple[np.ndarray, np.ndarray]:
+def colorize(values: np.ndarray, mode: str, gamma: float = GAMMA,
+             domain: tuple[float, float] | None = None) -> tuple[np.ndarray, np.ndarray]:
     """(H,W) values -> (rgb (H,W,3) uint8, alpha (H,W) float in [0,1]).
 
     Alpha encodes "how much signal is here", used by the no-background view so the
     mask silhouette floats free of a filled rectangle.
+
+    `domain` rescales before the ramp is applied, for the relative/per-sample view. The
+    default (None) is the fixed domain -- [0,1] for pred/truth, [-1,+1] for diff -- which
+    is the only one under which two cells can be compared, so it stays the default.
     """
     if mode == "diff":
         # Gamma applied symmetrically about the neutral midpoint, so over- and
-        # under-prediction brighten at the same rate. Domain stays fixed at [-1,+1].
+        # under-prediction brighten at the same rate.
         signed = np.clip(values, -1.0, 1.0)
+        if domain is not None:
+            # Symmetric about zero: the midpoint must stay "no difference", so only the
+            # magnitude is rescaled. An arm is never remapped onto the opposite colour.
+            span = max(abs(domain[0]), abs(domain[1]), 1e-6)
+            signed = np.clip(signed / span, -1.0, 1.0)
         mag = np.abs(signed) ** gamma
         t = 0.5 + 0.5 * np.sign(signed) * mag
         alpha = mag
         lut = DIV_LUT
     else:
-        t = np.clip(values, 0.0, 1.0) ** gamma
+        v = np.clip(values, 0.0, 1.0)
+        if domain is not None:
+            lo, hi = domain
+            # A flat mask has no range to stretch; leaving it at zero renders it empty
+            # rather than amplifying floating-point noise into a full-contrast image.
+            v = (v - lo) / (hi - lo) if hi - lo > 1e-6 else np.zeros_like(v)
+            v = np.clip(v, 0.0, 1.0)
+        t = v ** gamma
         alpha = t
         # "truth" draws the ground-truth ramp so a GT mask is green whether it is shown
         # on its own or as the underlay in the overlay view.
@@ -146,7 +166,7 @@ def canvas_size(h: int, w: int, backdrop: Image.Image | None) -> tuple[int, int]
 
 
 def render_both(pred: np.ndarray, truth: np.ndarray, background: bool,
-                backdrop: Image.Image | None = None) -> bytes:
+                backdrop: Image.Image | None = None, relative: bool = False) -> bytes:
     """Ground truth and prediction in one panel: green truth underneath, blue prediction
     over it, so agreement reads as overlap and each error type stays identifiable.
 
@@ -162,7 +182,10 @@ def render_both(pred: np.ndarray, truth: np.ndarray, background: bool,
         base = Image.new("RGB", size, (255, 255, 255))
 
     for values, hexcolor, gain in ((truth, TRUE_HEX, 0.72), (pred, PRED_HEX, 0.82)):
-        a = np.clip(values, 0.0, 1.0) ** GAMMA
+        # Each layer scales to its OWN range: truth and prediction are separate colours
+        # here, so a shared domain would let one layer's spread dictate the other's.
+        _, a = colorize(values, "pred",
+                        domain=domain_of(values, "pred") if relative else None)
         alpha = Image.fromarray((a * gain * 255).round().astype(np.uint8), mode="L").resize(size, Image.NEAREST)
         layer = Image.new("RGB", size, tuple(int(x) for x in _hex(hexcolor)))
         base = Image.composite(layer, base, alpha)
@@ -175,13 +198,22 @@ def render_both(pred: np.ndarray, truth: np.ndarray, background: bool,
     return buf.getvalue()
 
 
+def domain_of(values: np.ndarray, mode: str) -> tuple[float, float]:
+    """Per-sample colour domain for the relative view: this mask's own range."""
+    v = values[np.isfinite(values)]
+    if v.size == 0:
+        return (0.0, 1.0)
+    return (float(v.min()), float(v.max()))
+
+
 def render_mask(values: np.ndarray, mode: str, background: bool,
-                backdrop: Image.Image | None = None) -> bytes:
+                backdrop: Image.Image | None = None, relative: bool = False) -> bytes:
     """Colourize a (20,40) mask. With a backdrop, the mask is composited over the
     overhead photo so the prediction can be read against the real scene; without one it
     is drawn alone. The mask is always present -- `background` only decides whether the
     photo is behind it."""
-    rgb, alpha = colorize(values, mode)
+    rgb, alpha = colorize(values, mode,
+                          domain=domain_of(values, mode) if relative else None)
     if backdrop is None:
         return _png(rgb, None if background else alpha, config.UPSCALE)
 
@@ -229,11 +261,12 @@ def _backdrop(sid: int) -> Image.Image | None:
 
 
 @lru_cache(maxsize=200_000)
-def _cached(kind: str, run: str, sid: int, mode: str, background: bool, epoch: int) -> bytes:
+def _cached(kind: str, run: str, sid: int, mode: str, background: bool, epoch: int,
+            relative: bool = False) -> bytes:
     from viz.app import registry  # set at startup
     bd = _backdrop(sid) if background else None
     if kind == "gt":
-        return render_mask(registry.gt.masks[sid], "truth", background, bd)
+        return render_mask(registry.gt.masks[sid], "truth", background, bd, relative)
     rd = registry.run(run)
     row = rd.row_of[sid]
     values = rd.masks[row]
@@ -241,20 +274,22 @@ def _cached(kind: str, run: str, sid: int, mode: str, background: bool, epoch: i
     # table mixes resolutions and gt.masks holds only the primary one.
     truth = registry.gt.masks_at(rd.shape)
     if truth is None:
-        return render_mask(values, mode if mode != "diff" else "pred", background, bd)
+        return render_mask(values, mode if mode != "diff" else "pred", background, bd,
+                           relative)
     if mode in ("overlay", "stacked"):
-        return render_both(values, truth[sid], background, bd)
+        return render_both(values, truth[sid], background, bd, relative)
     if mode == "diff":
         values = values - truth[sid]
-    return render_mask(values, mode, background, bd)
+    return render_mask(values, mode, background, bd, relative)
 
 
-def cached_mask(kind: str, run: str, sid: int, mode: str, background: bool) -> bytes:
+def cached_mask(kind: str, run: str, sid: int, mode: str, background: bool,
+                relative: bool = False) -> bytes:
     # The run's loaded epoch is part of the cache key: a run that is still training gets
     # reloaded with new predictions, and a fixed key would keep serving the old render.
     from viz.app import registry
     epoch = registry.run(run).epoch if kind != "gt" else 0
-    return _cached(kind, run, sid, mode, background, epoch)
+    return _cached(kind, run, sid, mode, background, epoch, relative)
 
 
 def media_type(data: bytes) -> str:
