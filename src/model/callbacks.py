@@ -32,24 +32,40 @@ class VisualizeSMask(Callback):
         # update, or the final epoch after fit() ends) that wouldn't otherwise land on a due epoch
         self.force_save = force_save
 
-    def _render(self, pred_np, true_np, info, mse_vals, com_dists, i, scale=8, text_height=40, sep=4, font=ImageFont.load_default(size=14)):
-        h, w = pred_np[i].shape
-        ph, pw = h * scale, w * scale  # panel size after upscale
-        canvas = Image.new("RGB", (pw * 2 + sep, ph + text_height), (255, 255, 255))
-        for j, (arr, label) in enumerate([(pred_np[i], "Predicted"), (true_np[i], "Ground Truth")]):
-            panel = Image.fromarray((arr * 255).clip(0, 255).astype(np.uint8)).resize((pw, ph), Image.NEAREST)
-            canvas.paste(panel, (j * (pw + sep), text_height))
-            ImageDraw.Draw(canvas).text((j * (pw + sep) + pw // 2, text_height - 14), label, fill=(0, 0, 0), font=font, anchor="mt")
-        text = (f"id={info['sample_id'][i]}  pos={info['position_id'][i]}  spk={info['speaker'][i]}  objs={info['n_objects'][i]}  "
-                f"com=({info['x_com'][i]:.1f},{info['y_com'][i]:.1f})  mse={mse_vals[i]:.4f}  com_dist={com_dists[i]:.4f}")
-        ImageDraw.Draw(canvas).text((pw + sep // 2, 2), text, fill=(80, 80, 80), font=font, anchor="mt")
+    @staticmethod
+    def _fit_font(text: str, max_width: int, max_size: int, min_size: int = 6) -> ImageFont.ImageFont:
+        """Largest default font that fits `text` within `max_width` px."""
+        fonts = (ImageFont.load_default(size=s) for s in range(max_size, min_size, -1))
+        return next((f for f in fonts if f.getlength(text) <= max_width), ImageFont.load_default(size=min_size))
+
+    def _render(self, pred: np.ndarray, true: np.ndarray, caption: str, target_w: int = 640, sep: int = 4) -> np.ndarray:
+        """Two mask panels side by side under a caption, sized to ~target_w at any out_h/out_w."""
+        h, w = pred.shape
+        scale = max(1, (target_w - sep) // (2 * w))
+        ph, pw = h * scale, w * scale
+        canvas_w = pw * 2 + sep
+
+        caption_font = self._fit_font(caption, canvas_w - 2 * sep, max_size=max(7, canvas_w // 24))
+        label_font = self._fit_font("Ground Truth", pw - sep, max_size=max(7, canvas_w // 24))
+        pad = max(2, caption_font.size // 3)
+        caption_y, label_y = pad, pad + caption_font.size + pad
+        top = label_y + label_font.size + pad
+
+        canvas = Image.new("RGB", (canvas_w, top + ph), (255, 255, 255))
+        draw = ImageDraw.Draw(canvas)
+        draw.text((canvas_w // 2, caption_y), caption, fill=(80, 80, 80), font=caption_font, anchor="mt")
+        for x, arr, label in [(0, pred, "Predicted"), (pw + sep, true, "Ground Truth")]:
+            canvas.paste(Image.fromarray((arr * 255).clip(0, 255).astype(np.uint8)).resize((pw, ph), Image.NEAREST), (x, top))
+            draw.text((x + pw // 2, label_y), label, fill=(0, 0, 0), font=label_font, anchor="mt")
         return np.array(canvas)
 
     def _render_batch(self, mask_pred: torch.Tensor, mask_true: torch.Tensor, info: dict) -> list[np.ndarray]:
         com_dists = com_distances(mask_pred, mask_true, epsilon=1e-6, normalize=True).numpy()
         mse_vals = mses(mask_pred, mask_true).numpy()
-        pred_np, true_np = mask_pred.numpy(), mask_true.numpy()
-        return [self._render(pred_np, true_np, info, mse_vals, com_dists, i) for i in range(len(pred_np))]
+        captions = [f"id={info['sample_id'][i]}  pos={info['position_id'][i]}  spk={info['speaker'][i]}  objs={info['n_objects'][i]}  "
+                    f"com=({info['x_com'][i]:.1f},{info['y_com'][i]:.1f})  mse={mse_vals[i]:.4f}  com_dist={com_dists[i]:.4f}"
+                    for i in range(len(mask_pred))]
+        return [self._render(p, t, c) for p, t, c in zip(mask_pred.numpy(), mask_true.numpy(), captions)]
 
     def visualize(self, state: State, logger: Logger, data_name: str):
         """Render the batch's first MAX_WANDB_IMAGES samples straight from in-memory state, so viz
