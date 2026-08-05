@@ -59,11 +59,12 @@ class VisualizeSMask(Callback):
             draw.text((x + pw // 2, label_y), label, fill=(0, 0, 0), font=label_font, anchor="mt")
         return np.array(canvas)
 
-    def _render_batch(self, mask_pred: torch.Tensor, mask_true: torch.Tensor, info: dict) -> list[np.ndarray]:
+    def _render_batch(self, mask_pred: torch.Tensor, mask_true: torch.Tensor, info: dict, p_empty=None) -> list[np.ndarray]:
         com_dists = com_distances(mask_pred, mask_true, epsilon=1e-6, normalize=True).numpy()
         mse_vals = mses(mask_pred, mask_true).numpy()
         captions = [f"pos {info['position_id'][i]}  spk {info['speaker'][i]} (smp {info['sample_id'][i]})  objs={info['n_objects'][i]}  "
                     f"com=({info['x_com'][i]:.1f},{info['y_com'][i]:.1f})  mse={mse_vals[i]:.4f}  com_dist={com_dists[i]:.4f}"
+                    + (f"  p(empty)={p_empty[i]:.3f}" if p_empty is not None else "")
                     for i in range(len(mask_pred))]
         return [self._render(p, t, c) for p, t, c in zip(mask_pred.numpy(), mask_true.numpy(), captions)]
 
@@ -73,7 +74,12 @@ class VisualizeSMask(Callback):
         if not _is_due(self.viz_interval, state, self.force_save): return
         mask_pred, mask_true = _to_cpu(state.outputs['mask_pred'][:MAX_WANDB_IMAGES]), _to_cpu(state.batch['mask_true'][:MAX_WANDB_IMAGES])
         info = {k: v[:MAX_WANDB_IMAGES] for k, v in state.batch['info'].items()}
-        logger.log_images(self._render_batch(mask_pred, mask_true, info), name=f'SMask/{data_name}', channels_last=True, use_table=False)
+        # for the spatial losses the model really predicts a softmax over (cells + empty); show that empty prob
+        logits, p_empty = state.outputs.get('empty_logit'), None
+        if logits is not None:
+            flat = _to_cpu(state.outputs['mask_logits'][:MAX_WANDB_IMAGES]).flatten(1)
+            p_empty = torch.cat([flat, _to_cpu(logits[:MAX_WANDB_IMAGES])], dim=-1).softmax(-1)[:, -1].numpy()
+        logger.log_images(self._render_batch(mask_pred, mask_true, info, p_empty), name=f'SMask/{data_name}', channels_last=True, use_table=False)
 
     def after_forward(self, state, logger): self.visualize(state, logger, state.dataloader_label)
     def eval_after_forward(self, state, logger): self.visualize(state, logger, state.dataloader_label or "eval")
@@ -83,6 +89,7 @@ class VisualizeSMask(Callback):
 OUTPUT_EXTRACTORS = {
     'mask_pred':   lambda state: _to_cpu(state.outputs['mask_pred']),
     'mask_logits': lambda state: _to_cpu(state.outputs['mask_logits']),
+    'empty_logit': lambda state: _to_cpu(state.outputs['empty_logit']),
     'mask_true':   lambda state: _to_cpu(state.batch['mask_true']),
     'fft':         lambda state: _to_cpu(state.batch['fft']),
     'info':        lambda state: state.batch['info'],

@@ -91,14 +91,33 @@ def create_metrics(data_info): return {
 
 # mse is averaged over (B,H,W) so the error is independent of the out_h out_w we choose
 def mse_loss(mask_logits, mask_pred, mask_true): return F.mse_loss(mask_pred, mask_true)
-# ce reads logits not preds: sigmoid-then-log saturates to log(0) once the model gets confident
-def ce_loss(mask_logits, mask_pred, mask_true): return F.binary_cross_entropy_with_logits(mask_logits, mask_true)
+# ce-pixel: H*W independent binary questions, cells never compete. Reads logits for numerical stability.
+def ce_pixel_loss(mask_logits, mask_pred, mask_true): return F.binary_cross_entropy_with_logits(mask_logits, mask_true)
 def iou_loss(mask_logits, mask_pred, mask_true): return 1 - soft_iou(mask_pred, mask_true).mean()
 def dice_loss(mask_logits, mask_pred, mask_true): return 1 - soft_dice(mask_pred, mask_true).mean()
 def mse_iou_loss(mask_logits, mask_pred, mask_true, theta=0.5): return theta * mse_loss(mask_logits, mask_pred, mask_true) + (1 - theta) * iou_loss(mask_logits, mask_pred, mask_true)
 def mse_dice_loss(mask_logits, mask_pred, mask_true, theta=0.5): return theta * mse_loss(mask_logits, mask_pred, mask_true) + (1 - theta) * dice_loss(mask_logits, mask_pred, mask_true)
 
-LOSSES = {'mse': mse_loss, 'iou': iou_loss, 'dice': dice_loss, 'mse+iou': mse_iou_loss, 'mse+dice': mse_dice_loss, 'ce': ce_loss}
+# ce-spatial: ONE softmax over H*W cells + 1 "empty box" slot, so cells compete and mass sums to 1.
+# The empty slot avoids 0/0 on all-zero masks and lets the model say "no cube".
+# normalized=True renormalizes cube mass to 1, so the empty slot is a pure occupancy bit.
+def spatial_ce_loss(mask_logits, mask_pred, mask_true, empty_logit, normalized: bool = False):
+    flat = mask_true.flatten(1)                                              # (B,H*W)
+    mass = flat.sum(-1, keepdim=True)
+    if normalized:
+        occ = (mass > 0).float()
+        q = torch.cat([flat / mass.clamp_min(1e-9) * occ, 1 - occ], dim=-1)  # (B,H*W+1)
+    else:
+        q = torch.cat([flat, (1 - mass).clamp_min(0)], dim=-1)               # (B,H*W+1)
+    q = q / q.sum(-1, keepdim=True)
+    logits = torch.cat([mask_logits.flatten(1), empty_logit], dim=-1)                    # (B,H*W+1)
+    return -(q * F.log_softmax(logits, dim=-1)).sum(-1).mean()
+
+def spatial_ce_normalized_loss(mask_logits, mask_pred, mask_true, empty_logit):
+    return spatial_ce_loss(mask_logits, mask_pred, mask_true, empty_logit, normalized=True)
+
+LOSSES = {'mse': mse_loss, 'iou': iou_loss, 'dice': dice_loss, 'mse+iou': mse_iou_loss, 'mse+dice': mse_dice_loss,
+          'ce-pixel': ce_pixel_loss, 'ce-spatial': spatial_ce_loss, 'ce-spatial-normalized': spatial_ce_normalized_loss}
 
 #***** 3 decoder *****
 
@@ -209,7 +228,9 @@ class VibrationTransformer(ComposerModel):
         self.decoder = build_decoder(decoder, d_model, data_info['out_h'], data_info['out_w'], decoder_num_heads, decoder_num_layers)
 
         # loss and metrics
+        self.empty_head = nn.Linear(d_model, 1)  # extra "empty box" class for the spatial losses
         self.loss_fn = LOSSES[loss_fn]
+        self.is_spatial_loss = loss_fn.startswith('ce-spatial')
         self.train_metrics, self.val_metrics = create_metrics(data_info), create_metrics(data_info)
 
     def forward(self, batch):
@@ -234,10 +255,12 @@ class VibrationTransformer(ComposerModel):
         decoder_input = output if isinstance(self.decoder, AttnDecoder) else output[:, 0, :]
         mask_logits = self.decoder(decoder_input, key_padding_mask) if isinstance(self.decoder, AttnDecoder) else self.decoder(decoder_input) # (B,L+1,D) or (B,D) -> (B,H,W)
         mask_pred = mask_logits.sigmoid()
-        return dict(mask_pred=mask_pred, mask_logits=mask_logits)
+        empty_logit = self.empty_head(decoder_input)  # (B,D) -> (B,1), the "no cube anywhere" class
+        return dict(mask_pred=mask_pred, mask_logits=mask_logits, empty_logit=empty_logit)
 
     def loss(self, outputs, batch):
-        return self.loss_fn(outputs['mask_logits'], outputs['mask_pred'], batch['mask_true'])
+        kw = dict(empty_logit=outputs['empty_logit']) if self.is_spatial_loss else {}
+        return self.loss_fn(outputs['mask_logits'], outputs['mask_pred'], batch['mask_true'], **kw)
 
     def get_metrics(self, is_train=False):
         return self.train_metrics if is_train else self.val_metrics
