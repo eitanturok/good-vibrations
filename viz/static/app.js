@@ -1523,8 +1523,11 @@ function setEpochIdx(i) {
   else if (!S.frozenOrder) S.frozenOrder = new Map(S.order.map((s, k) => [s.i, k]));
   S.epochIdx = i == null ? null : Math.max(0, Math.min(i, eps.length - 1));
   renderEpochPanel();
+  // Before renderVisible, not after: this marks which columns have metrics in flight, and
+  // the repaint reads that to tell "loading" from "this epoch saved nothing". The fetch
+  // itself is still debounced, so this costs nothing extra.
+  fetchEpochMetrics();
   renderVisible();          // masks repaint immediately from local frame data
-  fetchEpochMetrics();      // metrics/sort catch up when the server answers
 }
 
 /* Re-sorting or re-filtering is an explicit request for a new order, so it releases the
@@ -1538,14 +1541,21 @@ const thawOrder = () => { S.frozenOrder = null; };
 let metricsTimer = 0;
 function fetchEpochMetrics() {
   clearTimeout(metricsTimer);
+  // Marked SYNCHRONOUSLY, before the debounce: callers repaint immediately and only then
+  // call this, so deferring the marker by 250ms would leave that first repaint reading
+  // the previous epoch's `samples` and reporting "not saved" for data that is merely
+  // still on its way.
+  for (const name of S.runOrder) {
+    const cur = S.runs[name];
+    const ep = epochFor(name);
+    if (cur && cur.metricsEpoch !== ep) cur.metricsPending = ep;
+  }
   metricsTimer = setTimeout(async () => {
     const jobs = S.runOrder.map(async (name) => {
       const ep = epochFor(name);
       const cur = S.runs[name];
-      if (cur.metricsEpoch === ep) return false;
+      if (cur.metricsEpoch === ep) { if (cur.metricsPending === ep) cur.metricsPending = undefined; return false; }
       const q = ep == null ? "" : `?epoch=${ep}`;
-      // Marked BEFORE the await so cells repainting mid-flight can say "loading" instead
-      // of reading the previous epoch's `samples` and calling the sample unsaved.
       cur.metricsPending = ep;
       try {
         const d = await api(`/api/run/${encodeURIComponent(name)}${q}`);
@@ -1718,8 +1728,11 @@ function bindTooltip() {
     const v = tip._v?.v?.[row]?.[col];
     const t = tip._v?.t?.[row]?.[col];
     tip.hidden = false;
-    tip.textContent = `[${row},${col}] ` + (v == null ? "–" : v.toFixed(3)) +
-      (t == null ? "" : ` pred · ${t.toFixed(3)} true`);
+    // 4dp, matching what /api/values actually sends -- it rounds to 4, so this is the
+    // full available precision and no more. At 3dp over half the cells of a low-confidence
+    // run printed a flat "0.000", which hid real 10x differences between them.
+    tip.textContent = `[${row},${col}] ` + (v == null ? "–" : v.toFixed(4)) +
+      (t == null ? "" : ` pred · ${t.toFixed(4)} true`);
     tip.style.left = `${ev.clientX + 12}px`;
     tip.style.top = `${ev.clientY + 14}px`;
   });
