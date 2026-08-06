@@ -99,16 +99,20 @@ def mse_iou_loss(mask_logits, mask_pred, mask_true, theta=0.5): return theta * m
 def mse_dice_loss(mask_logits, mask_pred, mask_true, theta=0.5): return theta * mse_loss(mask_logits, mask_pred, mask_true) + (1 - theta) * dice_loss(mask_logits, mask_pred, mask_true)
 
 # ce-spatial: ONE softmax over H*W cells + 1 "empty box" slot, so cells compete and mass sums to 1.
-# The empty slot avoids 0/0 on all-zero masks and lets the model say "no cube".
-# normalized=True renormalizes cube mass to 1, so the empty slot is a pure occupancy bit.
+# The empty slot is a pure occupancy bit in both branches -- 1 iff the mask is entirely empty -- which
+# avoids 0/0 on all-zero masks and lets the model say "no cube".
+# The branches differ in the cell targets: normalized=True rescales cube mass to sum to 1, so every
+# sample contributes the same total probability regardless of object size; normalized=False keeps the
+# raw per-cell mass, so bigger/brighter objects carry proportionally more of the target distribution
+# (the trailing q/q.sum() then makes it a distribution either way).
 def spatial_ce_loss(mask_logits, mask_pred, mask_true, empty_logit, normalized: bool = False):
     flat = mask_true.flatten(1)                                              # (B,H*W)
     mass = flat.sum(-1, keepdim=True)
+    occ = (mass > 0).float()
     if normalized:
-        occ = (mass > 0).float()
         q = torch.cat([flat / mass.clamp_min(1e-9) * occ, 1 - occ], dim=-1)  # (B,H*W+1)
     else:
-        q = torch.cat([flat, (1 - mass).clamp_min(0)], dim=-1)               # (B,H*W+1)
+        q = torch.cat([flat, 1 - occ], dim=-1)                               # (B,H*W+1)
     q = q / q.sum(-1, keepdim=True)
     logits = torch.cat([mask_logits.flatten(1), empty_logit], dim=-1)                    # (B,H*W+1)
     return -(q * F.log_softmax(logits, dim=-1)).sum(-1).mean()
@@ -252,10 +256,11 @@ class VibrationTransformer(ComposerModel):
         output = self.laser_encoder(x, src_key_padding_mask=key_padding_mask)  # (B,L+1,D) -> (B,L+1,D)
 
         # Predict segmentation mask
-        decoder_input = output if isinstance(self.decoder, AttnDecoder) else output[:, 0, :]
+        cls = output[:, 0, :]  # (B,L+1,D) -> (B,D)
+        decoder_input = output if isinstance(self.decoder, AttnDecoder) else cls
         mask_logits = self.decoder(decoder_input, key_padding_mask) if isinstance(self.decoder, AttnDecoder) else self.decoder(decoder_input) # (B,L+1,D) or (B,D) -> (B,H,W)
         mask_pred = mask_logits.sigmoid()
-        empty_logit = self.empty_head(decoder_input)  # (B,D) -> (B,1), the "no cube anywhere" class
+        empty_logit = self.empty_head(cls)  # (B,D) -> (B,1), the "no cube anywhere" class
         return dict(mask_pred=mask_pred, mask_logits=mask_logits, empty_logit=empty_logit)
 
     def loss(self, outputs, batch):
