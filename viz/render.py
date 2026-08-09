@@ -8,6 +8,8 @@ across the table -- which is the whole point of the tool.
 Palettes come from the dataviz skill's reference instance and were validated with a
 port of its checker: the diverging poles measure CVD deltaE 19.2 (target 8.0) in both
 light and dark mode. Sequential is a single blue hue, light->dark; never a rainbow.
+
+Every `sid` argument in this module is a ROW, not a sample id -- see SPEC.md.
 """
 
 import io
@@ -143,26 +145,56 @@ def _png(rgb: np.ndarray, alpha: np.ndarray | None, upscale: int) -> bytes:
 OVERLAY_GAIN = 0.85
 
 
-def canvas_size(h: int, w: int, backdrop: Image.Image | None) -> tuple[int, int]:
-    """Pixel size to composite an (h,w) mask over `backdrop`, in (W,H) order.
+@lru_cache(maxsize=1)
+def scene_aspect() -> float:
+    """Width/height of the cropped frame the masks tile: the ONE number that defines the
+    display box, for every grid size and whether or not the photo is drawn.
+
+    Probes real samples rather than trusting a constant, and falls back to the primary
+    grid's own ratio only when no backdrop is on disk at all. Cached for the process
+    lifetime, like the backdrops it reads -- the sample set cannot change under a running
+    server.
+    """
+    from viz.app import registry
+    # Rows, not sample ids: _backdrop takes a row, and its cache is keyed on one. Passing
+    # ids here read the wrong photos AND poisoned that shared cache with off-by-N entries,
+    # so a later legitimate row lookup got served someone else's scene.
+    for row in range(min(25, len(registry.gt))):
+        im = _backdrop(row)
+        if im is not None:
+            return im.size[0] / im.size[1]
+    return config.MASK_W / config.MASK_H
+
+
+def canvas_size(h: int, w: int, backdrop: Image.Image | None = None,
+                aspect: float | None = None) -> tuple[int, int]:
+    """Pixel size to draw an (h,w) mask in, in (W,H) order.
 
     The mask grid is a uniform box-downsample of the whole cropped frame -- verified
     corr=0.9998 against 03_smask.npy at both 20x40 and 30x30 -- so the two cover exactly
-    the same region and the PHOTO defines the geometry. Sizing the canvas from the mask
-    instead (w*up, h*up) forces the photo into the mask's aspect: 20x40 is 2.000 against
-    the frame's 2.197 (9% horizontal squeeze) and 30x30 is 1.000 (photo crushed to a
-    square). That is what made predictions sit off the scene.
+    the same region and the SCENE defines the geometry. Sizing the canvas from the mask
+    instead (w*up, h*up) forces the frame into the mask's aspect: 20x40 is 2.000 against
+    the frame's 2.197 (9% horizontal squeeze) and 30x30 is 1.000 (crushed to a square).
+    That is what made predictions sit off the scene.
 
-    So the canvas keeps the backdrop's own aspect and the MASK is stretched onto it --
+    So the canvas keeps the SCENE's aspect and the MASK is stretched onto it --
     anisotropic, but only undoing the anisotropic binning, which lands every cell back on
-    the pixels it averaged. Height is pinned to h*up so cell detail is preserved, and a
-    mask with no backdrop keeps the old square-cell geometry.
+    the pixels it averaged.
+
+    Size follows the PHOTO, not the grid. The photo carries all the real detail and the
+    mask is a coarse overlay drawn on top, so the mask is what gets upscaled (NEAREST,
+    cells stay crisp) and the photo is never downsampled to meet it. Pinning height to
+    h*UPSCALE instead rendered a 1337x1110 capture into 252px behind a 21x30 mask, which
+    is the blur; and it made a coarse grid produce a SMALLER image than a fine one of the
+    same scene. Without a photo there is nothing to preserve, so h*UPSCALE is the floor
+    that still gives a bare mask a sensible pixel size.
     """
-    if backdrop is None:
-        return w * config.UPSCALE, h * config.UPSCALE
-    bw, bh = backdrop.size
+    if aspect is None:
+        aspect = backdrop.size[0] / backdrop.size[1] if backdrop is not None else scene_aspect()
     height = h * config.UPSCALE
-    return max(1, round(height * bw / bh)), height
+    if backdrop is not None:
+        height = min(max(height, backdrop.size[1]), config.BACKDROP_MAX_PX)
+    return max(1, round(height * aspect)), height
 
 
 def render_both(pred: np.ndarray, truth: np.ndarray, background: bool,
@@ -262,11 +294,19 @@ def _backdrop(sid: int) -> Image.Image | None:
 
 @lru_cache(maxsize=200_000)
 def _cached(kind: str, run: str, sid: int, mode: str, background: bool, epoch: int,
-            relative: bool = False) -> bytes:
+            relative: bool = False, shape: tuple[int, int] | None = None) -> bytes:
     from viz.app import registry  # set at startup
     bd = _backdrop(sid) if background else None
     if kind == "gt":
-        return render_mask(registry.gt.masks[sid], "truth", background, bd, relative)
+        # The ground-truth column follows the columns beside it, so it can be asked for a
+        # grid other than the primary one. `sid` is a ROW here (callers resolve the id
+        # first) and masks_at is row-aligned with gt.sample_ids, so this needs no
+        # re-indexing. A missing size raises rather than quietly serving the primary
+        # shape -- a silent fallback would put an unrelated resolution beside the runs.
+        m = registry.gt.masks if shape is None else registry.gt.masks_at(shape)
+        if m is None:
+            raise KeyError(shape)
+        return render_mask(m[sid], "truth", background, bd, relative)
     rd = registry.run(run)
     row = rd.row_of[sid]
     values = rd.masks[row]
@@ -284,12 +324,13 @@ def _cached(kind: str, run: str, sid: int, mode: str, background: bool, epoch: i
 
 
 def cached_mask(kind: str, run: str, sid: int, mode: str, background: bool,
-                relative: bool = False) -> bytes:
+                relative: bool = False, shape: tuple[int, int] | None = None) -> bytes:
     # The run's loaded epoch is part of the cache key: a run that is still training gets
     # reloaded with new predictions, and a fixed key would keep serving the old render.
+    # Ground truth never changes within a process, so it keeps epoch 0.
     from viz.app import registry
     epoch = registry.run(run).epoch if kind != "gt" else 0
-    return _cached(kind, run, sid, mode, background, epoch, relative)
+    return _cached(kind, run, sid, mode, background, epoch, relative, shape)
 
 
 def media_type(data: bytes) -> str:
@@ -305,13 +346,21 @@ def cached_colorbar(mode: str) -> bytes:
 
 @lru_cache(maxsize=2048)
 def cached_backdrop(sid: int) -> bytes | None:
-    """The overhead frame encoded once at cell size, for use behind canvas cells."""
+    """The overhead frame, encoded once at full quality, for use behind canvas cells."""
     im = _backdrop(sid)
     if im is None:
         return None
-    # Same canvas as the composited cells: this is drawn behind mask layers, so sizing it
-    # any other way would reintroduce the misalignment at the boundary between the two.
-    im = im.resize(canvas_size(config.MASK_H, config.MASK_W, im), Image.LANCZOS)
+    # NATIVE resolution, only shrunk if it exceeds the cap. This photo is the sharpest
+    # thing on screen and the mask is a coarse grid drawn over it -- so the MASK is the
+    # layer that gets upscaled (NEAREST, keeping cells crisp), never the photo downscaled
+    # to meet it. Sizing this from the mask grid shipped a 1337x1110 capture at 434x360,
+    # which read as badly blurred behind an otherwise sharp cell.
+    if im.height > config.BACKDROP_MAX_PX:
+        h = config.BACKDROP_MAX_PX
+        im = im.resize((max(1, round(h * im.width / im.height)), h), Image.LANCZOS)
+    # Higher quality than the composited cells: this one is fetched ONCE per sample and
+    # reused across every run, epoch and repaint, so the extra bytes are paid once while
+    # the sharpness is what the whole view is read against.
     buf = io.BytesIO()
-    im.save(buf, format="JPEG", quality=82, optimize=True)
+    im.save(buf, format="JPEG", quality=92, optimize=True)
     return buf.getvalue()

@@ -3,6 +3,9 @@
 Nothing here runs inference: ground-truth masks are per-sample .npy files on disk and
 predicted masks were already dumped by the OutputSaver callback during training. The
 whole job is to join them on sample_id and compute per-sample metrics.
+
+Sample ids are NOT row indices into these arrays -- see SPEC.md for which of the two
+every field, argument and map is keyed by.
 """
 
 import json
@@ -91,11 +94,16 @@ class GtIndex:
         if self.experiment_dir is None:
             return None
         h, w = shape
-        rel = self.layout.gt_mask_for(h, w)
         out = np.zeros((len(self.sample_ids), h, w), dtype=np.float32)
         found = False
         for i, sid in enumerate(self.sample_ids):
-            p = self.experiment_dir / "samples" / sid / rel
+            # Globbed, exactly as disk_shapes/has_shape discover sizes -- templating the
+            # detected layout's prefix here is what let the two disagree, so a run could
+            # pass compatibility and then find no targets at all.
+            p = self.layout.resolve_gt_mask(
+                self.experiment_dir / "samples" / sid, h, w)
+            if p is None:
+                continue
             try:
                 m = np.asarray(np.load(p), dtype=np.float32)
             except Exception:
@@ -142,8 +150,8 @@ def load_gt(experiment_dir: Path) -> GtIndex:
     sample_dirs = sorted(p for p in samples_dir.iterdir() if p.is_dir())
     ids, masks, meta = [], [], []
     for d in sample_dirs:
-        gt = d / layout.gt_mask
-        if not gt.exists():
+        gt = layout.resolve_gt_mask(d, config.MASK_H, config.MASK_W)
+        if gt is None:
             continue
         m = np.load(gt)
         # A dataset can carry masks at several downsample sizes side by side (gastronorm
@@ -155,9 +163,14 @@ def load_gt(experiment_dir: Path) -> GtIndex:
         masks.append(m)
         meta.append(merge_metadata(d / "metadata.jsonl"))
     if not masks:
+        # Only reachable via an explicit --mask: the default is chosen from sizes that
+        # actually carry mass. Name the sizes that DO exist so the retry is obvious.
+        have = ", ".join(f"{a}x{b}" for a, b in config.mask_shapes(samples_dir)) or "none"
         raise SystemExit(
             f"[viz] no {config.MASK_H}x{config.MASK_W} ground-truth masks under "
-            f"{samples_dir} (layout '{layout.name}', expected {layout.gt_mask})."
+            f"{samples_dir} (layout '{layout.name}', searched "
+            f"{layout.gt_mask_glob(config.MASK_H, config.MASK_W)}).\n"
+            f"       available sizes: {have}. Pass one with --mask HxW."
         )
     masks = np.ascontiguousarray(np.stack(masks).astype(np.float32))
     com_gt = np.asarray(center_of_mass(masks), dtype=np.float64)
@@ -415,8 +428,14 @@ class RunData:
     family: str = "unknown"
     # Grid this run predicts at. Required, not defaulted: the table mixes resolutions, so
     # there is no sensible fallback, and a default evaluated at import time would freeze
-    # config.MASK_H/W from before --mask ran.
+    # config.MASK_H/W from before --mask ran. Every return path passes it explicitly --
+    # the zero-row ones used to fall through to (0,0), which the client read as "shape
+    # unknown" and silently replaced with the default grid.
     shape: tuple[int, int] = (0, 0)
+    # Why this run has no rows, when it has none. A run can pass compatibility (targets
+    # that size exist on disk) and still score nothing, and an empty column with no
+    # explanation is indistinguishable from a bug. Surfaced by /api/run.
+    reason: str | None = None
 
 
 def _split_dirs(outputs: Path) -> list[tuple[str, Path]]:
@@ -512,11 +531,13 @@ def _loadable(path: Path) -> bool:
 
 
 def load_run(name: str, runs_dir: Path, gt: GtIndex, family: str = "unknown",
-             epoch: int | None = None) -> RunData:
+             epoch: int | None = None, shape: tuple[int, int] | None = None) -> RunData:
     """Load one run's predictions and score every sample against the target.
 
     `epoch` selects which saved epoch to read; the default (None) uses each split's
-    latest, which is what the table shows.
+    latest, which is what the table shows. `shape` is the grid the run was classified at,
+    used only so a run that decodes NO predictions can still report the size it would
+    have had -- without it the client cannot size that column's canvas.
 
     Metrics mirror the training loop exactly (see src/model/arch.py mses/com_distances
     and utils/metrics.soft_iou), which is what lets the column headers be cross-checked
@@ -565,11 +586,15 @@ def load_run(name: str, runs_dir: Path, gt: GtIndex, family: str = "unknown",
             usable = [e for e in run_epochs(name, runs_dir)
                       if want is None or e <= want]
             if usable:
-                return load_run(name, runs_dir, gt, family, epoch=max(usable))
+                return load_run(name, runs_dir, gt, family, epoch=max(usable), shape=shape)
         empty_f = np.zeros(0, dtype=np.float64)
-        return RunData(name, epoch, np.zeros(0, dtype=np.int64), np.zeros((0, config.MASK_H, config.MASK_W),
-                       dtype=np.float32), [], empty_f, empty_f, empty_f,
-                       np.zeros((0, 2)), {}, skipped, family)
+        # The classified shape, not the primary grid: this run predicts at its own size
+        # even when nothing decoded, and the column has to be drawn at that size.
+        out_shape = shape or (config.MASK_H, config.MASK_W)
+        return RunData(name, epoch, np.zeros(0, dtype=np.int64),
+                       np.zeros((0, *out_shape), dtype=np.float32), [], empty_f, empty_f,
+                       empty_f, np.zeros((0, 2)), {}, skipped, family, out_shape,
+                       "no readable prediction files")
 
     sample_ids = np.concatenate(ids)
     preds = np.concatenate(masks).astype(np.float32)
@@ -600,7 +625,8 @@ def load_run(name: str, runs_dir: Path, gt: GtIndex, family: str = "unknown",
         empty_f = np.zeros(0, dtype=np.float64)
         return RunData(name, epoch, sample_ids, preds, splits, empty_f, empty_f,
                        empty_f, np.zeros((0, 2)), {}, skipped, family,
-                       (preds.shape[-2], preds.shape[-1]))
+                       (preds.shape[-2], preds.shape[-1]),
+                       "no predicted sample belongs to this dataset")
 
     # Score against ground truth AT THIS RUN'S GRID. Runs trained at different
     # resolutions each get their own targets, so a 16x16 and a 30x30 column can sit side
@@ -609,10 +635,14 @@ def load_run(name: str, runs_dir: Path, gt: GtIndex, family: str = "unknown",
     shape = (preds.shape[-2], preds.shape[-1])
     gt_masks = gt.masks_at(shape)
     if gt_masks is None:
+        # Classification said targets exist at this size (has_shape globs real filenames)
+        # but none could actually be decoded. Say so: this used to return an empty column
+        # with no explanation, which reads exactly like a broken run.
         empty_f = np.zeros(0, dtype=np.float64)
         return RunData(name, epoch, np.zeros(0, dtype=np.int64),
                        np.zeros((0, *shape), dtype=np.float32), [], empty_f, empty_f,
-                       empty_f, np.zeros((0, 2)), {}, skipped, family, shape)
+                       empty_f, np.zeros((0, 2)), {}, skipped, family, shape,
+                       f"no ground truth at {shape[0]}x{shape[1]}")
 
     pred = torch.from_numpy(preds)
     truth = torch.from_numpy(gt_masks[gt_rows])
@@ -632,7 +662,11 @@ def load_run(name: str, runs_dir: Path, gt: GtIndex, family: str = "unknown",
     # the top of a "worst COM distance" sort, which is the tool's main workflow.
     comdist = np.where(truth.sum(dim=(-2, -1)).numpy() > 0, comdist, np.nan)
 
-    row_of = {int(s): i for i, s in enumerate(sample_ids)}
+    # Keyed by ROW, not sample id: every consumer (render._cached, /api/mask.png,
+    # /api/values, /api/neighbors) resolves the id through _sid() at the HTTP edge and
+    # passes the row down. gt_rows is filtered in lockstep with sample_ids above, so
+    # gt_rows[i] is the ground-truth row of sample_ids[i]. See SPEC.md 2.
+    row_of = {int(r): i for i, r in enumerate(gt_rows)}
     return RunData(name, epoch, sample_ids, pred.numpy(), splits,
                    mse, iou, comdist, com_pred, row_of, skipped, family, shape)
 
@@ -683,7 +717,8 @@ class Registry:
         if reload:
             self._runs.pop(key, None)
         if key not in self._runs:
-            self._runs[key] = load_run(name, self.runs_dir, self.gt, entry.family, epoch)
+            self._runs[key] = load_run(name, self.runs_dir, self.gt, entry.family, epoch,
+                                       entry.shape)
             # Each RunData is ~5MB, and scrubbing a 200-epoch run would otherwise pin a
             # gigabyte. Latest-epoch entries (epoch=None) are what the table always needs,
             # so evict scrubbed ones first, oldest first.

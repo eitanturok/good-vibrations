@@ -38,6 +38,14 @@ def set_mask_shape(h: int, w: int) -> None:
     MASK_H, MASK_W = int(h), int(w)
 
 
+# How a downsampled target is named, with the numeric prefix left OPEN. The size is the
+# file's identity; the prefix is an artifact of which export wrote it and varies both
+# across datasets and, on experiment-25, between two sizes of the SAME dataset. Every
+# lookup -- discovery (mask_shapes), layout detection, and loading (masks_at) -- goes
+# through this one pattern, so they cannot disagree about which sizes exist.
+GT_MASK_GLOB = "*_downsampled_smask_{h}h_{w}w.npy"
+
+
 def mask_shapes(samples_dir) -> list[tuple[int, int]]:
     """Downsampled-mask sizes actually present, newest-layout first, for error messages
     and for --mask's default. Reads one sample dir; sizes are uniform across a dataset."""
@@ -48,7 +56,7 @@ def mask_shapes(samples_dir) -> list[tuple[int, int]]:
     except OSError:
         return []
     for d in probes:
-        for f in (d / "image").glob("*_downsampled_smask_*h_*w.npy"):
+        for f in (d / "image").glob(GT_MASK_GLOB.format(h="*", w="*")):
             m = re.search(r"_(\d+)h_(\d+)w\.npy$", f.name)
             if m:
                 out.add((int(m.group(1)), int(m.group(2))))
@@ -81,7 +89,7 @@ def usable_mask_shapes(samples_dir) -> list[tuple[int, int]]:
     for h, w in mask_shapes(samples_dir):
         cov = []
         for d in probes:
-            for f in (d / "image").glob(f"*_downsampled_smask_{h}h_{w}w.npy"):
+            for f in (d / "image").glob(GT_MASK_GLOB.format(h=h, w=w)):
                 try:
                     cov.append(float(np.asarray(np.load(f), dtype=np.float64).mean()))
                 except Exception:
@@ -106,35 +114,27 @@ def usable_mask_shapes(samples_dir) -> list[tuple[int, int]]:
 #
 # Every entry is a path RELATIVE TO A SAMPLE DIR. `{h}`/`{w}` are filled with MASK_H and
 # MASK_W so the mask name follows the configured target shape.
-# A layout entry names a FILENAME SCHEME, not a dataset. The two used to coincide, but the
-# current experiment-25 capture breaks that: it writes `06_..._20h_40w.npy` alongside
-# `04_..._30h_30w.npy`, so one dataset needs two entries because the numeric prefix varies
-# with the mask size. `dataset` therefore carries the data identity separately, and
-# EVAL_SPLITS is keyed on it -- without that split, selecting 30x30 would match this
-# capture against gastronorm's split whitelist and reject every experiment-25 run as
-# "different dataset".
+#
+# A layout entry names a FILENAME SCHEME, not a dataset -- `dataset` carries the data
+# identity separately, and EVAL_SPLITS is keyed on THAT. Two layouts sharing a dataset is
+# normal; without the split, selecting a non-default size would match this capture against
+# gastronorm's whitelist and reject every experiment-25 run as "different dataset".
+#
+# `gt_mask` is now only a label for error messages: masks are found by GT_MASK_GLOB, which
+# ignores the numeric prefix. That prefix is not stable enough to identify anything --
+# experiment-25 writes 20x40 as both `04_` and `06_` but 30x30 as `04_` only, which is why
+# a second "same dataset at another size" entry used to be needed here and no longer is.
 LAYOUTS = {
-    # The experiment-25 capture currently on disk, at 20x40. Same underlying data as
-    # "experiment-25" below, re-exported with shifted prefixes: `06_` mask (not `05_`) and
-    # the cropped overhead as backdrop rather than `01_cropped.png`. Nothing in the files
-    # declares the era, hence a separate entry probed ahead of the older one.
+    # The experiment-25 capture currently on disk. Same underlying data as "experiment-25"
+    # below, re-exported with shifted prefixes and the cropped overhead as backdrop rather
+    # than `01_cropped.png`. Nothing in the files declares the era, hence a separate entry
+    # probed ahead of the older one.
     "experiment-25-v2": {
         "dataset": "experiment-25",
         "image_dir": "image",
         "gt_mask": "image/06_downsampled_smask_{h}h_{w}w.npy",
         "backdrop": "image/02_cropped_overhead.png",
         "overhead": "image/06_overhead_speaker.png",  # detail modal (shows the speaker)
-        "audio": {"original": "audio.wav", "recovered": "recovered_audio.wav"},
-    },
-    # The same capture at 30x30, where the mask prefix is `04_` instead of `06_`. Listed
-    # ahead of "gastronorm", which uses the identical mask filename and backdrop and would
-    # otherwise absorb this dataset and apply the wrong split whitelist to its runs.
-    "experiment-25-v2-30h": {
-        "dataset": "experiment-25",
-        "image_dir": "image",
-        "gt_mask": "image/04_downsampled_smask_{h}h_{w}w.npy",
-        "backdrop": "image/02_cropped_overhead.png",
-        "overhead": "image/06_overhead_speaker.png",
         "audio": {"original": "audio.wav", "recovered": "recovered_audio.wav"},
     },
     "experiment-25": {
@@ -166,10 +166,9 @@ LAYOUTS = {
     },
 }
 
-# Probed in order; the first layout whose mask file exists in a sample dir wins.
-LAYOUT_ORDER = [
-    "experiment-25-v2", "experiment-25-v2-30h", "experiment-25", "gastronorm",
-]
+# Probed in order; the first layout matching a sample dir wins. Masks are matched by glob,
+# so ORDER CANNOT BREAK TIES between datasets any more -- `overhead` and `backdrop` do.
+LAYOUT_ORDER = ["experiment-25-v2", "experiment-25", "gastronorm"]
 
 # Per-sample extras shown in the detail modal. The recovery laser index varies by
 # experiment (50 on experiment-25, 55 on gastronorm), and gastronorm drops the axis
@@ -216,6 +215,28 @@ class Layout:
         """
         return self._gt_mask_spec.format(h=h, w=w)
 
+    def gt_mask_glob(self, h: int, w: int) -> str:
+        """The search pattern for the target at (h,w), relative to a sample dir."""
+        return f"{self.image_dir}/{GT_MASK_GLOB.format(h=h, w=w)}"
+
+    def resolve_gt_mask(self, sample_dir, h: int, w: int):
+        """The ground-truth file for (h,w) in one sample dir, or None.
+
+        Globbed rather than templated because THE SIZE IN THE NAME IS THE IDENTITY AND THE
+        NUMERIC PREFIX IS NOT. One dataset can write the same size under two prefixes
+        (experiment-25 ships 20x40 as both `04_` and `06_`) and ship another size under
+        only one of them (30x30 is `04_`-only). Formatting the detected layout's prefix
+        into every size then names a file that does not exist: has_shape() globs and says
+        30x30 is available, masks_at() templated and found nothing, so the run classified
+        as compatible and then rendered as an empty column.
+
+        sorted()[0] makes the choice stable across samples. The duplicated 04_/06_ 20x40
+        masks agree to 0.002, so either is correct -- but picking a different one per
+        sample would stack rows from two exports into a single array.
+        """
+        hits = sorted(sample_dir.glob(self.gt_mask_glob(h, w)))
+        return hits[0] if hits else None
+
     @classmethod
     def detect(cls, samples_dir) -> "Layout":
         """Pick the layout whose ground-truth mask actually exists on disk.
@@ -225,14 +246,19 @@ class Layout:
         probing only the first directory would then fall through to the wrong layout --
         or to none at all -- for an otherwise healthy 3000-sample dataset.
 
-        The mask alone does not always identify a layout: `experiment-25-v2-30h` and
-        `gastronorm` name the same `04_downsampled_smask_{h}h_{w}w.npy`, so both match
-        either dataset and LAYOUT_ORDER alone would always hand gastronorm to the
-        experiment-25 entry -- which then applies the wrong EVAL_SPLITS whitelist and
-        rejects every gastronorm run as "different dataset". So require the layout's own
-        `overhead` file too, which does differ (06_overhead_speaker.png on experiment-25,
-        02_cropped_overhead.png on gastronorm), and only fall back to a mask-only match if
-        nothing matches on both.
+        The mask NEVER identifies a layout on its own: it is matched by glob, so the
+        numeric prefix -- the only thing that used to distinguish `experiment-25-v2` from
+        `gastronorm` -- is deliberately ignored. Identity therefore rests entirely on the
+        `overhead` and `backdrop` files, which do differ (06_overhead_speaker.png is on
+        experiment-25 and absent from gastronorm). Getting this wrong is expensive:
+        EVAL_SPLITS is keyed on layout.dataset, so mislabelling gastronorm as
+        experiment-25 rejects every one of its runs as "different dataset".
+
+        The loose pass exists for a capture missing its overhead file, and now demands the
+        backdrop rather than matching on the mask alone -- a mask-only match would accept
+        the first layout in LAYOUT_ORDER for literally any dataset. It also says so out
+        loud, because a misdetection otherwise surfaces three steps later as "every run is
+        incompatible" with nothing pointing back to here.
         """
         try:
             probes = sorted(p for p in samples_dir.iterdir() if p.is_dir())[:25]
@@ -242,14 +268,24 @@ class Layout:
         for strict in (True, False):
             for layout in layouts:
                 for d in probes:
-                    if (d / layout.gt_mask).exists() and (not strict or (d / layout.overhead).exists()):
-                        return layout
+                    if layout.resolve_gt_mask(d, MASK_H, MASK_W) is None:
+                        continue
+                    if not (d / layout.backdrop).exists():
+                        continue
+                    if strict and not (d / layout.overhead).exists():
+                        continue
+                    if not strict:
+                        print(f"[viz] layout '{layout.name}' matched WITHOUT its overhead "
+                              f"file ({layout.overhead}); dataset identity is a guess, and "
+                              f"runs may be wrongly rejected as 'different dataset'.")
+                    return layout
         known = ", ".join(LAYOUT_ORDER)
         raise SystemExit(
             f"[viz] no known sample layout under {samples_dir}.\n"
-            f"       tried: {known}. Expected one of "
-            + ", ".join(cls(n, LAYOUTS[n]).gt_mask for n in LAYOUT_ORDER)
-            + "\n       Add a new entry to LAYOUTS in viz/config.py if this is a new "
+            f"       tried: {known}. Expected a mask matching "
+            + GT_MASK_GLOB.format(h=MASK_H, w=MASK_W)
+            + " plus that layout's backdrop.\n"
+              "       Add a new entry to LAYOUTS in viz/config.py if this is a new "
               "dataset format."
         )
 
@@ -312,7 +348,16 @@ SPEAKER_POSITION = {
 
 # ***** rendering *****
 
-UPSCALE = 12  # 20x40 -> 480x240; nearest-neighbour so hover cells stay exact
+# Height, in pixels, of a rendered mask: the canvas is `h * UPSCALE` tall and as wide as
+# the scene's aspect makes it (see render.canvas_size). Nearest-neighbour, so hover cells
+# stay exact.
+UPSCALE = 12
+# Cap on the backdrop JPEG's height. The photo is served at its NATIVE resolution up to
+# this, never upscaled past it -- the overhead frame is the only real detail on screen and
+# the mask is a coarse grid drawn on top, so the photo must stay sharp while the mask is
+# what gets stretched. Sizing this to the mask grid made a 1337x1110 capture ship at
+# 434x360 and look badly blurred. Independent of any grid: one image serves every column.
+BACKDROP_MAX_PX = 1600
 EPSILON = 1e-6
 
 # Mask images are served `immutable` for a year, so browsers never revalidate them.

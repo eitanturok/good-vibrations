@@ -429,6 +429,9 @@ body.dragging-col .hgrip { cursor: grabbing; }
 .hmeta { font-size: 10px; color: var(--ink-3); margin-top: 2px; font-variant-numeric: tabular-nums; }
 .hmeta b { font-weight: 600; color: var(--ink-2); }
 .hmeta .k { color: var(--ink-3); font-weight: 400; }
+/* An empty column states why. Warn-coloured because it means the column shows nothing --
+   a fact about this run, not the neutral per-column detail .hmeta otherwise carries. */
+.hmeta.empty { color: var(--warn); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 #epoch-label b { font-weight: 600; color: var(--ink-2); }
 #epoch-label .k { color: var(--accent); }
 /* Wraps rather than overflowing into the next column: the column is sized to the sample

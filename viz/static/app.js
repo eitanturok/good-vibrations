@@ -161,6 +161,16 @@ function runShape(name) {
   return [S.lut.h, S.lut.w];
 }
 
+/* The grid the ground-truth column renders at: the FINEST among the loaded columns, so
+   the reference is never coarser than the predictions it is being compared against. Every
+   cell is stretched to the same box, so this changes fidelity, not layout -- and when all
+   columns agree it collapses to that single shape. */
+function gtShape() {
+  const shapes = S.runOrder.map(runShape);
+  if (!shapes.length) return [S.lut.h, S.lut.w];
+  return shapes.reduce((a, b) => (b[0] * b[1] > a[0] * a[1] ? b : a));
+}
+
 const truthKey = (sid, h, w) => (h ? `${sid}@${h}x${w}` : String(sid));
 
 /* Whether the loaded columns disagree on grid size, so the header only spends space on
@@ -519,6 +529,11 @@ function renderHeader() {
       ? `<span class="warnbadge" title="No eval split directories; dataset identity unconfirmed">?</span>` : "";
     const skipped = r.skipped_files.length
       ? ` · <span title="${r.skipped_files.join(", ")}">${r.skipped_files.length} file(s) skipped</span>` : "";
+    // A run can pass the compatibility scan and still score nothing -- targets exist at
+    // its grid but none decoded, or no predicted sample belongs to this dataset. Saying
+    // which is the difference between "this run is broken" and "viz is broken".
+    const why = r.reason && !r.n
+      ? `<div class="hmeta empty" title="${r.reason}">empty: ${r.reason}</div>` : "";
     // Read status from the latest poll, not the snapshot taken when the run was added --
     // a run that finishes or crashes while open must update its badge.
     const live = S.meta.runs.find((x) => x.name === name);
@@ -537,6 +552,7 @@ function renderHeader() {
         <span class="hep">${epochLabel(name)}</span>
         ${statusChip(status)}
       </div>
+      ${why}
       ${skipped ? `<div class="hmeta">${skipped.replace(/^ · /, "")}</div>` : ""}
       <div class="hstats">${METRICS.map((m) => {
         const s = st[m.key];
@@ -583,8 +599,9 @@ function renderHeader() {
    cached the old one. Table prediction cells no longer use images -- they are canvases
    drawn from /api/frames -- so this covers the ground-truth column and the modals. */
 function gtMaskURL(sid) {
+  const [h, w] = gtShape();
   return `/api/gt_mask.png?sid=${sid}&bg=${S.view.background ? 1 : 0}` +
-         `&rel=${S.view.relative ? 1 : 0}&v=${S.renderVersion}`;
+         `&rel=${S.view.relative ? 1 : 0}&shape=${h}x${w}&v=${S.renderVersion}`;
 }
 
 function buildRow() {
@@ -740,7 +757,11 @@ function paintRow(el, rank) {
     // The backdrop is a CSS background behind the canvas rather than baked into the
     // pixels: it is fetched once per sample and reused for every run and every epoch,
     // which is most of why scrubbing costs no bandwidth.
-    const want = S.view.background ? `url(/api/backdrop/${s.i}.jpg)` : "";
+    // Versioned like every other image: this response is `immutable` for a year, so a
+    // change to how the backdrop is sized would otherwise never reach a browser that
+    // already cached the old dimensions.
+    const want = S.view.background
+      ? `url(/api/backdrop/${s.i}.jpg?v=${S.renderVersion})` : "";
     if (m.style.backgroundImage !== want) m.style.backgroundImage = want;
     paintCanvas(m, name, s.i, epochFor(name));
 
@@ -1694,9 +1715,16 @@ function openPicker() {
 
 const valueCache = new Map();
 async function valuesFor(run, sid, mode) {
-  const k = `${run}|${sid}|${mode}`;
+  // The ground-truth cell has no run to take a grid from, and /api/values defaults to the
+  // primary shape -- which would hand back a differently-sized array than the [row, col]
+  // the tooltip just computed off gtShape(), reporting the wrong cell's value. Runs carry
+  // their own shape server-side, so only the GT branch needs the hint. Part of the cache
+  // key: the same sample has a different array at each resolution.
+  const [gh, gw] = gtShape();
+  const q = run ? "" : `&shape=${gh}x${gw}`;
+  const k = `${run}|${sid}|${mode}${q}`;
   if (!valueCache.has(k))
-    valueCache.set(k, api(`/api/values?sid=${sid}&run=${encodeURIComponent(run)}&mode=${mode}`));
+    valueCache.set(k, api(`/api/values?sid=${sid}&run=${encodeURIComponent(run)}&mode=${mode}${q}`));
   return valueCache.get(k);   // {v} or, in overlay/stacked mode, {v, t}
 }
 
@@ -1712,7 +1740,7 @@ function bindTooltip() {
     // column and a 20x40 one need different divisors to turn a cursor position into
     // [row, col]. Using the global default indexed the wrong cell on any run whose grid
     // is not the default -- and out of bounds on a coarser one.
-    const [mh, mw] = img.dataset.run ? runShape(img.dataset.run) : [S.lut.h, S.lut.w];
+    const [mh, mw] = img.dataset.run ? runShape(img.dataset.run) : gtShape();
     // Clamp rather than index straight from the ratio. Under browser zoom the rect is
     // fractional while `pixelated` snaps the painted cells to whole device pixels, so the
     // two disagree by up to a cell at the edges -- which read as a shifted mask.
@@ -1746,7 +1774,10 @@ async function openModal(rank) {
   const s = S.order[rank];
   if (!s) return;
   $("#m-prev").hidden = $("#m-next").hidden = false;
-  const d = await api(`/api/detail/${s.i}`);
+  // Same grid as the table's ground-truth column, so the COM the modal prints is in the
+  // coordinate system the row beside it was read in.
+  const [dh, dw] = gtShape();
+  const d = await api(`/api/detail/${s.i}?shape=${dh}x${dw}`);
   $("#m-title").textContent = `Sample ${d.sample_id}`;
   // Named by the server rather than hardcoded: the default grid is chosen from the data.
   const grid = d.grid ? `${d.grid[0]}×${d.grid[1]}` : `${S.lut.h}×${S.lut.w}`;
@@ -1809,7 +1840,7 @@ async function openNeighbors(run, sid) {
 
   const list = (rows, cls) => rows.map((x) => `
     <li class="nb ${cls}" data-i="${x.i}">
-      <img src="/api/gt_mask.png?sid=${x.i}&bg=1&v=${S.renderVersion}" loading="lazy" alt="">
+      <img src="/api/gt_mask.png?sid=${x.i}&bg=1&shape=${d.shape[0]}x${d.shape[1]}&v=${S.renderVersion}" loading="lazy" alt="">
       <div class="nbmeta">
         <div class="nbtop"><b>${+x.sample_id}</b> <span class="tag">pos ${+x.output_id}</span></div>
         <div class="nbsub">d ${fmt(x.distance, 3)} · com ${dc(x.com[0], x.com[1])}</div>
@@ -1829,7 +1860,7 @@ async function openNeighbors(run, sid) {
       <div class="nbviews">
         <figure><img src="/api/mask.png?run=${encodeURIComponent(run)}&sid=${sid}&mode=pred&bg=1&rel=${rel}&${v}${ep}" alt="">
           <figcaption>predicted</figcaption></figure>
-        <figure><img src="/api/gt_mask.png?sid=${sid}&bg=1&rel=${rel}&${v}" alt="">
+        <figure><img src="/api/gt_mask.png?sid=${sid}&bg=1&rel=${rel}&shape=${d.shape[0]}x${d.shape[1]}&${v}" alt="">
           <figcaption>ground truth</figcaption></figure>
         <figure><img src="/api/mask.png?run=${encodeURIComponent(run)}&sid=${sid}&mode=diff&bg=1&rel=${rel}&${v}${ep}" alt="">
           <figcaption>difference</figcaption></figure>

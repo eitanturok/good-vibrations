@@ -4,6 +4,9 @@ The server does only what the browser cannot: decode .pt files, compute metrics 
 per run, and render PNGs. Sorting and filtering are entirely client-side -- the whole
 dataset is a few hundred KB and already in memory there, so a round-trip per slider
 frame would only add latency.
+
+Routes speak sample ids; everything below this module speaks rows. _sid() is the single
+conversion between them -- see SPEC.md.
 """
 
 import json
@@ -147,6 +150,9 @@ def api_run(name: str, reload: int = 0, epoch: int | None = None):
             # The grid this run predicts at. The client sizes the column's canvas from it,
             # so a 16x16 run and a 30x30 run render correctly in the same table.
             "h": rd.shape[0], "w": rd.shape[1],
+            # Why the column is empty, when it is. A run can classify compatible and still
+            # score nothing, and an unexplained empty column looks like a bug in viz.
+            "reason": rd.reason,
             "skipped_files": rd.skipped_files, "n": len(rd.sample_ids),
             "epochs": registry.epochs(name),   # drives the epoch slider
             "samples": samples}
@@ -170,8 +176,14 @@ def api_mask(run: str, sid: int, mode: str = "pred", bg: int = 1, rel: int = 0):
 
 
 @app.get("/api/gt_mask.png")
-def api_gt_mask(sid: int, bg: int = 1, rel: int = 0):
-    img = render.cached_mask("gt", "", _sid(sid), "pred", bool(bg), bool(rel))
+def api_gt_mask(sid: int, bg: int = 1, rel: int = 0, shape: str = ""):
+    """The target mask. `shape` ("21x30") renders it at a grid other than the primary one,
+    so the ground-truth column can match the runs it sits beside."""
+    want = _parse_shape(shape) if shape else None
+    try:
+        img = render.cached_mask("gt", "", _sid(sid), "pred", bool(bg), bool(rel), want)
+    except KeyError:
+        raise HTTPException(404, f"no ground truth at {shape}")
     return Response(img, media_type=render.media_type(img), headers=IMMUTABLE)
 
 
@@ -274,22 +286,15 @@ def api_lut():
     return {"pred": render.SEQ_LUT.tolist(), "truth": render.TRUE_SEQ_LUT.tolist(),
             "diff": render.DIV_LUT.tolist(), "gamma": render.GAMMA,
             "gain": render.OVERLAY_GAIN,   # alpha scale when drawn over the backdrop
+            # FALLBACK grid only, for a cell whose run has not reported its shape yet.
+            # Not "the table's grid": columns each draw at their own resolution, and the
+            # thing that actually drives layout is `aspect`, which is grid-independent.
             "h": config.MASK_H, "w": config.MASK_W,
             # Width/height of the cropped frame the masks were downsampled from. The mask
             # grid tiles that frame uniformly, so the CELL BOX must use this aspect, not
             # w/h -- a 30x30 grid over a 2.2-aspect scene is not square, and drawing it in
             # a square box slides every prediction off the features it refers to.
-            "aspect": _backdrop_aspect()}
-
-
-def _backdrop_aspect() -> float:
-    """Aspect of the layout's backdrop, from a real sample; falls back to the mask's own
-    ratio if no backdrop is on disk (masks then render as they always did)."""
-    for sid in registry.gt.sample_ids[:25]:
-        im = render._backdrop(int(sid))
-        if im is not None:
-            return im.size[0] / im.size[1]
-    return config.MASK_W / config.MASK_H
+            "aspect": render.scene_aspect()}
 
 
 @app.get("/api/frames")
@@ -426,7 +431,7 @@ def api_neighbors(run: str, sid: int, k: int = 5):
 
 
 @app.get("/api/detail/{sid}")
-def api_detail(sid: int):
+def api_detail(sid: int, shape: str = ""):
     i = _sid(sid)
     m = registry.gt.meta[i]
     d = registry.sample_dir(i)
@@ -441,10 +446,19 @@ def api_detail(sid: int):
     # coms/avg_com are numpy reprs on the gastronorm layout; normalise the one the UI
     # actually plots so the modal never prints a raw "[603.1 901.2]" string.
     out["avg_com"] = data.parse_com(m.get("avg_com"))
-    out["com_gt_grid"] = [_clean(registry.gt.com_gt[i][0]), _clean(registry.gt.com_gt[i][1])]
-    # The grid those coordinates are in. The modal used to hardcode "20x40", which became
-    # a lie the moment the default shape was picked from the data.
-    out["grid"] = [config.MASK_H, config.MASK_W]
+    # COM and the grid it is measured in, kept together so the modal can never print one
+    # against the other. `shape` follows the table's ground-truth column, so the modal
+    # agrees with the row it was opened from rather than reporting a resolution nothing
+    # on screen uses. Falls back to the primary grid when the size has no targets.
+    grid = (config.MASK_H, config.MASK_W)
+    com = registry.gt.com_gt
+    if shape:
+        want = _parse_shape(shape)
+        alt = registry.gt.com_at(want)
+        if alt is not None:
+            grid, com = want, alt
+    out["com_gt_grid"] = [_clean(com[i][0]), _clean(com[i][1])]
+    out["grid"] = list(grid)
     audio = registry.gt.layout.audio
     out["has"] = {
         # A track the layout does not define is simply absent, so the modal hides it
