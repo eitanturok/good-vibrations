@@ -90,6 +90,7 @@ OUTPUT_EXTRACTORS = {
     'mask_pred':   lambda state: _to_cpu(state.outputs['mask_pred']),
     'mask_logits': lambda state: _to_cpu(state.outputs['mask_logits']),
     'empty_logit': lambda state: _to_cpu(state.outputs['empty_logit']),
+    'count_logits': lambda state: _to_cpu(state.outputs['count_logits']),
     'mask_true':   lambda state: _to_cpu(state.batch['mask_true']),
     'fft':         lambda state: _to_cpu(state.batch['fft']),
     'info':        lambda state: state.batch['info'],

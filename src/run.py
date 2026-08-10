@@ -34,7 +34,7 @@ from icecream import install; install()
 
 from model.callbacks import VisualizeSMask, OutputSaver, AttributionSaver, OUTPUT_EXTRACTORS, DEFAULT_OUTPUT_KEYS
 from model.dataset import build_dataset
-from model.arch import VibrationTransformer, LOSSES
+from model.arch import VibrationTransformer, LOSSES, N_COUNT_CLASSES
 from utils.helpers import cleanup
 from viz import ensure_viz
 
@@ -99,6 +99,8 @@ def get_parser():
     parser.add_argument("--decoder-num-heads",          type=int,   default=2)
     parser.add_argument("--decoder-num-layers",         type=int,   default=2)
     parser.add_argument("--loss-fn",                    type=str,   default='mse', choices=list(LOSSES))
+    parser.add_argument("--loss-alpha",                 type=float, default=0.5, help="for the -asym losses: weight on false negatives; >0.5 paints more, <0.5 holds back")
+    parser.add_argument("--count-loss-weight",          type=float, default=0.0, help="weight on the auxiliary n_objects classification loss; 0 disables it (the head still runs, so count-acc stays readable as a free probe).")
     parser.add_argument("--d-model",                    type=int,   default=128)
     parser.add_argument("--pnt-num-heads",              type=int,   default=2)
     parser.add_argument("--seq-num-heads",              type=int,   default=2)
@@ -207,7 +209,7 @@ def run(**kwargs):
         split=args.split, test_size=args.test_size, speakers=args.speakers, n_objects=args.n_objects, box=args.box, n_samples=args.n_samples,
         out_h=args.out_h, out_w=args.out_w, signal_mode=args.signal_mode, normalize_mode=args.normalize_mode, patch_size=args.patch_size, seed=args.seed,
         augment_fft=args.augment_fft, augment_mask=args.augment_mask, subtract_speaker_mean=bool(args.subtract_speaker_mean),
-        force_rebuild_data=bool(args.force_rebuild_data))
+        force_rebuild_data=bool(args.force_rebuild_data), n_classes=N_COUNT_CLASSES)
     boundary_loaders = eval_loaders + [Evaluator(label='train', dataloader=train_eval_loader)]
     ensure_viz(args.data_dir, port=args.viz_port, enabled=not args.no_viz)
 
@@ -217,7 +219,7 @@ def run(**kwargs):
     n_freqs_real = len(train_loader.dataloader.dataset.dataset.pk["freqs"])
     data_info = dict(out_h=args.out_h, out_w=args.out_w, n_laser_rows=args.n_laser_rows, n_laser_cols=args.n_laser_cols, patch_size=args.patch_size, n_freqs=n_patches * patch_size, n_channels=n_channels)
     print(f"{n_freqs_real} freq bins -> {n_patches} patches of {patch_size} = {n_patches * patch_size} ({n_patches * patch_size - n_freqs_real} padded)")
-    model = VibrationTransformer(args.d_model, args.pnt_num_heads, args.pnt_num_layers, args.seq_num_heads, args.seq_num_layers, data_info, args.decoder, args.decoder_num_heads, args.decoder_num_layers, freq_dropout=args.freq_dropout, laser_dropout=args.laser_dropout, loss_fn=args.loss_fn)
+    model = VibrationTransformer(args.d_model, args.pnt_num_heads, args.pnt_num_layers, args.seq_num_heads, args.seq_num_layers, data_info, args.decoder, args.decoder_num_heads, args.decoder_num_layers, freq_dropout=args.freq_dropout, laser_dropout=args.laser_dropout, loss_fn=args.loss_fn, loss_alpha=args.loss_alpha, count_loss_weight=args.count_loss_weight)
     load_path = str(args.checkpoint_path) if args.checkpoint_path else None
 
     # logger

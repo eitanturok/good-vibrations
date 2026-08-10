@@ -383,7 +383,10 @@ class VibrationDataset(StreamingDataset):
         s = super().__getitem__(idx)
         X = torch.from_numpy(s.pop("X").copy()).unsqueeze(0).to(self.pk["device"])
         y = torch.from_numpy(s.pop("y").copy()).unsqueeze(0).to(self.pk["device"])
-        info = dict(sample_id=s["sample_id"], position_id=s["position_id"], n_objects=s["n_objects"], speaker=s["speaker"], box=s["box"], is_empty_box=s["is_empty_box"], x_com=s["downsampled_com_x"], y_com=s["downsampled_com_y"])
+        n_classes = self.pk["n_classes"]
+        assert 0 <= s["n_objects"] < n_classes, f'n_objects={s["n_objects"]} outside the {n_classes} count classes'
+        n_objects = torch.tensor(s["n_objects"], dtype=torch.long, device=self.pk["device"])
+        info = dict(sample_id=s["sample_id"], position_id=s["position_id"], n_objects=n_objects, speaker=s["speaker"], box=s["box"], is_empty_box=s["is_empty_box"], x_com=s["downsampled_com_x"], y_com=s["downsampled_com_y"])
         speaker_mean = self.speaker_means[int(s["speaker"])].to(self.pk["device"]) if self.speaker_means is not None else None
         fft = X if self.pk["mds_precomputed_fft"] else process_vibration(X, self.pk["freqs"], self.pk["signal_mode"], self.pk["normalize_mode"], self.pk["patch_size"], augment=self.pk["augment_fft"], speaker_mean=speaker_mean, stats=self.stats)
         mask_true = process_image(y, self.pk["out_h"], self.pk["out_w"], augment=self.pk["augment_mask"])
@@ -571,9 +574,93 @@ def gastronorm_one_cube(mds_path, test_size=0.2, seed=42, speakers=None, n_objec
     one_cube_train, one_cube_eval = train_test_split([i for i, row in enumerate(index) if row['layout'] in ['purple-cube', 'empty-box']], test_size=0.2, random_state=seed, shuffle=True)
     return {'train': one_cube_train, 'eval/1-cube': one_cube_eval}
 
+def _gastronorm_object_count_split(mds_path, train_objects: int, eval_objects: int, test_size=0.05, seed=42,
+                                   speakers=None, n_objects=None, box=None, n_samples: int | None = None,
+                                   verbose: int = 1, index: list[dict] | None = None):
+    """Cross-object-count generalisation: train on `1 - test_size` of the samples holding `train_objects`
+    objects, and produce two evals -- the held-out `test_size` of that same object count, and every
+    sample holding `eval_objects` objects.
+
+    The held-out fraction is drawn by position_id, not by sample: every position is captured once per
+    speaker, so splitting samples would leave the same position in both train and eval and let the model
+    score on a position it had already memorised from another speaker.
+
+    The object count comes from each row's `n_objects`, not its layout name -- the two disagree on this
+    dataset (x-shift/y-shift are 2-object layouts, and lid-purple-cube is split across 0 and 1).
+    """
+    if index is None:
+        lines = (Path(mds_path) / "metadata.jsonl").read_text().strip().splitlines()
+        index = [json.loads(line) for line in lines if line]
+
+    keep = [i for i, row in enumerate(index) if _matches(row, speakers, n_objects, box)]
+    if n_samples is not None: keep = keep[:n_samples]
+
+    train_pool = [i for i in keep if index[i]["n_objects"] == train_objects]
+    eval_pool = [i for i in keep if index[i]["n_objects"] == eval_objects]
+    if not train_pool: raise ValueError(f"no samples with n_objects={train_objects} to train on")
+    if not eval_pool: raise ValueError(f"no samples with n_objects={eval_objects} to eval on")
+
+    position_ids = sorted({index[i]["position_id"] for i in train_pool})
+    _, held_position_ids = train_test_split(position_ids, test_size=test_size, random_state=seed, shuffle=True)
+    held_position_ids = set(held_position_ids)
+    train_idx = [i for i in train_pool if index[i]["position_id"] not in held_position_ids]
+    held_idx = [i for i in train_pool if index[i]["position_id"] in held_position_ids]
+
+    splits = {"train": sorted(train_idx),
+              f"eval/{train_objects}-obj": sorted(held_idx),
+              f"eval/{eval_objects}-obj": sorted(eval_pool)}
+
+    if verbose:
+        for label, idxs in splits.items(): print(f"{label}: {len(idxs)} samples")
+    return splits
+
+
+def gastronorm_train1_eval2(*args, **kwargs):
+    """Train on the 1-object scenes, eval on the 2-object scenes."""
+    return _gastronorm_object_count_split(*args, train_objects=1, eval_objects=2, **kwargs)
+
+
+def gastronorm_train2_eval1(*args, **kwargs):
+    """Train on the 2-object scenes, eval on the 1-object scenes."""
+    return _gastronorm_object_count_split(*args, train_objects=2, eval_objects=1, **kwargs)
+
+
+def gastronorm_train12_eval12(mds_path, test_size=0.05, seed=42, speakers=None, n_objects=None, box=None,
+                              n_samples: int | None = None, verbose: int = 1, index: list[dict] | None = None):
+    """The in-distribution control for the two cross-object-count splits: train on both the 1- and
+    2-object scenes, and eval on held-out positions of each, reported separately so the numbers line up
+    with `eval/1-obj` and `eval/2-obj` from the other two runs.
+
+    Positions are held out per object count, using the same by-position rule, so a position held out for
+    one count cannot leak in through the other.
+    """
+    if index is None:
+        lines = (Path(mds_path) / "metadata.jsonl").read_text().strip().splitlines()
+        index = [json.loads(line) for line in lines if line]
+
+    keep = [i for i, row in enumerate(index) if _matches(row, speakers, n_objects, box)]
+    if n_samples is not None: keep = keep[:n_samples]
+
+    splits = {"train": []}
+    for count in (1, 2):
+        pool = [i for i in keep if index[i]["n_objects"] == count]
+        if not pool: raise ValueError(f"no samples with n_objects={count}")
+        position_ids = sorted({index[i]["position_id"] for i in pool})
+        _, held_position_ids = train_test_split(position_ids, test_size=test_size, random_state=seed, shuffle=True)
+        held_position_ids = set(held_position_ids)
+        splits["train"] += [i for i in pool if index[i]["position_id"] not in held_position_ids]
+        splits[f"eval/{count}-obj"] = sorted(i for i in pool if index[i]["position_id"] in held_position_ids)
+    splits["train"] = sorted(splits["train"])
+
+    if verbose:
+        for label, idxs in splits.items(): print(f"{label}: {len(idxs)} samples")
+    return splits
+
 #***** 8 build dataloaders *****
 
-SPLIT_METHODS = {"exp25": exp25_split, "gastronorm": gastronorm, "gastronorm_one_cube": gastronorm_one_cube}
+SPLIT_METHODS = {"exp25": exp25_split, "gastronorm": gastronorm, "gastronorm_one_cube": gastronorm_one_cube,
+                 "gastronorm_train1_eval2": gastronorm_train1_eval2, "gastronorm_train2_eval1": gastronorm_train2_eval1,
+                 "gastronorm_train12_eval12": gastronorm_train12_eval12}
 
 def num_samples(batch): return batch["mask_true"].shape[0]
 
@@ -586,7 +673,7 @@ def build_dataset(data_dir: str | Path, split: str = "exp25", batch_size: int = 
                    num_workers: int = 8, out_h: int = 20, out_w: int = 40, signal_mode: str = "magnitude",
                    normalize_mode: str = "std", patch_size: int = 64, seed: int = 42,
                    force_rebuild_data: bool = False, augment_fft: float = 0.5, augment_mask: float = 0.5,
-                   subtract_speaker_mean: bool = False, verbose: int = 1, **split_kwargs):
+                   subtract_speaker_mean: bool = False, n_classes: int = 4, verbose: int = 1, **split_kwargs):
 
     if split not in SPLIT_METHODS: raise ValueError(f"Unknown split {split!r}, expected one of {sorted(SPLIT_METHODS)}")
     if not 0 <= augment_fft <= 1: raise ValueError(f"{augment_fft=} must be a probability in [0, 1]")
@@ -627,7 +714,7 @@ def build_dataset(data_dir: str | Path, split: str = "exp25", batch_size: int = 
     splits = SPLIT_METHODS[split](mds_dir, seed=seed, verbose=verbose, **split_kwargs)
 
     generator = torch.Generator().manual_seed(seed)
-    process_kwargs = dict(device="cpu", signal_mode=signal_mode, normalize_mode=normalize_mode, patch_size=patch_size, out_h=out_h, out_w=out_w, mds_precomputed_fft=not raw_fft)
+    process_kwargs = dict(device="cpu", signal_mode=signal_mode, normalize_mode=normalize_mode, patch_size=patch_size, out_h=out_h, out_w=out_w, mds_precomputed_fft=not raw_fft, n_classes=n_classes)
     train_dataset = VibrationDataset(local=mds_dir, seed=seed, process_kwargs=dict(process_kwargs, augment_fft=augment_fft, augment_mask=augment_mask))
     eval_dataset = VibrationDataset(local=mds_dir, seed=seed, process_kwargs=dict(process_kwargs, augment_fft=0.0, augment_mask=0.0))
 

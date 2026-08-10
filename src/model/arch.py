@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from composer import ComposerModel
 from torchmetrics import MeanSquaredError, Metric
+from torchmetrics.classification import MulticlassAccuracy
 
 from utils.metrics import center_of_mass, soft_iou, soft_dice
 
@@ -31,6 +32,8 @@ def apply_rope(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
     return torch.cat([x1 * cos - x2 * sin, x2 * cos + x1 * sin], dim=-1)
 
 #***** 1 metrics *****
+
+N_COUNT_CLASSES = 4  # n_objects observed in {0,1,2,3}
 
 def com_distances(mask_pred, mask_true, epsilon, normalize):
     com_dist = center_of_mass(mask_pred, normalize=normalize, epsilon=epsilon) - center_of_mass(mask_true, normalize=normalize, epsilon=epsilon)
@@ -80,11 +83,47 @@ class SoftDice(Metric):
 
     def compute(self): return self.total / self.count
 
+# soft-iou fuses over- and under-prediction; these split them so a loss alpha sweep is readable.
+# precision = tp/(tp+fp) punishes over-painting, recall = tp/(tp+fn) punishes missing.
+class SoftPrecision(Metric):
+    def __init__(self, epsilon:float=1e-6):
+        super().__init__()
+        self.epsilon = epsilon
+        self.add_state("tp", default=torch.tensor(0.0), dist_reduce_fx="sum")
+        self.add_state("fp", default=torch.tensor(0.0), dist_reduce_fx="sum")
+
+    def update(self, mask_pred, mask_true):
+        self.tp = self.tp + torch.minimum(mask_pred, mask_true).sum()
+        self.fp = self.fp + (mask_pred - mask_true).clamp_min(0).sum()
+
+    def compute(self): return (self.tp + self.epsilon) / (self.tp + self.fp + self.epsilon)
+
+class SoftRecall(Metric):
+    def __init__(self, epsilon:float=1e-6):
+        super().__init__()
+        self.epsilon = epsilon
+        self.add_state("tp", default=torch.tensor(0.0), dist_reduce_fx="sum")
+        self.add_state("fn", default=torch.tensor(0.0), dist_reduce_fx="sum")
+
+    def update(self, mask_pred, mask_true):
+        self.tp = self.tp + torch.minimum(mask_pred, mask_true).sum()
+        self.fn = self.fn + (mask_true - mask_pred).clamp_min(0).sum()
+
+    def compute(self): return (self.tp + self.epsilon) / (self.tp + self.fn + self.epsilon)
+
+# scores the count head instead of the mask; update_metric dispatches on this type.
+# classes are imbalanced ({0:55, 1:624, 2:2288, 3:40}) so macro is the honest read.
+class CountAccuracy(MulticlassAccuracy): pass
+
 def create_metrics(data_info): return {
     "mse": MeanSquaredError(),
     'com-distance': CenterOfMassDistance(),
     'soft-iou': SoftIoU(),
+    'soft-precision': SoftPrecision(),
+    'soft-recall': SoftRecall(),
     # 'soft-dice': SoftDice(),
+    'count-acc': CountAccuracy(num_classes=N_COUNT_CLASSES, average='micro'),
+    'count-acc-macro': CountAccuracy(num_classes=N_COUNT_CLASSES, average='macro'),
     }
 
 #***** 2 losses *****
@@ -93,6 +132,16 @@ def create_metrics(data_info): return {
 def mse_loss(mask_logits, mask_pred, mask_true): return F.mse_loss(mask_pred, mask_true)
 # ce-pixel: H*W independent binary questions, cells never compete. Reads logits for numerical stability.
 def ce_pixel_loss(mask_logits, mask_pred, mask_true): return F.binary_cross_entropy_with_logits(mask_logits, mask_true)
+
+# asym: the signal is sparse, so background dominates the gradient. alpha weighs under-prediction
+# (false negatives) against over-prediction; alpha>0.5 paints more, alpha<0.5 holds back. The 2*
+# keeps the scale fixed so alpha=0.5 is exactly mse / ce-pixel.
+def mse_asym_loss(mask_logits, mask_pred, mask_true, alpha=0.5):
+    err = mask_pred - mask_true
+    return (2 * (1 - alpha) * err.clamp_min(0).square() + 2 * alpha * (-err).clamp_min(0).square()).mean()
+# pos_weight scales only the y*log(p) term, i.e. the false-negative half
+def ce_pixel_asym_loss(mask_logits, mask_pred, mask_true, alpha=0.5):
+    return F.binary_cross_entropy_with_logits(mask_logits, mask_true, pos_weight=mask_logits.new_tensor(alpha / (1 - alpha)))
 def iou_loss(mask_logits, mask_pred, mask_true): return 1 - soft_iou(mask_pred, mask_true).mean()
 def dice_loss(mask_logits, mask_pred, mask_true): return 1 - soft_dice(mask_pred, mask_true).mean()
 def mse_iou_loss(mask_logits, mask_pred, mask_true, theta=0.5): return theta * mse_loss(mask_logits, mask_pred, mask_true) + (1 - theta) * iou_loss(mask_logits, mask_pred, mask_true)
@@ -120,8 +169,12 @@ def spatial_ce_loss(mask_logits, mask_pred, mask_true, empty_logit, normalized: 
 def spatial_ce_normalized_loss(mask_logits, mask_pred, mask_true, empty_logit):
     return spatial_ce_loss(mask_logits, mask_pred, mask_true, empty_logit, normalized=True)
 
+# n_objects arrives from the dataset already validated, long, and on-device
+def count_loss(count_logits, n_objects): return F.cross_entropy(count_logits, n_objects)
+
 LOSSES = {'mse': mse_loss, 'iou': iou_loss, 'dice': dice_loss, 'mse+iou': mse_iou_loss, 'mse+dice': mse_dice_loss,
-          'ce-pixel': ce_pixel_loss, 'ce-spatial': spatial_ce_loss, 'ce-spatial-normalized': spatial_ce_normalized_loss}
+          'ce-pixel': ce_pixel_loss, 'ce-spatial': spatial_ce_loss, 'ce-spatial-normalized': spatial_ce_normalized_loss,
+          'mse-asym': mse_asym_loss, 'ce-pixel-asym': ce_pixel_asym_loss}
 
 #***** 3 decoder *****
 
@@ -216,7 +269,7 @@ class FreqEncoder(nn.Module):
 #***** 5 model *****
 
 class VibrationTransformer(ComposerModel):
-    def __init__(self, d_model:int=128, pnt_num_heads:int=2, pnt_num_layers:int=2, seq_num_heads:int=2, seq_num_layers:int=2, data_info=None, decoder:str='mlp', decoder_num_heads:int=2, decoder_num_layers:int=2, freq_dropout:float=0.3, laser_dropout:float=0.3, loss_fn:str='mse'):
+    def __init__(self, d_model:int=128, pnt_num_heads:int=2, pnt_num_layers:int=2, seq_num_heads:int=2, seq_num_layers:int=2, data_info=None, decoder:str='mlp', decoder_num_heads:int=2, decoder_num_layers:int=2, freq_dropout:float=0.3, laser_dropout:float=0.3, loss_fn:str='mse', loss_alpha:float=0.5, count_loss_weight:float=0.0):
         super().__init__()
 
         # encoder
@@ -233,8 +286,13 @@ class VibrationTransformer(ComposerModel):
 
         # loss and metrics
         self.empty_head = nn.Linear(d_model, 1)  # extra "empty box" class for the spatial losses
+        # a single Linear on cls, so count-acc answers exactly "is n_objects linearly decodable from cls"
+        self.count_head = nn.Linear(d_model, N_COUNT_CLASSES)
+        self.count_loss_weight = count_loss_weight
         self.loss_fn = LOSSES[loss_fn]
         self.is_spatial_loss = loss_fn.startswith('ce-spatial')
+        self.is_asym_loss = loss_fn.endswith('-asym')
+        self.loss_alpha = loss_alpha
         self.train_metrics, self.val_metrics = create_metrics(data_info), create_metrics(data_info)
 
     def forward(self, batch):
@@ -261,17 +319,23 @@ class VibrationTransformer(ComposerModel):
         mask_logits = self.decoder(decoder_input, key_padding_mask) if isinstance(self.decoder, AttnDecoder) else self.decoder(decoder_input) # (B,L+1,D) or (B,D) -> (B,H,W)
         mask_pred = mask_logits.sigmoid()
         empty_logit = self.empty_head(cls)  # (B,D) -> (B,1), the "no cube anywhere" class
-        return dict(mask_pred=mask_pred, mask_logits=mask_logits, empty_logit=empty_logit)
+        count_logits = self.count_head(cls)  # (B,D) -> (B,n_classes), how many objects in the box
+        return dict(mask_pred=mask_pred, mask_logits=mask_logits, empty_logit=empty_logit, count_logits=count_logits)
 
     def loss(self, outputs, batch):
         kw = dict(empty_logit=outputs['empty_logit']) if self.is_spatial_loss else {}
-        return self.loss_fn(outputs['mask_logits'], outputs['mask_pred'], batch['mask_true'], **kw)
+        if self.is_asym_loss: kw = dict(alpha=self.loss_alpha)
+        total = self.loss_fn(outputs['mask_logits'], outputs['mask_pred'], batch['mask_true'], **kw)
+        if self.count_loss_weight:
+            total = total + self.count_loss_weight * count_loss(outputs['count_logits'], batch['info']['n_objects'])
+        return total
 
     def get_metrics(self, is_train=False):
         return self.train_metrics if is_train else self.val_metrics
 
     def update_metric(self, batch, outputs, metric):
-        metric.update(outputs['mask_pred'], batch['mask_true'])
+        if isinstance(metric, CountAccuracy): metric.update(outputs['count_logits'], batch['info']['n_objects'])
+        else: metric.update(outputs['mask_pred'], batch['mask_true'])
 
     def eval_forward(self, batch, outputs=None):
         return outputs if outputs is not None else self.forward(batch)

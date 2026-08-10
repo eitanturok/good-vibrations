@@ -4,8 +4,8 @@ Two families of measure live here:
 
 - *attention*: the cls-row of each self-attention map, read straight off the encoders.
   Cheap (free with the forward pass) but a weak proxy -- see the note on `ablate_lasers`.
-- *ablation*: zero an input and measure how much true MSE degrades. This is the metric to
-  lead with.
+- *ablation*: zero an input and measure how much true BCE degrades. This is the metric to
+  lead with. (Pass `metric=_mse` to any ablation helper for the old squared-error view.)
 
 The architecture factorizes the two axes (freq attention runs per-laser and never sees other
 lasers; laser attention runs on tokens where frequency has already been collapsed into one cls
@@ -383,8 +383,35 @@ def _mse(model, X, y, chunk=None):
 
 
 @torch.no_grad()
-def ablate_lasers(model, X, y, baseline=None):
-    """Delta true-MSE from zeroing each laser in turn. Returns (100,).
+def _bce(model, X, y, chunk=None):
+    """Mean per-pixel BCE over the batch, in nats. Same chunking contract as `_mse`.
+
+    Computed from `mask_logits`, not `mask_pred`: this is the numerically stable form
+    (`binary_cross_entropy_with_logits` folds the sigmoid into a log-sum-exp), and it matches the
+    project's own `ce_pixel_loss` exactly. Going through the post-sigmoid `mask_pred` would blow up
+    to inf wherever a confident logit saturates to exactly 0.0 or 1.0 in float32 -- which is common
+    on a trained checkpoint, and precisely where an ablation delta needs to stay finite.
+
+    Note BCE is only bounded below by 0 for a hard target; the masks here are soft-valued in [0,1],
+    so the floor is the target's own entropy and the absolute number is not comparable to MSE. Only
+    differences between it and a baseline are meaningful -- which is all the ablation helpers use.
+    """
+    import torch.nn.functional as F
+    chunk = chunk or MSE_CHUNK
+    total, n = 0.0, 0
+    for s in range(0, X.shape[0], chunk):
+        logits = model({'fft': X[s:s + chunk]})['mask_logits']
+        yc = y[s:s + chunk].reshape(logits.shape)
+        total += F.binary_cross_entropy_with_logits(logits, yc, reduction='sum').item()
+        n += logits.numel()
+    return total / n
+
+
+@torch.no_grad()
+def ablate_lasers(model, X, y, baseline=None, metric=None):
+    """Delta true-BCE from zeroing each laser in turn. Returns (100,).
+
+    `metric` defaults to `_bce`; pass `_mse` for the old squared-error view.
 
     Zeroing (rather than noising or resampling) is the in-distribution choice here: training
     already zeroes dropped laser/freq tokens, so the model has seen this exact input.
@@ -392,49 +419,58 @@ def ablate_lasers(model, X, y, baseline=None):
     Leave-one-out understates importance when lasers are redundant -- two neighbours carrying
     the same signal each look useless alone. Pair with `retain_top_k` to catch that.
     """
-    baseline = _mse(model, X, y) if baseline is None else baseline
+    metric = metric or _bce
+    baseline = metric(model, X, y) if baseline is None else baseline
     out = np.zeros(X.shape[1])
     for i in range(X.shape[1]):
         Xa = X.clone(); Xa[:, i] = 0
-        out[i] = _mse(model, Xa, y) - baseline
+        out[i] = metric(model, Xa, y) - baseline
     return out
 
 
 @torch.no_grad()
-def ablate_freq_patches(model, X, y, baseline=None):
-    """Delta true-MSE from zeroing each frequency patch in turn. Returns (n_patches,)."""
-    baseline = _mse(model, X, y) if baseline is None else baseline
+def ablate_freq_patches(model, X, y, baseline=None, metric=None):
+    """Delta true-BCE from zeroing each frequency patch in turn. Returns (n_patches,).
+
+    `metric` defaults to `_bce`; pass `_mse` for the old squared-error view."""
+    metric = metric or _bce
+    baseline = metric(model, X, y) if baseline is None else baseline
     out = np.zeros(X.shape[2])
     for p in range(X.shape[2]):
         Xa = X.clone(); Xa[:, :, p] = 0
-        out[p] = _mse(model, Xa, y) - baseline
+        out[p] = metric(model, Xa, y) - baseline
     return out
 
 
 @torch.no_grad()
-def ablate_laser_freq(model, X, y, lasers=None, patches=None, baseline=None):
-    """Delta true-MSE from zeroing a single (laser, freq patch) cell. Returns (len(lasers), len(patches)).
+def ablate_laser_freq(model, X, y, lasers=None, patches=None, baseline=None, metric=None):
+    """Delta true-BCE from zeroing a single (laser, freq patch) cell. Returns (len(lasers), len(patches)).
 
     The joint view attention cannot give: the model scores the two axes in separate encoders.
+    `metric` defaults to `_bce`; pass `_mse` for the old squared-error view.
     """
-    baseline = _mse(model, X, y) if baseline is None else baseline
+    metric = metric or _bce
+    baseline = metric(model, X, y) if baseline is None else baseline
     lasers = range(X.shape[1]) if lasers is None else lasers
     patches = range(X.shape[2]) if patches is None else patches
     out = np.zeros((len(lasers), len(patches)))
     for a, i in enumerate(lasers):
         for b, p in enumerate(patches):
             Xa = X.clone(); Xa[:, i, p] = 0
-            out[a, b] = _mse(model, Xa, y) - baseline
+            out[a, b] = metric(model, Xa, y) - baseline
     return out
 
 
 @torch.no_grad()
-def retain_top_k(model, X, y, order, axis='laser', ks=None):
-    """MSE when only the top-k inputs (by `order`) are kept and the rest are zeroed.
+def retain_top_k(model, X, y, order, axis='laser', ks=None, metric=None):
+    """BCE when only the top-k inputs (by `order`) are kept and the rest are zeroed.
+
+    `metric` defaults to `_bce`; pass `_mse` for the old squared-error view.
 
     Stronger evidence than leave-one-out: it reports how much of the signal a subset actually
     carries, so redundancy between correlated inputs shows up instead of hiding.
     """
+    metric = metric or _bce
     n = X.shape[1] if axis == 'laser' else X.shape[2]
     ks = ks if ks is not None else range(1, n + 1)
     out = {}
@@ -443,7 +479,7 @@ def retain_top_k(model, X, y, order, axis='laser', ks=None):
         keep = order[:k]
         if axis == 'laser': Xa[:, keep] = X[:, keep]
         else:               Xa[:, :, keep] = X[:, :, keep]
-        out[k] = _mse(model, Xa, y)
+        out[k] = metric(model, Xa, y)
     return out
 
 
