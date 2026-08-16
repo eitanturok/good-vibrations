@@ -1,9 +1,0 @@
-[
-  {"label": "baseline: fp32,\n1 forward pass/prompt", "time_ms": 589.5, "status": "baseline"},
-  {"label": "encode image once,\nbatch prompts", "time_ms": 364.3, "status": "speedup"},
-  {"label": "+ native bf16\nweights", "time_ms": 352.4, "status": "speedup"},
-  {"label": "+ torch.compile", "time_ms": 325.4, "status": "speedup"},
-  {"label": "+ CUDA graphs\n(rejected: GPU contention)", "time_ms": 1011.6, "status": "rejected"},
-  {"label": "+ smaller vision grid\n(image_size=672)", "time_ms": 217.6, "status": "speedup"},
-  {"label": "image_size=336\n(faster, but scores drop)", "time_ms": 159.8, "status": "speedup"}
-]
