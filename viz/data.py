@@ -281,22 +281,38 @@ def _probe(files: list[Path]) -> tuple[dict | None, str | None]:
     if key in _PROBE_CACHE:
         return _PROBE_CACHE[key]
     result = (None, "all recent prediction files unreadable")
+    # Read all five rather than stopping at the first success. Sample ids are the ONLY
+    # dataset-identity gate in _classify, and one file is one saved batch (B = eval batch
+    # size, 108 by default), which is thin evidence -- five batches is ~540 ids. They are
+    # usually five batches of the SAME split, since `files` is sorted by epoch and the
+    # newest epoch's train batches sort together; the win is sample size, not split
+    # coverage. Reading every .pt instead is not viable: one run can be 152MB over 556
+    # files and there are hundreds of run dirs.
+    #
+    # Measured over 271 runs: ~390ms of torch.load vs ~100ms when this stopped at the
+    # first success. That is a COLD cost only -- _PROBE_CACHE is keyed per file, so the
+    # 10s rescans re-probe just the new runs -- and 433ms total against RESCAN_SECONDS
+    # is worth a 5x stronger gate now that ids are the only dataset check.
+    base = None
+    ids: list[int] = []
     for p in files[:5]:
         try:
             obj = torch.load(p, map_location="cpu", weights_only=False)
-            mask, info = obj.get("mask_pred"), obj.get("info") or {}
-            # Keep only the few facts classification needs; holding the tensors would
-            # pin hundreds of MB across every scanned run for no benefit.
-            sid = info.get("sample_id")
-            result = ({"shape": tuple(mask.shape[-2:]) if mask is not None else None,
-                       "info_keys": set(info),
-                       # A few ids are enough to tell which dataset a run was trained on
-                       # when its split names carry no whitelist.
-                       "sample_ids": _as_int_array(sid).tolist() if sid is not None else []},
-                      None)
-            break
         except Exception:
             continue
+        mask, info = obj.get("mask_pred"), obj.get("info") or {}
+        sid = info.get("sample_id")
+        if sid is not None:
+            ids.extend(_as_int_array(sid).tolist())
+        if base is None:
+            # Keep only the few facts classification needs; holding the tensors would
+            # pin hundreds of MB across every scanned run for no benefit. Schema is fixed
+            # by the code that trained the run, so the first readable file settles shape
+            # and info_keys -- later files only widen the id sample.
+            base = {"shape": tuple(mask.shape[-2:]) if mask is not None else None,
+                    "info_keys": set(info)}
+    if base is not None:
+        result = (base | {"sample_ids": ids}, None)
     _PROBE_CACHE[key] = result
     return result
 
@@ -339,26 +355,20 @@ def _classify(name: str, run_dir: Path, gt: GtIndex) -> RunEntry:
     splits = [p.name for p in _eval_dirs(outputs)]
 
     # Sample ids collide across experiments, so a run from another dataset would join
-    # cleanly against the loaded ground truth and produce silently wrong metrics.
-    # Where the dataset declares its split names, that is the strongest available signal.
-    # Keyed on layout.dataset, NOT layout.name: one dataset can be read through several
-    # layouts (the same capture at two mask sizes), and keying on the filename scheme
-    # would apply the wrong whitelist and reject every run as "different dataset".
-    allowed = config.EVAL_SPLITS.get(gt.layout.dataset)
-    if allowed is not None:
-        if splits and not set(splits) <= allowed:
-            preview = ", ".join(splits[:3])
-            return RunEntry(name, False, f"different dataset (eval splits: {preview})",
-                            eval_splits=splits)
-    else:
-        # No whitelist for this dataset: fall back to requiring that EVERY sample id in
-        # the probe exists here. Weaker than matching split names -- two datasets with
-        # overlapping id ranges still pass -- so it is a backstop for a not-yet-declared
-        # dataset, not a substitute for adding one to config.EVAL_SPLITS.
-        probe_ids = obj["sample_ids"]
-        if probe_ids and not all(int(s) in gt.row_of for s in probe_ids):
-            return RunEntry(name, False, "different dataset (sample ids not in this dataset)",
-                            eval_splits=splits)
+    # cleanly against the loaded ground truth and produce silently wrong metrics. Test that
+    # directly: every id in the probe must exist in this dataset.
+    #
+    # Split NAMES are deliberately NOT the test. One dataset gets sliced many ways -- the
+    # same gastronorm capture yields 1-cube/2-cubes from `--split gastronorm` and
+    # 1-obj/2-obj from gastronorm_train1_eval2 (_gastronorm_object_count_split in
+    # src/model/dataset.py) -- so matching on names rejected every objcount-* run as
+    # "different dataset" despite identical sample ids, grid and info schema. Runs that
+    # slice one dataset differently belong in the same table: each column keeps its own
+    # split label, and samples a run does not cover render per-cell as "not in run".
+    probe_ids = obj["sample_ids"]
+    if probe_ids and not all(int(s) in gt.row_of for s in probe_ids):
+        return RunEntry(name, False, "different dataset (sample ids not in this dataset)",
+                        eval_splits=splits)
 
     family = gt.layout.dataset if splits else "unknown"
     # Recency comes from the highest-epoch file rather than a stat() of every .pt: epochs

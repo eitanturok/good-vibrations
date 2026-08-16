@@ -492,6 +492,11 @@ function makeDraggable(cell, name) {
       window.removeEventListener("pointermove", onMove);
       window.removeEventListener("pointerup", onUp);
       window.removeEventListener("pointercancel", onUp);
+      // MUST come before the transforms are cleared below: the transform transition is
+      // scoped to body.dragging-col (see style.css), so dropping the class first makes the
+      // clearing instant. Clearing while it still applied animated every displaced column
+      // back to its OLD position, and the re-render then snapped it to the new one -- the
+      // distracting swap-on-release. Order is load-bearing, not incidental.
       document.body.classList.remove("dragging-col");
       // Clear inline transforms before re-rendering, or a recycled row keeps the offset.
       document.querySelectorAll(".hcell.run, .cell.run").forEach((c) => {
@@ -544,7 +549,7 @@ function renderHeader() {
     // ate the name down to "norm-4-...". Grip and close ride the top-right corner.
     cell.innerHTML = `
       <div class="htop">
-        <div class="hname" title="${name} — click to cycle sort">${name}${warn}</div>
+        <div class="hname" title="Click to cycle sort by this run">${name}${warn}</div>
         <span class="hgrip" title="Drag to reorder this column">⠿</span>
         <button class="hclose" title="Remove this run">&times;</button>
       </div>
@@ -575,6 +580,12 @@ function renderHeader() {
       removeRun(name);
     };
     cell.querySelector(".hname").onclick = () => {
+      // Selecting the name to copy it ends in a click here, which would re-sort the whole
+      // table as a side effect of highlighting text. If the user just dragged out a
+      // selection inside this name, that was the intent -- leave the sort alone.
+      const sel = window.getSelection();
+      if (sel && !sel.isCollapsed && sel.anchorNode
+          && cell.querySelector(".hname").contains(sel.anchorNode)) return;
       if (S.sort.run !== name) S.sort = { run: name, metric: S.sort.metric, dir: "worst" };
       else if (S.sort.dir === "worst") S.sort.dir = "best";
       else S.sort = { run: null, metric: S.sort.metric, dir: "worst" };

@@ -116,9 +116,9 @@ def usable_mask_shapes(samples_dir) -> list[tuple[int, int]]:
 # MASK_W so the mask name follows the configured target shape.
 #
 # A layout entry names a FILENAME SCHEME, not a dataset -- `dataset` carries the data
-# identity separately, and EVAL_SPLITS is keyed on THAT. Two layouts sharing a dataset is
-# normal; without the split, selecting a non-default size would match this capture against
-# gastronorm's whitelist and reject every experiment-25 run as "different dataset".
+# identity separately, and it is what a run's `family` is reported as. Two layouts sharing
+# a dataset is normal: the same capture read at two mask sizes is one dataset, and folding
+# the two apart would label otherwise-identical runs as belonging to different families.
 #
 # `gt_mask` is now only a label for error messages: masks are found by GT_MASK_GLOB, which
 # ignores the numeric prefix. That prefix is not stable enough to identify anything --
@@ -250,9 +250,9 @@ class Layout:
         numeric prefix -- the only thing that used to distinguish `experiment-25-v2` from
         `gastronorm` -- is deliberately ignored. Identity therefore rests entirely on the
         `overhead` and `backdrop` files, which do differ (06_overhead_speaker.png is on
-        experiment-25 and absent from gastronorm). Getting this wrong is expensive:
-        EVAL_SPLITS is keyed on layout.dataset, so mislabelling gastronorm as
-        experiment-25 rejects every one of its runs as "different dataset".
+        experiment-25 and absent from gastronorm). Getting this wrong is expensive: the
+        wrong layout loads the wrong ground-truth masks, so every run scores against
+        targets from another capture and the whole table reports silently wrong numbers.
 
         The loose pass exists for a capture missing its overhead file, and now demands the
         backdrop rather than matching on the mask alone -- a mask-only match would accept
@@ -276,8 +276,8 @@ class Layout:
                         continue
                     if not strict:
                         print(f"[viz] layout '{layout.name}' matched WITHOUT its overhead "
-                              f"file ({layout.overhead}); dataset identity is a guess, and "
-                              f"runs may be wrongly rejected as 'different dataset'.")
+                              f"file ({layout.overhead}); dataset identity is a guess, so "
+                              f"runs may be scored against the wrong ground truth.")
                     return layout
         known = ", ".join(LAYOUT_ORDER)
         raise SystemExit(
@@ -295,24 +295,13 @@ class Layout:
 # `forward_outputs/` with incompatible schemas; those are rejected by the compat scan.
 OUTPUTS_SUBDIR = "outputs_history"
 
-# Eval-split directory names identify which dataset a run was trained on. Sample ids
-# collide across experiments, so joining a cylinder/bullet run against experiment-25
-# ground truth would silently produce meaningless metrics.
-#
-# Keyed by layout name: a run is only comparable against the ground truth currently
-# loaded, and the layouts are different datasets. A layout absent from this map (or
-# mapped to None) accepts any split names and falls back to the sample-id overlap check
-# in data._classify, which is weaker but dataset-agnostic.
-EVAL_SPLITS = {
-    "experiment-25": {
-        "purple_cube", "purple_cube_speaker",
-        "green_cube", "green_cube_speaker",
-        "purple_green_cubes", "purple_green_cubes_speaker",
-    },
-    "gastronorm": {
-        "1-cube", "1-cube-speaker", "2-cubes", "2-cubes-speaker", "3-cubes", "red-cube",
-    },
-}
+# There is deliberately no eval-split whitelist here. Dataset identity is checked in
+# data._classify by sample-id overlap against the loaded ground truth, which tests the
+# actual invariant (do these predictions refer to samples in this dataset?) instead of a
+# naming convention. A whitelist used to live here and rejected every objcount-* run as
+# "different dataset" because gastronorm_train1_eval2 names its evaluators 1-obj/2-obj
+# rather than 1-cube/2-cubes -- same capture, same grid, same ids, different slicing.
+# Runs that slice one dataset differently are meant to sit in the same table.
 
 N_DEFAULT_RUNS = 3  # auto-loaded on first open, most recently modified first
 

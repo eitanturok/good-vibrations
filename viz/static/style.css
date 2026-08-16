@@ -367,23 +367,56 @@ body.stacked .gtimg { margin-top: 114px; }
 .hcell { flex: none; padding: 8px 10px; border-right: 1px solid var(--line); }
 .hcell.idx { width: var(--idx-w); }
 .hcell.gt { width: var(--gt-w); }
-.hcell.run { width: var(--col-w); border-left: 3px solid transparent; position: relative; }
+/* Column flex so .hchips can margin-top:auto to the bottom, keeping the chip/metric rows
+   aligned across columns whose names wrap to different heights. */
+.hcell.run {
+  width: var(--col-w); border-left: 3px solid transparent; position: relative;
+  display: flex; flex-direction: column;
+}
 .hcell.run.sorted { border-left-color: var(--accent); background: var(--accent-sf); }
 .hcell.run.dim { opacity: .62; }
 
 /* The name's line. Grip and close sit at the right end as a pair, so the name gets the
-   whole width minus those two controls. */
-.htop { display: flex; align-items: center; gap: 4px; overflow: hidden; }
+   whole width minus those two controls.
+   align-items:flex-start, not center: the name may now take two lines (see .hname) and
+   centring would drag the grip and close button down to the middle of a tall name while
+   they stayed put beside a short one, so the controls would not line up across columns. */
+.htop { display: flex; align-items: flex-start; gap: 4px; overflow: hidden; }
 /* Epoch and status on their own line: at a column sized to the sample image there is not
-   room for both chips beside the name, and the name is what identifies the column. */
-.hchips { display: flex; align-items: center; gap: 5px; margin-top: 3px; overflow: hidden; }
+   room for both chips beside the name, and the name is what identifies the column.
+   margin-top:auto pushes this to the bottom of the header cell, so every column's chips,
+   metrics and sort control line up on the same baseline even though the names above them
+   are one, two or three lines tall (.hname wraps). Without it the chips would step up and
+   down across the row and the header would read as ragged. */
+.hchips {
+  display: flex; align-items: center; gap: 5px;
+  margin-top: auto; padding-top: 3px; overflow: hidden;
+}
 /* Takes the whole line except the grip and close button. Run names differ at the END
    ("norm-4-lr3"), so ellipsising is a real loss -- which is why the chips moved off this
-   line rather than the name giving way to them. */
+   line rather than the name giving way to them.
+
+   Wraps rather than truncating, taking only the lines it needs. Measured on the rendered
+   page over the 76 runs currently comparable here (column is ~143px, so ~23 chars a
+   line): 42 names still fit on one line and render exactly as before, 33 take two, and
+   exactly one -- "gastronorm-one-cube-16x16-smoothed-empty-box" -- needs three. Hence
+   clamp 3, which covers the whole set with no cost to the short names. A smaller font
+   would have shrunk all 76 to rescue a third of them, and a copy button would have put a
+   permanent control in every column for a problem most columns do not have.
+
+   The clamp still caps growth so one pathological name cannot push the header
+   arbitrarily tall; the ellipsis reappears past it. .hcell has no fixed height and every
+   header shares a flex row, so columns re-align on their own. Wrapping also makes the
+   full name selectable with the cursor, which a title= tooltip never allowed -- see the
+   .hname click handler in app.js, which skips the sort when a selection was just made. */
 .hname {
   flex: 1 1 auto; min-width: 0;
-  font-size: 11.5px; font-weight: 700; white-space: nowrap;
-  overflow: hidden; text-overflow: ellipsis; cursor: pointer;
+  font-size: 11.5px; font-weight: 700;
+  /* anywhere: these names are long hyphenated runs, and the default only breaks at the
+     hyphens -- a 30-char unhyphenated segment would otherwise overflow the column. */
+  overflow-wrap: anywhere;
+  display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 3; line-clamp: 3;
+  overflow: hidden; cursor: pointer;
 }
 /* First on the chip line, so it starts at the cell's text edge like the name above it. */
 .hep { flex: none; white-space: nowrap; }
@@ -410,7 +443,15 @@ body.stacked .gtimg { margin-top: 114px; }
   position: relative; z-index: 50; opacity: .92;
   box-shadow: 0 0 0 1px var(--accent), 0 6px 18px rgba(0, 0, 0, .18);
 }
-.hcell.run:not(.dragging), .cell.run:not(.dragging) { transition: transform .14s ease; }
+/* Scoped to body.dragging-col so it applies only WHILE dragging, where it does real work:
+   opening the gap as the pointer passes a column. On release, onUp clears the inline
+   transforms and moveRun repaints in the new order -- with an unscoped transition those
+   two steps animated the displaced columns sliding back to their OLD positions before the
+   repaint snapped them to their new ones, which read as a distracting swap animation for
+   a state that exists for zero frames. Clearing must be instant; the drag itself is the
+   feedback that the reorder happened. */
+body.dragging-col .hcell.run:not(.dragging),
+body.dragging-col .cell.run:not(.dragging) { transition: transform .14s ease; }
 /* Kill text selection and the browser's own touch panning for the whole gesture. */
 body.dragging-col { user-select: none; cursor: grabbing; }
 body.dragging-col .hgrip { cursor: grabbing; }
