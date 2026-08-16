@@ -88,16 +88,15 @@ function shortLayout(s) {
   return s.split("-").filter((w) => w !== "cube" && w !== "cubes").join("+") || s;
 }
 
-/* Split names run long (purple_green_cubes_speaker). Abbreviate the words but keep the
-   distinctions that matter -- which cubes, and whether it is the held-out-speaker
-   variant. The full name stays in the chip's title attribute. */
-function shortSplit(s) {
-  if (!s) return "–";
-  if (s === "train") return "train";
-  const spk = s.endsWith("_speaker");
-  const base = spk ? s.slice(0, -8) : s;
-  const abbr = base.split("_").map((w) => (w === "cubes" || w === "cube" ? "" : w[0])).join("");
-  return (abbr || base) + (spk ? "+spk" : "");
+/* The split chip. Two runs can put the same sample in different splits, so this is the
+   one qualifier a reader must never have to decode -- it is written out in full (the
+   epoch moved to its own line to make room) and coloured by the distinction that changes
+   what a number means: trained on, or held out. */
+function splitChip(s) {
+  if (!s) return "";
+  const held = s !== "train";
+  return `<span class="spchip ${held ? "held" : "train"}" title="${
+    held ? `held-out split: ${s}` : "this run trained on this sample"}">${s.replace(/_/g, " ")}</span>`;
 }
 const api = (u) => fetch(u).then((r) => { if (!r.ok) throw new Error(u); return r.json(); });
 
@@ -182,7 +181,7 @@ function mixedShapes() {
 
 /* Membership at the run's latest epoch: which samples it covers and their splits. This is
    the run's identity for filtering, and it must survive the epoch scrubber swapping
-   `samples` -- see predictedSplit. */
+   `samples` -- see splitsOf. */
 function indexMembership(d) {
   d.splits = new Set(Object.values(d.samples).map((x) => x.split));
   d.splitOf = Object.fromEntries(Object.entries(d.samples).map(([k, v]) => [k, v.split]));
@@ -275,7 +274,14 @@ function uniq(get) {
   return [...m.entries()].sort((a, b) => (a[0] > b[0] ? 1 : -1));
 }
 
-/* A sample is in the table if any loaded run predicted it.
+/* Every split a loaded run assigned this sample to -- a SET, not one value.
+
+   A sample does not have "a split": each run's dataloader files it independently, and
+   two runs need not even use the same split vocabulary. The same capture is `2-obj` in
+   object_count_train12 and `2-cubes` in prep-r0. This used to return the first run's
+   answer and stop, which made the sidebar lie in both directions: `2-obj` claimed all 120
+   samples while `2-cubes` showed 0 (its samples had already been counted under the other
+   run's name), and filtering to `2-cubes` hid rows that genuinely are `2-cubes`.
 
    Read from `splitOf`, the run's membership at its LATEST epoch, not from `samples`,
    which the epoch scrubber swaps out. A run does not save every sample at every epoch
@@ -283,12 +289,13 @@ function uniq(get) {
    epoch has not left the run -- its ground truth certainly has not changed. Keying the
    filter on the swapped table made those rows fail `passes` and vanish from the table
    entirely, taking the ground-truth column with them. */
-function predictedSplit(sampleIdx) {
+function splitsOf(sampleIdx) {
+  const out = new Set();
   for (const n of S.runOrder) {
     const sp = S.runs[n].splitOf && S.runs[n].splitOf[sampleIdx];
-    if (sp) return sp;
+    if (sp) out.add(sp);
   }
-  return null;
+  return out;
 }
 
 function passes(s) {
@@ -311,9 +318,14 @@ function passes(s) {
   // With no runs loaded the table is a ground-truth browser, so every sample qualifies;
   // the split filter only applies once some run has assigned splits.
   if (S.runOrder.length) {
-    const sp = predictedSplit(s.i);
-    if (sp == null) return false;               // no loaded run predicted this sample
-    if (!f.splits.has(sp)) return false;
+    const sps = splitsOf(s.i);
+    if (!sps.size) return false;                // no loaded run predicted this sample
+    // Contains-any, like the object filter. A sample that is `2-obj` to one run and
+    // `2-cubes` to another belongs to both chips, so either one alone must show it --
+    // otherwise turning off a split hides rows that another run still files elsewhere.
+    let ok = false;
+    for (const sp of sps) if (f.splits.has(sp)) { ok = true; break; }
+    if (!ok) return false;
   }
 
   // Metric ranges read the sorted run when one is chosen, else any loaded run may
@@ -658,6 +670,9 @@ function paintRow(el, rank) {
   el.querySelector(".idxn").textContent = rank + 1;
   // Identity line: which sample, where it was captured, which speaker played. The 8
   // samples sharing a position differ only by speaker, so all three belong together.
+  // The run columns no longer repeat this: the sample is the same across the whole row,
+  // so saying it once in the sticky column leaves the run cells free to spend their
+  // title on what actually differs between them (name, split, epoch).
   el.querySelector(".gt-head").innerHTML =
     `<span class="t1">Ground truth</span><span class="t2">${identity(s)}</span>`;
 
@@ -696,31 +711,24 @@ function paintRow(el, rank) {
     const chips = c.querySelector(".subtags");
     const [rh, rw] = runShape(name);
 
-    // Title line 1 identifies the frame: which run, which epoch it is showing, and the
-    // split THIS run put the sample in (dataloaders decide that independently, so the
-    // same sample can be train in one run and eval in another). Runs also save on
-    // different cadences, so at one slider position two columns can legitimately show
-    // different epochs -- hence the epoch belongs per cell, not just in the header.
+    // Split and epoch are both PER-CELL facts, which is why neither can be left to the
+    // column header: dataloaders assign splits independently, so one sample can be train
+    // in one run and held out in another, and runs save on different cadences, so at one
+    // slider position two columns can legitimately show different epochs.
     const cellEp = epochFor(name);
     const shownEp = cellEp == null ? (S.runs[name].epochs || []).slice(-1)[0] : cellEp;
     const latest = cellEp == null;
     const split = e ? e.split : (S.runs[name].splitOf || {})[s.i];
-    // Only the run name truncates. Epoch and split are always legible -- they say which
-    // frame you are looking at, so losing them to an ellipsis would make the cell
-    // ambiguous, whereas a shortened run name is still recognisable.
     // The grid is shown only when columns disagree on it. Both metrics are
     // grid-normalized so the numbers share a scale, but a coarser grid is systematically
     // easier -- a small cross-size gap is not evidence of a better model, so the reader
     // needs to see which size they are looking at.
-    const gs = mixed ? `<span class="sp gsz" title="mask grid">${rh}x${rw}</span>` : "";
-    // Same shape as the column header: name (and its qualifiers) pack left, the epoch
-    // rides the right edge in its own chip so the epochs line up down the column and
-    // read as a state badge rather than as part of the run's name.
+    const gs = mixed ? `<span class="tag gsz" title="mask grid">${rh}x${rw}</span>` : "";
+    // The title is identity only: the run name (wrapped over two lines, never cut) and
+    // the sample. Split and epoch describe THIS PREDICTION rather than the sample or the
+    // run, so they go below the image with the metrics -- see `chips` further down.
     head.innerHTML =
-      `<span class="t1 run"><span class="rn" title="${name}">${name}</span>${gs}` +
-      `${split ? `<span class="sp" title="${split}">${shortSplit(split)}</span>` : ""}` +
-      `<span class="epchip${latest ? "" : " scrub"}"><b>${shownEp ?? "–"}</b>` +
-      `<span class="k">ep</span></span></span>` +
+      `<span class="t1 run" title="${name}">${name}</span>` +
       `<span class="t2">${identity(s)}</span>`;
 
     if (!e) {
@@ -746,11 +754,21 @@ function paintRow(el, rank) {
       return;
     }
     if (c._np) c._np.hidden = true;
-    // Predicted centre of mass on its own line, then the three metrics on the next. All
+    // Below the image, in reading order: first WHICH FRAME this is (the split this run
+    // filed the sample under, and the epoch shown), then what it scored. The frame line
+    // comes first because it qualifies everything after it -- a good MSE means something
+    // different on a train sample than on a held-out one. Both chips sit at the natural
+    // left edge with the rest of the metadata; nothing here is right-aligned, so the
+    // column reads as a single left-hand stack instead of two drifting apart.
+    // Predicted centre of mass then gets its own line, then the three metrics. All
     // four at full size do not fit 224px on one line, and shrinking them to fit made the
     // numbers hard to scan -- which is the one thing this column exists for. Splitting
     // keeps the metrics aligned across every run column at a readable size.
     chips.innerHTML =
+      `${splitChip(split)}` +
+      `<span class="epchip${latest ? "" : " scrub"}" title="epoch ${shownEp ?? "?"}${
+        latest ? " (latest saved)" : " (scrubbed)"}"><b>${shownEp ?? "–"}</b>` +
+      `<span class="k">ep</span></span>${gs}<i class="brk"></i>` +
       `<span class="tag com" title="predicted center of mass (row, col) in grid coords">${
         fmt(e.com[0], 1)}, ${fmt(e.com[1], 1)}</span><i class="brk"></i>` +
       METRICS.map((mm) => {
@@ -856,12 +874,16 @@ function refresh(toTop = false) {
 
 /* ***** sidebar: chips ***** */
 
-function chipRow(host, values, set, labelFn) {
+/* `titleFn` is optional: when a chip needs to explain itself (which runs define this
+   split, and why its count may be 0 for the run you are looking at) the explanation goes
+   in the tooltip rather than onto the chip face, which has to stay scannable. */
+function chipRow(host, values, set, labelFn, titleFn) {
   host.innerHTML = "";
   values.forEach(([v, n]) => {
     const b = document.createElement("button");
     b.className = "chip" + (set.has(v) ? "" : " off");
     b.innerHTML = `${labelFn(v)}<span class="n">${n}</span>`;
+    if (titleFn) b.title = titleFn(v);
     b.onclick = () => { set.has(v) ? set.delete(v) : set.add(v); refresh(); };
     host.appendChild(b);
   });
@@ -922,11 +944,26 @@ function bindFind() {
 function renderChips() {
   const f = S.filters;
   renderFindChips();
+  // Splits are counted per RUN, not pooled. Runs need not share a split vocabulary --
+  // object_count_train12 has `2-obj` where prep-r0 has `2-cubes` over the same captures --
+  // so a single tally attributed each sample to whichever run happened to be loaded first
+  // and left the other run's chips reading 0. Each chip now counts every sample any run
+  // filed under that name, which is a number that stays true no matter what else is open.
   const splits = new Set();
   S.runOrder.forEach((n) => S.runs[n].splits.forEach((s) => splits.add(s)));
   const counts = new Map();
-  S.samples.forEach((s) => { const sp = predictedSplit(s.i); if (sp) counts.set(sp, (counts.get(sp) || 0) + 1); });
-  chipRow($("#split-chips"), [...splits].sort().map((s) => [s, counts.get(s) || 0]), f.splits, (v) => v);
+  S.samples.forEach((s) => splitsOf(s.i).forEach((sp) => counts.set(sp, (counts.get(sp) || 0) + 1)));
+  // Which runs use each name. Kept off the chip face -- a run name on every chip is the
+  // kind of noise that made these labels unreadable before -- and put in the tooltip,
+  // where it answers "why does this chip exist / why is it empty for what I'm looking at"
+  // at the moment the question is actually asked.
+  const owners = new Map();
+  S.runOrder.forEach((n) => S.runs[n].splits.forEach((sp) => {
+    if (!owners.has(sp)) owners.set(sp, []);
+    owners.get(sp).push(n);
+  }));
+  chipRow($("#split-chips"), [...splits].sort().map((s) => [s, counts.get(s) || 0]), f.splits,
+    (v) => v, (v) => `${v} — used by ${(owners.get(v) || []).join(", ") || "no loaded run"}`);
   chipRow($("#layout-chips"), uniq((s) => s.layout), f.layouts, (v) => v);
   chipRow($("#nobj-chips"), uniq((s) => s.n_objects), f.nObjects, (v) => `${v}`);
   chipRow($("#box-chips"), uniq((s) => s.box), f.boxes, (v) => v);
