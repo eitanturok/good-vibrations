@@ -13,7 +13,7 @@ set -u  # deliberately NOT -e: one diverging run should not kill the rest of the
 cd "$(dirname "$0")/.."
 export PYTHONPATH=.
 
-TAG=v2
+TAG=v3
 GROUP=loss-alpha-ablation-attn-$TAG
 
 # ***** mse-asym *****
