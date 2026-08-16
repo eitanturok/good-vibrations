@@ -138,7 +138,9 @@ def ce_pixel_loss(mask_logits, mask_pred, mask_true): return F.binary_cross_entr
 # keeps the scale fixed so alpha=0.5 is exactly mse / ce-pixel.
 def mse_asym_loss(mask_logits, mask_pred, mask_true, alpha=0.5):
     err = mask_pred - mask_true
-    return (2 * (1 - alpha) * err.clamp_min(0).square() + 2 * alpha * (-err).clamp_min(0).square()).mean()
+    fp = 2 * alpha * (-err).clamp_min(0).square() # we want more fp, then fn -> low alpha
+    fn = 2 * (1 - alpha) * err.clamp_min(0).square()
+    return (fn + fp).mean()
 # pos_weight scales only the y*log(p) term, i.e. the false-negative half
 def ce_pixel_asym_loss(mask_logits, mask_pred, mask_true, alpha=0.5):
     return F.binary_cross_entropy_with_logits(mask_logits, mask_true, pos_weight=mask_logits.new_tensor(alpha / (1 - alpha)))

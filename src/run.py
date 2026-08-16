@@ -86,6 +86,7 @@ def get_parser():
     parser.add_argument("--augment-mask",               type=float, default=0.5, help="Probability a sample gets mask augmentation (blur+noise). 0 disables.")
     parser.add_argument("--augment-fft",                type=float, default=0.5, help="Probability a sample gets FFT frequency-gain augmentation. 0 disables.")
     parser.add_argument("--subtract-speaker-mean",      type=int,   default=0, choices=(0, 1), nargs="?", const=1, help="Subtract each speaker's offline mean spectrum (computed over train samples only) after the magnitude and before normalization. Bare flag means 1. Requires --signal-mode magnitude or log_magnitude.")
+    parser.add_argument("--subtract-empty-box",         type=int,   default=0, choices=(0, 1), nargs="?", const=1, help="Subtract each speaker's mean empty-box spectrum, i.e. divide out the box's own transfer function. Requires --signal-mode log_magnitude, where subtracting a log reference IS dividing by it (safe at anti-resonances, unlike linear division). Combines with --subtract-speaker-mean: the empty-box reference is applied first and the speaker mean is then computed on referenced signal. Bare flag means 1.")
     parser.add_argument("--force-rebuild-data",         type=int,   default=0, choices=(0, 1), nargs="?", const=1, help="Discard the cached MDS and rebuild it, re-running mask downsampling and fft precomputation. Bare flag means 1. Needed when the preprocessing code changes, since the cache key only covers the config, not the code.")
 
     # filter data
@@ -208,7 +209,7 @@ def run(**kwargs):
         args.data_dir, batch_size=args.batch_size, eval_batch_size=args.eval_batch_size, num_workers=args.num_workers,
         split=args.split, test_size=args.test_size, speakers=args.speakers, n_objects=args.n_objects, box=args.box, n_samples=args.n_samples,
         out_h=args.out_h, out_w=args.out_w, signal_mode=args.signal_mode, normalize_mode=args.normalize_mode, patch_size=args.patch_size, seed=args.seed,
-        augment_fft=args.augment_fft, augment_mask=args.augment_mask, subtract_speaker_mean=bool(args.subtract_speaker_mean),
+        augment_fft=args.augment_fft, augment_mask=args.augment_mask, subtract_speaker_mean=bool(args.subtract_speaker_mean), subtract_empty_box=bool(args.subtract_empty_box),
         force_rebuild_data=bool(args.force_rebuild_data), n_classes=N_COUNT_CLASSES)
     boundary_loaders = eval_loaders + [Evaluator(label='train', dataloader=train_eval_loader)]
     ensure_viz(args.data_dir, port=args.viz_port, enabled=not args.no_viz)
