@@ -1,4 +1,4 @@
-import hashlib, json, os, shutil
+import hashlib, json, os, random, shutil
 from pathlib import Path
 
 import numpy as np
@@ -64,8 +64,10 @@ def collect_samples(base_sample_dir: Path, verbose: int = 1) -> list[tuple[Path,
 
 def hash_samples(samples: list[tuple[Path, dict]], out_h: int | None = None, out_w: int | None = None,
                   augment_fft: bool = True, signal_mode: str = "magnitude", normalize_mode: str = "std", patch_size: int = 64,
-                  subtract_speaker_mean: bool = False, subtract_empty_box: bool = False) -> str:
+                  subtract_speaker_mean: bool = False, subtract_empty_box: bool = False,
+                  mag_recipe: str | None = None) -> str:
     h = hashlib.sha256()
+    if mag_recipe is not None: h.update(f"recipe{mag_recipe}".encode())  # changes the stored tensor
     if out_h is not None: h.update(f"{out_h}x{out_w}".encode())  # resolution is baked into y, so it must invalidate the cache too
     if not augment_fft: h.update(f"{augment_fft}{signal_mode}{normalize_mode}{patch_size}".encode())  # baked into X when not augmenting, so it must invalidate the cache too
     # the sidecars below are written on both paths and depend on signal_mode, so they're hashed unconditionally
@@ -307,11 +309,27 @@ def augment_vibration(x: torch.Tensor, freqs: torch.Tensor, n_control: int = 5, 
     gain = gain[None, None, :, None]
     return x * gain
 
-def process_vibration(fft: torch.Tensor, freqs: torch.Tensor, signal_mode: str, normalize_mode: str, patch_size: int, augment: float = 0.5, gain_kwargs: dict | None = None, speaker_mean: torch.Tensor | None = None, stats: dict[str, torch.Tensor] | None = None, empty_box_ref: torch.Tensor | None = None) -> torch.Tensor:
+def process_vibration(fft: torch.Tensor, freqs: torch.Tensor, signal_mode: str, normalize_mode: str, patch_size: int, augment: float = 0.5, gain_kwargs: dict | None = None, speaker_mean: torch.Tensor | None = None, stats: dict[str, torch.Tensor] | None = None, empty_box_ref: torch.Tensor | None = None, mag_recipe: str | None = None) -> torch.Tensor:
+    """fft -> tokens.
+
+    `mag_recipe` selects one of the 11 arms in normalizations.MAG_RECIPES and REPLACES
+    the two subtract_* steps. It owns both the domain (|Z| vs log|Z|) and the operation
+    (divide vs subtract), so `signal_mode` and both references must be in that same
+    domain -- build_dataset derives all three from the recipe name.
+
+    Order matters: the reference is removed BEFORE normalize_fft, because dividing by
+    the std first would rescale the sample but not the reference, so they would no
+    longer be commensurable. And std-normalizing last is what makes every arm
+    scale-free, so the ablation compares distribution SHAPE rather than gain.
+    """
     if should_augment(augment): fft = augment_vibration(fft, freqs, **(gain_kwargs or {}))
     x = extract_signal(fft, signal_mode).float()
-    x = subtract_empty_box_ref(x, empty_box_ref)
-    x = subtract_speaker_mean(x, speaker_mean)
+    if mag_recipe is not None:
+        from model.normalizations import apply_mag_recipe
+        x = apply_mag_recipe(x, mag_recipe, empty_box=empty_box_ref, speaker_mean=speaker_mean)
+    else:
+        x = subtract_empty_box_ref(x, empty_box_ref)
+        x = subtract_speaker_mean(x, speaker_mean)
     x = normalize_fft(x, normalize_mode, stats)
     return normalize_token(tokenize(x, patch_size), normalize_mode)
 
@@ -334,8 +352,12 @@ def compute_speaker_means(samples: list[tuple[Path, dict]], signal_mode: str = "
     """{speaker: mean signal (1,L,F,C)}, averaged over that speaker's samples. The mean is taken on
     whatever extract_signal returns, so under log_magnitude it is a mean of logs
 
-    With `empty_box_ref`, the mean is taken on already-referenced signal -- otherwise both terms
-    carry the speaker gain and subtracting them removes it twice.
+    `empty_box_ref` is DEPRECATED and defaults to None. It used to reference the signal before
+    averaging, on the reasoning that both terms otherwise carry the speaker gain and it would be
+    removed twice. That reasoning is wrong: subtraction makes the empty box cancel outright,
+        (x - EB) - mean(x - EB) = x - mean(x),
+    so referencing first silently turned the empty box into a no-op rather than avoiding a double
+    subtraction. Compute both references on raw signal and subtract each once.
 
     keep_idxs restricts the average to a subset (pass the train split to avoid eval leakage)."""
     sums, counts = {}, {}
@@ -402,7 +424,7 @@ def load_dataset_stats(path: Path) -> dict[str, torch.Tensor]:
     d = np.load(path)
     return {k: torch.from_numpy(d[k]).unsqueeze(0) for k in d.files}
 
-def precompute_vibration_samples(samples: list[tuple[Path, dict]], signal_mode: str, normalize_mode: str, patch_size: int, verbose: int = 1, speaker_means: dict[int, torch.Tensor] | None = None, stats: dict[str, torch.Tensor] | None = None, empty_box_ref: dict[int, torch.Tensor] | None = None) -> None:
+def precompute_vibration_samples(samples: list[tuple[Path, dict]], signal_mode: str, normalize_mode: str, patch_size: int, verbose: int = 1, speaker_means: dict[int, torch.Tensor] | None = None, stats: dict[str, torch.Tensor] | None = None, empty_box_ref: dict[int, torch.Tensor] | None = None, mag_recipe: str | None = None) -> None:
     freqs = torch.from_numpy(np.load(samples[0][0] / "vibration/04_fft.npz")["freqs"])
     for sample_dir, meta in tqdm(samples, desc="precomputing fft", disable=not verbose):
         X = np.load(sample_dir / "vibration/04_fft.npz")["fft"]  # (1, L, F, C) complex64
@@ -411,7 +433,7 @@ def precompute_vibration_samples(samples: list[tuple[Path, dict]], signal_mode: 
         speaker = int(meta.get("speaker", -1))
         speaker_mean = speaker_means[speaker] if speaker_means is not None else None
         ref = empty_box_ref[speaker] if empty_box_ref is not None else None
-        X = process_vibration(X, freqs, signal_mode, normalize_mode, patch_size, augment=0.0, speaker_mean=speaker_mean, stats=stats, empty_box_ref=ref).squeeze(0).numpy()
+        X = process_vibration(X, freqs, signal_mode, normalize_mode, patch_size, augment=0.0, speaker_mean=speaker_mean, stats=stats, empty_box_ref=ref, mag_recipe=mag_recipe).squeeze(0).numpy()
         np.save(sample_dir / precomputed_fft_name(signal_mode, normalize_mode, patch_size, speaker_means is not None, empty_box_ref is not None), X)
 
 #***** 5 define dataset *****
@@ -438,7 +460,7 @@ class VibrationDataset(StreamingDataset):
         info = dict(sample_id=s["sample_id"], position_id=s["position_id"], n_objects=n_objects, speaker=s["speaker"], box=s["box"], is_empty_box=s["is_empty_box"], x_com=s["downsampled_com_x"], y_com=s["downsampled_com_y"])
         speaker_mean = self.speaker_means[int(s["speaker"])].to(self.pk["device"]) if self.speaker_means is not None else None
         ref = self.empty_box_ref[int(s["speaker"])].to(self.pk["device"]) if self.empty_box_ref is not None else None
-        fft = X if self.pk["mds_precomputed_fft"] else process_vibration(X, self.pk["freqs"], self.pk["signal_mode"], self.pk["normalize_mode"], self.pk["patch_size"], augment=self.pk["augment_fft"], speaker_mean=speaker_mean, stats=self.stats, empty_box_ref=ref)
+        fft = X if self.pk["mds_precomputed_fft"] else process_vibration(X, self.pk["freqs"], self.pk["signal_mode"], self.pk["normalize_mode"], self.pk["patch_size"], augment=self.pk["augment_fft"], speaker_mean=speaker_mean, stats=self.stats, empty_box_ref=ref, mag_recipe=self.pk.get("mag_recipe"))
         mask_true = process_image(y, self.pk["out_h"], self.pk["out_w"], augment=self.pk["augment_mask"])
         return dict(fft=fft.squeeze(0), mask_true=mask_true.squeeze(0), info=info)
 
@@ -619,47 +641,83 @@ def gastronorm_one_cube(mds_path, test_size=0.2, seed=42, speakers=None, n_objec
     one_cube_train, one_cube_eval = train_test_split([i for i, row in enumerate(index) if row['layout'] in ['purple-cube', 'empty-box']], test_size=0.2, random_state=seed, shuffle=True)
     return {'train': one_cube_train, 'eval/1-cube': one_cube_eval}
 
-def _gastronorm_object_count_split(mds_path, train_objects: int, eval_objects: int, test_size=0.05, seed=42,
-                                   speakers=None, n_objects=None, box=None, n_samples: int | None = None,
-                                   verbose: int = 1, index: list[dict] | None = None):
-    """Cross-object-count generalisation: train on `1 - test_size` of the samples holding `train_objects`
-    objects, and produce two evals -- the held-out `test_size` of that same object count, and every
-    sample holding `eval_objects` objects.
+# The object-count experiment excludes red-cube: it is a distinct object, so keeping it would
+# confound "how many objects" with "which object".
+OBJECT_COUNT_EXCLUDED_LAYOUTS = (LID_LAYOUT, 'red-cube')
 
-    The held-out fraction is drawn by position_id, not by sample: every position is captured once per
-    speaker, so splitting samples would leave the same position in both train and eval and let the model
-    score on a position it had already memorised from another speaker.
+# Positions held out for eval, per object count. Every position carries 8 samples, so this is
+# 40 eval samples per count.
+OBJECT_COUNT_EVAL_POSITIONS = 5
+
+# Train positions per run. The 1-object pool is the binding constraint (70 positions once red-cube
+# and the lid layout are dropped, minus the 5 held out for eval), so every run gets this many so
+# that no run is simply trained on more data than another.
+OBJECT_COUNT_TRAIN_POSITIONS = 65
+
+
+def _object_count_pools(mds_path, seed, speakers, n_objects, box, n_samples, index):
+    """Shared setup for the object-count splits: the per-count position pools, and the eval positions
+    held out of each.
+
+    The holdout is drawn per object count from a fixed seed, independent of what any given run trains
+    on, so all runs in the experiment evaluate on exactly the same samples. Splitting by position_id
+    rather than by sample matters because every position is captured once per speaker -- splitting
+    samples would leave the same position in both train and eval.
 
     The object count comes from each row's `n_objects`, not its layout name -- the two disagree on this
-    dataset (x-shift/y-shift are 2-object layouts, and lid-purple-cube is split across 0 and 1).
-
-    The empty-box (n_objects==0) samples go wholly into train in every arm. They carry no object to
-    localise, so they can only ever be train signal -- and they are what teaches the model the box's own
-    resonances, i.e. what the response looks like with nothing in it.
+    dataset (x-shift/y-shift are 2-object layouts).
     """
     if index is None:
         lines = (Path(mds_path) / "metadata.jsonl").read_text().strip().splitlines()
         index = [json.loads(line) for line in lines if line]
 
-    keep = [i for i, row in enumerate(index) if _matches(row, speakers, n_objects, box) and row['layout'] != LID_LAYOUT]
+    keep = [i for i, row in enumerate(index)
+            if _matches(row, speakers, n_objects, box) and row['layout'] not in OBJECT_COUNT_EXCLUDED_LAYOUTS]
     if n_samples is not None: keep = keep[:n_samples]
 
-    train_pool = [i for i in keep if index[i]["n_objects"] == train_objects]
-    eval_pool = [i for i in keep if index[i]["n_objects"] == eval_objects]
-    if not train_pool: raise ValueError(f"no samples with n_objects={train_objects} to train on")
-    if not eval_pool: raise ValueError(f"no samples with n_objects={eval_objects} to eval on")
+    pools, eval_positions = {}, {}
+    for count in (1, 2):
+        pool = [i for i in keep if index[i]["n_objects"] == count]
+        if not pool: raise ValueError(f"no samples with n_objects={count}")
+        position_ids = sorted({index[i]["position_id"] for i in pool})
+        if len(position_ids) < OBJECT_COUNT_EVAL_POSITIONS + OBJECT_COUNT_TRAIN_POSITIONS:
+            raise ValueError(f"n_objects={count} has only {len(position_ids)} positions, need "
+                             f"{OBJECT_COUNT_EVAL_POSITIONS + OBJECT_COUNT_TRAIN_POSITIONS}")
+        _, held = train_test_split(position_ids, test_size=OBJECT_COUNT_EVAL_POSITIONS, random_state=seed, shuffle=True)
+        pools[count], eval_positions[count] = pool, set(held)
 
-    position_ids = sorted({index[i]["position_id"] for i in train_pool})
-    _, held_position_ids = train_test_split(position_ids, test_size=test_size, random_state=seed, shuffle=True)
-    held_position_ids = set(held_position_ids)
-    train_idx = [i for i in train_pool if index[i]["position_id"] not in held_position_ids]
-    held_idx = [i for i in train_pool if index[i]["position_id"] in held_position_ids]
+    # empty-box samples go wholly into train in every run: they carry no object to localise, so they
+    # can only ever be train signal -- they are what teaches the model the box's own resonances.
+    empty_box = [i for i in keep if index[i]["n_objects"] == 0]
+    return index, pools, eval_positions, empty_box
 
-    train_idx += [i for i in keep if index[i]["n_objects"] == 0]
 
-    splits = {"train": sorted(train_idx),
-              f"eval/{train_objects}-obj": sorted(held_idx),
-              f"eval/{eval_objects}-obj": sorted(eval_pool)}
+def _object_count_split(mds_path, train_positions: dict[int, int], test_size=0.05, seed=42, speakers=None,
+                        n_objects=None, box=None, n_samples: int | None = None, verbose: int = 1,
+                        index: list[dict] | None = None):
+    """One run of the object-count experiment. `train_positions` maps object count -> how many positions
+    of that count to train on; counts absent from it are not trained on at all.
+
+    Every run evaluates on the same `eval/1-obj` and `eval/2-obj` sets regardless of what it trained on,
+    so the numbers line up across runs. `test_size` is accepted for interface compatibility and unused --
+    the eval size is fixed by OBJECT_COUNT_EVAL_POSITIONS so that it cannot drift between runs.
+    """
+    index, pools, eval_positions, empty_box = _object_count_pools(
+        mds_path, seed, speakers, n_objects, box, n_samples, index)
+
+    splits = {"train": list(empty_box)}
+    for count, n_positions in train_positions.items():
+        # train positions are drawn from the same seeded shuffle for every run, so a run training on
+        # fewer positions gets a subset of what a run training on more gets, not a different sample.
+        available = sorted({index[i]["position_id"] for i in pools[count]} - eval_positions[count])
+        rng = random.Random(seed + count)
+        rng.shuffle(available)
+        chosen = set(available[:n_positions])
+        splits["train"] += [i for i in pools[count] if index[i]["position_id"] in chosen]
+    splits["train"] = sorted(splits["train"])
+
+    for count in (1, 2):
+        splits[f"eval/{count}-obj"] = sorted(i for i in pools[count] if index[i]["position_id"] in eval_positions[count])
 
     if verbose:
         for label, idxs in splits.items(): print(f"{label}: {len(idxs)} samples")
@@ -667,53 +725,39 @@ def _gastronorm_object_count_split(mds_path, train_objects: int, eval_objects: i
 
 
 def gastronorm_train1_eval2(*args, **kwargs):
-    """Train on the 1-object scenes, eval on the 2-object scenes."""
-    return _gastronorm_object_count_split(*args, train_objects=1, eval_objects=2, **kwargs)
+    """Train on 1-object scenes only."""
+    return _object_count_split(*args, train_positions={1: OBJECT_COUNT_TRAIN_POSITIONS}, **kwargs)
 
 
 def gastronorm_train2_eval1(*args, **kwargs):
-    """Train on the 2-object scenes, eval on the 1-object scenes."""
-    return _gastronorm_object_count_split(*args, train_objects=2, eval_objects=1, **kwargs)
+    """Train on 2-object scenes only."""
+    return _object_count_split(*args, train_positions={2: OBJECT_COUNT_TRAIN_POSITIONS}, **kwargs)
 
 
-def gastronorm_train12_eval12(mds_path, test_size=0.05, seed=42, speakers=None, n_objects=None, box=None,
-                              n_samples: int | None = None, verbose: int = 1, index: list[dict] | None = None):
-    """The in-distribution control for the two cross-object-count splits: train on both the 1- and
-    2-object scenes, and eval on held-out positions of each, reported separately so the numbers line up
-    with `eval/1-obj` and `eval/2-obj` from the other two runs.
-
-    Positions are held out per object count, using the same by-position rule, so a position held out for
-    one count cannot leak in through the other.
-
-    As in the two cross-count arms, the empty-box (n_objects==0) samples go wholly into train.
+def gastronorm_train12_eval12(*args, **kwargs):
+    """Budget-matched control: train on both object counts, same total positions as the single-count
+    runs. Isolates how a fixed data budget is best spent -- all on one count, or split across both.
     """
-    if index is None:
-        lines = (Path(mds_path) / "metadata.jsonl").read_text().strip().splitlines()
-        index = [json.loads(line) for line in lines if line]
+    half = OBJECT_COUNT_TRAIN_POSITIONS // 2
+    return _object_count_split(*args, train_positions={1: half, 2: OBJECT_COUNT_TRAIN_POSITIONS - half}, **kwargs)
 
-    keep = [i for i, row in enumerate(index) if _matches(row, speakers, n_objects, box) and row['layout'] != LID_LAYOUT]
-    if n_samples is not None: keep = keep[:n_samples]
 
-    splits = {"train": [i for i in keep if index[i]["n_objects"] == 0]}
-    for count in (1, 2):
-        pool = [i for i in keep if index[i]["n_objects"] == count]
-        if not pool: raise ValueError(f"no samples with n_objects={count}")
-        position_ids = sorted({index[i]["position_id"] for i in pool})
-        _, held_position_ids = train_test_split(position_ids, test_size=test_size, random_state=seed, shuffle=True)
-        held_position_ids = set(held_position_ids)
-        splits["train"] += [i for i in pool if index[i]["position_id"] not in held_position_ids]
-        splits[f"eval/{count}-obj"] = sorted(i for i in pool if index[i]["position_id"] in held_position_ids)
-    splits["train"] = sorted(splits["train"])
+def gastronorm_train12_eval12_full(*args, **kwargs):
+    """Exposure-matched control: train on both object counts at the full per-count budget, so each count
+    gets as many positions as it does in its own single-count run. Twice the data of the other three
+    runs -- it answers whether adding the other count on top of what you have helps, where the
+    budget-matched control answers how to divide a fixed budget.
+    """
+    return _object_count_split(*args, train_positions={1: OBJECT_COUNT_TRAIN_POSITIONS,
+                                                       2: OBJECT_COUNT_TRAIN_POSITIONS}, **kwargs)
 
-    if verbose:
-        for label, idxs in splits.items(): print(f"{label}: {len(idxs)} samples")
-    return splits
 
 #***** 8 build dataloaders *****
 
 SPLIT_METHODS = {"exp25": exp25_split, "gastronorm": gastronorm, "gastronorm_one_cube": gastronorm_one_cube,
                  "gastronorm_train1_eval2": gastronorm_train1_eval2, "gastronorm_train2_eval1": gastronorm_train2_eval1,
-                 "gastronorm_train12_eval12": gastronorm_train12_eval12}
+                 "gastronorm_train12_eval12": gastronorm_train12_eval12,
+                 "gastronorm_train12_eval12_full": gastronorm_train12_eval12_full}
 
 def num_samples(batch): return batch["mask_true"].shape[0]
 
@@ -726,16 +770,31 @@ def build_dataset(data_dir: str | Path, split: str = "exp25", batch_size: int = 
                    num_workers: int = 8, out_h: int = 20, out_w: int = 40, signal_mode: str = "magnitude",
                    normalize_mode: str = "std", patch_size: int = 64, seed: int = 42,
                    force_rebuild_data: bool = False, augment_fft: float = 0.5, augment_mask: float = 0.5,
-                   subtract_speaker_mean: bool = False, subtract_empty_box: bool = False, n_classes: int = 4, verbose: int = 1, **split_kwargs):
+                   subtract_speaker_mean: bool = False, subtract_empty_box: bool = False, n_classes: int = 4, verbose: int = 1,
+                   mag_recipe: str | None = None, **split_kwargs):
+
+    # A recipe owns the domain and the operation, so it OVERRIDES signal_mode and both
+    # subtract_* flags. Deriving signal_mode here is what guarantees the references are
+    # built in the same domain the recipe uses them in -- a linear arm dividing by a log
+    # reference is silently meaningless, and nothing downstream would catch it.
+    if mag_recipe is not None:
+        from model.normalizations import MAG_RECIPES
+        if mag_recipe not in MAG_RECIPES:
+            raise ValueError(f"unknown {mag_recipe=}; expected one of {sorted(MAG_RECIPES)}")
+        signal_mode = "log_magnitude" if mag_recipe.startswith("logmag") else "magnitude"
+        subtract_empty_box = mag_recipe.endswith(("_eb", "_both"))
+        subtract_speaker_mean = mag_recipe.endswith(("_spk", "_both"))
+        if verbose:
+            print(f"{mag_recipe=} -> {signal_mode=}, {subtract_empty_box=}, {subtract_speaker_mean=}")
 
     if split not in SPLIT_METHODS: raise ValueError(f"Unknown split {split!r}, expected one of {sorted(SPLIT_METHODS)}")
     if not 0 <= augment_fft <= 1: raise ValueError(f"{augment_fft=} must be a probability in [0, 1]")
     if not 0 <= augment_mask <= 1: raise ValueError(f"{augment_mask=} must be a probability in [0, 1]")
-    if subtract_speaker_mean and signal_mode not in ("magnitude", "log_magnitude"):
+    if mag_recipe is None and subtract_speaker_mean and signal_mode not in ("magnitude", "log_magnitude"):
         raise ValueError(f"{subtract_speaker_mean=} requires signal_mode='magnitude' or 'log_magnitude', got {signal_mode!r}")
     # log space only: the whole point is that subtracting == dividing there. In linear space this
     # would be a subtraction of magnitudes, which is not the multiplicative correction we want.
-    if subtract_empty_box and signal_mode != "log_magnitude":
+    if mag_recipe is None and subtract_empty_box and signal_mode != "log_magnitude":
         raise ValueError(f"{subtract_empty_box=} requires signal_mode='log_magnitude' (subtracting a log reference is dividing by it), got {signal_mode!r}")
     data_dir = Path(data_dir)
     if not data_dir.exists(): raise FileNotFoundError(f"{data_dir=} does not exist")
@@ -743,7 +802,7 @@ def build_dataset(data_dir: str | Path, split: str = "exp25", batch_size: int = 
     # the fft gain augmentation needs the raw complex fft, so any nonzero probability means we store it raw
     raw_fft = augment_fft > 0
     samples = collect_samples(data_dir / "samples", verbose)
-    mds_dir = data_dir / "mds" / hash_samples(samples, out_h, out_w, raw_fft, signal_mode, normalize_mode, patch_size, subtract_speaker_mean, subtract_empty_box)[:16]
+    mds_dir = data_dir / "mds" / hash_samples(samples, out_h, out_w, raw_fft, signal_mode, normalize_mode, patch_size, subtract_speaker_mean, subtract_empty_box, mag_recipe)[:16]
     done = mds_dir / "metadata.jsonl"  # last file convert_to_mds writes -- its presence means the build completed
 
     if force_rebuild_data and mds_dir.exists():
@@ -756,14 +815,14 @@ def build_dataset(data_dir: str | Path, split: str = "exp25", batch_size: int = 
         # train-only, so eval spectra don't leak into either set of statistics
         needs_stats = normalize_mode.split('+')[0] in DATASET_STATS_MODES
         train_idxs = SPLIT_METHODS[split](mds_dir, seed=seed, verbose=0, index=[m for _, m in samples], **split_kwargs)["train"] if subtract_speaker_mean or subtract_empty_box or needs_stats else None
-        # empty-box ref first: the speaker mean is then taken on referenced signal
+        
         empty_box_ref = compute_empty_box_ref(samples, signal_mode, keep_idxs=train_idxs, verbose=verbose) if subtract_empty_box else None
-        speaker_means = compute_speaker_means(samples, signal_mode, keep_idxs=train_idxs, verbose=verbose, empty_box_ref=empty_box_ref) if subtract_speaker_mean else None
+        speaker_means = compute_speaker_means(samples, signal_mode, keep_idxs=train_idxs, verbose=verbose, empty_box_ref=None) if subtract_speaker_mean else None
         stats = compute_dataset_stats(samples, signal_mode, keep_idxs=train_idxs, verbose=verbose) if needs_stats else None
 
         # downsample image, precompute fft, and convert to mds
         downsample_samples(samples, out_h, out_w, verbose=verbose)
-        if not raw_fft: precompute_vibration_samples(samples, signal_mode, normalize_mode, patch_size, verbose=verbose, speaker_means=speaker_means, stats=stats, empty_box_ref=empty_box_ref)
+        if not raw_fft: precompute_vibration_samples(samples, signal_mode, normalize_mode, patch_size, verbose=verbose, speaker_means=speaker_means, stats=stats, empty_box_ref=empty_box_ref, mag_recipe=mag_recipe)
         convert_to_mds(mds_dir, samples, out_h, out_w, verbose=verbose, augment_fft=raw_fft, signal_mode=signal_mode, normalize_mode=normalize_mode, patch_size=patch_size, subtract_speaker_mean=subtract_speaker_mean, subtract_empty_box=subtract_empty_box)
         if speaker_means is not None: save_speaker_means(speaker_means, mds_dir / SPEAKER_MEANS_FILE)
         if stats is not None: save_dataset_stats(stats, mds_dir / DATASET_STATS_FILE)
@@ -774,7 +833,7 @@ def build_dataset(data_dir: str | Path, split: str = "exp25", batch_size: int = 
     splits = SPLIT_METHODS[split](mds_dir, seed=seed, verbose=verbose, **split_kwargs)
 
     generator = torch.Generator().manual_seed(seed)
-    process_kwargs = dict(device="cpu", signal_mode=signal_mode, normalize_mode=normalize_mode, patch_size=patch_size, out_h=out_h, out_w=out_w, mds_precomputed_fft=not raw_fft, n_classes=n_classes)
+    process_kwargs = dict(device="cpu", signal_mode=signal_mode, normalize_mode=normalize_mode, patch_size=patch_size, out_h=out_h, out_w=out_w, mds_precomputed_fft=not raw_fft, n_classes=n_classes, mag_recipe=mag_recipe)
     train_dataset = VibrationDataset(local=mds_dir, seed=seed, process_kwargs=dict(process_kwargs, augment_fft=augment_fft, augment_mask=augment_mask))
     eval_dataset = VibrationDataset(local=mds_dir, seed=seed, process_kwargs=dict(process_kwargs, augment_fft=0.0, augment_mask=0.0))
 

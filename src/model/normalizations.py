@@ -206,28 +206,26 @@ def as_cos_sin(phasor: np.ndarray, weight: np.ndarray | None = None) -> np.ndarr
     return np.concatenate([phasor.real, phasor.imag], axis=-1)
 
 #***** 2 stage A: magnitude recipes *****
-# Signature is uniform -- (fft, refs) -> (L,F,C) real -- so callers can treat them
-# interchangeably. `refs` carries the precomputed log-domain references; both are
-# subtractions because log turns the multiplicative chain Y = S(f)H(f) additive.
-
-def mag_none(fft, refs=None):
-    return log_mag(_to_LFC(fft))
-
-def mag_sub_speaker(fft, refs):
-    return log_mag(_to_LFC(fft)) - refs['speaker']
-
-def mag_sub_emptybox(fft, refs):
-    return log_mag(_to_LFC(fft)) - refs['empty_box']
-
-def mag_sub_both(fft, refs):
-    return log_mag(_to_LFC(fft)) - refs['speaker'] - refs['empty_box']
 
 MAG_RECIPES = {
-    'A0_logmag':            mag_none,
-    'A1_sub_speaker':       mag_sub_speaker,
-    'A2_sub_emptybox':      mag_sub_emptybox,
-    'A3_sub_both':          mag_sub_both,
+    # linear: references DIVIDE out (the matched operation), `both` is the product
+    'mag':              lambda x, eb, sm: x,
+    'mag_div_spk':      lambda x, eb, sm: x / sm,
+    'mag_div_eb':       lambda x, eb, sm: x / eb,
+    'mag_div_both':     lambda x, eb, sm: x / (eb * sm),
+    # linear, mismatched -- the control arm
+    'mag_sub_spk':      lambda x, eb, sm: x - sm,
+    'mag_sub_eb':       lambda x, eb, sm: x - eb,
+    'mag_sub_both':     lambda x, eb, sm: x - (eb + sm),
+    # log: references SUBTRACT out (the matched operation), `both` is the sum
+    'logmag':           lambda x, eb, sm: x,
+    'logmag_sub_spk':   lambda x, eb, sm: x - sm,
+    'logmag_sub_eb':    lambda x, eb, sm: x - eb,
+    'logmag_sub_both':  lambda x, eb, sm: x - (eb + sm),
 }
+
+def apply_mag_recipe(x, recipe: str, empty_box=None, speaker_mean=None):
+    return MAG_RECIPES[recipe](x, empty_box, speaker_mean)
 
 #***** 3 stage B: phase recipes *****
 # Each returns real (L, F', K) phase channels only -- stage B features are built
