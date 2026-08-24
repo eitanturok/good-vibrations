@@ -251,7 +251,7 @@ class FreqEncoder(nn.Module):
         super().__init__()
         self.embed = nn.Linear(n_channels * patch_size, d_model)
         self.speakers_embed = nn.Embedding(4, d_model)
-        self.layers = nn.TransformerEncoder(nn.TransformerEncoderLayer(d_model=d_model, nhead=num_heads, batch_first=True), num_layers=num_layers)
+        self.layers = nn.TransformerEncoder(nn.TransformerEncoderLayer(d_model=d_model, nhead=num_heads, dim_feedforward=4 * d_model, batch_first=True), num_layers=num_layers)
         self.cls_token = nn.Parameter(torch.zeros(1, 1, d_model))
         self.register_buffer("freqs_cis", precompute_freqs_cis(d_model, signal_length // patch_size))
         self.freq_dropout = freq_dropout
@@ -276,7 +276,7 @@ class VibrationTransformer(ComposerModel):
 
         # encoder
         self.freq_encoder = FreqEncoder(data_info['patch_size'], d_model, pnt_num_heads, pnt_num_layers, data_info['n_freqs'], freq_dropout, n_channels=data_info.get('n_channels', 2))
-        self.laser_encoder = nn.TransformerEncoder(nn.TransformerEncoderLayer(d_model=d_model, nhead=seq_num_heads, batch_first=True), num_layers=seq_num_layers)
+        self.laser_encoder = nn.TransformerEncoder(nn.TransformerEncoderLayer(d_model=d_model, nhead=seq_num_heads, dim_feedforward=4 * d_model, batch_first=True), num_layers=seq_num_layers)
         self.laser_dropout = laser_dropout
 
         self.cls_token = nn.Parameter(torch.zeros(1, 1, d_model))
