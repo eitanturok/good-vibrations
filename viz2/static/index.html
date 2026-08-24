@@ -1,0 +1,153 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>viz2</title>
+<link rel="stylesheet" href="/style.css">
+
+<header id="bar">
+  <div class="bhead"><div class="brand">viz2</div>
+    <div id="summary" class="summary"></div></div>
+</header>
+
+<main>
+<div id="flow">
+
+  <!-- 1 . which recording -->
+  <section class="card step">
+    <h2><b>1</b> sample</h2>
+    <div class="stepbody">
+      <div class="pickers">
+        <div class="pk"><span>sample <em id="nmatch"></em></span>
+          <div class="combo">
+            <input id="sid" autocomplete="off" spellcheck="false" placeholder="type an id">
+            <div id="sidlist" hidden></div>
+          </div>
+          <em class="note">overrides the filters</em>
+        </div>
+        <div class="pk"><span>objects <button class="link" data-all="nobj">all</button><button class="link" data-none="nobj">none</button></span>
+          <div class="chips nobj" id="nobjchips"></div>
+        </div>
+        <div class="pk lay"><span>layout <button class="link" data-all="layouts">all</button><button class="link" data-none="layouts">none</button></span>
+          <div class="chips" id="layoutchips"></div>
+        </div>
+        <div class="pk"><span>speaker <button class="link" data-all="spk">all</button><button class="link" data-none="spk">none</button></span>
+          <svg id="spk" tabindex="0"></svg></div>
+        <div class="pk"><span>position <button id="empty" class="tog">empty</button>
+          <em id="poscount"></em></span>
+          <svg id="scatter" tabindex="0"></svg>
+          <div id="repeats" hidden></div>
+        </div>
+      </div>
+      <div class="scenes">
+        <figure><img id="scene" alt=""><figcaption>overhead</figcaption></figure>
+        <figure><img id="smask" alt=""><figcaption>segmentation mask</figcaption></figure>
+      </div>
+    </div>
+  </section>
+
+  <!-- 2 . which laser and frequency -->
+  <section class="card step">
+    <h2><b>2</b> laser &amp; frequency <em id="heatread" class="soft"></em></h2>
+    <p class="ptitle" id="lftitle"></p>
+    <div class="stepbody">
+      <div class="rail-l">
+        <span class="cl">channel</span>
+        <div class="seg chsel" id="ch">
+          <button data-v="x">x</button><button data-v="y">y</button>
+          <button data-v="avg" class="on">avg</button>
+        </div>
+        <span class="cl">scale</span>
+        <div class="seg chsel" id="heatlog">
+          <button data-v="0">lin</button><button data-v="1" class="on">log</button>
+        </div>
+        <span class="cl">laser <em id="lasernow"></em></span>
+        <svg id="grid" tabindex="0"></svg>
+      </div>
+      <div class="vkey">
+        <span id="cbmax"></span>
+        <canvas id="cbar"></canvas>
+        <span id="cbmin"></span>
+        <em id="cblab"></em>
+      </div>
+      <div class="lf">
+        <div class="strip lbl" data-l="average"><canvas id="heatmean"></canvas></div>
+        <div class="plot h160"><i class="yl" id="yh"></i><img id="heat" alt=""><svg class="ov" id="heatov"></svg></div>
+        <div class="plot axonly gut"><svg class="ov" id="heatax"></svg></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- 3 . the signal -->
+  <section class="card step">
+    <h2><b>3</b> signal</h2>
+    <p class="ptitle" id="sigtitle"></p>
+    <div class="legend" id="siglegend"></div>
+    <div class="stepbody">
+      <div class="rail-l">
+        <span class="cl">spectrum</span>
+        <div class="seg chsel col" id="specmode">
+          <button data-v="magphase" class="on">mag + φ</button><button data-v="reim">re + im</button>
+        </div>
+        <span class="cl">scale</span>
+        <div class="seg chsel" id="speclog">
+          <button data-v="0">lin</button><button data-v="1" class="on">log</button>
+        </div>
+        <span class="cl">shifts</span>
+        <div class="seg chsel" id="kind">
+          <button data-v="raw">raw</button><button data-v="clean" class="on">clean</button>
+        </div>
+        <button id="hold" class="tog hold wide">+ hold probe</button>
+      </div>
+      <div class="vkey spacer"></div>
+      <div class="lf">
+        <div class="plot h150"><i class="yl" id="y1"></i><canvas id="p1"></canvas><svg class="ov" id="p1ov"></svg></div>
+        <div class="plot h110 gut"><i class="yl" id="y2"></i><canvas id="p2"></canvas><svg class="ov" id="p2ov"></svg></div>
+        <div class="plot h110 gut"><i class="yl" id="y3"></i><canvas id="p3"></canvas><svg class="ov" id="p3ov"></svg></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- 4 . the mode -->
+  <section class="card step">
+    <h2><b>4</b> mode
+      <span class="seg sm" id="modeview">
+        <button data-v="arrows" class="on">arrows</button><button data-v="field">field</button>
+      </span>
+    </h2>
+    <p class="ptitle" id="modetitle"></p>
+    <div class="modebody">
+      <div class="modecol">
+        <div class="ctl modectl">
+          <button id="play" class="tog">▶</button>
+          <label class="asz">size <input id="asize" type="range" min="0.3" max="3" step="0.1" value="1"></label>
+        </div>
+        <div class="legend" id="modelegend"></div>
+        <div class="modewrap">
+          <i class="mlab my">laser row</i>
+          <canvas id="mode" width="320" height="320"></canvas>
+          <i class="mlab mx">laser column</i>
+          <svg class="mode-ax" id="modeax"></svg>
+        </div>
+        <em class="hint mhint">arrow = (x, y) displacement of that laser</em>
+      </div>
+    </div>
+  </section>
+
+  <!-- 5 . recovered audio -->
+  <section class="card step">
+    <h2><b>5</b> recovered audio</h2>
+    <p class="ptitle" id="audtitle"></p>
+    <div class="audio"><audio id="audio" controls preload="none"></audio></div>
+    <div id="heldaudio"></div>
+  </section>
+
+</div>
+
+<aside id="probes">
+  <h2>current</h2>
+  <div id="now" class="probe live"></div>
+  <h2 id="heldh">held <button id="clear" class="link">clear</button></h2>
+  <div id="plist"></div>
+</aside>
+</main>
+<script src="/app.js"></script>

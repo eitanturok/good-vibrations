@@ -95,6 +95,17 @@ prediction for the same sample.
 - **Metrics** — dual-handle range sliders. They read the sorted run when one is
   selected, otherwise a sample passes if any loaded run is in range.
 
+The count under **+ Add run** says how many samples survived, and — when rows are
+missing — names each filter that is holding rows back, with how many *only* that filter
+is hiding. Each name is a button that switches that one filter off and leaves the rest
+alone. `not predicted by any loaded run` is the exception: no chip can bring those back,
+so it is reported but not clickable.
+
+Two filters are easy to confuse, and the readout is how you tell them apart: **split**
+`2-cubes` is the handful of *held-out positions* a run evaluated on, while **objects**
+`2` is every two-object sample in the dataset. Filtering to the split and expecting the
+object count leaves ~3 rows per speaker where you expected ~286.
+
 Selected is a filled accent; deselected is muted, desaturated and dashed — the same
 rule for chips, speakers and scatter points.
 

@@ -47,6 +47,7 @@ const S = {
   // under which two cells mean the same thing, which is the point of a comparison table.
   view: { mode: "pred", background: true, relative: false },
   domain: {}, positions: [], activePos: -1, modalRow: -1,
+  hidden: new Map(),  // filter key -> samples that ONLY that filter is holding back
   renderVersion: 0,   // from /api/runs; part of image URLs to defeat immutable caching
   lut: null,          // colormaps from the server, so client and server agree on colour
   epochIdx: null,     // null = each run's latest; otherwise an index into the epoch list
@@ -287,7 +288,7 @@ function uniq(get) {
    which the epoch scrubber swaps out. A run does not save every sample at every epoch
    (early epochs in particular cover a different subset), and a sample missing from one
    epoch has not left the run -- its ground truth certainly has not changed. Keying the
-   filter on the swapped table made those rows fail `passes` and vanish from the table
+   filter on the swapped table made those rows fail `failures` and vanish from the table
    entirely, taking the ground-truth column with them. */
 function splitsOf(sampleIdx) {
   const out = new Set();
@@ -298,40 +299,51 @@ function splitsOf(sampleIdx) {
   return out;
 }
 
-function passes(s) {
+/* EVERY reason this sample is off screen, as filter keys; empty means it is on screen.
+
+   The table's contents and the "why is nothing here" readout both come from this one
+   function, so they cannot drift apart: a sample is hidden if and only if a key names
+   the filter doing the hiding, and that key is what the readout offers to clear. */
+function failures(s) {
   const f = S.filters;
+  const out = [];
   // An explicit ID search overrides the browsing filters: when you ask for a sample by
   // number you want to see it, not have it hidden by a speaker chip you set earlier.
   if (f.findSamples.size || f.findPositions.size) {
-    return f.findSamples.has(+s.sample_id) || f.findPositions.has(+s.output_id);
+    const hit = f.findSamples.has(+s.sample_id) || f.findPositions.has(+s.output_id);
+    return hit ? out : ["find"];
   }
-  if (!f.speakers.has(s.speaker)) return false;
-  if (!f.layouts.has(s.layout)) return false;
-  if (!f.nObjects.has(s.n_objects)) return false;
-  if (!f.boxes.has(s.box)) return false;
+  if (!f.speakers.has(s.speaker)) out.push("speakers");
+  if (!f.layouts.has(s.layout)) out.push("layouts");
+  if (!f.nObjects.has(s.n_objects)) out.push("nObjects");
+  if (!f.boxes.has(s.box)) out.push("boxes");
   // Contains-any: a scene passes if any object in it is selected. Empty boxes have no
   // objects, so they ride on the "empty" pseudo-entry rather than never matching.
   const objs = s.objects && s.objects.length ? s.objects : ["(none)"];
-  if (!objs.some((o) => f.objects.has(o))) return false;
-  if (f.positions && !(s.pos >= 0 && f.positions.has(s.pos))) return false;
+  if (!objs.some((o) => f.objects.has(o))) out.push("objects");
+  if (f.positions && !(s.pos >= 0 && f.positions.has(s.pos))) out.push("positions");
 
   // With no runs loaded the table is a ground-truth browser, so every sample qualifies;
   // the split filter only applies once some run has assigned splits.
   if (S.runOrder.length) {
     const sps = splitsOf(s.i);
-    if (!sps.size) return false;                // no loaded run predicted this sample
-    // Contains-any, like the object filter. A sample that is `2-obj` to one run and
-    // `2-cubes` to another belongs to both chips, so either one alone must show it --
-    // otherwise turning off a split hides rows that another run still files elsewhere.
-    let ok = false;
-    for (const sp of sps) if (f.splits.has(sp)) { ok = true; break; }
-    if (!ok) return false;
+    // No loaded run predicted this sample. Reported separately from the split chips
+    // because no chip can bring it back -- the fix is loading a run that covers it.
+    if (!sps.size) out.push("nopred");
+    else {
+      // Contains-any, like the object filter. A sample that is `2-obj` to one run and
+      // `2-cubes` to another belongs to both chips, so either one alone must show it --
+      // otherwise turning off a split hides rows that another run still files elsewhere.
+      let ok = false;
+      for (const sp of sps) if (f.splits.has(sp)) { ok = true; break; }
+      if (!ok) out.push("splits");
+    }
   }
 
   // Metric ranges read the sorted run when one is chosen, else any loaded run may
   // satisfy them (union) — the intuitive reading of "show me samples where MSE is high".
   const names = S.sort.run && S.runs[S.sort.run] ? [S.sort.run] : S.runOrder;
-  if (!names.length) return true;
+  if (!names.length) return out;
   let any = false;
   for (const n of names) {
     const r = S.runs[n];
@@ -348,11 +360,50 @@ function passes(s) {
     }
     if (ok) { any = true; break; }
   }
-  return any;
+  if (!any) out.push("ranges");
+  return out;
+}
+
+/* What each filter key is called in the readout, and how to switch it off again.
+
+   `clear` restores that one dimension to "everything", leaving the others alone: the
+   readout's whole job is to let you undo the single filter that is hiding what you came
+   to look at, without resetting the ones you set deliberately. */
+const FILTERS = {
+  speakers:  { label: "speaker",  clear: (f) => S.samples.forEach((s) => f.speakers.add(s.speaker)) },
+  splits:    { label: "split",    clear: (f) => S.runOrder.forEach((n) => S.runs[n].splits.forEach((sp) => f.splits.add(sp))) },
+  nObjects:  { label: "objects",  clear: (f) => S.samples.forEach((s) => f.nObjects.add(s.n_objects)) },
+  objects:   { label: "contains", clear: (f) => S.samples.forEach((s) => (s.objects && s.objects.length ? s.objects : ["(none)"]).forEach((o) => f.objects.add(o))) },
+  layouts:   { label: "layout",   clear: (f) => S.samples.forEach((s) => s.layout && f.layouts.add(s.layout)) },
+  boxes:     { label: "box",      clear: (f) => S.samples.forEach((s) => s.box && f.boxes.add(s.box)) },
+  positions: { label: "position", clear: (f) => { f.positions = null; S.activePos = -1; } },
+  ranges:    { label: "metrics",  clear: (f) => { for (const m of METRICS) f.ranges[m.key] = [...S.domain[m.key]]; syncSliders(); } },
+  find:      { label: "id search", clear: (f) => { f.findSamples.clear(); f.findPositions.clear(); renderFindChips(); } },
+  // Not a filter and not clearable: say so rather than offering a button that does
+  // nothing. Reported because "the loaded runs never predicted these" is the one answer
+  // the chips cannot give, and it is what an eval-only run looks like from the table.
+  nopred:    { label: "not predicted by any loaded run" },
+};
+
+function clearFilter(key) {
+  const info = FILTERS[key];
+  if (!info || !info.clear) return;
+  info.clear(S.filters);
+  refresh();
 }
 
 function applyFilters() {
-  const rows = S.samples.filter(passes);
+  // One pass, two answers: the rows to draw, and -- for everything held back -- which
+  // filter would have to be relaxed to admit it. A sample failing several filters at
+  // once is not attributed to any of them: clearing one would not bring it back, so
+  // promising that it would is worse than staying quiet.
+  const rows = [], solo = new Map();
+  for (const s of S.samples) {
+    const why = failures(s);
+    if (!why.length) rows.push(s);
+    else if (why.length === 1) solo.set(why[0], (solo.get(why[0]) || 0) + 1);
+  }
+  S.hidden = solo;
   const { run, metric, dir } = S.sort;
 
   // While scrubbing epochs the metrics underneath are changing, and re-sorting on them
@@ -861,9 +912,23 @@ function refresh(toTop = false) {
   $("#rows").style.top = `${hh}px`;
   $("#spacer").style.height = `${hh + S.order.length * rowH()}px`;
   const nRuns = S.runOrder.length;
+  // "3 of 3007" on its own reads as a broken tool. Naming the filter that is holding the
+  // other 3004 back -- and making the name the button that switches it off -- turns
+  // "why is nothing showing up" into one click, which is the question this readout is for.
+  const held = [...S.hidden.entries()]
+    .filter(([k]) => FILTERS[k])
+    .sort((a, b) => b[1] - a[1]);
   $("#rowcount").innerHTML =
     `<b>${S.order.length}</b> of ${S.samples.length} samples` +
-    ` · <b>${nRuns}</b> run${nRuns === 1 ? "" : "s"}`;
+    ` · <b>${nRuns}</b> run${nRuns === 1 ? "" : "s"}` +
+    (held.length
+      ? `<span class="held">hidden by ` + held.map(([k, n]) => (FILTERS[k].clear
+          ? `<button class="why" data-k="${k}" title="Show these ${n} — clears the ${FILTERS[k].label} filter, leaving the others alone">${FILTERS[k].label} +${n}</button>`
+          : `<span class="why off" title="No filter is hiding these — no loaded run has a prediction for them">${FILTERS[k].label} +${n}</span>`)).join(" ") + `</span>`
+      : "");
+  $("#rowcount").querySelectorAll("button.why").forEach((b) => {
+    b.onclick = () => clearFilter(b.dataset.k);
+  });
   $("#empty").hidden = S.order.length > 0;
   renderChips();
   renderScatter();
