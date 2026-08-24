@@ -9,7 +9,7 @@ const S = {
   probes: [], hues: {}, hot: null,
   fi: null, hoverFi: null,
   log: { spec: 1 },
-  specMode: 'magphase', fieldbg: false, kind: 'clean',
+  specMode: 'magphase', phmode: 'cos', fieldbg: false, kind: 'clean',
   empty: false, anim: 0, asize: 1,
   f: { layouts: new Set(), nobj: new Set(), spk: new Set([1]) },  // empty == no filter
 };
@@ -99,7 +99,7 @@ const css = (n) => getComputedStyle(document.body).getPropertyValue(n).trim();
     S.byId[s.id] = s;
     (S.byPos[s.pos] ??= {})[s.spk] = s.id;
   }
-  buildFilters(); buildScatter(); buildSpk(); buildGrid(); wire(); applyFilter();
+  buildFilters(); buildScatter(); buildSpk(); buildGrid(); wire(); phVis(); applyFilter();
   await select(S.all.find((s) => !s.empty)?.id || S.all[0].id);
 })();
 
@@ -206,8 +206,16 @@ function line(g, y, w, h, c, lw) {
 // Shared y-range so overlaid probes are actually comparable.
 function span(list, key) {
   let lo = Infinity, hi = -Infinity;
-  for (const s of list) for (const v of s.d[key]) { if (v < lo) lo = v; if (v > hi) hi = v; }
+  for (const s of list) for (const v of vals(s.d, key)) { if (v < lo) lo = v; if (v > hi) hi = v; }
   return [lo, hi];
+}
+
+/* cos(phase) instead of the raw angle. Raw phase wraps at +/-pi, so the plot is a picket
+   fence of 2pi jumps that hides the structure; the cosine is continuous and shows the same
+   thing. Derived here and cached on the payload -- the server already sent the angle. */
+function vals(d, key) {
+  if (key !== 'cosphase') return d[key];
+  return (d._cos ??= d.phase.map(Math.cos));
 }
 
 function multi(cv, key) {
@@ -217,7 +225,7 @@ function multi(cv, key) {
   S.rng[cv.id] = { lo, hi };                  // so the y axis can label the same scale
   if (cv.id === 'p1') S.p1 = { lo, hi, h };   // so peak markers can sit ON the curve
   for (const s of ss) {
-    const y = s.d[key];
+    const y = vals(s.d, key);
     g.beginPath();
     for (let i = 0; i < y.length; i++) {
       const X = (i / (y.length - 1)) * w, Y = h - (y[i] - lo) * k;
@@ -238,7 +246,7 @@ const DIV = ['#8c3b12', '#d98635', '#f7dcc0', '#f5f5f3', '#cfe0f2', '#5595d4', '
 /* "All lasers" turns each plot into a lasers x frequency image. The five quantities have
    different units and two different palettes, so each carries its own colorbar. */
 const HEATQ = () => (S.specMode === 'magphase'
-  ? [S.log.spec ? 'logmag' : 'mag', 'phase'] : ['re', 'im']);
+  ? [S.log.spec ? 'logmag' : 'mag', S.phmode === 'cos' ? 'cosphase' : 'phase'] : ['re', 'im']);
 
 async function drawHeat() {
   const all = S.live.laser === 'all';
@@ -262,7 +270,8 @@ async function drawHeat() {
 
 function drawSpec() {
   const a = S.specMode === 'magphase' ? (S.log.spec ? 'logmag' : 'mag') : 're';
-  const b = S.specMode === 'magphase' ? 'phase' : 'im';
+  const b = S.specMode === 'magphase'
+    ? (S.phmode === 'cos' ? 'cosphase' : 'phase') : 'im';
   multi($('#p1'), a); multi($('#p2'), b);
   yAxis('#p1ov', 'p1'); yAxis('#p2ov', 'p2');
   drawHeat();
@@ -478,8 +487,8 @@ function xAxis(svg, lo, hi, label, showNums) {
   if (showNums) {
     out += t.map((v) => {
       const x = ((v - lo) / (hi - lo)) * 100;
-      return `<text class="tk" x="${x}%" y="100%" dy="11">${v}</text>`;
-    }).join('') + `<text class="unit" x="50%" y="100%" dy="23">${label}</text>`;
+      return `<text class="tk" x="${x}%" y="100%" dy="10">${v}</text>`;
+    }).join('') + `<text class="unit" x="50%" y="100%" dy="21">${label}</text>`;
   }
   g.innerHTML = out;
 }
@@ -653,15 +662,16 @@ function axes() {
   if (!S.d) return;
   const f = S.d.freqs, lo = f[0], hi = f[f.length - 1];
   const HZ = 'frequency (Hz)';
-  xAxis($('#p1ov'), lo, hi, HZ, false);       // top of the spectrum stack: grid only
-  xAxis($('#p2ov'), lo, hi, HZ, true);        // bottom carries the numbers
+  xAxis($('#p1ov'), lo, hi, HZ, false);       // top of the frequency pair: grid only
+  xAxis($('#p2ov'), lo, hi, HZ, true);        // bottom of the pair carries the numbers
+  // Shifts sits above them on a time axis of its own, so it labels itself.
   if (S.probe) xAxis($('#p3ov'), 0, S.probe.dur, 'time (s)', true);
 
   const mp = S.specMode === 'magphase';
   // In all-lasers view every plot's y axis is the laser index, not the quantity.
   const all = S.live.laser === 'all';
   yLabel('#y1', all ? 'laser' : mp ? (S.log.spec ? 'log |FFT|' : '|FFT|') : 'real');
-  yLabel('#y2', all ? 'laser' : mp ? 'phase (rad)' : 'imag');
+  yLabel('#y2', all ? 'laser' : mp ? (S.phmode === 'cos' ? 'cos(phase)' : 'phase (rad)') : 'imag');
   yLabel('#y3', all ? 'laser' : 'shift (px)');
 }
 
@@ -1125,14 +1135,31 @@ function allMasks() {
 }
 
 /* Who is who, in the panels where several probes are drawn on the same axes. */
+/* The swatch IS the line: same colour, same dash. A "both" entry becomes two swatches --
+   x solid, y dashed -- so the key states which line is which instead of leaving it to be
+   inferred from the plot. */
+const swatch = (c, dash) =>
+  `<b style="color:${c};${dash?.length ? 'border-top-style:dashed' : ''}"></b>`;
+
+/* The phase control belongs to mag+phi; in re+im there is no phase plot to reshape. */
+function phVis() {
+  const on = S.specMode === 'magphase';
+  for (const id of ['#phlab', '#phmode']) $(id).style.display = on ? '' : 'none';
+}
+
 function legends() {
+  const ink = css('--ink');
   const live = S.muted ? '' :
-    `<span data-live="1"><b style="color:${css('--ink')}"></b>` +
-    `current — L${S.live.laser}  ${S.live.ch}</span>`;
+    (S.live.ch === 'both'
+      ? `<span data-live="1">${swatch(ink, DASH.x)}x ${swatch(ink, DASH.y)}y` +
+        ` — current  L${S.live.laser}</span>`
+      : `<span data-live="1">${swatch(ink, DASH[S.live.ch])}` +
+        `current — L${S.live.laser}  ${S.live.ch}</span>`);
   const rows = S.probes.map((p) => {
-    const d = p.dash?.length ? `border-top-style:${p.dash[0] > 4 ? 'dashed' : 'dotted'}` : '';
-    return `<span data-id="${p.id}"><b style="color:${col(p)};${d}"></b>` +
-      `${fmt(p.hzv)} Hz  ${shortId(p.sid)}  L${p.laser}  ${p.ch}</span>`;
+    const c = col(p), tail = `${fmt(p.hzv)} Hz  ${shortId(p.sid)}  L${p.laser}`;
+    return p.dataY
+      ? `<span data-id="${p.id}">${swatch(c, DASH.x)}x ${swatch(c, DASH.y)}y  ${tail}</span>`
+      : `<span data-id="${p.id}">${swatch(c, p.dash)}${tail}  ${p.ch}</span>`;
   }).join('');
   const prev = S.preview
     ? `<span><b style="color:${css('--accent')}"></b>preview — L${S.hoverLaser}</span>` : '';
@@ -1201,7 +1228,8 @@ function wire() {
   $('#summary').onclick = () => $('#pickers').classList.toggle('hid');
 
   seg('#ch', (v) => { S.live.ch = v; refresh(); });
-  seg('#specmode', (v) => { S.specMode = v; drawSpec(); buildPeaks(); peakList(); cursors(); });
+  seg('#specmode', (v) => { S.specMode = v; phVis(); drawSpec(); buildPeaks(); peakList(); cursors(); axes(); });
+  seg('#phmode', (v) => { S.phmode = v; drawSpec(); axes(); });
   seg('#speclog', (v) => { S.log.spec = +v; drawSpec(); buildPeaks(); peakList(); cursors(); });
   seg('#kind', (v) => { S.kind = v; refresh(); });
   wheel($('#fkey2d'));                    // the square 2-D key, drawn once

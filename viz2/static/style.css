@@ -39,7 +39,7 @@ h2 em { font-style:normal; color:var(--accent); font-family:var(--mono);
           margin:0 0 8px; font:10px var(--mono); color:var(--ink2); }
 .legend:empty { display:none; }
 .legend span { display:inline-flex; align-items:center; gap:5px; }
-.legend b { width:14px; height:0; border-top:2.5px solid currentColor; display:inline-block; }
+.legend b { width:20px; height:0; border-top:2.5px solid currentColor; display:inline-block; }
 .legend.dim span { opacity:.35; }
 .legend span.hot { opacity:1; font-weight:600; }
 .hint { color:var(--ink3); font-style:normal; font-size:11px; }
@@ -153,8 +153,9 @@ main { flex:1; display:grid; grid-template-columns:1fr 208px; gap:12px;
 .plot { position:relative; margin-bottom:6px; padding-left:64px; }
 /* Every stacked plot reserves the number gutter, in both curve and heatmap mode, so
    switching to all-lasers never nudges a plot up or down. */
-.plot.gut, .plot.gut:last-child { margin-bottom:34px; }
-.plot.h150 { margin-bottom:34px; }
+.plot.gut, .plot.gut:last-child { margin-bottom:56px; }
+.plot.h150 { margin-bottom:56px; }
+.plot.h110 { margin-bottom:56px; }
 .yl { position:absolute; left:2px; top:0; height:100%; width:0; font:9px var(--mono);
       font-style:normal; color:var(--ink3); white-space:nowrap;
       display:flex; align-items:center; justify-content:center; }
@@ -162,7 +163,7 @@ main { flex:1; display:grid; grid-template-columns:1fr 208px; gap:12px;
 .yl { writing-mode:vertical-rl; transform:rotate(180deg); width:12px; }
 
 .h160 { height:170px; } .h150 { height:160px; } .h110 { height:120px; }
-.plot.h150 { margin-top:16px; }
+
 .plot canvas, .plot img { width:100%; height:100%; display:block; }
 
 .plot img { image-rendering:pixelated; border-radius:2px; }

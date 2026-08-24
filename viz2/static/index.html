@@ -63,6 +63,10 @@
         <div class="seg chsel" id="specmode">
           <button data-v="magphase" class="on">mag+φ</button><button data-v="reim">re+im</button>
         </div>
+        <span class="cl" id="phlab">phase</span>
+        <div class="seg chsel" id="phmode">
+          <button data-v="raw">raw</button><button data-v="cos" class="on">cos</button>
+        </div>
         <span class="cl">scale</span>
         <div class="seg chsel" id="speclog">
           <button data-v="0">lin</button><button data-v="1" class="on">log</button>
@@ -76,12 +80,12 @@
       </div>
       <div class="vkey spacer"></div>
       <div class="lf">
+        <div class="plot h110 gut"><i class="yl" id="y3"></i><img class="hm" id="h3" alt="">
+          <canvas id="p3"></canvas><svg class="ov" id="p3ov"></svg><i class="cb" id="cb3"></i></div>
         <div class="plot h150"><i class="yl" id="y1"></i><img class="hm" id="h1" alt="">
           <canvas id="p1"></canvas><svg class="ov" id="p1ov"></svg><i class="cb" id="cb1"></i></div>
         <div class="plot h110 gut"><i class="yl" id="y2"></i><img class="hm" id="h2" alt="">
           <canvas id="p2"></canvas><svg class="ov" id="p2ov"></svg><i class="cb" id="cb2"></i></div>
-        <div class="plot h110 gut"><i class="yl" id="y3"></i><img class="hm" id="h3" alt="">
-          <canvas id="p3"></canvas><svg class="ov" id="p3ov"></svg><i class="cb" id="cb3"></i></div>
       </div>
     </div>
   </section>

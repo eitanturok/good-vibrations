@@ -106,7 +106,8 @@ def _plane(sid, ch, q, kind):
     else:
         z = data.chan(data.fft(sid)[0], ch)
         v = {"logmag": lambda: data.logmag(np.abs(z)), "mag": lambda: np.abs(z),
-             "phase": lambda: np.angle(z), "re": lambda: z.real, "im": lambda: z.imag}[q]()
+             "phase": lambda: np.angle(z), "cosphase": lambda: np.cos(np.angle(z)),
+             "re": lambda: z.real, "im": lambda: z.imag}[q]()
     if q in ("logmag", "mag"):
         return v, "seq", float(np.percentile(v, 1)), float(np.percentile(v, 99))
     m = float(np.percentile(np.abs(v), 99)) or 1.0     # symmetric: zero stays neutral
