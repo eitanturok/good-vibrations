@@ -206,6 +206,8 @@ def extract_signal(x: torch.Tensor, signal_mode: str) -> torch.Tensor:
     if signal_mode == "log_magnitude": return torch.log(x.abs() + LOG_EPS)  # before normalize_fft: normalizing first doesn't survive the log
     if signal_mode == "complex": return torch.cat([x.real, x.imag], dim=-1)
     if signal_mode == "mag_phase": return torch.cat([x.abs(), x.angle()], dim=-1)
+    if signal_mode == "mag_trig_phase": return torch.cat([x.abs(), torch.sin(x.angle()), torch.cos(x.angle())], dim=-1)
+    # if signal_mode == "mag_trig_phase"
     raise ValueError(f"Unknown signal mode: {signal_mode}")
 
 def subtract_speaker_mean(x: torch.Tensor, speaker_mean: torch.Tensor | None) -> torch.Tensor:
@@ -759,6 +761,29 @@ SPLIT_METHODS = {"exp25": exp25_split, "gastronorm": gastronorm, "gastronorm_one
                  "gastronorm_train12_eval12": gastronorm_train12_eval12,
                  "gastronorm_train12_eval12_full": gastronorm_train12_eval12_full}
 
+#***** 7 pair two speakers into one sample *****
+
+SPEAKER_PARTNER = {1: 3, 3: 1, 2: 4, 4: 2, 7: 5, 5: 7, 8: 6, 6: 8}
+
+class PairedSpeakerDataset(torch.utils.data.Dataset):
+    """One item = two speakers' captures of the same position, stacked on the channel axis:
+    two (L,P,PS,C) -> (L,P,PS,2C). The partner is fixed by SPEAKER_PARTNER, and must be in `idxs`,
+    so pairs never cross the train/eval boundary.
+    """
+    def __init__(self, dataset, idxs, index):
+        self.dataset = dataset
+        partner_of = {(index[j]["position_id"], index[j]["speaker"]): j for j in idxs}
+        self.pairs = [(i, partner_of[key]) for i in idxs
+                      if (key := (index[i]["position_id"], SPEAKER_PARTNER[index[i]["speaker"]])) in partner_of]
+
+    def __len__(self): return len(self.pairs)
+
+    def __getitem__(self, k):
+        i, j = self.pairs[k]
+        a, b = self.dataset[i], self.dataset[j]
+        info = dict(a["info"], speaker_b=b["info"]["speaker"])
+        return dict(fft=torch.cat([a["fft"], b["fft"]], dim=-1), mask_true=a["mask_true"], info=info)
+
 def num_samples(batch): return batch["mask_true"].shape[0]
 
 def loader(dataset, idxs, bs, num_workers, generator, shuffle=False, drop_last=False):
@@ -771,7 +796,7 @@ def build_dataset(data_dir: str | Path, split: str = "exp25", batch_size: int = 
                    normalize_mode: str = "std", patch_size: int = 64, seed: int = 42,
                    force_rebuild_data: bool = False, augment_fft: float = 0.5, augment_mask: float = 0.5,
                    subtract_speaker_mean: bool = False, subtract_empty_box: bool = False, n_classes: int = 4, verbose: int = 1,
-                   mag_recipe: str | None = None, **split_kwargs):
+                   mag_recipe: str | None = None, pair_speakers_mode: bool = False, **split_kwargs):
 
     # A recipe owns the domain and the operation, so it OVERRIDES signal_mode and both
     # subtract_* flags. Deriving signal_mode here is what guarantees the references are
@@ -815,7 +840,7 @@ def build_dataset(data_dir: str | Path, split: str = "exp25", batch_size: int = 
         # train-only, so eval spectra don't leak into either set of statistics
         needs_stats = normalize_mode.split('+')[0] in DATASET_STATS_MODES
         train_idxs = SPLIT_METHODS[split](mds_dir, seed=seed, verbose=0, index=[m for _, m in samples], **split_kwargs)["train"] if subtract_speaker_mean or subtract_empty_box or needs_stats else None
-        
+
         empty_box_ref = compute_empty_box_ref(samples, signal_mode, keep_idxs=train_idxs, verbose=verbose) if subtract_empty_box else None
         speaker_means = compute_speaker_means(samples, signal_mode, keep_idxs=train_idxs, verbose=verbose, empty_box_ref=None) if subtract_speaker_mean else None
         stats = compute_dataset_stats(samples, signal_mode, keep_idxs=train_idxs, verbose=verbose) if needs_stats else None
@@ -837,8 +862,18 @@ def build_dataset(data_dir: str | Path, split: str = "exp25", batch_size: int = 
     train_dataset = VibrationDataset(local=mds_dir, seed=seed, process_kwargs=dict(process_kwargs, augment_fft=augment_fft, augment_mask=augment_mask))
     eval_dataset = VibrationDataset(local=mds_dir, seed=seed, process_kwargs=dict(process_kwargs, augment_fft=0.0, augment_mask=0.0))
 
+    if pair_speakers_mode:
+        index = [json.loads(line) for line in (mds_dir / "metadata.jsonl").read_text().strip().splitlines() if line]
+        train_dataset = PairedSpeakerDataset(train_dataset, splits["train"], index)
+        eval_datasets = {label: PairedSpeakerDataset(eval_dataset, idxs, index) for label, idxs in splits.items()}
+        if verbose:
+            for label, idxs in splits.items(): print(f"{label}: {len(idxs)} samples -> {len(eval_datasets[label])} pairs")
+        splits = {label: list(range(len(ds))) for label, ds in eval_datasets.items()}
+    else:
+        eval_datasets = {label: eval_dataset for label in splits}
+
     train_loader = loader(train_dataset, splits["train"], batch_size, num_workers, generator, shuffle=True, drop_last=True)
-    train_eval_loader = loader(eval_dataset, splits["train"], eval_batch_size, num_workers, generator)
-    eval_loaders = [Evaluator(label=label, dataloader=loader(eval_dataset, idxs, eval_batch_size, num_workers, generator)) for label, idxs in splits.items() if label != "train"]
+    train_eval_loader = loader(eval_datasets["train"], splits["train"], eval_batch_size, num_workers, generator)
+    eval_loaders = [Evaluator(label=label, dataloader=loader(eval_datasets[label], idxs, eval_batch_size, num_workers, generator)) for label, idxs in splits.items() if label != "train"]
 
     return train_loader, eval_loaders, train_eval_loader

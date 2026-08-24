@@ -132,64 +132,6 @@ def group_delay_phasor(fft: np.ndarray) -> np.ndarray:
     z = fft[:, 1:, :] * np.conj(fft[:, :-1, :])
     return z / (np.abs(z) + _DIV_EPS)
 
-def delay_slope(fft: np.ndarray, df: float) -> float:
-    """Per-sample delay slope b (rad/Hz) by magnitude-weighted WRAPPED differencing.
-
-    Deliberately not np.unwrap + least squares (nb57's method): unwrap makes
-    irreversible 2*pi decisions in low-magnitude bins that corrupt everything
-    downstream. Wrapped differencing has no such failure -- each step stays inside
-    +/-pi as long as tau < 1/(2*df) = 0.65 s here, far above any plausible jitter.
-
-    MEASURED: the two methods genuinely disagree -- per-laser median slope 1.566
-    (unwrap+LSQ) vs 2.063 (wrapped), median |difference| 0.557 rad/Hz. So unwrap
-    fragility is real and is a plausible contributor to nb57's -0.136.
-
-    A slope IS estimable here -- dphi has circular resultant 0.90 across frequency
-    on the top decile -- but see the comment below: subtracting a per-laser slope
-    makes across-laser agreement much worse (R 0.400 -> 0.102). Use this for
-    diagnostics, not as a normalization.
-    """
-    fft = _to_LFC(fft)
-    d = np.angle(fft[:, 1:, :] * np.conj(fft[:, :-1, :]))
-    w = np.abs(fft[:, 1:, :]) * np.abs(fft[:, :-1, :])
-    return float((d * w).sum() / w.sum() / df)
-
-# MEASURED.  An earlier version of this comment claimed there was NO linear-in-f
-# structure, based on std(dphi - mean) / std(dphi) = 1.00.  That test was invalid:
-# arithmetic std on WRAPPED angles reports ~uniform (1.81 rad) for a distribution
-# that is actually concentrated near +/-pi, and subtracting a constant from a
-# circular variable cannot change a resultant length anyway.  Redone with circular
-# (cos/sin) statistics on the top-decile energy bins, magnitude-weighted:
-#
-#   is dphi constant in f?  Weighted circular resultant of dphi ACROSS frequency,
-#   against a phase-randomized null:
-#       all bins   R = 0.867   (null 0.173)
-#       top 10%    R = 0.901   (null 0.213)
-#   dphi is strongly concentrated, i.e. very nearly constant in f.  There IS a large
-#   linear-in-f (delay-like) component.  The opposite of the earlier claim.
-#
-#   but it is not laser-constant.  Across-laser agreement within one sample
-#   (top decile, magnitude weighted, mean of 8 samples):
-#       raw phase                            R = 0.400
-#       after removing a per-laser ramp fit  R = 0.102     <- much WORSE
-#       group delay (differenced along f)    R = 0.993     <- much better
-#   So estimating and subtracting a per-laser delay destroys real signal, while
-#   differencing cancels the ramp without ever estimating it.  This reproduces both
-#   nb57's failure (-0.526 -> -0.136) and nb68's success (0.41 -> 0.76), and explains
-#   them with one mechanism: the ramp is real and largely shared, so cancel it
-#   structurally -- never fit it.
-#
-#   The fitted constant delay implies tau ~ -600 ms, consistent across all 8
-#   speakers.  That is far too large for trigger jitter and is most likely the log
-#   chirp's own sweep timing (1.0 s sweep, each frequency emitted at a known moment),
-#   which is a genuine laser-shared ramp.
-#
-#   per-speaker vs per-sample.  Slope variance decomposition over 8 speakers x 12
-#   purple-cube samples: within-speaker std 0.466, between-speaker std 0.326,
-#   eta^2(speaker) = 0.297.  Treat this as provisional -- it was computed with the
-#   same unweighted wrapped-angle slopes that the test above invalidated, and has
-#   not been redone under circular statistics.
-
 def as_cos_sin(phasor: np.ndarray, weight: np.ndarray | None = None) -> np.ndarray:
     """Complex (L,F,C) -> real (L,F,2C) as [cos, sin].
 
@@ -208,7 +150,7 @@ def as_cos_sin(phasor: np.ndarray, weight: np.ndarray | None = None) -> np.ndarr
 #***** 2 stage A: magnitude recipes *****
 
 MAG_RECIPES = {
-    # linear: references DIVIDE out (the matched operation), `both` is the product
+# linear: references DIVIDE out (the matched operation), `both` is the product
     'mag':              lambda x, eb, sm: x,
     'mag_div_spk':      lambda x, eb, sm: x / sm,
     'mag_div_eb':       lambda x, eb, sm: x / eb,
