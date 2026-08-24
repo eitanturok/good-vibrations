@@ -69,14 +69,56 @@ def mask(sid: str):
                     media_type="image/png", headers=CACHE)
 
 
+@app.get("/api/masks.png")
+def masks(ids: str = "", colors: str = ""):
+    """Several samples' masks composited into one image, one color each."""
+    sids = [i for i in ids.split(",") if i]
+    cols = [c for c in colors.split(",") if c]
+    if not sids:
+        raise HTTPException(404, "no ids")
+    ms, cs = [], []
+    for sid, c in zip(sids, cols):
+        d = _d(sid)
+        if data.INFO["mask"] and (d / data.INFO["mask"]).exists():
+            ms.append(np.load(d / data.INFO["mask"]))
+            cs.append(tuple(int(c[i:i + 2], 16) for i in (0, 2, 4)))
+    if not ms:
+        raise HTTPException(404, "no masks")
+    return Response(render.masks_overlay(ms, cs), media_type="image/png", headers=CACHE)
+
+
 @app.get("/api/heat/{sid}.png")
-def heat(sid: str, ch: str = "avg", log: int = 1):
+def heat(sid: str, ch: str = "avg", q: str = "logmag", kind: str = "clean"):
+    """One quantity for every laser at once: rows = lasers, columns = frequency (or time).
+
+    Signed quantities are scaled symmetrically about zero on the diverging ramp, so the
+    neutral middle really is zero and the sign is readable.
+    """
     _d(sid)
-    f, _ = data.fft(sid)
-    v = np.abs(data.chan(f, ch))
-    v = data.logmag(v) if log else v
-    lo, hi = data.domain(v)
-    return Response(render.heat(v, lo, hi), media_type="image/png", headers=CACHE)
+    v, lut, lo, hi = _plane(sid, ch, q, kind)
+    return Response(render.heat(v, lo, hi, lut), media_type="image/png", headers=CACHE)
+
+
+def _plane(sid, ch, q, kind):
+    """The (lasers x columns) array for one quantity, plus its palette and range."""
+    if q == "shifts":
+        v = data.chan(data.shifts(sid, kind), ch)
+    else:
+        z = data.chan(data.fft(sid)[0], ch)
+        v = {"logmag": lambda: data.logmag(np.abs(z)), "mag": lambda: np.abs(z),
+             "phase": lambda: np.angle(z), "re": lambda: z.real, "im": lambda: z.imag}[q]()
+    if q in ("logmag", "mag"):
+        return v, "seq", float(np.percentile(v, 1)), float(np.percentile(v, 99))
+    m = float(np.percentile(np.abs(v), 99)) or 1.0     # symmetric: zero stays neutral
+    return v, "div", -m, m
+
+
+@app.get("/api/heatrange/{sid}")
+def heatrange(sid: str, ch: str = "avg", q: str = "logmag", kind: str = "clean"):
+    """Just the colorbar bounds, so the client can label without decoding the PNG."""
+    _d(sid)
+    _, lut, lo, hi = _plane(sid, ch, q, kind)
+    return {"lo": lo, "hi": hi, "lut": lut}
 
 
 @app.get("/api/probe/{sid}")
@@ -86,7 +128,6 @@ def probe(sid: str, ch: str = "avg", laser: str = "avg", kind: str = "clean"):
     f, freqs = data.fft(sid)
     z = data.pick(data.chan(f, ch), laser)
     mag = np.abs(z)
-    v = data.logmag(np.abs(data.chan(f, ch)))
     s = data.pick(data.chan(data.shifts(sid, kind), ch), laser)
     r = lambda a: [round(float(x), 5) for x in a]
     return {
@@ -94,7 +135,6 @@ def probe(sid: str, ch: str = "avg", laser: str = "avg", kind: str = "clean"):
         "re": r(z.real), "im": r(z.imag),
         "peaks": data.peaks(mag, freqs),
         "shifts": [round(float(x), 5) for x in data.envelope(s)],
-        "domain": data.domain(v),
         "dur": len(s) / data.INFO["fps"],
     }
 

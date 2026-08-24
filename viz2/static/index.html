@@ -45,48 +45,23 @@
     </div>
   </section>
 
-  <!-- 2 . which laser and frequency -->
+  <!-- 2 . the signal -->
   <section class="card step">
-    <h2><b>2</b> laser &amp; frequency <em id="heatread" class="soft"></em></h2>
-    <p class="ptitle" id="lftitle"></p>
+    <h2><b>2</b> signal <em id="heatread" class="soft"></em></h2>
+    <p class="ptitle" id="sigtitle"></p>
+    <div class="legend" id="siglegend"></div>
     <div class="stepbody">
       <div class="rail-l">
         <span class="cl">channel</span>
         <div class="seg chsel" id="ch">
           <button data-v="x">x</button><button data-v="y">y</button>
-          <button data-v="avg" class="on">avg</button>
-        </div>
-        <span class="cl">scale</span>
-        <div class="seg chsel" id="heatlog">
-          <button data-v="0">lin</button><button data-v="1" class="on">log</button>
+          <button data-v="avg" class="on">avg</button><button data-v="both">both</button>
         </div>
         <span class="cl">laser <em id="lasernow"></em></span>
         <svg id="grid" tabindex="0"></svg>
-      </div>
-      <div class="vkey">
-        <span id="cbmax"></span>
-        <canvas id="cbar"></canvas>
-        <span id="cbmin"></span>
-        <em id="cblab"></em>
-      </div>
-      <div class="lf">
-        <div class="strip lbl" data-l="average"><canvas id="heatmean"></canvas></div>
-        <div class="plot h160"><i class="yl" id="yh"></i><img id="heat" alt=""><svg class="ov" id="heatov"></svg></div>
-        <div class="plot axonly gut"><svg class="ov" id="heatax"></svg></div>
-      </div>
-    </div>
-  </section>
-
-  <!-- 3 . the signal -->
-  <section class="card step">
-    <h2><b>3</b> signal</h2>
-    <p class="ptitle" id="sigtitle"></p>
-    <div class="legend" id="siglegend"></div>
-    <div class="stepbody">
-      <div class="rail-l">
         <span class="cl">spectrum</span>
-        <div class="seg chsel col" id="specmode">
-          <button data-v="magphase" class="on">mag + φ</button><button data-v="reim">re + im</button>
+        <div class="seg chsel" id="specmode">
+          <button data-v="magphase" class="on">mag+φ</button><button data-v="reim">re+im</button>
         </div>
         <span class="cl">scale</span>
         <div class="seg chsel" id="speclog">
@@ -96,46 +71,61 @@
         <div class="seg chsel" id="kind">
           <button data-v="raw">raw</button><button data-v="clean" class="on">clean</button>
         </div>
-        <button id="hold" class="tog hold wide">+ hold probe</button>
+        <span class="cl">peaks <em id="npk"></em></span>
+        <div class="pklist" id="pklist"></div>
       </div>
       <div class="vkey spacer"></div>
       <div class="lf">
-        <div class="plot h150"><i class="yl" id="y1"></i><canvas id="p1"></canvas><svg class="ov" id="p1ov"></svg></div>
-        <div class="plot h110 gut"><i class="yl" id="y2"></i><canvas id="p2"></canvas><svg class="ov" id="p2ov"></svg></div>
-        <div class="plot h110 gut"><i class="yl" id="y3"></i><canvas id="p3"></canvas><svg class="ov" id="p3ov"></svg></div>
+        <div class="plot h150"><i class="yl" id="y1"></i><img class="hm" id="h1" alt="">
+          <canvas id="p1"></canvas><svg class="ov" id="p1ov"></svg><i class="cb" id="cb1"></i></div>
+        <div class="plot h110 gut"><i class="yl" id="y2"></i><img class="hm" id="h2" alt="">
+          <canvas id="p2"></canvas><svg class="ov" id="p2ov"></svg><i class="cb" id="cb2"></i></div>
+        <div class="plot h110 gut"><i class="yl" id="y3"></i><img class="hm" id="h3" alt="">
+          <canvas id="p3"></canvas><svg class="ov" id="p3ov"></svg><i class="cb" id="cb3"></i></div>
       </div>
     </div>
   </section>
 
   <!-- 4 . the mode -->
   <section class="card step">
-    <h2><b>4</b> mode
-      <span class="seg sm" id="modeview">
-        <button data-v="arrows" class="on">arrows</button><button data-v="field">field</button>
-      </span>
-    </h2>
+    <h2><b>3</b> mode</h2>
     <p class="ptitle" id="modetitle"></p>
-    <div class="modebody">
-      <div class="modecol">
-        <div class="ctl modectl">
-          <button id="play" class="tog">▶</button>
-          <label class="asz">size <input id="asize" type="range" min="0.3" max="3" step="0.1" value="1"></label>
+    <div class="stepbody">
+      <div class="rail-l">
+        <span class="cl">animate</span>
+        <button id="play" class="tog">▶ play</button>
+        <span class="cl">arrow size</span>
+        <input id="asize" type="range" min="0.3" max="3" step="0.1" value="1">
+        <span class="cl">background</span>
+        <label class="chk"><input type="checkbox" id="fieldbg"> color</label>
+        <div id="modekey" hidden>
+          <canvas id="fkey2d" width="88" height="88"></canvas>
+          <em>hue = direction<br>bright = amplitude</em>
         </div>
-        <div class="legend" id="modelegend"></div>
-        <div class="modewrap">
-          <i class="mlab my">laser row</i>
-          <canvas id="mode" width="320" height="320"></canvas>
-          <i class="mlab mx">laser column</i>
-          <svg class="mode-ax" id="modeax"></svg>
+      </div>
+      <div class="vkey spacer"></div>
+      <div class="lf">
+      <div class="legend modelegend" id="modelegend"></div>
+      <div class="modesplit">
+        <div class="modeleft">
+          <div class="modewrap">
+            <i class="mlab my">laser row</i>
+            <canvas id="mode" width="320" height="320"></canvas>
+            <i class="mlab mx">laser column</i>
+            <svg class="mode-ax" id="modeax"></svg>
+          </div>
         </div>
-        <em class="hint mhint">arrow = (x, y) displacement of that laser</em>
+        <div class="moderight">
+          <div class="fgrid" id="fgrid"></div>
+        </div>
+      </div>
       </div>
     </div>
   </section>
 
   <!-- 5 . recovered audio -->
   <section class="card step">
-    <h2><b>5</b> recovered audio</h2>
+    <h2><b>4</b> recovered audio</h2>
     <p class="ptitle" id="audtitle"></p>
     <div class="audio"><audio id="audio" controls preload="none"></audio></div>
     <div id="heldaudio"></div>
@@ -144,9 +134,11 @@
 </div>
 
 <aside id="probes">
+  <h2>masks</h2>
+  <figure id="maskfig"><img id="allmasks" alt=""><figcaption>current + pinned</figcaption></figure>
   <h2>current</h2>
   <div id="now" class="probe live"></div>
-  <h2 id="heldh">held <button id="clear" class="link">clear</button></h2>
+  <h2 id="heldh">workbench <em class="addhint">press <kbd>Enter</kbd> to add</em><button id="clear" class="link">clear</button></h2>
   <div id="plist"></div>
 </aside>
 </main>

@@ -92,7 +92,6 @@ button { font:inherit; cursor:pointer; }
 .tog { padding:3px 8px; border:1px solid var(--firm); border-radius:var(--r);
        background:var(--s0); color:var(--ink2); font-size:11px; }
 .tog.on { background:var(--accent); border-color:var(--accent); color:#fff; }
-.tog.hold { background:var(--accent-sf); border-color:var(--accent); color:var(--accent); font-weight:600; }
 .link { border:0; background:none; color:var(--accent); font-size:11px; padding:0; margin-left:auto; }
 .seg { display:inline-flex; border:1px solid var(--firm); border-radius:var(--r); overflow:hidden; }
 .seg button { border:0; background:var(--s0); color:var(--ink2); padding:3px 9px; font-size:11px; }
@@ -103,7 +102,7 @@ button { font:inherit; cursor:pointer; }
 .ctl input { flex:1; }
 
 /* ***** layout ***** */
-main { flex:1; display:grid; grid-template-columns:1fr 240px; gap:12px;
+main { flex:1; display:grid; grid-template-columns:1fr 208px; gap:12px;
         padding:12px; overflow-y:auto; align-items:start; }
 #flow { display:flex; flex-direction:column; gap:12px; min-width:0; }
 .step h2 b { display:inline-flex; width:16px; height:16px; border-radius:50%;
@@ -130,10 +129,10 @@ main { flex:1; display:grid; grid-template-columns:1fr 240px; gap:12px;
 .ha .tag { font:10px var(--mono); color:var(--c); min-width:120px; text-align:right; }
 .ha audio { height:28px; width:min(420px,60vw); }
 .modebody { display:flex; gap:22px; align-items:flex-start; }
-.modewrap { position:relative; padding:0 0 22px 26px; flex:none; }
+.modewrap { position:relative; padding:0 0 22px 64px; flex:none; }
 .modebody canvas { width:320px; height:320px; display:block; flex:none;
                    border:1px solid var(--line); border-radius:4px; background:var(--s0); }
-.mode-ax { position:absolute; left:26px; top:0; width:320px; height:320px;
+.mode-ax { position:absolute; left:64px; top:0; width:320px; height:320px;
            overflow:visible; pointer-events:none; }
 .mode-ax .ml { font:9px var(--mono); fill:var(--ink3); text-anchor:end; }
 .mode-ax .ml.col { text-anchor:middle; }
@@ -151,9 +150,12 @@ main { flex:1; display:grid; grid-template-columns:1fr 240px; gap:12px;
 
 
 
-.plot { position:relative; margin-bottom:6px; padding-left:34px; }
+.plot { position:relative; margin-bottom:6px; padding-left:64px; }
+/* Every stacked plot reserves the number gutter, in both curve and heatmap mode, so
+   switching to all-lasers never nudges a plot up or down. */
 .plot.gut, .plot.gut:last-child { margin-bottom:34px; }
-.yl { position:absolute; left:10px; top:0; height:100%; width:0; font:9px var(--mono);
+.plot.h150 { margin-bottom:34px; }
+.yl { position:absolute; left:2px; top:0; height:100%; width:0; font:9px var(--mono);
       font-style:normal; color:var(--ink3); white-space:nowrap;
       display:flex; align-items:center; justify-content:center; }
 .yl::before { content:''; }
@@ -164,10 +166,10 @@ main { flex:1; display:grid; grid-template-columns:1fr 240px; gap:12px;
 .plot canvas, .plot img { width:100%; height:100%; display:block; }
 
 .plot img { image-rendering:pixelated; border-radius:2px; }
-.ov { position:absolute; top:0; left:34px; right:0; bottom:0;
-       width:calc(100% - 34px); overflow:visible; pointer-events:none; }
+.ov { position:absolute; top:0; left:64px; right:0; bottom:0;
+       width:calc(100% - 64px); overflow:visible; pointer-events:none; }
 .ov circle.pk { pointer-events:auto; cursor:pointer; }
-.ov line.ptick { stroke-width:1.4; stroke-dasharray:5 3; }
+.ov line.ptick { stroke-width:1.4; }
 .ov rect.lr { fill:none; stroke:var(--accent); stroke-width:1.2; }
 .ov rect.lr.hov { stroke:var(--ink); stroke-dasharray:3 2; opacity:.75; }
 .ov line.cur { stroke:var(--accent); stroke-width:1; }
@@ -192,17 +194,17 @@ main { flex:1; display:grid; grid-template-columns:1fr 240px; gap:12px;
 #spk .on text { fill:#fff; }
 #spk .off { opacity:.3; }
 #spk .box, #grid .box { fill:var(--s2); stroke:var(--firm); }
-/* Lasers are green dots -- the beam colour -- on the same grey box the other
+/* Lasers are green dots -- the beam color -- on the same grey box the other
    pickers use, even though they physically enter from the side. */
-#grid .avgcell rect { fill:var(--s2); stroke:var(--firm); cursor:pointer; }
-#grid .avgcell text { font:600 6px var(--sans); fill:var(--ink2); text-anchor:middle;
+#grid .avgcell rect, #grid .allcell rect { fill:var(--s2); stroke:var(--firm); cursor:pointer; }
+#grid .avgcell text, #grid .allcell text { font:600 6px var(--sans); fill:var(--ink2); text-anchor:middle;
                       dominant-baseline:middle; pointer-events:none; letter-spacing:.08em; }
-#grid .avgcell:hover rect { fill:var(--accent-sf); stroke:var(--accent); }
+#grid .avgcell:hover rect, #grid .allcell:hover rect { fill:var(--accent-sf); stroke:var(--accent); }
 #grid .gl { font:5px var(--mono); fill:var(--ink3); text-anchor:end;
             dominant-baseline:middle; pointer-events:none; }
 #grid .gl.col { text-anchor:middle; }
-#grid .avgcell.on rect { fill:var(--accent); stroke:var(--accent); }
-#grid .avgcell.on text { fill:#fff; }
+#grid .avgcell.on rect, #grid .allcell.on rect { fill:var(--accent); stroke:var(--accent); }
+#grid .avgcell.on text, #grid .allcell.on text { fill:#fff; }
 #grid .ls { fill:#2f9e5e; opacity:.55; cursor:pointer; }
 #grid .ls.hot { opacity:.85; }
 #grid .ls.on { opacity:1; stroke:var(--ink); stroke-width:1.6; }
@@ -210,12 +212,12 @@ svg:focus, .plot:focus { outline:1px solid var(--accent); outline-offset:2px; }
 .plot:focus { border-radius:3px; }
 
 /* ***** probes ***** */
-#probes { background:var(--s1); border:1px solid var(--line); border-radius:var(--r); padding:10px 12px; height:max-content; }
+#probes { background:var(--s1); border:1px solid var(--line); border-radius:var(--r); padding:9px 9px; height:max-content; }
 
-.probe { display:flex; gap:7px; align-items:flex-start; padding:6px 4px; border-radius:4px; cursor:pointer; }
+.probe { display:flex; gap:6px; align-items:flex-start; padding:4px 3px; border-radius:4px; cursor:pointer; }
 .probe:hover { background:var(--s2); }
 .probe .sw { width:9px; height:9px; border-radius:50%; flex:none; margin-top:3px; }
-.probe .id { font:11px/1.35 var(--mono); color:var(--ink2); flex:1; min-width:0; }
+.probe .id { font:9.5px/1.3 var(--mono); color:var(--ink2); flex:1; min-width:0; }
 .probe .id b { color:var(--ink); font-weight:600; display:block; }
 .probe.live { cursor:default; border:1px dashed var(--firm); background:var(--s0); }
 .probe.live.muted { opacity:.4; }
@@ -223,68 +225,20 @@ svg:focus, .plot:focus { outline:1px solid var(--accent); outline-offset:2px; }
                            color:var(--ink3); margin-left:auto; }
 .probe.live:hover { background:var(--s0); }
 .probe .id u { text-decoration:none; color:var(--accent); font-weight:400; font-size:9px; }
-#probes h2 { margin-top:14px; }
+#maskfig { margin:0 0 4px; }
+#maskfig[hidden] { display:none; }
+#maskfig img { width:100%; border-radius:4px; display:block; background:var(--s2);
+                max-height:120px; object-fit:contain; }
+#maskfig figcaption { font:9px var(--mono); color:var(--ink3); margin-top:3px;
+                      text-align:center; }
+#probes h2 { margin-top:11px; margin-bottom:5px; }
 #probes h2:first-child { margin-top:0; }
 .probe .x { border:0; background:none; color:var(--ink3); font-size:14px; line-height:1; padding:0 2px; }
 .probe .x:hover { color:var(--ink); }
 
-.strip { margin-left:34px; height:11px; margin-bottom:2px; }
-.strip canvas { width:100%; height:100%; display:block; border-radius:2px;
-                box-shadow:0 0 0 1px transparent; }
-.strip canvas.sel { box-shadow:0 0 0 1.5px var(--accent); }
-.strip.lbl:hover::after { color:var(--accent); }
-.plot.h160 { margin-top:3px; margin-bottom:3px; }
-.key { display:flex; align-items:center; gap:5px; font:9px var(--mono); color:var(--ink3);
-       margin-left:10px; }
-.key canvas { width:96px; height:8px; border-radius:2px; display:block; }
-.key em { font-style:normal; color:var(--ink2); text-transform:none;
-          letter-spacing:0; font-size:10px; }
-.plot.axonly { height:28px; margin-bottom:0; }
-.strip.lbl { position:relative; }
-.strip.lbl::after { content:attr(data-l); position:absolute; right:100%; top:0;
-                    margin-right:5px; font:8px var(--mono); color:var(--ink3);
-                    line-height:11px; }
-h2 em.soft { color:var(--ink3); font-weight:400; margin-left:auto; }
-
-.pk.lay { width:186px; }
-.chips { display:flex; flex-wrap:wrap; gap:3px; }
-.chips.nobj { flex-direction:column; align-items:flex-start; }
-.chip { font:10px var(--sans); padding:2px 7px; border:1px solid var(--firm);
-        border-radius:10px; background:var(--s0); color:var(--ink2); cursor:pointer;
-        display:inline-flex; gap:4px; align-items:center; }
-.chip .dot { width:7px; height:7px; border-radius:50%; flex:none;
-             background:hsl(var(--h) 58% 52%); }
-.chip i { font-style:normal; font-size:9px; opacity:.55; font-family:var(--mono); }
-.chip.on { border-color:hsl(var(--h) 58% 45%); background:hsl(var(--h) 58% 94%);
-           color:hsl(var(--h) 45% 28%); font-weight:600; }
-.chip.off { opacity:.35; }
-.note { font-style:normal; font-size:9px; color:var(--ink3); font-family:var(--sans); }
-.pk > span .link { margin-left:4px; }
-
-
-/* ***** held probe cards ***** */
-/* A held probe is one card: its scene and its identity in the same box. */
-.card2 { display:flex; gap:7px; align-items:center; padding:4px;
-         border:1px solid var(--line); border-left:3px solid var(--c);
-         border-radius:5px; margin-bottom:5px; background:var(--s0); cursor:pointer; }
-.card2:hover { background:var(--s2); }
-.card2 .thumb { width:52px; height:44px; object-fit:cover; border-radius:3px;
-                flex:none; display:block; }
-.card2 .meta { min-width:0; flex:1; font-family:var(--mono); line-height:1.3; }
-.card2 .ln1 { display:flex; align-items:center; gap:4px; }
-.card2 .ln1 .sw { width:8px; height:8px; border-radius:50%; flex:none; background:var(--c); }
-.card2 .ln1 b { font-size:12px; color:var(--ink); font-weight:600; }
-.card2 .sub { font-size:9.5px; color:var(--ink3); }
-.card2 .ln2 { font-size:9px; color:var(--ink3); overflow:hidden;
-              text-overflow:ellipsis; white-space:nowrap; }
-.card2 .ln3 { font-size:10px; color:var(--ink2); }
-.card2 .x { border:0; background:none; color:var(--ink3); font-size:13px;
-            line-height:1; padding:0 1px; margin-left:auto; cursor:pointer; }
-.card2 .x:hover { color:var(--ink); }
-
-/* ***** steps 2 and 3: a shared control rail, so the plots line up ***** */
-/* One rail width for both steps means the heatmap's x-axis and the spectrum's sit at
-   exactly the same page x -- you can read a frequency straight down between them. */
+/* ***** the control rail, shared by the signal and mode steps so their plots line up *****
+   One rail width for both means the spectrum's x-axis and the mode's sit at exactly the
+   same page x. */
 :root { --rail: 132px; }
 
 .rail-l { width:var(--rail); flex:none; display:flex; flex-direction:column;
@@ -296,11 +250,29 @@ h2 em.soft { color:var(--ink3); font-weight:400; margin-left:auto; }
                  text-transform:none; letter-spacing:0; }
 .chsel { width:100%; }
 .chsel button { flex:1; padding:3px 0; font-size:11px; }
-.chsel.col { flex-direction:column; }
-.chsel.col button + button { border-left:0; border-top:1px solid var(--firm); }
-.tog.wide { width:100%; margin-top:8px; padding:6px 0; }
+h2 em.soft { color:var(--ink3); font-weight:400; margin-left:auto; }
+.pk.lay { width:186px; }
+.chips { display:flex; flex-wrap:wrap; gap:3px; }
+.chips.nobj { flex-direction:column; align-items:flex-start; }
+.chip { font:10px var(--sans); padding:2px 7px; border:1px solid var(--firm);
+        border-radius:10px; background:var(--s0); color:var(--ink2); cursor:pointer;
+        display:inline-flex; gap:4px; align-items:center; }
+.chip .dot { width:7px; height:7px; border-radius:50%; flex:none;
+             background:hsl(var(--h) 58% 52%); }
+.chip i { font-style:normal; font-size:9px; opacity:.55; font-family:var(--mono); }
+.pklist { display:grid; grid-template-columns:1fr 1fr; gap:2px; outline:none;
+           border-radius:4px; }
+.pklist.armed { box-shadow:0 0 0 2px var(--accent-sf); }
+.pkrow { font:9.5px var(--mono); padding:2px 4px; border:1px solid transparent;
+         border-radius:3px; background:var(--s2); color:var(--ink2); cursor:pointer;
+         display:flex; flex-direction:column; align-items:center; gap:0; line-height:1.25; }
+.pkrow .hzv { font-weight:600; }
+.pkrow .dbv { font-size:8px; opacity:.6; }
+.pkrow:hover { border-color:var(--firm); color:var(--ink); }
+.pkrow.on { background:var(--accent); border-color:var(--accent); color:#fff; }
+.pkrow.on i { opacity:.75; }
 
-/* The colour key reads vertically, beside the ramp it explains. */
+/* The color key reads vertically, beside the ramp it explains. */
 .vkey { display:flex; flex-direction:column; align-items:center; gap:3px; flex:none;
         font:9px var(--mono); color:var(--ink3); padding-top:14px; width:54px; }
 .vkey.spacer { visibility:hidden; }
@@ -320,5 +292,119 @@ h2 em.soft { color:var(--ink3); font-weight:400; margin-left:auto; }
                 color:var(--ink3); }
 .modectl .asz input { width:130px; flex:none; }
 #modelegend { padding-left:26px; margin-bottom:6px; gap:2px 9px; font-size:9.5px; }
-.mhint { display:block; padding-left:26px; text-align:center; margin-top:4px;
+.mhint-unused { display:block; padding-left:26px; text-align:center; margin-top:4px;
          font-size:9px; }
+
+/* ***** mode: field small-multiples *****
+   One field per probe at a SHARED brightness scale, so panels are comparable. */
+.fgrid { display:grid; grid-template-columns:repeat(auto-fill, 124px); gap:10px 12px;
+         align-content:start; flex:1; min-width:0; }
+.fghead { grid-column:1/-1; display:flex; align-items:center; gap:8px;
+          font:11px var(--mono); color:var(--ink3); letter-spacing:.04em; }
+.fgrid figure { margin:0; transition:opacity .12s; }
+.fgrid canvas { width:124px; height:124px; display:block; border-radius:3px; }
+.fgrid figcaption { font:10px/1.4 var(--mono); margin-top:5px;
+                    padding-left:6px; border-left:2px solid var(--ink); }
+.fgrid figcaption b { color:var(--ink); font-weight:600; }
+.fgrid figcaption i { display:block; font-style:normal; color:var(--ink3); }
+.fgrid:has(figure.hot) figure:not(.hot) { opacity:.28; }
+/* The 2-D key: hue across x (direction), lightness down y (amplitude). */
+.fkey { margin:0; position:relative; padding:0 0 12px 42px; }
+.fkey canvas { width:132px; height:34px; display:block; border-radius:2px; }
+.fkey i { position:absolute; font:9px var(--mono); font-style:normal; color:var(--ink3);
+          letter-spacing:.04em; }
+.fkey .kx { left:42px; bottom:0; }
+.fkey .ky { left:-2px; top:34px; transform:rotate(-90deg); transform-origin:left center; }
+/* y-axis ticks: numbers in the gutter beside the rotated label, grid lines behind data. */
+.ov .ynum { font:9px var(--mono); fill:var(--ink3); text-anchor:end;
+            transform:translateX(-2px); }
+.ov .ygrid { stroke:var(--line); stroke-width:1; opacity:.55; }
+/* The empty workbench states its one gesture, where the result will appear. */
+.addhint { font:9px var(--sans); font-style:normal; color:var(--ink3);
+           text-transform:none; letter-spacing:0; }
+.addhint kbd { font:9px var(--mono); border:1px solid var(--firm); border-radius:3px;
+               padding:0 3px; background:var(--s0); color:var(--ink2); }
+/* Step 4 uses the same rail + key + plot skeleton as steps 2 and 3, so all three plots
+   start at the same x. */
+.rail-l input[type=range] { width:100%; margin:2px 0 0; }
+.chk { display:flex; align-items:center; gap:5px; font:11px var(--mono); color:var(--ink2);
+       cursor:pointer; }
+/* The key lives in the rail under its checkbox, and only when the fill is on. */
+#modekey { margin-top:6px; }
+#modekey canvas { width:78px; aspect-ratio:1; height:auto; border-radius:3px;
+                  border:1px solid var(--line); display:block; }
+#modekey em { display:block; font-style:normal; font:9px/1.4 var(--mono); color:var(--ink3);
+              margin-top:3px; }
+.fgrid figure.hot canvas { outline:2px solid var(--accent); outline-offset:1px; }
+/* The mode canvas is square, so it sizes to its height rather than stretching. The hint
+   belongs under it, not beside the tiles. */
+/* The overlay plot on the left, the per-probe tiles on the right half.
+   .modeleft is pinned to the canvas width (320 + 34 label gutter): otherwise the legend,
+   which grows with every probe, widened this column and walked the grid rightwards. */
+.modesplit { display:flex; gap:20px; align-items:flex-start; }
+.modeleft { flex:none; width:384px; }
+/* One legend spanning the whole step, so it labels the overlay plot and the per-probe
+   tiles at once. Vertical, so a long probe list reads down a single narrow column rather
+   than wrapping into rows that push the plots around. */
+.modelegend { display:flex; flex-flow:row wrap; justify-content:flex-start;
+              align-items:baseline; gap:3px 14px; margin:0 0 8px 64px; }
+.moderight { flex:1; min-width:0; }
+.modeleft .modewrap { display:inline-block; }
+.modeleft .mhint { display:block; margin:2px 0 0 64px; }
+.ghint { display:block; margin:0 0 6px; }
+.fgrid { margin-top:0; }
+/* The live card's last line wraps once the laser/frequency numbers get wide, which made
+   the whole workbench jump on every hover. Reserve the tallest layout so it never moves. */
+/* The live card's last line must never wrap -- that is what made the column jump on
+   hover. Fix it in the text, not by reserving height. */
+#now .id { display:block; white-space:pre; }
+/* ***** workbench probe cards *****
+   One pinned probe per card: its mask and its identity in the same box, with the probe's
+   colour as the left rule. */
+.card2 { display:flex; gap:6px; align-items:center; padding:3px 4px 3px 3px;
+         border:1px solid var(--line); border-left:3px solid var(--c);
+         border-radius:4px; margin-bottom:3px; background:var(--s0); cursor:pointer; }
+.card2:hover { background:var(--s2); }
+.card2 .thumb { width:44px; height:36px; object-fit:contain; border-radius:3px;
+                flex:none; display:block; background:var(--s2); }
+.card2 .meta { min-width:0; flex:1; font-family:var(--mono); line-height:1.25; }
+.card2 .ln1 { display:flex; align-items:baseline; gap:4px; }
+.card2 .ln1 b { font-size:11px; color:var(--ink); font-weight:600; }
+.card2 .sub { font-size:9px; color:var(--ink3); }
+.card2 .ln3 { font-size:9.5px; color:var(--ink2); white-space:nowrap; }
+.card2 .x { border:0; background:none; color:var(--ink3); font-size:13px;
+            line-height:1; padding:0 1px; margin-left:auto; cursor:pointer; }
+.card2 .x:hover { color:var(--ink); }
+
+/* The list scrolls inside the column instead of growing the page. */
+#plist { max-height:58vh; overflow-y:auto; overscroll-behavior:contain; }
+
+/* Workbench thumbnails are the segmentation mask alone, tinted to the probe's color --
+   the overhead photo carries no per-probe information at 52px. */
+.card2 .thumb.mask { object-fit:contain; background:var(--s2); }
+/* Probe fields are separated by two spaces rather than a dot: the units (Hz, L55) already
+   label each field, so the dot was decoration that cost width. HTML collapses runs of
+   whitespace, so the gap has to be preserved explicitly. */
+.legend span, .ha .tag, .probe .id, .card2 .ln3, .fgrid figcaption i,
+#sidlist .opt i, .summary, #poscount { white-space:pre-wrap; }
+/* NOT on flex containers (.meta, .ln1): there the whitespace between child elements
+   becomes real text nodes and stacks the row vertically. */
+/* ***** all-lasers view *****
+   Each plot swaps its line canvas for a lasers x frequency image, with its own colorbar:
+   the five quantities have different units and two different palettes, so one shared bar
+   would be a lie. */
+.plot .hm { position:absolute; left:64px; top:0; right:0; bottom:0;
+            width:calc(100% - 64px); height:100%;
+            display:none; image-rendering:pixelated; border-radius:2px; }
+.plot.all .hm { display:block; }
+.plot.all canvas { visibility:hidden; }
+/* Vertical, in the gutter left of the image: it reads as part of that plot's y edge and
+   never covers data. Max on top, matching the ramp's own direction. */
+/* Laser numbers sit just inside the image edge, clear of the colorbar. */
+.plot.all .ov .ynum { fill:var(--ink3); transform:translateX(2px); text-anchor:start; }
+.cb { position:absolute; left:30px; top:0; bottom:0; width:30px; display:none;
+      flex-direction:column; align-items:center; justify-content:center; gap:3px;
+      font:8px var(--mono); font-style:normal; color:var(--ink3); }
+.plot.all .cb { display:flex; }
+.cb b { width:9px; flex:1; min-height:0; border-radius:2px; display:block; font-weight:400; }
+

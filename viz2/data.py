@@ -118,11 +118,6 @@ def logmag(z):
     return np.log10(np.abs(z) + 1e-8)
 
 
-def domain(v):
-    """1st/99th pct -- shared by heatmap and spectrum so the two agree."""
-    return [float(np.percentile(v, 1)), float(np.percentile(v, 99))]
-
-
 def peaks(mag, freqs, k=12):
     """The k strongest resonances, as a residual against a smooth baseline
     (notebooks/53 cell 9). Ranked by prominence rather than thresholded: the spectrum is
