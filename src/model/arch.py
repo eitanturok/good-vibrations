@@ -249,7 +249,7 @@ def pad_mask(keep, B_or_BL):
 class FreqEncoder(nn.Module):
     def __init__(self, patch_size:int, d_model:int, num_heads:int, num_layers:int, signal_length:int, freq_dropout:float, n_channels:int=2):
         super().__init__()
-        self.embed = nn.Linear(n_channels * patch_size, d_model)
+        self.embed = nn.Linear(patch_size * n_channels, d_model)
         self.speakers_embed = nn.Embedding(4, d_model)
         self.layers = nn.TransformerEncoder(nn.TransformerEncoderLayer(d_model=d_model, nhead=num_heads, dim_feedforward=4 * d_model, batch_first=True), num_layers=num_layers)
         self.cls_token = nn.Parameter(torch.zeros(1, 1, d_model))
@@ -257,9 +257,10 @@ class FreqEncoder(nn.Module):
         self.freq_dropout = freq_dropout
 
     def forward(self, x, speaker=None):
-        # x.shape = (B_L,P,C,PS) = (batch_size * n_lasers, n_patches, n_coords, patch_size)
+        # x.shape = (B_L,P,PS,C) = (batch_size * n_lasers, n_patches, patch_size, n_coords)
+        # canonical layout, matching dataset.tokenize: each token flattens to [f0c0,f0c1,f1c0,...]
         B_L, P, _, _ = x.shape
-        x = self.embed(x.reshape(B_L, P, -1))                                   # (B_L,P,C,PS)          -> (B_L,P,D)
+        x = self.embed(x.reshape(B_L, P, -1))                                   # (B_L,P,PS,C)          -> (B_L,P,D)
         # drop entire freq patches by setting them to zero, don't actually remove them
         x, keep = dropout(x, (B_L, P), self.freq_dropout, self.training)        # (B_L,P,D)             -> (B_L,P,D), (B_L,P)
         x = apply_rope(x, self.freqs_cis)                                       # (B_L,P,D)             -> (B_L,P,D)
@@ -299,13 +300,13 @@ class VibrationTransformer(ComposerModel):
 
     def forward(self, batch):
         # B=batch size, L=n_lasers, C=n_coordinates=2, PS=patch_size, D=d_model
-        x = batch['fft'] # (B,L,P,2,PS)
+        x = batch['fft'] # (B,L,P,PS,2)
         B, L, _, _, _ = x.shape
 
         # FreqEncoder learns patterns between all frequencies from a single laser
         # flatten so FreqEncoder processes all lasers AND all batches in parallel
         speaker = speaker.repeat_interleave(L) if (speaker := batch.get('speakers_encoded', None)) is not None else None # (BL,D)
-        x = self.freq_encoder(x.flatten(0, 1), speaker).reshape(B, L, -1)  # (B,L,P,C,PS) -> (B,L,D)
+        x = self.freq_encoder(x.flatten(0, 1), speaker).reshape(B, L, -1)  # (B,L,P,PS,C) -> (B,L,D)
         # drop entire laser positions by setting them to zero, don't actually remove them
         x, keep = dropout(x, (B, L), self.laser_dropout, self.training)
         key_padding_mask = pad_mask(keep, B)  # (B,L+1), True = ignore; None if not dropping

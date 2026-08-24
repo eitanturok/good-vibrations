@@ -274,7 +274,7 @@ def normalize_token(x: torch.Tensor, normalize_mode: str) -> torch.Tensor:
     'std+token-mean' -- normalize_fft handles the part before the '+', this handles the rest.
 
     The channel is pooled into the denominator on purpose: embed is
-    nn.Linear(n_channels*patch_size, d_model) over a flattened patch (arch.py), so x and y live in
+    nn.Linear(patch_size*n_channels, d_model) over a flattened patch (arch.py), so x and y live in
     one token and the model never sees them apart. A per-channel scale would be something it
     cannot represent.
     """
