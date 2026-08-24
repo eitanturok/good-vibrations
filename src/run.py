@@ -74,27 +74,20 @@ def get_parser():
     parser.add_argument("--split",                      type=str,   default="gastronorm", help="Which split method from SPLIT_METHODS to use (e.g. 'exp22', 'exp23').")
     parser.add_argument("--num-workers",                type=int,   default=4)
     parser.add_argument("--test-size",                  type=float, default=0.2)
-
-    parser.add_argument("--out-h",                      type=int,   default=30)
-    parser.add_argument("--out-w",                      type=int,   default=30)
     parser.add_argument("--n-laser-rows",               type=int,   default=10)
     parser.add_argument("--n-laser-cols",               type=int,   default=10)
-    parser.add_argument("--patch-size",                 type=int,   default=128)
+    parser.add_argument("--patch-size",                 type=int,   default=32)
 
+    # data normalization
     parser.add_argument("--signal-mode",                type=str,   default="magnitude", choices=["magnitude", "log_magnitude", "complex", "mag_phase"])
     parser.add_argument("--normalize-mode",             type=str,   default="std", help="Per-sample: std, z, per_laser_z. Train-split statistics: per_bin_z. Append '+token-mean' for token-level normalization.")
     parser.add_argument("--augment-mask",               type=float, default=0.5, help="Probability a sample gets mask augmentation (blur+noise). 0 disables.")
-    parser.add_argument("--augment-fft",                type=float, default=0.5, help="Probability a sample gets FFT frequency-gain augmentation. 0 disables.")
+    parser.add_argument("--augment-fft",                type=float, default=0, help="Probability a sample gets FFT frequency-gain augmentation. 0 disables.")
     parser.add_argument("--subtract-speaker-mean",      type=int,   default=0, choices=(0, 1), nargs="?", const=1, help="Subtract each speaker's offline mean spectrum (computed over train samples only) after the magnitude and before normalization. Bare flag means 1. Requires --signal-mode magnitude or log_magnitude.")
-    parser.add_argument("--mag-recipe",                 type=str,   default=None,
-                        help="One of the 14 magnitude arms in normalizations.MAG_RECIPES "
-                             "(e.g. logmag_sub_eb, mag_div_eb; 11 arms). OVERRIDES --signal-mode, "
-                             "--subtract-speaker-mean and --subtract-empty-box: the recipe owns "
-                             "both the domain (|Z| vs log|Z|) and the operation (divide vs "
-                             "subtract), and its references are built in the matching domain. "
-                             "Best measured arm is logmag_sub_eb (rho -0.452 vs COM distance).")
+    parser.add_argument("--mag-recipe",                 type=str,   default=None, help="One of the 14 magnitude arms in normalizations MAG_RECIPES")
     parser.add_argument("--subtract-empty-box",         type=int,   default=0, choices=(0, 1), nargs="?", const=1, help="Subtract each speaker's mean empty-box spectrum, i.e. divide out the box's own transfer function. Requires --signal-mode log_magnitude, where subtracting a log reference IS dividing by it (safe at anti-resonances, unlike linear division). Combines with --subtract-speaker-mean: the empty-box reference is applied first and the speaker mean is then computed on referenced signal. Bare flag means 1.")
     parser.add_argument("--force-rebuild-data",         type=int,   default=0, choices=(0, 1), nargs="?", const=1, help="Discard the cached MDS and rebuild it, re-running mask downsampling and fft precomputation. Bare flag means 1. Needed when the preprocessing code changes, since the cache key only covers the config, not the code.")
+    parser.add_argument("--pair-speakers",              type=int,   default=0, choices=(0, 1), nargs="?", const=1, help="Make one sample out of two speakers' captures of the same scene, stacked on the channel axis. The partner is fixed: 1<->3, 2<->4, 7<->5, 8<->6. Doubles n_channels; lasers and freqs are unchanged.")
 
     # filter data
     parser.add_argument("--n-samples",                  type=int,   default=None)
@@ -102,23 +95,30 @@ def get_parser():
     parser.add_argument("--n-objects",                  type=int,   default=None)
     parser.add_argument("--box",                        type=str,   default=None)
 
-    # model
-    parser.add_argument("--decoder",                     type=str,   default='mlp')
+    # arch
+    parser.add_argument("--d-model",                    type=int,   default=128)
+    parser.add_argument("--decoder",                    type=str,   default='mlp')
     parser.add_argument("--decoder-num-heads",          type=int,   default=2)
     parser.add_argument("--decoder-num-layers",         type=int,   default=2)
-    parser.add_argument("--loss-fn",                    type=str,   default='mse', choices=list(LOSSES))
-    parser.add_argument("--loss-alpha",                 type=float, default=0.5, help="for the -asym losses: weight on false negatives; >0.5 paints more, <0.5 holds back")
-    parser.add_argument("--count-loss-weight",          type=float, default=0.0, help="weight on the auxiliary n_objects classification loss; 0 disables it (the head still runs, so count-acc stays readable as a free probe).")
-    parser.add_argument("--d-model",                    type=int,   default=128)
     parser.add_argument("--pnt-num-heads",              type=int,   default=2)
     parser.add_argument("--seq-num-heads",              type=int,   default=2)
     parser.add_argument("--pnt-num-layers",             type=int,   default=2)
     parser.add_argument("--seq-num-layers",             type=int,   default=2)
     parser.add_argument("--freq-dropout",               type=float, default=0.3)
     parser.add_argument("--laser-dropout",              type=float, default=0.3)
+    parser.add_argument("--out-h",                      type=int,   default=21)
+    parser.add_argument("--out-w",                      type=int,   default=30)
+
+    # train faster
     parser.add_argument("--precision",                  type=str,   default="amp_bf16", choices=["fp32", "amp_fp16", "amp_bf16"], help="bf16 matches fp16's tensor-core throughput on Blackwell but keeps fp32's exponent range, so no loss scaling and no underflow on wide-dynamic-range FFT magnitudes.")
     parser.add_argument("--compile",                    type=int,   default=1, choices=(0, 1), help="torch.compile-ing the model before training/eval.")
     parser.add_argument("--compile-mode",               type=str,   default="default", help="torch.compile mode, e.g. 'default', 'reduce-overhead', 'max-autotune'.")
+
+    # loss
+    parser.add_argument("--loss-fn",                    type=str,   default='mse', choices=list(LOSSES))
+    parser.add_argument("--loss-alpha",                 type=float, default=0.5, help="for the -asym losses: weight on false negatives; >0.5 paints more, <0.5 holds back")
+    parser.add_argument("--count-loss-weight",          type=float, default=0.0, help="weight on the auxiliary n_objects classification loss; 0 disables it (the head still runs, so count-acc stays readable as a free probe).")
+
     # train
     parser.add_argument("--batch-size",                 type=int,   default=128)
     parser.add_argument("--lr",                         type=float, default=1e-4)
@@ -126,6 +126,7 @@ def get_parser():
     parser.add_argument("--scheduler",                  type=str,   default="cosine-warmup", choices=tuple(SCHEDULERS), help="LR schedule. 'constant' reproduces the old no-scheduler behavior.")
     parser.add_argument("--t-warmup",                   type=str,   default="100ep", help="Warmup length for the *-warmup schedulers; ignored by 'constant'.")
     parser.add_argument("--max-duration",               type=str,   default="2000ep")
+
     # eval
     parser.add_argument("--eval-only",                  type=int,   default=0, choices=(0, 1), help="Skip training, just eval a loaded checkpoint (requires --checkpoint-path).")
     parser.add_argument("--eval-batch-size",            type=int,   default=108) # wandb caps images logged in a single call to 108, so eval batch size should be <= 108 to log all images
@@ -136,11 +137,13 @@ def get_parser():
     parser.add_argument("--output-keys",                type=str,   default=list(DEFAULT_OUTPUT_KEYS), nargs="*", choices=list(OUTPUT_EXTRACTORS), help="Payloads to dump per-batch as .pt in runs/<run>/outputs_history. Pass with no values to skip saving outputs entirely; 'fft' and 'mask_logits' are very large.")
     parser.add_argument("--attribution",                type=int,   default=0, help="Save per-eval-batch laser/freq attribution (cls attention maps) to runs/<run>/attribution.")
     parser.add_argument("--attribution-ablate",         type=int,   default=0, help="Also measure delta-MSE from zeroing each laser and freq patch. Costs n_lasers+n_patches extra forwards on the first eval batch; more trustworthy than attention.")
+
     # run
     parser.add_argument("--run-name",                   type=str,   default=None)
     parser.add_argument("--wandb-group",                type=str,   default="attn-lr-sweep", help="wandb group, for keeping sweep runs together.")
     parser.add_argument("--viz-port",                   type=int,   default=8504, help="Port for the auto-launched viz dashboard.")
     parser.add_argument("--no-viz",                     action="store_true", help="Don't auto-launch the viz dashboard.")
+
     # checkpointing
     parser.add_argument("--checkpoint-path",            type=str,   default=None, help="Checkpoint to load for eval. If not set, defaults to the run's latest checkpoint.")
     parser.add_argument("--checkpoint-interval",        type=str,   default="500ep")
@@ -217,14 +220,15 @@ def run(**kwargs):
         split=args.split, test_size=args.test_size, speakers=args.speakers, n_objects=args.n_objects, box=args.box, n_samples=args.n_samples,
         out_h=args.out_h, out_w=args.out_w, signal_mode=args.signal_mode, normalize_mode=args.normalize_mode, patch_size=args.patch_size, seed=args.seed,
         augment_fft=args.augment_fft, augment_mask=args.augment_mask, subtract_speaker_mean=bool(args.subtract_speaker_mean), subtract_empty_box=bool(args.subtract_empty_box), mag_recipe=args.mag_recipe,
-        force_rebuild_data=bool(args.force_rebuild_data), n_classes=N_COUNT_CLASSES)
+        force_rebuild_data=bool(args.force_rebuild_data), n_classes=N_COUNT_CLASSES, pair_speakers_mode=bool(args.pair_speakers))
     boundary_loaders = eval_loaders + [Evaluator(label='train', dataloader=train_eval_loader)]
     ensure_viz(args.data_dir, port=args.viz_port, enabled=not args.no_viz)
 
     # read n_freqs, n_channels from the dataset
     _, n_patches, patch_size, n_channels = train_loader.dataloader.dataset[0]['fft'].shape  # (L,P,PS,C)
     # tokenize() zero-pads the frequency axis, so n_patches * patch_size is the padded length
-    n_freqs_real = len(train_loader.dataloader.dataset.dataset.pk["freqs"])
+    base = train_loader.dataloader.dataset.dataset  # Subset -> (PairedSpeakerDataset ->) VibrationDataset
+    n_freqs_real = len(getattr(base, "dataset", base).pk["freqs"])
     data_info = dict(out_h=args.out_h, out_w=args.out_w, n_laser_rows=args.n_laser_rows, n_laser_cols=args.n_laser_cols, patch_size=args.patch_size, n_freqs=n_patches * patch_size, n_channels=n_channels)
     print(f"{n_freqs_real} freq bins -> {n_patches} patches of {patch_size} = {n_patches * patch_size} ({n_patches * patch_size - n_freqs_real} padded)")
     model = VibrationTransformer(args.d_model, args.pnt_num_heads, args.pnt_num_layers, args.seq_num_heads, args.seq_num_layers, data_info, args.decoder, args.decoder_num_heads, args.decoder_num_layers, freq_dropout=args.freq_dropout, laser_dropout=args.laser_dropout, loss_fn=args.loss_fn, loss_alpha=args.loss_alpha, count_loss_weight=args.count_loss_weight)
