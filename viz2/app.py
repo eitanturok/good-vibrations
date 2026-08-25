@@ -16,6 +16,22 @@ CACHE = {"Cache-Control": "public, max-age=31536000, immutable"}
 RENDER_V = int(Path(render.__file__).stat().st_mtime)
 
 
+@app.get("/")
+def index():
+    """index.html with the asset URLs stamped by mtime.
+
+    Without this the browser keeps a cached app.js/style.css across restarts, so code
+    changes appear not to take effect -- which is a genuinely confusing failure, because
+    the server is serving the new file and the page is running the old one.
+    """
+    html = (STATIC / "index.html").read_text()
+    for name in ("app.js", "style.css"):
+        v = int((STATIC / name).stat().st_mtime)
+        html = html.replace(f'"/{name}"', f'"/{name}?v={v}"')
+    return Response(html, media_type="text/html",
+                    headers={"Cache-Control": "no-cache"})
+
+
 def init(exp):
     n = data.init(exp)
     app.mount("/", StaticFiles(directory=STATIC, html=True), name="static")
@@ -108,10 +124,10 @@ def _plane(sid, ch, q, kind):
         v = {"logmag": lambda: data.logmag(np.abs(z)), "mag": lambda: np.abs(z),
              "phase": lambda: np.angle(z), "cosphase": lambda: np.cos(np.angle(z)),
              "re": lambda: z.real, "im": lambda: z.imag}[q]()
-    if q in ("logmag", "mag"):
-        return v, "seq", float(np.percentile(v, 1)), float(np.percentile(v, 99))
-    m = float(np.percentile(np.abs(v), 99)) or 1.0     # symmetric: zero stays neutral
-    return v, "div", -m, m
+    # The SAME range for every sample, so two heatmaps are directly comparable and the
+    # colorbar means one thing across the whole app.
+    lo, hi = data.INFO["scale"][q]
+    return v, ("seq" if q in ("logmag", "mag") else "div"), lo, hi
 
 
 @app.get("/api/heatrange/{sid}")

@@ -10,7 +10,7 @@ const S = {
   fi: null, hoverFi: null,
   log: { spec: 1 },
   specMode: 'magphase', phmode: 'cos', fieldbg: false, kind: 'clean',
-  empty: false, anim: 0, asize: 1,
+  empty: false, anim: 0, asize: 1, frame: 0,
   f: { layouts: new Set(), nobj: new Set(), spk: new Set([1]) },  // empty == no filter
 };
 
@@ -88,6 +88,9 @@ function hex(h, s, l) {
   const f = (n) => Math.round(255 * (l - a * Math.max(-1, Math.min(k(n) - 3, 9 - k(n), 1))));
   return [f(0), f(8), f(4)].map((v) => v.toString(16).padStart(2, '0')).join('');
 }
+/* One full oscillation of the mode, quantised into frames. The slider spans exactly one
+   period, so scrubbing off either end wraps rather than dead-ending. */
+const NFRAME = 60;
 const probeHex = (p) => hex(p.hue, 68, p.lit ?? 47);
 const css = (n) => getComputedStyle(document.body).getPropertyValue(n).trim();
 
@@ -203,8 +206,17 @@ function line(g, y, w, h, c, lw) {
   g.strokeStyle = c; g.lineWidth = lw; g.stroke();
 }
 
-// Shared y-range so overlaid probes are actually comparable.
+/* Shared y-range so overlaid probes are actually comparable.
+
+   The range is GLOBAL -- data.py:_scales() measures it once at boot across a sample of
+   every recording and ships it in S.info.scale. Deriving it from the drawn curves instead
+   would rescale the axis on every sample change, so identical curve heights would mean
+   different physical values and the axis would appear to drift as you browse.
+
+   Falls back to the drawn data for any quantity without a global entry. */
 function span(list, key) {
+  const g = S.info?.scale?.[key];
+  if (g) return [g[0], g[1]];
   let lo = Infinity, hi = -Infinity;
   for (const s of list) for (const v of vals(s.d, key)) { if (v < lo) lo = v; if (v > hi) hi = v; }
   return [lo, hi];
@@ -296,7 +308,12 @@ function yAxis(sel, id) {
             g.setAttribute('class', 'yt'); svg.prepend(g); }
   g.dataset.mode = 'val';
   const { lo, hi } = r;
-  g.innerHTML = ticks(lo, hi, 4).map((v) => {
+  // Linear magnitude is a distance from zero, so the zero line is the reference the eye
+  // reads everything against. The tick step only lands on it by luck, so force it in.
+  const tv = ticks(lo, hi, 4);
+  if (S.specMode === 'magphase' && !S.log.spec && id === 'p1'
+      && lo <= 0 && hi >= 0 && !tv.some((v) => Math.abs(v) < 1e-9)) tv.push(0);
+  g.innerHTML = tv.map((v) => {
     const y = (1 - (v - lo) / ((hi - lo) || 1)) * 100;
     if (y < 1 || y > 99) return '';           // skip labels that would clip the frame
     return `<line class="ygrid" x1="0" x2="100%" y1="${y}%" y2="${y}%"/>` +
@@ -365,7 +382,7 @@ const maxOf = (sets) => {
 };
 
 function arrows(g, sets, w, h, R, C, cw, chh, k, fan) {
-  const t = S.anim ? Math.cos(performance.now() / 300) : 1;
+  const t = Math.cos((S.frame / NFRAME) * 2 * Math.PI);
   sets.forEach((s, n) => {
     const a = fan ? (n / sets.length) * 2 * Math.PI : 0;
     const ox = fan * Math.cos(a), oy = fan * Math.sin(a);
@@ -414,7 +431,10 @@ function fieldGrid() {
     ...S.probes.filter((p) => p.mode)
       .map((p) => ({ m: p.mode, c: col(p), id: p.id, t: cap(p.meta, p.hzv) })),
   ];
-  if (sets.length < 2) { box.innerHTML = ''; return; }
+  // Draw even for a single set. The tiles are not only a comparison: the lone tile is the
+  // current mode on its OWN scale, which the overlaid plot above cannot show, so it is
+  // worth having before any probe is pinned.
+  if (!sets.length) { box.innerHTML = ''; box.dataset.sig = ''; return; }
 
   const sig = sets.map((s) => s.id).join(',') + '|' + sets.map((s) => s.t).join('|');
   if (box.dataset.sig !== sig) {          // rebuild only when the SET changes, not per frame
@@ -920,8 +940,18 @@ function goPos(pos) {
 }
 
 function renderScatter() {
-  $('#scatter').querySelectorAll('.pt').forEach(
-    (c) => c.classList.toggle('on', +c.dataset.p === S.byId[S.live.sid]?.pos));
+  const svg = $('#scatter');
+  let sel = null;
+  svg.querySelectorAll('.pt').forEach((c) => {
+    const on = +c.dataset.p === S.byId[S.live.sid]?.pos;
+    c.classList.toggle('on', on);
+    if (on) sel = c;
+  });
+  // Positions overlap, and SVG has no z-index -- paint order IS document order, so the
+  // current dot was being covered by whichever grey dots happened to come after it.
+  // Moving it last puts it on top; the fill is semi-transparent (see .pt.on) so the
+  // dots underneath stay visible rather than being blotted out.
+  if (sel) sel.parentNode.appendChild(sel);
   $('#poscount').textContent = `${POS().length}  spk ${S.byId[S.live.sid]?.spk ?? '-'}`;
 }
 
@@ -1017,8 +1047,30 @@ function setLaser(i) {
 
 function renderGrid() {
   const i = S.live.laser;
-  $('#grid').querySelectorAll('.ls').forEach(
-    (x) => x.classList.toggle('on', i !== 'avg' && +x.dataset.i === +i));
+  const svg = $('#grid');
+  let sel = null;
+  svg.querySelectorAll('.ls').forEach((x) => {
+    const on = i !== 'avg' && i !== 'all' && +x.dataset.i === +i;
+    x.classList.toggle('on', on);
+    // Grown in JS, not CSS: the `r` geometry property is not supported everywhere.
+    x.setAttribute('r', on ? 5.4 : 3.2);
+    if (on) sel = x;
+  });
+  // The clicked laser carries its own index. One reusable node that moves to the
+  // selection, so the other ~100 dots stay unlabelled and the grid stays readable.
+  let tag = svg.querySelector('.lsnum');
+  if (!sel) { tag?.remove(); }
+  else {
+    if (!tag) {
+      tag = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+      tag.setAttribute('class', 'lsnum');
+      tag.setAttribute('dy', '1.7');
+    }
+    tag.setAttribute('x', sel.getAttribute('cx'));
+    tag.setAttribute('y', sel.getAttribute('cy'));
+    tag.textContent = sel.dataset.i;
+    svg.appendChild(tag);        // last child: drawn over the circle, never under it
+  }
   $('#grid').querySelector('.avgcell').classList.toggle('on', i === 'avg');
   $('#grid').querySelector('.allcell').classList.toggle('on', i === 'all');
   $('#lasernow').textContent = i;
@@ -1144,7 +1196,11 @@ const swatch = (c, dash) =>
 /* The phase control belongs to mag+phi; in re+im there is no phase plot to reshape. */
 function phVis() {
   const on = S.specMode === 'magphase';
-  for (const id of ['#phlab', '#phmode']) $(id).style.display = on ? '' : 'none';
+  // Faded rather than hidden: the control stays in place so the rail does not reflow,
+  // and it reads as inapplicable rather than missing.
+  for (const id of ['#phlab', '#phmode']) $(id).classList.toggle('dis', !on);
+  // pointer-events alone still leaves the buttons tab-focusable, so close that path too.
+  $('#phmode').querySelectorAll('button').forEach((b) => { b.disabled = !on; });
 }
 
 function legends() {
@@ -1230,7 +1286,9 @@ function wire() {
   seg('#ch', (v) => { S.live.ch = v; refresh(); });
   seg('#specmode', (v) => { S.specMode = v; phVis(); drawSpec(); buildPeaks(); peakList(); cursors(); axes(); });
   seg('#phmode', (v) => { S.phmode = v; drawSpec(); axes(); });
-  seg('#speclog', (v) => { S.log.spec = +v; drawSpec(); buildPeaks(); peakList(); cursors(); });
+  // axes() too: lin/log swaps the y label between |FFT| and log |FFT|, and without it
+  // the label kept whatever text the previous mode left behind.
+  seg('#speclog', (v) => { S.log.spec = +v; drawSpec(); buildPeaks(); peakList(); cursors(); axes(); });
   seg('#kind', (v) => { S.kind = v; refresh(); });
   wheel($('#fkey2d'));                    // the square 2-D key, drawn once
   $('#fieldbg').onchange = (e) => {
@@ -1247,14 +1305,61 @@ function wire() {
     if (S.empty) { renderRepeats(); select(S.all.find((s) => s.empty && s.spk === S.byId[S.live.sid].spk).id); }
   };
 
-  $('#asize').oninput = (e) => { S.asize = +e.target.value; drawMode(); };
-  $('#play').onclick = () => {
-    S.anim = !S.anim;
-    $('#play').classList.toggle('on', !!S.anim);
-    $('#play').textContent = S.anim ? '❚❚ pause' : '▶ play';
-    const tick = () => { if (!S.anim) return; drawMode(); requestAnimationFrame(tick); };
-    tick();
+  // Both sliders read out their value beside the label, in the same `.cl em` slot the
+  // laser and peak counts already use, so the rail keeps one style of readout.
+  const setAsize = (v) => {
+    S.asize = v;
+    $('#asize').value = v;
+    $('#asizenow').textContent = `${v.toFixed(1)}x`;
+    drawMode();
   };
+  $('#asize').oninput = (e) => setAsize(+e.target.value);
+  /* One frame index drives everything: play advances it, the slider sets it, and both
+     land in the same place -- so pausing leaves the scrubber exactly where the eye was. */
+  const setFrame = (i) => {
+    S.frame = ((i % NFRAME) + NFRAME) % NFRAME;   // wrap: the mode is periodic
+    $('#frame').value = S.frame;
+    // 1-based: reads as "where in the loop". The label is mono with tabular figures, so
+    // the width does not jump as the counter rolls past 9 thirty times a second.
+    $('#framenow').textContent = `${S.frame + 1}/${NFRAME}`;
+    drawMode();
+  };
+  const setPlay = (on) => {
+    S.anim = on;
+    $('#play').classList.toggle('on', !!S.anim);
+    $('#play').textContent = S.anim ? '\u275a\u275a pause' : '\u25b6 play';
+  };
+  let animSeq = 0;              // pause/play faster than a frame would otherwise stack loops
+  $('#play').onclick = () => {
+    setPlay(!S.anim);
+    if (!S.anim) return;
+    // rAF is display-rate, which would spin the mode far too fast; step on a fixed
+    // interval instead so the speed does not depend on the monitor.
+    const mine = ++animSeq;
+    let last = 0;
+    const tick = (ts) => {
+      if (!S.anim || mine !== animSeq) return;
+      if (ts - last > 33) { last = ts; setFrame(S.frame + 1); }
+      requestAnimationFrame(tick);
+    };
+    requestAnimationFrame(tick);
+  };
+  // Dragging is a manual scrub: take over from the animation rather than fighting it.
+  $('#frame').oninput = (e) => { setPlay(false); setFrame(+e.target.value); };
+  // Arrow keys nudge it, the same way the range input already handles them natively;
+  // this only has to add the wrap at the two ends.
+  $('#frame').onkeydown = (e) => {
+    const d = { ArrowLeft: -1, ArrowDown: -1, ArrowRight: 1, ArrowUp: 1 }[e.key];
+    if (!d) return;
+    e.preventDefault();
+    setPlay(false);
+    setFrame(S.frame + d);
+  };
+  // Seed both readouts from the starting state: they would otherwise sit empty until the
+  // first drag. Written straight to the nodes -- calling the setters here would trigger a
+  // drawMode() before there is anything to draw.
+  $('#asizenow').textContent = `${S.asize.toFixed(1)}x`;
+  $('#framenow').textContent = `${S.frame + 1}/${NFRAME}`;
 
   addEventListener('keydown', (e) => {
     if (e.target.tagName === 'INPUT') return;

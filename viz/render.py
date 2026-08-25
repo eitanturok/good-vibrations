@@ -26,11 +26,14 @@ from viz import config
 # mask carries the same identity whether it is shown alone or overlaid.
 # Both ramps start at white so an empty cell reads as nothing at all, and darken to the
 # hue that identifies the layer.
-SEQ_HEX = ["#ffffff", "#eaf2fd", "#cde2fb", "#b7d3f6", "#9ec5f4", "#86b6ef", "#6da7ec",
+# Starts at a real blue, not white. The two palest stops (#ffffff, #eaf2fd) sat within a
+# few RGB units of the backdrop, so the bottom of the ramp was invisible no matter how
+# opaque it was drawn -- which is exactly where an under-painting model puts its evidence.
+SEQ_HEX = ["#cde2fb", "#b7d3f6", "#9ec5f4", "#86b6ef", "#6da7ec",
            "#5598e7", "#3987e5", "#2a78d6", "#256abf", "#1c5cab", "#184f95",
            "#104281", "#0d366b"]
 
-TRUE_SEQ_HEX = ["#ffffff", "#e7f4ec", "#c9e8d6", "#a9dbc0", "#86cda8", "#63bf90", "#45ad79",
+TRUE_SEQ_HEX = ["#c9e8d6", "#a9dbc0", "#86cda8", "#63bf90", "#45ad79",
                 "#2f9a66", "#1f8757", "#17744a", "#0f6640", "#0d5c33", "#0a4d2b",
                 "#083f23", "#06311b"]
 
@@ -82,7 +85,22 @@ DIV_LUT = _ramp([DIV_NEG_HEX, DIV_MID_HEX, DIV_POS_HEX])
 #
 # 0.85 keeps most of the low-end lift while leaving the top decile legible. This is a
 # DISPLAY transform only: hover tooltips and every metric report the true values.
-GAMMA = 0.85
+# Low gamma on purpose. The model under-paints, so the cells that matter for diagnosis sit
+# near 0.1-0.3, and at gamma 0.85 those land on the near-white end of the ramp: a 0.24
+# prediction rendered [155,195,243] against a [238,238,235] backdrop, barely distinguishable
+# even at full opacity. Gamma 0.5 pushes them onto saturated colour instead. Raising alpha
+# alone could not fix this -- the colour, not the opacity, was the binding constraint.
+GAMMA = 0.5
+
+# Opacity used to be the value itself, which made a weak-but-real cell effectively
+# invisible. Floor it, so anything above ALPHA_EPS is visibly present and only true zeros
+# stay clear.
+ALPHA_FLOOR = 0.35
+ALPHA_EPS = 0.02
+
+
+def _alpha(t):
+    return np.where(t > ALPHA_EPS, ALPHA_FLOOR + (1.0 - ALPHA_FLOOR) * t, 0.0)
 
 
 def colorize(values: np.ndarray, mode: str, gamma: float = GAMMA,
@@ -107,7 +125,7 @@ def colorize(values: np.ndarray, mode: str, gamma: float = GAMMA,
             signed = np.clip(signed / span, -1.0, 1.0)
         mag = np.abs(signed) ** gamma
         t = 0.5 + 0.5 * np.sign(signed) * mag
-        alpha = mag
+        alpha = _alpha(mag)
         lut = DIV_LUT
     else:
         v = np.clip(values, 0.0, 1.0)
@@ -118,7 +136,7 @@ def colorize(values: np.ndarray, mode: str, gamma: float = GAMMA,
             v = (v - lo) / (hi - lo) if hi - lo > 1e-6 else np.zeros_like(v)
             v = np.clip(v, 0.0, 1.0)
         t = v ** gamma
-        alpha = t
+        alpha = _alpha(t)
         # "truth" draws the ground-truth ramp so a GT mask is green whether it is shown
         # on its own or as the underlay in the overlay view.
         lut = TRUE_SEQ_LUT if mode == "truth" else SEQ_LUT

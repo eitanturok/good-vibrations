@@ -96,9 +96,10 @@
     <p class="ptitle" id="modetitle"></p>
     <div class="stepbody">
       <div class="rail-l">
-        <span class="cl">animate</span>
+        <span class="cl">animate <em id="framenow"></em></span>
         <button id="play" class="tog">▶ play</button>
-        <span class="cl">arrow size</span>
+        <input id="frame" type="range" min="0" max="59" step="1" value="0">
+        <span class="cl">arrow size <em id="asizenow"></em></span>
         <input id="asize" type="range" min="0.3" max="3" step="0.1" value="1">
         <span class="cl">background</span>
         <label class="chk"><input type="checkbox" id="fieldbg"> color</label>

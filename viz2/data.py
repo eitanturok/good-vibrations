@@ -5,6 +5,8 @@ there is no row space and no id->row conversion to get wrong.
 """
 
 import json
+import math
+import random
 from functools import lru_cache
 from pathlib import Path
 
@@ -79,7 +81,68 @@ def init(exp: Path) -> int:
         min_freq=float(m0.get("min_freq") or 50), max_freq=float(m0.get("max_freq") or 1000),
         photo=_first(d0, PHOTOS), mask=_first(d0, MASKS),
     )
+    INFO["scale"] = _scales()
     return len(DIRS)
+
+
+# Signed quantities vary ~5x between samples and log magnitude shifts by ~0.7 decades, so
+# per-sample ranges silently rescale every axis as you browse -- identical curve heights
+# would then mean different physical values. These global ranges make every plot comparable.
+SCALE_N = 160          # measured: converged and stable across seeds by ~80; 160 costs ~1 s
+
+
+def _scales(n=SCALE_N):
+    """One range per quantity, shared by every sample.
+
+    Taken over a random subset (a full scan is not worth ~20 s at boot) and reduced with a
+    percentile rather than min/max, so one freak recording cannot stretch every axis in
+    the app. Signed quantities still reduce per sample then across; log magnitude pools
+    first -- see the note below.
+    """
+    ids = sorted(DIRS)
+    pick = ids if len(ids) <= n else random.Random(0).sample(ids, n)
+    lm_all, sig, sh, md = [], [], [], []
+    for sid in pick:
+        z = chan(fft(sid)[0], "avg")
+        # Log magnitude is POOLED across samples rather than reduced per sample first.
+        # Taking p99 within a sample and then p90 across them clipped twice over: the top
+        # of the range landed below the median sample's own peak, so the tallest resonance
+        # ran off the frame on most recordings. One percentile over the pooled values
+        # spends the budget where the data actually is.
+        lm_all.append(logmag(np.abs(z)).ravel())
+        sig.append(np.percentile(np.abs(z.real), 99))
+        sig.append(np.percentile(np.abs(z.imag), 99))
+        sh.append(np.percentile(np.abs(chan(shifts(sid, "clean"), "avg")), 99))
+        md.append(np.abs(z).max())          # peak modal displacement of the sample
+    fft.cache_clear()
+    shifts.cache_clear()
+    m, t = float(np.percentile(sig, 90)), float(np.percentile(sh, 90))
+    mode = float(np.percentile(md, 90))
+    # Both ends are the extreme actually observed, not a percentile. The tails here are
+    # thin enough that trimming buys almost no vertical space while cutting real curve off
+    # the frame: p99.9 dropped 0.1% of points yet cut the PEAK off 98 of 160 samples, and
+    # p0.5 dropped 0.5% yet cut the TROUGH off all 160. Taking the true extremes clips
+    # nothing and still spans only ~6.5 decades.
+    lm = np.concatenate(lm_all)
+    lm_lo = float(min(x.min() for x in lm_all))
+    lm_hi = float(max(x.max() for x in lm_all))
+    pad = 0.02 * (lm_hi - lm_lo)             # a hair of headroom so peaks are not flush
+    lm_lo, lm_hi = lm_lo - pad, lm_hi + pad
+    _mag_hi = float(10 ** np.percentile(lm, 99.9))
+    return {
+        "logmag": [lm_lo, lm_hi],
+        # Linear magnitude, unlike the log axis, is dominated by the single largest peak:
+        # 10**lm_hi would leave the typical curve a flat line along the bottom. A high
+        # percentile of the pooled values keeps the usual shape readable. Magnitude cannot
+        # go below zero, so the axis starts there -- nudged just under it so a curve
+        # sitting on the floor is not drawn flush along the frame edge.
+        "mag": [-0.02 * _mag_hi, _mag_hi],
+        "phase": [-math.pi, math.pi],          # bounded already, so global by definition
+        "cosphase": [-1.0, 1.0],
+        "re": [-m, m], "im": [-m, m],
+        "shifts": [-t, t],
+        "mode": [0.0, mode],
+    }
 
 
 def d(sid: str) -> Path:

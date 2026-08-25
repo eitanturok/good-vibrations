@@ -2052,7 +2052,12 @@ function bindUI() {
       refresh();
     };
   });
-  $("#bg-toggle").onchange = (e) => { S.view.background = e.target.checked; renderVisible(); };
+  const setBackground = (on) => {
+    S.view.background = on;
+    $("#bg-toggle").checked = on;          // keep the checkbox honest when "b" drives it
+    renderVisible();
+  };
+  $("#bg-toggle").onchange = (e) => setBackground(e.target.checked);
   $("#rel-toggle").onchange = (e) => { S.view.relative = e.target.checked; renderVisible(); };
 
   $("#epoch-slider").oninput = (e) => setEpochIdx(+e.target.value);
@@ -2108,6 +2113,11 @@ function bindUI() {
     if (e.key === "f" && !typing && !e.ctrlKey && !e.metaKey && !e.altKey) {
       e.preventDefault();
       setSidebar(document.body.classList.contains("nosidebar"));
+    }
+    // Bare "b" toggles the backdrop, on the same terms as "f".
+    if (e.key === "b" && !typing && !e.ctrlKey && !e.metaKey && !e.altKey) {
+      e.preventDefault();
+      setBackground(!S.view.background);
     }
   });
 
