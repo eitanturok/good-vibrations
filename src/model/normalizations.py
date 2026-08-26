@@ -253,3 +253,70 @@ def compute_refs(ffts: list[np.ndarray]) -> dict[str, np.ndarray]:
     over random tau and collapses toward zero instead of toward the common term.
     """
     return {'speaker': np.mean([log_mag(_to_LFC(f)) for f in ffts], axis=0)}
+
+#***** 6 dataset-facing phase arms *****
+# The notebook helpers above take (L,F,C) numpy; the dataset works in (B,L,F,C) torch.
+# These wrap them for `dataset.process_vibration`, which is the only caller.
+
+def _phasor_cos_sin(z, weight=None):
+    """Complex (B,L,F,C) -> real (B,L,F,2C) unit-phasor [cos, sin], optionally weighted."""
+    import torch
+    z = z / (z.abs() + _DIV_EPS)
+    if weight is not None: z = z * (weight / (weight.amax() + _DIV_EPS))
+    return torch.cat([z.real, z.imag], dim=-1)
+
+def _pad_to(x, n_freqs: int):
+    """Group delay is one bin short (it differences along F). Pad the missing bin with
+    zeros so the phase block lines up with the magnitude block on the frequency axis."""
+    import torch.nn.functional as F_
+    return F_.pad(x, (0, 0, 0, n_freqs - x.shape[-2])) if x.shape[-2] < n_freqs else x
+
+def torch_relative_laser(fft, weighted: bool):
+    """exp(i(theta_l - theta_ref)) against the magnitude-weighted mean phasor over lasers.
+    Cancels every term constant across lasers -- chirp phase, speaker transfer, trigger
+    jitter -- exactly, whatever its shape in f."""
+    z_ref = fft.sum(dim=1, keepdim=True)
+    return _phasor_cos_sin(fft * z_ref.conj(), weight=fft.abs() if weighted else None)
+
+def torch_group_delay(fft, weighted: bool):
+    """exp(i(theta(f+df) - theta(f))). Cancels only terms linear in f."""
+    z = fft[:, :, 1:, :] * fft[:, :, :-1, :].conj()
+    w = fft[:, :, :-1, :].abs() if weighted else None
+    return _pad_to(_phasor_cos_sin(z, weight=w), fft.shape[-2])
+
+def torch_raw_phase(fft, weighted: bool = False):
+    """Ungauged [cos, sin] of angle(Z). The control that separates 'phase helps' from
+    'the gauge fix helps' -- without it, a relative-laser win is unattributable."""
+    return _phasor_cos_sin(fft)
+
+def _both(fft, weighted: bool):
+    import torch
+    return torch.cat([torch_relative_laser(fft, weighted), torch_group_delay(fft, weighted)], dim=-1)
+
+# name -> (fn, weighted). 'none' is absent on purpose: it is the no-op, handled by phase=None.
+PHASE_ARMS = {
+    'rel_laser':          (torch_relative_laser, False),
+    'rel_laser_w':        (torch_relative_laser, True),
+    'group_delay':        (torch_group_delay,    False),
+    'group_delay_w':      (torch_group_delay,    True),
+    'both':               (_both,                False),
+    'both_w':             (_both,                True),
+    'raw_phase':          (torch_raw_phase,      False),
+}
+
+def apply_phase_arm(fft, arm: str, top_frac: float | None = 0.10):
+    """Complex (B,L,F,C) -> real (B,L,F,K) phase channels.
+
+    Bins outside the top `top_frac` by laser-mean magnitude are zeroed rather than
+    dropped, which keeps the frequency axis aligned with the magnitude block. Phase
+    there is near-uniform noise (circular resultant 0.27 over all bins vs 0.98 on the
+    top decile), so zeroing it asserts no phase claim instead of asserting a random one.
+    """
+    if arm not in PHASE_ARMS: raise ValueError(f"unknown {arm=}; expected one of {sorted(PHASE_ARMS)}")
+    fn, weighted = PHASE_ARMS[arm]
+    p = fn(fft, weighted)
+    if top_frac is not None:
+        mag = fft.abs().mean(dim=(1, 3))                      # (B,F)
+        keep = mag >= mag.quantile(1.0 - top_frac, dim=-1, keepdim=True)
+        p = p * keep[:, None, :, None]
+    return p

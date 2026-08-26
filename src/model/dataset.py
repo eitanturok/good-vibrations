@@ -30,11 +30,12 @@ def should_augment(p: float) -> bool:
 
 #***** 0 collect samples *****
 
-def precomputed_fft_name(signal_mode: str, normalize_mode: str, patch_size: int, subtract_speaker_mean: bool, subtract_empty_box: bool = False) -> str:
+def precomputed_fft_name(signal_mode: str, normalize_mode: str, patch_size: int, subtract_speaker_mean: bool, subtract_empty_box: bool = False, phase_arm: str | None = None, phase_weight: float = 1.0) -> str:
     # the speaker mean and empty-box reference are baked into the precomputed array, so they have to
     # be part of the filename
     suffix = "_spkmean" if subtract_speaker_mean else ""
     suffix += "_emptybox" if subtract_empty_box else ""
+    suffix += f"_{phase_arm}w{phase_weight:g}" if phase_arm else ""
     return f"vibration/05_precomputed_fft_{signal_mode}_{normalize_mode}_{patch_size}{suffix}.npy"
 
 def mds_columns(augment_fft: bool) -> dict[str, str]:
@@ -65,9 +66,12 @@ def collect_samples(base_sample_dir: Path, verbose: int = 1) -> list[tuple[Path,
 def hash_samples(samples: list[tuple[Path, dict]], out_h: int | None = None, out_w: int | None = None,
                   augment_fft: bool = True, signal_mode: str = "magnitude", normalize_mode: str = "std", patch_size: int = 64,
                   subtract_speaker_mean: bool = False, subtract_empty_box: bool = False,
-                  mag_recipe: str | None = None) -> str:
+                  mag_recipe: str | None = None, rgb: bool = False,
+                  phase_arm: str | None = None, phase_weight: float = 1.0) -> str:
     h = hashlib.sha256()
+    if rgb: h.update(b"rgb")  # different target entirely, so it needs its own cache
     if mag_recipe is not None: h.update(f"recipe{mag_recipe}".encode())  # changes the stored tensor
+    if phase_arm is not None: h.update(f"phase{phase_arm}{phase_weight}".encode())  # adds channels to X
     if out_h is not None: h.update(f"{out_h}x{out_w}".encode())  # resolution is baked into y, so it must invalidate the cache too
     if not augment_fft: h.update(f"{augment_fft}{signal_mode}{normalize_mode}{patch_size}".encode())  # baked into X when not augmenting, so it must invalidate the cache too
     # the sidecars below are written on both paths and depend on signal_mode, so they're hashed unconditionally
@@ -83,15 +87,17 @@ def hash_samples(samples: list[tuple[Path, dict]], out_h: int | None = None, out
 
 def convert_to_mds(mds_dir: Path, samples: list[tuple[Path, dict]], out_h: int, out_w: int, verbose: int = 1,
                     augment_fft: bool = True, signal_mode: str = "magnitude", normalize_mode: str = "std", patch_size: int = 64,
-                    subtract_speaker_mean: bool = False, subtract_empty_box: bool = False) -> Path:
+                    subtract_speaker_mean: bool = False, subtract_empty_box: bool = False, rgb: bool = False,
+                    phase_arm: str | None = None, phase_weight: float = 1.0) -> Path:
 
     def load_X(sample_dir: Path) -> np.ndarray:
         if not augment_fft:
-            return np.load(sample_dir / precomputed_fft_name(signal_mode, normalize_mode, patch_size, subtract_speaker_mean, subtract_empty_box))
+            return np.load(sample_dir / precomputed_fft_name(signal_mode, normalize_mode, patch_size, subtract_speaker_mean, subtract_empty_box, phase_arm, phase_weight))
         X = np.load(sample_dir / "vibration/04_fft.npz")["fft"]  # (1, L, F, C) complex64
         return np.squeeze(X, axis=0) if X.ndim == 4 and X.shape[0] == 1 else X
 
-    x_shape, y_shape = load_X(samples[0][0]).shape, (out_h, out_w)  # y: downsampled (out_h,out_w) mask
+    x_shape = load_X(samples[0][0]).shape
+    y_shape = (out_h, out_w, 3) if rgb else (out_h, out_w)  # y: the downsampled mask, or the downsampled rgb photo
 
     samples = [(sample_dir.resolve(), meta) for sample_dir, meta in samples]
     index_rows = []
@@ -105,7 +111,7 @@ def convert_to_mds(mds_dir: Path, samples: list[tuple[Path, dict]], out_h: int, 
                 X = load_X(sample_dir)
                 assert X.shape == x_shape, f"{sample_dir.name}: X.shape={X.shape} != {x_shape}"
 
-                y = np.load(sample_dir / f"image/04_downsampled_smask_{out_h}h_{out_w}w.npy")  # precomputed by downsample_samples
+                y = np.load(sample_dir / f"image/{target_name(rgb, out_h, out_w)}.npy")  # precomputed by downsample_samples
                 assert y.shape == y_shape, f"{sample_dir.name}: y.shape={y.shape} != {y_shape}"
 
                 com = meta.get("downsampled_com", [-1.0, -1.0])
@@ -136,19 +142,23 @@ def convert_to_mds(mds_dir: Path, samples: list[tuple[Path, dict]], out_h: int, 
 
 #***** 2 downsample image *****
 
-def downsample_mask(mask: Image.Image, out_h: int, out_w: int) -> np.ndarray:
+# the two prediction targets: the (h,w) segmentation mask, or the (h,w,3) overhead photo
+def source_name(rgb: bool) -> str: return "02_cropped_overhead.png" if rgb else "03_smask.png"
+def target_name(rgb: bool, out_h: int, out_w: int) -> str: return f"04_downsampled_{'overhead' if rgb else 'smask'}_{out_h}h_{out_w}w"
+
+def downsample_mask(mask: Image.Image, out_h: int, out_w: int, rgb: bool = False) -> np.ndarray:
     # BOX resampling area-averages over the full H x W mask
     # Convert to float FIRST so BOX
     # would threshold the average back to binary and throw away partial coverage.
-    out = np.array(mask.convert("F").resize((out_w, out_h), resample=Image.BOX), dtype=np.float32)
+    out = np.array(mask.convert("RGB" if rgb else "F").resize((out_w, out_h), resample=Image.BOX), dtype=np.float32)
     return np.clip(out / 255.0, 0.0, 1.0)
 
-def downsample_samples(samples: list[tuple[Path, dict]], out_h: int, out_w: int, verbose: int = 1) -> None:
-    """Downsample every sample's full-resolution mask to (out_h, out_w). Only called when
+def downsample_samples(samples: list[tuple[Path, dict]], out_h: int, out_w: int, verbose: int = 1, rgb: bool = False) -> None:
+    """Downsample every sample's full-resolution target to (out_h, out_w). Only called when
     build_dataset's hashed mds_dir doesn't already exist, so no per-sample cache check here."""
-    for sample_dir, _ in tqdm(samples, desc="downsampling masks", disable=not verbose):
-        out_path = sample_dir / f"image/04_downsampled_smask_{out_h}h_{out_w}w"
-        mask = downsample_mask(Image.open(sample_dir / "image/03_smask.png"), out_h, out_w)
+    for sample_dir, _ in tqdm(samples, desc="downsampling targets", disable=not verbose):
+        out_path = sample_dir / f"image/{target_name(rgb, out_h, out_w)}"
+        mask = downsample_mask(Image.open(sample_dir / f"image/{source_name(rgb)}"), out_h, out_w, rgb)
         Image.fromarray((mask * 255).astype(np.uint8)).save(out_path.with_suffix(".png"))
         np.save(out_path.with_suffix(".npy"), mask)
 
@@ -192,7 +202,7 @@ def noisy_blur(mask: torch.Tensor, blur_noise: tuple = (0.5, 1.0), object_noise:
     return out.clamp(0, 1)
 
 def process_image(mask: torch.Tensor, out_h: int, out_w: int, augment: float = 0.5) -> torch.Tensor:
-    assert mask.shape[-2:] == (out_h, out_w), f"mask {tuple(mask.shape[-2:])} != expected ({out_h},{out_w})"
+    assert mask.shape[1:3] == (out_h, out_w), f"mask {tuple(mask.shape[1:3])} != expected ({out_h},{out_w})"
     # apply augmentation after downsampling so augmentations don't get washed out
     if should_augment(augment): mask = noisy_blur(mask)
     return mask
@@ -311,13 +321,17 @@ def augment_vibration(x: torch.Tensor, freqs: torch.Tensor, n_control: int = 5, 
     gain = gain[None, None, :, None]
     return x * gain
 
-def process_vibration(fft: torch.Tensor, freqs: torch.Tensor, signal_mode: str, normalize_mode: str, patch_size: int, augment: float = 0.5, gain_kwargs: dict | None = None, speaker_mean: torch.Tensor | None = None, stats: dict[str, torch.Tensor] | None = None, empty_box_ref: torch.Tensor | None = None, mag_recipe: str | None = None) -> torch.Tensor:
+def process_vibration(fft: torch.Tensor, freqs: torch.Tensor, signal_mode: str, normalize_mode: str, patch_size: int, augment: float = 0.5, gain_kwargs: dict | None = None, speaker_mean: torch.Tensor | None = None, stats: dict[str, torch.Tensor] | None = None, empty_box_ref: torch.Tensor | None = None, mag_recipe: str | None = None, phase_arm: str | None = None, phase_weight: float = 1.0) -> torch.Tensor:
     """fft -> tokens.
 
     `mag_recipe` selects one of the 11 arms in normalizations.MAG_RECIPES and REPLACES
     the two subtract_* steps. It owns both the domain (|Z| vs log|Z|) and the operation
     (divide vs subtract), so `signal_mode` and both references must be in that same
     domain -- build_dataset derives all three from the recipe name.
+
+    `phase_arm` selects one of normalizations.PHASE_ARMS and CONCATENATES real phase
+    channels onto the magnitude block, scaled by `phase_weight`. It is orthogonal to
+    `mag_recipe`: stage A picks what the magnitude block is, stage B what rides along.
 
     Order matters: the reference is removed BEFORE normalize_fft, because dividing by
     the std first would rescale the sample but not the reference, so they would no
@@ -333,6 +347,14 @@ def process_vibration(fft: torch.Tensor, freqs: torch.Tensor, signal_mode: str, 
         x = subtract_empty_box_ref(x, empty_box_ref)
         x = subtract_speaker_mean(x, speaker_mean)
     x = normalize_fft(x, normalize_mode, stats)
+    if phase_arm is not None:
+        # AFTER normalize_fft, and computed from `fft` rather than `x`: the phase block is
+        # already bounded in [-1,1] by construction, so std-normalizing it would distort the
+        # circular geometry that makes cos/sin the right encoding. Normalizing the magnitude
+        # first is also what puts the two blocks on a common scale, so `phase_weight` sets a
+        # meaningful mix instead of fighting the raw |Z| dynamic range.
+        from model.normalizations import apply_phase_arm
+        x = torch.cat([x, phase_weight * apply_phase_arm(fft, phase_arm).float()], dim=-1)
     return normalize_token(tokenize(x, patch_size), normalize_mode)
 
 SPEAKER_MEANS_FILE = "speaker_means.npz"
@@ -426,7 +448,7 @@ def load_dataset_stats(path: Path) -> dict[str, torch.Tensor]:
     d = np.load(path)
     return {k: torch.from_numpy(d[k]).unsqueeze(0) for k in d.files}
 
-def precompute_vibration_samples(samples: list[tuple[Path, dict]], signal_mode: str, normalize_mode: str, patch_size: int, verbose: int = 1, speaker_means: dict[int, torch.Tensor] | None = None, stats: dict[str, torch.Tensor] | None = None, empty_box_ref: dict[int, torch.Tensor] | None = None, mag_recipe: str | None = None) -> None:
+def precompute_vibration_samples(samples: list[tuple[Path, dict]], signal_mode: str, normalize_mode: str, patch_size: int, verbose: int = 1, speaker_means: dict[int, torch.Tensor] | None = None, stats: dict[str, torch.Tensor] | None = None, empty_box_ref: dict[int, torch.Tensor] | None = None, mag_recipe: str | None = None, phase_arm: str | None = None, phase_weight: float = 1.0) -> None:
     freqs = torch.from_numpy(np.load(samples[0][0] / "vibration/04_fft.npz")["freqs"])
     for sample_dir, meta in tqdm(samples, desc="precomputing fft", disable=not verbose):
         X = np.load(sample_dir / "vibration/04_fft.npz")["fft"]  # (1, L, F, C) complex64
@@ -435,8 +457,8 @@ def precompute_vibration_samples(samples: list[tuple[Path, dict]], signal_mode: 
         speaker = int(meta.get("speaker", -1))
         speaker_mean = speaker_means[speaker] if speaker_means is not None else None
         ref = empty_box_ref[speaker] if empty_box_ref is not None else None
-        X = process_vibration(X, freqs, signal_mode, normalize_mode, patch_size, augment=0.0, speaker_mean=speaker_mean, stats=stats, empty_box_ref=ref, mag_recipe=mag_recipe).squeeze(0).numpy()
-        np.save(sample_dir / precomputed_fft_name(signal_mode, normalize_mode, patch_size, speaker_means is not None, empty_box_ref is not None), X)
+        X = process_vibration(X, freqs, signal_mode, normalize_mode, patch_size, augment=0.0, speaker_mean=speaker_mean, stats=stats, empty_box_ref=ref, mag_recipe=mag_recipe, phase_arm=phase_arm, phase_weight=phase_weight).squeeze(0).numpy()
+        np.save(sample_dir / precomputed_fft_name(signal_mode, normalize_mode, patch_size, speaker_means is not None, empty_box_ref is not None, phase_arm, phase_weight), X)
 
 #***** 5 define dataset *****
 
@@ -462,7 +484,7 @@ class VibrationDataset(StreamingDataset):
         info = dict(sample_id=s["sample_id"], position_id=s["position_id"], n_objects=n_objects, speaker=s["speaker"], box=s["box"], is_empty_box=s["is_empty_box"], x_com=s["downsampled_com_x"], y_com=s["downsampled_com_y"])
         speaker_mean = self.speaker_means[int(s["speaker"])].to(self.pk["device"]) if self.speaker_means is not None else None
         ref = self.empty_box_ref[int(s["speaker"])].to(self.pk["device"]) if self.empty_box_ref is not None else None
-        fft = X if self.pk["mds_precomputed_fft"] else process_vibration(X, self.pk["freqs"], self.pk["signal_mode"], self.pk["normalize_mode"], self.pk["patch_size"], augment=self.pk["augment_fft"], speaker_mean=speaker_mean, stats=self.stats, empty_box_ref=ref, mag_recipe=self.pk.get("mag_recipe"))
+        fft = X if self.pk["mds_precomputed_fft"] else process_vibration(X, self.pk["freqs"], self.pk["signal_mode"], self.pk["normalize_mode"], self.pk["patch_size"], augment=self.pk["augment_fft"], speaker_mean=speaker_mean, stats=self.stats, empty_box_ref=ref, mag_recipe=self.pk.get("mag_recipe"), phase_arm=self.pk.get("phase_arm"), phase_weight=self.pk.get("phase_weight", 1.0))
         mask_true = process_image(y, self.pk["out_h"], self.pk["out_w"], augment=self.pk["augment_mask"])
         return dict(fft=fft.squeeze(0), mask_true=mask_true.squeeze(0), info=info)
 
@@ -796,7 +818,8 @@ def build_dataset(data_dir: str | Path, split: str = "exp25", batch_size: int = 
                    normalize_mode: str = "std", patch_size: int = 64, seed: int = 42,
                    force_rebuild_data: bool = False, augment_fft: float = 0.5, augment_mask: float = 0.5,
                    subtract_speaker_mean: bool = False, subtract_empty_box: bool = False, n_classes: int = 4, verbose: int = 1,
-                   mag_recipe: str | None = None, pair_speakers_mode: bool = False, **split_kwargs):
+                   mag_recipe: str | None = None, pair_speakers_mode: bool = False, rgb: bool = False,
+                   phase_arm: str | None = None, phase_weight: float = 1.0, **split_kwargs):
 
     # A recipe owns the domain and the operation, so it OVERRIDES signal_mode and both
     # subtract_* flags. Deriving signal_mode here is what guarantees the references are
@@ -811,6 +834,14 @@ def build_dataset(data_dir: str | Path, split: str = "exp25", batch_size: int = 
         subtract_speaker_mean = mag_recipe.endswith(("_spk", "_both"))
         if verbose:
             print(f"{mag_recipe=} -> {signal_mode=}, {subtract_empty_box=}, {subtract_speaker_mean=}")
+
+    # Phase is orthogonal to stage A: it reads the complex fft directly, so it imposes no
+    # constraint on signal_mode. Validated here rather than at use so a typo fails before the
+    # ~10 min MDS build rather than after it.
+    if phase_arm is not None:
+        from model.normalizations import PHASE_ARMS
+        if phase_arm not in PHASE_ARMS:
+            raise ValueError(f"unknown {phase_arm=}; expected one of {sorted(PHASE_ARMS)}")
 
     if split not in SPLIT_METHODS: raise ValueError(f"Unknown split {split!r}, expected one of {sorted(SPLIT_METHODS)}")
     if not 0 <= augment_fft <= 1: raise ValueError(f"{augment_fft=} must be a probability in [0, 1]")
@@ -827,7 +858,7 @@ def build_dataset(data_dir: str | Path, split: str = "exp25", batch_size: int = 
     # the fft gain augmentation needs the raw complex fft, so any nonzero probability means we store it raw
     raw_fft = augment_fft > 0
     samples = collect_samples(data_dir / "samples", verbose)
-    mds_dir = data_dir / "mds" / hash_samples(samples, out_h, out_w, raw_fft, signal_mode, normalize_mode, patch_size, subtract_speaker_mean, subtract_empty_box, mag_recipe)[:16]
+    mds_dir = data_dir / "mds" / hash_samples(samples, out_h, out_w, raw_fft, signal_mode, normalize_mode, patch_size, subtract_speaker_mean, subtract_empty_box, mag_recipe, rgb, phase_arm, phase_weight)[:16]
     done = mds_dir / "metadata.jsonl"  # last file convert_to_mds writes -- its presence means the build completed
 
     if force_rebuild_data and mds_dir.exists():
@@ -846,9 +877,9 @@ def build_dataset(data_dir: str | Path, split: str = "exp25", batch_size: int = 
         stats = compute_dataset_stats(samples, signal_mode, keep_idxs=train_idxs, verbose=verbose) if needs_stats else None
 
         # downsample image, precompute fft, and convert to mds
-        downsample_samples(samples, out_h, out_w, verbose=verbose)
-        if not raw_fft: precompute_vibration_samples(samples, signal_mode, normalize_mode, patch_size, verbose=verbose, speaker_means=speaker_means, stats=stats, empty_box_ref=empty_box_ref, mag_recipe=mag_recipe)
-        convert_to_mds(mds_dir, samples, out_h, out_w, verbose=verbose, augment_fft=raw_fft, signal_mode=signal_mode, normalize_mode=normalize_mode, patch_size=patch_size, subtract_speaker_mean=subtract_speaker_mean, subtract_empty_box=subtract_empty_box)
+        downsample_samples(samples, out_h, out_w, verbose=verbose, rgb=rgb)
+        if not raw_fft: precompute_vibration_samples(samples, signal_mode, normalize_mode, patch_size, verbose=verbose, speaker_means=speaker_means, stats=stats, empty_box_ref=empty_box_ref, mag_recipe=mag_recipe, phase_arm=phase_arm, phase_weight=phase_weight)
+        convert_to_mds(mds_dir, samples, out_h, out_w, verbose=verbose, augment_fft=raw_fft, signal_mode=signal_mode, normalize_mode=normalize_mode, patch_size=patch_size, subtract_speaker_mean=subtract_speaker_mean, subtract_empty_box=subtract_empty_box, rgb=rgb, phase_arm=phase_arm, phase_weight=phase_weight)
         if speaker_means is not None: save_speaker_means(speaker_means, mds_dir / SPEAKER_MEANS_FILE)
         if stats is not None: save_dataset_stats(stats, mds_dir / DATASET_STATS_FILE)
         if empty_box_ref is not None: save_empty_box_ref(empty_box_ref, mds_dir / EMPTY_BOX_REF_FILE)
@@ -858,7 +889,8 @@ def build_dataset(data_dir: str | Path, split: str = "exp25", batch_size: int = 
     splits = SPLIT_METHODS[split](mds_dir, seed=seed, verbose=verbose, **split_kwargs)
 
     generator = torch.Generator().manual_seed(seed)
-    process_kwargs = dict(device="cpu", signal_mode=signal_mode, normalize_mode=normalize_mode, patch_size=patch_size, out_h=out_h, out_w=out_w, mds_precomputed_fft=not raw_fft, n_classes=n_classes, mag_recipe=mag_recipe)
+    if rgb: augment_mask = 0.0  # blur+noise is a mask augmentation, meaningless on a photo
+    process_kwargs = dict(device="cpu", signal_mode=signal_mode, normalize_mode=normalize_mode, patch_size=patch_size, out_h=out_h, out_w=out_w, mds_precomputed_fft=not raw_fft, n_classes=n_classes, mag_recipe=mag_recipe, phase_arm=phase_arm, phase_weight=phase_weight)
     train_dataset = VibrationDataset(local=mds_dir, seed=seed, process_kwargs=dict(process_kwargs, augment_fft=augment_fft, augment_mask=augment_mask))
     eval_dataset = VibrationDataset(local=mds_dir, seed=seed, process_kwargs=dict(process_kwargs, augment_fft=0.0, augment_mask=0.0))
 

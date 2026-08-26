@@ -40,7 +40,7 @@ class VisualizeSMask(Callback):
 
     def _render(self, pred: np.ndarray, true: np.ndarray, caption: str, target_w: int = 640, sep: int = 4) -> np.ndarray:
         """Two mask panels side by side under a caption, sized to ~target_w at any out_h/out_w."""
-        h, w = pred.shape
+        h, w = pred.shape[:2]  # (H,W) mask or (H,W,3) rgb; Image.fromarray handles both
         scale = max(1, (target_w - sep) // (2 * w))
         ph, pw = h * scale, w * scale
         canvas_w = pw * 2 + sep
@@ -60,10 +60,12 @@ class VisualizeSMask(Callback):
         return np.array(canvas)
 
     def _render_batch(self, mask_pred: torch.Tensor, mask_true: torch.Tensor, info: dict, p_empty=None) -> list[np.ndarray]:
-        com_dists = com_distances(mask_pred, mask_true, epsilon=1e-6, normalize=True).numpy()
+        is_rgb = mask_pred.ndim == 4  # center of mass is an occupancy notion, so skip it on rgb targets
+        com_dists = None if is_rgb else com_distances(mask_pred, mask_true, epsilon=1e-6, normalize=True).numpy()
         mse_vals = mses(mask_pred, mask_true).numpy()
         captions = [f"pos {info['position_id'][i]}  spk {info['speaker'][i]} (smp {info['sample_id'][i]})  objs={info['n_objects'][i]}  "
-                    f"com=({info['x_com'][i]:.1f},{info['y_com'][i]:.1f})  mse={mse_vals[i]:.4f}  com_dist={com_dists[i]:.4f}"
+                    f"mse={mse_vals[i]:.4f}"
+                    + ("" if is_rgb else f"  com=({info['x_com'][i]:.1f},{info['y_com'][i]:.1f})  com_dist={com_dists[i]:.4f}")
                     + (f"  p(empty)={p_empty[i]:.3f}" if p_empty is not None else "")
                     for i in range(len(mask_pred))]
         return [self._render(p, t, c) for p, t, c in zip(mask_pred.numpy(), mask_true.numpy(), captions)]
