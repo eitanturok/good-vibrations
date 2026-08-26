@@ -209,8 +209,13 @@ async function addRun(name, reload = false) {
   S.runs[name] = d;
   S.runOrder.push(name);
   invalidateEpochs();
-  for (const sp of d.splits) S.filters.splits.add(sp);
-  recomputeDomains();
+  // Only splits no loaded run had before. Adding a second run must not re-check splits the
+  // user turned off -- the two runs' vocabularies overlap, so blanket-adding resets them.
+  const known = new Set();
+  for (const n of S.runOrder) if (n !== name) S.runs[n].splits.forEach((sp) => known.add(sp));
+  const first = S.runOrder.length === 1;
+  for (const sp of d.splits) if (first || !known.has(sp)) S.filters.splits.add(sp);
+  recomputeDomains({ preserve: S.runOrder.length > 1 });
   refresh();
 }
 
@@ -580,13 +585,28 @@ function makeDraggable(cell, name) {
   };
 }
 
+/* The ground-truth column collapses to true zero width. It sits BETWEEN the sticky index column
+   and the runs, so the handle to bring it back lives in the index header cell (and on "g") rather
+   than in the column itself. Width lives in a CSS var, so the header, every pooled row, and the
+   sticky offsets all follow from one class -- no re-render, and no row heights change. */
+function setGtCol(open) {
+  document.body.classList.toggle("nogt", !open);
+  try { localStorage.setItem("viz.gtcol", open ? "1" : "0"); } catch (_) {}
+}
+
 function renderHeader() {
   const h = document.createElement("div");
   h.className = "hrow";
   h.style.height = "auto";
-  h.innerHTML = `<div class="hcell idx sticky-1"></div>
-    <div class="hcell gt sticky-2"><div class="hname" style="cursor:default">Ground truth</div>
+  h.innerHTML = `<div class="hcell idx sticky-1">
+      <button class="gtcol" id="gt-hide" title="Collapse ground truth" aria-label="Collapse ground truth">‹</button>
+      <button class="gtcol" id="gt-show" title="Show ground truth" aria-label="Show ground truth">›</button>
+    </div>
+    <div class="hcell gt sticky-2">
+      <div class="hname" style="cursor:default">Ground truth</div>
       <div class="hmeta">sample · overhead + mask</div></div>`;
+  h.querySelector("#gt-hide").onclick = () => setGtCol(false);
+  h.querySelector("#gt-show").onclick = () => setGtCol(true);
 
   for (const name of S.runOrder) {
     const r = S.runs[name], st = statsFor(name);
@@ -748,7 +768,10 @@ function paintRow(el, rank) {
     `<span class="tag" title="${s.layout}">${shortLayout(s.layout)}</span>` +
     `<span class="tag">${s.n_objects} obj</span>` +
     (s.box ? `<span class="tag" title="box: ${s.box}">${s.box}</span>` : "");
-  el.querySelector(".gtcell").onclick = () => openModal(rank);
+  // Collapsed, the cell is a bare rail -- clicking it must not open the sample modal.
+  el.querySelector(".gtcell").onclick = () => {
+    if (!document.body.classList.contains("nogt")) openModal(rank);
+  };
 
   syncRowCells(el);
   // Hoisted: depends only on S.runOrder, so computing it per cell rebuilt a Set ~140
@@ -1791,7 +1814,7 @@ async function poll() {
     }
   }
   const added = meta.runs.filter((r) => r.compatible && !prevNames.has(r.name));
-  if (added.length && !$("#runpicker").hidden) openPicker();   // keep an open picker live
+  if (added.length && pickerOpen()) openPicker();   // keep an open picker live
   if (!advanced.length && statusChanged) refresh();
 }
 
@@ -1799,28 +1822,53 @@ async function poll() {
    Loaded runs are their own columns, so there is no separate list of them: each column
    header carries its own close button. */
 
+let pickCur = -1;               // highlighted row, for arrow-key selection
+
+function pickerOpen() { return !$("#run-list").hidden; }
+
+function closePicker() {
+  $("#run-list").hidden = true;
+  $("#run-search").setAttribute("aria-expanded", "false");
+  pickCur = -1;
+}
+
+/* Rows that can actually be clicked -- the arrow keys skip incompatible and already-added
+   runs rather than parking on a dead row. */
+function pickable() { return [...$("#run-list").querySelectorAll(".ritem.ok")]; }
+
+function markCur() {
+  const rows = pickable();
+  rows.forEach((d, i) => d.classList.toggle("cur", i === pickCur));
+  if (pickCur >= 0 && rows[pickCur]) rows[pickCur].scrollIntoView({ block: "nearest" });
+}
+
 function openPicker() {
   const list = $("#run-list"), q = $("#run-search");
-  const draw = () => {
-    const term = q.value.trim().toLowerCase();
-    list.innerHTML = "";
-    S.meta.runs
-      .filter((r) => !term || r.name.toLowerCase().includes(term))
-      .forEach((r) => {
-        const added = !!S.runs[r.name];
-        const d = document.createElement("div");
-        d.className = "ritem" + (r.compatible ? (added ? " added" : "") : " bad");
-        d.innerHTML = `<div><div class="nm">${r.name}</div>
-          <div class="sub">${statusChip(r.status)} ${r.compatible
-            ? `ep ${r.epoch ?? "?"} · ${r.eval_splits.length} eval splits` : r.reason}</div></div>
-          <span class="badge">${added ? "added" : r.compatible ? "add" : "unavailable"}</span>`;
-        if (r.compatible && !added) d.onclick = async () => { $("#runpicker").hidden = true; await addRun(r.name); };
-        list.appendChild(d);
-      });
-  };
-  q.value = ""; q.oninput = draw; draw();
-  $("#runpicker").hidden = false;
-  q.focus();
+  const term = q.value.trim().toLowerCase();
+  list.innerHTML = "";
+  const hits = S.meta.runs.filter((r) => !term || r.name.toLowerCase().includes(term));
+  if (!hits.length) list.innerHTML = `<div class="none">no run matches "${term}"</div>`;
+  hits.forEach((r) => {
+    const added = !!S.runs[r.name];
+    const ok = r.compatible && !added;
+    const d = document.createElement("div");
+    d.className = "ritem" + (r.compatible ? (added ? " added" : "") : " bad") + (ok ? " ok" : "");
+    d.innerHTML = `<div><div class="nm">${r.name}</div>
+      <div class="sub">${statusChip(r.status)} ${r.compatible
+        ? `ep ${r.epoch ?? "?"} · ${r.eval_splits.length} eval splits` : r.reason}</div></div>
+      <span class="badge">${added ? "added" : r.compatible ? "add" : "unavailable"}</span>`;
+    if (ok) d.onclick = () => pick(r.name);
+    list.appendChild(d);
+  });
+  pickCur = -1;
+  list.hidden = false;
+  q.setAttribute("aria-expanded", "true");
+}
+
+async function pick(name) {
+  $("#run-search").value = "";
+  closePicker();
+  await addRun(name);
 }
 
 /* ***** hover tooltip *****
@@ -2040,6 +2088,7 @@ function bindUI() {
   $("#sidebar-hide").onclick = () => setSidebar(false);
   $("#sidebar-show").onclick = () => setSidebar(true);
   try { if (localStorage.getItem("viz.sidebar") === "0") setSidebar(false); } catch (_) {}
+  try { if (localStorage.getItem("viz.gtcol") === "0") setGtCol(false); } catch (_) {}
 
   $("#mode-seg").querySelectorAll("button").forEach((b) => {
     b.onclick = () => {
@@ -2090,7 +2139,32 @@ function bindUI() {
     b.onclick = () => { S.filters[b.dataset.none] = new Set(); refresh(); };
   });
 
-  $("#add-run").onclick = openPicker;
+  const q = $("#run-search");
+  q.oninput = openPicker;
+  q.onfocus = openPicker;
+  q.onkeydown = (e) => {
+    if (e.key === "Escape") { closePicker(); q.blur(); return; }
+    if (!pickerOpen()) { if (e.key === "ArrowDown") openPicker(); return; }
+    const rows = pickable();
+    if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+      e.preventDefault();
+      if (!rows.length) return;
+      const step = e.key === "ArrowDown" ? 1 : -1;
+      // From "nothing highlighted", Down lands on the first row and Up on the last.
+      pickCur = pickCur < 0 ? (step > 0 ? 0 : rows.length - 1)
+                            : (pickCur + step + rows.length) % rows.length;
+      markCur();
+    } else if (e.key === "Enter") {
+      e.preventDefault();
+      // Enter with nothing highlighted takes the only candidate, if there is exactly one.
+      const d = pickCur >= 0 ? rows[pickCur] : (rows.length === 1 ? rows[0] : null);
+      if (d) d.click();
+    }
+  };
+  // A click anywhere else dismisses the list, the way a native dropdown behaves.
+  document.addEventListener("mousedown", (e) => {
+    if (pickerOpen() && !e.target.closest("#runbox")) closePicker();
+  });
   document.querySelectorAll("[data-close]").forEach((b) => {
     b.onclick = () => { b.closest(".overlay").hidden = true; };
   });
@@ -2101,7 +2175,7 @@ function bindUI() {
   $("#m-next").onclick = () => stepModal(1);
 
   document.addEventListener("keydown", (e) => {
-    if (e.key === "Escape") document.querySelectorAll(".overlay").forEach((o) => (o.hidden = true));
+    if (e.key === "Escape") { document.querySelectorAll(".overlay").forEach((o) => (o.hidden = true)); closePicker(); }
     if (!$("#modal").hidden) {
       if (e.key === "ArrowLeft") { e.preventDefault(); stepModal(-1); }
       if (e.key === "ArrowRight") { e.preventDefault(); stepModal(1); }
@@ -2109,7 +2183,14 @@ function bindUI() {
     }
     // Bare "f" toggles the filter panel -- but not while typing in the id searches, and
     // not when it is a browser/OS chord.
-    const typing = /^(INPUT|TEXTAREA|SELECT)$/.test(e.target.tagName);
+    // Only fields that swallow the character count as typing. A focused range, checkbox or
+    // button does not: arrow-stepping the epoch slider leaves focus on it, and a tagName-only
+    // test would kill these shortcuts for the rest of the session.
+    const t = e.target;
+    const typing =
+      t.isContentEditable ||
+      /^(TEXTAREA|SELECT)$/.test(t.tagName) ||
+      (t.tagName === "INPUT" && !/^(range|checkbox|radio|button|submit|reset|color)$/.test(t.type));
     if (e.key === "f" && !typing && !e.ctrlKey && !e.metaKey && !e.altKey) {
       e.preventDefault();
       setSidebar(document.body.classList.contains("nosidebar"));
@@ -2118,6 +2199,11 @@ function bindUI() {
     if (e.key === "b" && !typing && !e.ctrlKey && !e.metaKey && !e.altKey) {
       e.preventDefault();
       setBackground(!S.view.background);
+    }
+    // Bare "g" collapses/restores the ground-truth column, same terms again.
+    if (e.key === "g" && !typing && !e.ctrlKey && !e.metaKey && !e.altKey) {
+      e.preventDefault();
+      setGtCol(document.body.classList.contains("nogt"));
     }
   });
 

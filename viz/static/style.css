@@ -590,6 +590,31 @@ body.dragging-col .hgrip { cursor: grabbing; }
 .gtcell { cursor: pointer; }
 .gtcell:hover .gtimg { outline: 2px solid var(--accent); outline-offset: 1px; }
 
+/* ***** collapsing the ground-truth column *****
+   The toggle lives in the index column's otherwise-empty header cell, so it stays put and
+   stays clickable whether the column is open or collapsed -- the column itself can then go
+   to zero width with nothing left over. Contents are hidden rather than unmounted, so
+   reopening shows the already-decoded mask images with no refetch and no re-render. */
+.hcell.idx { display: flex; align-items: flex-start; justify-content: center; }
+.gtcol {
+  cursor: pointer; padding: 0; line-height: 1;
+  border: 1px solid var(--line-firm); background: var(--surface-1); color: var(--ink-3);
+  border-radius: var(--r); font-size: 13px; width: 20px; height: 20px;
+}
+.gtcol:hover { border-color: var(--accent); color: var(--accent); }
+#gt-show { display: none; }
+body.nogt #gt-hide { display: none; }
+body.nogt #gt-show { display: block; }
+
+/* Zero width, and every box-model contributor with it. .cell/.hcell carry horizontal
+   padding and a right border, which would otherwise leave a visible ~21px stripe. */
+body.nogt { --gt-w: 0px; }
+body.nogt .cell.gt, body.nogt .hcell.gt {
+  padding-left: 0; padding-right: 0; border-right: 0; overflow: hidden;
+}
+body.nogt .cell.gt { cursor: default; }
+body.nogt .cell.gt > *, body.nogt .hcell.gt > * { display: none; }
+
 /* Three-line cell title, 13px per line. Lines 1-2 name the thing (Ground truth, or the
    run). Line 2 identifies the sample, and is the same text in every column of the row.
    Split and epoch are NOT here: they describe the prediction, so they live below the image
@@ -745,16 +770,26 @@ body.dragging-col .hgrip { cursor: grabbing; }
 }
 .sheet-head .x { border: 0; background: none; font-size: 19px; color: var(--ink-3); }
 
+/* The run picker is an inline combobox, not a modal: adding a run is a small, repeated
+   action and should not black out the table you are comparing against. */
+#runbox { position: relative; }
 #run-search {
-  font: inherit; margin: 12px 16px; padding: 7px 10px;
+  font: inherit; width: 100%; box-sizing: border-box; padding: 7px 10px;
   border: 1px solid var(--line-firm); border-radius: var(--r);
   background: var(--surface-0); color: var(--ink);
 }
-#run-list { overflow-y: auto; padding: 0 8px 12px; }
+#run-list {
+  position: absolute; z-index: 60; top: calc(100% + 4px); left: 0; right: 0;
+  max-height: 300px; overflow-y: auto; padding: 4px;
+  background: var(--surface-1); border: 1px solid var(--line-firm); border-radius: var(--r);
+  box-shadow: 0 12px 28px rgba(0,0,0,.28);
+}
+#run-list .none { padding: 8px 10px; font-size: 11px; color: var(--ink-3); }
 .ritem {
   display: flex; justify-content: space-between; align-items: center; gap: 10px;
   padding: 8px 10px; border-radius: var(--r); cursor: pointer;
 }
+.ritem.cur { background: var(--surface-2); }
 .ritem:hover { background: var(--surface-2); }
 .ritem .nm { font-size: 11.5px; font-weight: 500; }
 .ritem .sub { font-size: 10px; color: var(--ink-3); margin-top: 1px; }

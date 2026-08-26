@@ -16,7 +16,11 @@
   </header>
 
   <section class="panel">
-    <button id="add-run" class="btn wide">+ Add run</button>
+    <div id="runbox">
+      <input id="run-search" type="search" placeholder="+ Add run…" autocomplete="off"
+             role="combobox" aria-expanded="false" aria-controls="run-list">
+      <div id="run-list" role="listbox" hidden></div>
+    </div>
     <p id="rowcount" class="rowcount"></p>
   </section>
 
@@ -136,17 +140,6 @@
 </main>
 
 <div id="tooltip" hidden></div>
-
-<div id="runpicker" class="overlay" hidden>
-  <div class="sheet">
-    <div class="sheet-head">
-      <h2>Add a run</h2>
-      <button class="x" data-close>&times;</button>
-    </div>
-    <input id="run-search" type="search" placeholder="Filter runs…" autocomplete="off">
-    <div id="run-list"></div>
-  </div>
-</div>
 
 <div id="modal" class="overlay" hidden>
   <div class="sheet wide">
