@@ -82,6 +82,11 @@ def get_parser():
     # data normalization
     parser.add_argument("--encoder",                    type=str,   default="single", choices=["single", "two-stream"], help="boombox only. 'single' fuses magnitude and phase in the first conv's weights (the v2 encoder). 'two-stream' gives each its own full-width frequency stack and fuses after it, at ~+7%% params.")
     parser.add_argument("--fuse",                       type=str,   default="concat", choices=["concat", "gate"], help="--encoder two-stream only. 'concat' stacks the two streams; 'gate' admits phase through a sigmoid gate driven by the magnitude stream, biased shut at init so training starts near the no-phase model.")
+    parser.add_argument("--trim-pad",                   action="store_true", help="boombox only. Drop tokenize()'s trailing zero-pad before the convs (45/1280 bins at patch_size 64, 211/3072 at 256). The pad is harmless to the transformer, which sees it at fixed positions, but a conv slides over it and then averages it in.")
+    parser.add_argument("--learned-collapse",           action="store_true", help="boombox only. Replace the frequency stack's AdaptiveAvgPool with a learned (1,width) conv, so WHERE in the spectrum a filter fired survives the collapse instead of being averaged out. +328K params.")
+    parser.add_argument("--freq-mult",                  type=int,   default=1, help="boombox only. Scale every frequency-stack width (32/64/128/256 -> x mult). NOTE this also scales the grid stack's input, so params grow well beyond the frequency stack itself.")
+    parser.add_argument("--freq-depth",                 type=int,   default=1, help="boombox only. Stride-1 (1,3) blocks per stage, adding depth at each frequency scale. Unlike --freq-mult the output width is unchanged, so the grid stack costs nothing extra.")
+    parser.add_argument("--resize",                     type=str,   default="conv", choices=["conv", "bilinear"], help="boombox decoder. 'conv' absorbs the 24x32 -> out_h x out_w margin in a valid-mode head conv (no interpolation); 'bilinear' is the original resize, needed to load older checkpoints.")
     parser.add_argument("--signal-mode",                type=str,   default="magnitude", choices=["magnitude", "log_magnitude", "complex", "mag_phase", "mag_trig_phase"])
     parser.add_argument("--normalize-mode",             type=str,   default="std", help="Per-sample: std, z, per_laser_z. Train-split statistics: per_bin_z. Append '+token-mean' for token-level normalization.")
     parser.add_argument("--augment-mask",               type=float, default=0.5, help="Probability a sample gets mask augmentation (blur+noise). 0 disables.")
@@ -104,7 +109,7 @@ def get_parser():
     # arch
     parser.add_argument("--model",                      type=str,   default="transformer", choices=("transformer", "boombox"), help="transformer = VibrationTransformer; boombox = the conv encoder/decoder from arXiv 2105.08052.")
     parser.add_argument("--d-model",                    type=int,   default=128)
-    parser.add_argument("--decoder",                    type=str,   default='mlp')
+    parser.add_argument("--decoder",                    type=str,   default='mlp', choices=('mlp', 'mlp-mid', 'attn', 'attn-no-rope', 'conv'), help="--model transformer only. 'conv' is boombox's transposed-conv decoder on the transformer's cls token, i.e. the freq+laser transformer encoder with the boombox decoder.")
     parser.add_argument("--decoder-num-heads",          type=int,   default=2)
     parser.add_argument("--decoder-num-layers",         type=int,   default=2)
     parser.add_argument("--ffn-dim",                    type=int,   default=None, help="Width of every transformer FFN (freq encoder, laser encoder, attn decoder). Default None = 4*d_model. Torch's own default is a fixed 2048, so pre-2026-08 runs had a 2048-wide FFN regardless of d_model; pass 2048 to reproduce them. No effect on --model boombox.")
@@ -237,10 +242,10 @@ def run(**kwargs):
     # tokenize() zero-pads the frequency axis, so n_patches * patch_size is the padded length
     base = train_loader.dataloader.dataset.dataset  # Subset -> (PairedSpeakerDataset ->) VibrationDataset
     n_freqs_real = len(getattr(base, "dataset", base).pk["freqs"])
-    data_info = dict(out_h=args.out_h, out_w=args.out_w, out_c=3 if args.rgb else 1, n_laser_rows=args.n_laser_rows, n_laser_cols=args.n_laser_cols, patch_size=args.patch_size, n_freqs=n_patches * patch_size, n_channels=n_channels)
+    data_info = dict(out_h=args.out_h, out_w=args.out_w, out_c=3 if args.rgb else 1, n_laser_rows=args.n_laser_rows, n_laser_cols=args.n_laser_cols, patch_size=args.patch_size, n_freqs=n_patches * patch_size, n_freqs_real=n_freqs_real, n_channels=n_channels)
     print(f"{n_freqs_real} freq bins -> {n_patches} patches of {patch_size} = {n_patches * patch_size} ({n_patches * patch_size - n_freqs_real} padded)")
     if args.model == "boombox":
-        model = BoomboxModel(args.d_model, data_info, loss_fn=args.loss_fn, loss_alpha=args.loss_alpha, count_loss_weight=args.count_loss_weight, freq_dropout=args.freq_dropout, laser_dropout=args.laser_dropout, encoder=args.encoder, fuse=args.fuse)
+        model = BoomboxModel(args.d_model, data_info, loss_fn=args.loss_fn, loss_alpha=args.loss_alpha, count_loss_weight=args.count_loss_weight, freq_dropout=args.freq_dropout, laser_dropout=args.laser_dropout, encoder=args.encoder, fuse=args.fuse, trim_pad=args.trim_pad, learned_collapse=args.learned_collapse, freq_mult=args.freq_mult, freq_depth=args.freq_depth, resize=args.resize)
     else:
         model = VibrationTransformer(args.d_model, args.pnt_num_heads, args.pnt_num_layers, args.seq_num_heads, args.seq_num_layers, data_info, args.decoder, args.decoder_num_heads, args.decoder_num_layers, freq_dropout=args.freq_dropout, laser_dropout=args.laser_dropout, loss_fn=args.loss_fn, loss_alpha=args.loss_alpha, count_loss_weight=args.count_loss_weight, ffn_dim=args.ffn_dim)
     load_path = str(args.checkpoint_path) if args.checkpoint_path else None

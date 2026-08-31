@@ -288,6 +288,12 @@ class AttnDecoder(nn.Module):
 
 def build_decoder(decoder, d_model, out_h, out_w, decoder_num_heads:int=2, decoder_num_layers:int=2, out_c:int=1, ffn_dim:int|None=None):
     if decoder == 'mlp': return MLPDecoder(d_model, out_h, out_w, out_c)  # no attention, so ffn_dim does not apply
+    # boombox's transposed-conv stack on the transformer's cls token. Imported here, not at module
+    # scope: boombox.py imports from this file, so a top-level import would be circular. Its
+    # signature is already (B,D)->(B,H,W), the same contract as MLPDecoder, so nothing else changes.
+    if decoder == 'conv':
+        from model.boombox import Decoder as ConvDecoder
+        return ConvDecoder(d_model, out_h, out_w, out_c)
     if decoder == 'mlp-mid': return MLPMidDecoder(d_model, out_h, out_w, out_c)
     if decoder == 'attn': return AttnDecoder(d_model, out_h, out_w, num_heads=decoder_num_heads, num_layers=decoder_num_layers, out_c=out_c, ffn_dim=ffn_dim)
     if decoder == 'attn-no-rope': return AttnDecoder(d_model, out_h, out_w, num_heads=decoder_num_heads, num_layers=decoder_num_layers, do_rope=False, out_c=out_c, ffn_dim=ffn_dim)

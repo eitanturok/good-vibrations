@@ -33,6 +33,49 @@ def conv_block(c_in, c_out, kernel, stride, padding=0):
     return nn.Sequential(nn.Conv2d(c_in, c_out, kernel, stride=stride, padding=padding),
                          nn.BatchNorm2d(c_out), nn.LeakyReLU(0.2, inplace=True))
 
+def freq_collapse(c, width, learned):
+    """Collapse the surviving frequency width to 1. `learned` swaps the uniform mean for a
+    per-channel weighted sum: AdaptiveAvgPool throws away WHERE in the spectrum a filter fired,
+    but band identity is exactly what carries the signal here (133-215Hz and 380-463Hz dominate
+    the ablations), and it is also the only way the trailing zero-pad can be downweighted rather
+    than averaged in at full strength."""
+    if not learned: return nn.AdaptiveAvgPool2d((None, 1))
+    return nn.Conv2d(c, c, (1, width), groups=1)  # valid-mode: (.,.,L,width) -> (.,.,L,1)
+
+# (kernel, padding) per stride-4 stage. One list so the stack, the width arithmetic and both
+# encoders can never drift apart. Wider first kernel: at full resolution you want a bigger
+# receptive field on raw bins before throwing resolution away; after that each stride-4 already
+# quadruples the effective field.
+FREQ_STAGES = ((7, 3), (5, 2), (5, 2), (5, 2))
+
+def freq_stack(c_in, freq_width, mult=1, depth=1):
+    """The (1,k) frequency stack: 32->64->128->256 (times `mult`), stride 4 each stage.
+
+    `mult` scales every width, so the grid stack's input scales with it too -- widening here
+    drags params into the grid, which is why it is not free. `depth` inserts stride-1 (1,3)
+    blocks after each downsample, adding nonlinearity at each scale WITHOUT touching the
+    output width, so the grid stack is unaffected. The frequency stack is only ~216K params of
+    a ~28M model at mult=1, so this is the cheapest place in the arch to buy capacity.
+    """
+    layers, c = [], c_in
+    for i, (k, p) in enumerate(FREQ_STAGES):
+        c_out = int(32 * 2 ** i * mult)
+        layers.append(conv_block(c, c_out, (1, k), (1, 4), (0, p)))
+        for _ in range(depth - 1):  # stride 1, 'same' padding: refines at this scale, no resize
+            layers.append(conv_block(c_out, c_out, (1, 3), (1, 1), (0, 1)))
+        c = c_out
+    layers.append(freq_collapse(c, freq_width, freq_width is not None))
+    return nn.Sequential(*layers), c
+
+def _surviving_width(n_freqs):
+    """Frequency width left after the four stride-4 stages, which is what a learned collapse
+    must be sized to. Mirrors conv arithmetic rather than hardcoding: the width depends on
+    patch_size and on whether the pad was trimmed (1235 -> 5, 2816 -> 11, 3072 -> 12). The
+    stride-1 `depth` blocks use 'same' padding, so they do not change it."""
+    w = n_freqs
+    for k, p in FREQ_STAGES: w = (w + 2 * p - k) // 4 + 1
+    return w
+
 class Encoder(nn.Module):
     """(B,C,L,F) -> (B,D). Convolves frequency only, then mixes the laser grid.
 
@@ -48,19 +91,14 @@ class Encoder(nn.Module):
     latch onto a few.
     """
     def __init__(self, n_channels, d_model, n_laser_rows, n_laser_cols,
-                 freq_dropout=0.0, laser_dropout=0.0):
+                 freq_dropout=0.0, laser_dropout=0.0, freq_width=None,
+                 freq_mult=1, freq_depth=1):
         super().__init__()
         self.grid_shape = (n_laser_rows, n_laser_cols)
         self.freq_dropout, self.laser_dropout = freq_dropout, laser_dropout
-        self.freq = nn.Sequential(
-            conv_block(n_channels, 32, (1, 7), (1, 4), (0, 3)),
-            conv_block(32, 64, (1, 5), (1, 4), (0, 2)),
-            conv_block(64, 128, (1, 5), (1, 4), (0, 2)),
-            conv_block(128, 256, (1, 5), (1, 4), (0, 2)),
-            nn.AdaptiveAvgPool2d((None, 1)),  # collapse whatever width survives
-            )
+        self.freq, c = freq_stack(n_channels, freq_width, freq_mult, freq_depth)
         self.grid = nn.Sequential(
-            conv_block(256, 512, 3, 2, 1),       # 10x10 -> 5x5
+            conv_block(c, 512, 3, 2, 1),         # 10x10 -> 5x5
             conv_block(512, 1024, 3, 2, 1),      # 5x5 -> 3x3
             conv_block(1024, d_model, 3, 1, 0),  # 3x3 -> 1x1
             )
@@ -97,34 +135,30 @@ class TwoStreamEncoder(nn.Module):
     from _phasor_cos_sin) or 10 (both gauges).
     """
     def __init__(self, n_channels, d_model, n_laser_rows, n_laser_cols,
-                 freq_dropout=0.0, laser_dropout=0.0, fuse='concat'):
+                 freq_dropout=0.0, laser_dropout=0.0, fuse='concat', freq_width=None,
+                 freq_mult=1, freq_depth=1):
         super().__init__()
         self.grid_shape = (n_laser_rows, n_laser_cols)
         self.freq_dropout, self.laser_dropout = freq_dropout, laser_dropout
         self.n_mag, self.n_phase = 2, n_channels - 2
         self.fuse = fuse
 
-        def stream(c_in):  # same (1,k) kernels and stride-4 schedule as Encoder.freq
-            return nn.Sequential(
-                conv_block(c_in, 32, (1, 7), (1, 4), (0, 3)),
-                conv_block(32,   64, (1, 5), (1, 4), (0, 2)),
-                conv_block(64,  128, (1, 5), (1, 4), (0, 2)),
-                conv_block(128, 256, (1, 5), (1, 4), (0, 2)),
-                nn.AdaptiveAvgPool2d((None, 1)))
+        def stream(c_in):  # identical schedule to Encoder.freq, separate weights
+            return freq_stack(c_in, freq_width, freq_mult, freq_depth)
 
-        self.mag = stream(self.n_mag)
-        self.phase = stream(self.n_phase) if self.n_phase > 0 else None
+        self.mag, c_stream = stream(self.n_mag)
+        self.phase, _ = stream(self.n_phase) if self.n_phase > 0 else (None, None)
         if self.n_phase > 0 and fuse == 'gate':
             # Phase admitted per-channel through a sigmoid gate driven by the MAGNITUDE
             # stream. Bias init -2 (sigmoid ~ 0.12) so training starts near the no-phase
             # model at 0.2823 and has to earn its way up, rather than starting at the fused
             # optimum v2 showed is worse. The gate can always close, so this arm's floor is
             # roughly B1 instead of P2.
-            self.gate = nn.Conv2d(256, 256, 1)
+            self.gate = nn.Conv2d(c_stream, c_stream, 1)
             nn.init.constant_(self.gate.bias, -2.0)
 
         # With no phase channels this degenerates to exactly the single-stream widths.
-        c_fused = 256 * (2 if self.n_phase > 0 else 1)
+        c_fused = c_stream * (2 if self.n_phase > 0 else 1)
         self.grid = nn.Sequential(
             conv_block(c_fused, 512, 3, 2, 1),   # 10x10 -> 5x5
             conv_block(512, 1024, 3, 2, 1),      # 5x5 -> 3x3
@@ -156,20 +190,37 @@ class TwoBranchUp(nn.Module):
 
 class Decoder(nn.Module):
     """(B,D) -> (B,out_h,out_w), or (B,out_h,out_w,out_c) when out_c > 1. Seeds a 3x4
-    grid, doubles it to 24x32, resizes. 21x30 isn't a power of two, so the resize is
-    explicit rather than an asymmetric crop that would bias one edge."""
+    grid and doubles it three times to 24x32.
+
+    21x30 isn't a power of two, so something has to absorb the 3-row/2-col margin. `resize`
+    picks how. 'conv' (default) makes the head's first conv valid-mode with a kernel sized to
+    eat exactly the margin: no interpolation, and the head convs then run on real feature-map
+    pixels rather than resampled ones. It is also not the asymmetric *crop* the old comment
+    warned about -- a conv sees every input position, so no edge is discarded. 'bilinear' is
+    the original behaviour, kept because checkpoints trained with it need it to load.
+    """
     SEED = (3, 4)
 
-    def __init__(self, d_model, out_h, out_w, out_c=1):
+    def __init__(self, d_model, out_h, out_w, out_c=1, resize='conv'):
         super().__init__()
-        self.out_hw, self.out_c = (out_h, out_w), out_c
+        self.out_hw, self.out_c, self.resize = (out_h, out_w), out_c, resize
         self.project = nn.Linear(d_model, 512 * self.SEED[0] * self.SEED[1])
         self.up = nn.Sequential(TwoBranchUp(512, 256), TwoBranchUp(256, 128), TwoBranchUp(128, 64))
-        self.head = nn.Sequential(nn.Conv2d(64, 32, 3, padding=1), nn.ReLU(inplace=True), nn.Conv2d(32, out_c, 3, padding=1))
+        up_h, up_w = self.SEED[0] * 8, self.SEED[1] * 8
+        if resize == 'conv':
+            # valid-mode kernel k = margin + 1 collapses up_hw down to out_hw exactly
+            k = (up_h - out_h + 1, up_w - out_w + 1)
+            if k[0] < 1 or k[1] < 1:
+                raise ValueError(f"resize='conv' needs {up_h}x{up_w} >= {out_h}x{out_w}; use 'bilinear'")
+            first = nn.Conv2d(64, 32, k)
+        else:
+            first = nn.Conv2d(64, 32, 3, padding=1)
+        self.head = nn.Sequential(first, nn.ReLU(inplace=True), nn.Conv2d(32, out_c, 3, padding=1))
 
     def forward(self, emb):
         x = self.up(self.project(emb).view(-1, 512, *self.SEED))
-        x = F.interpolate(x, size=self.out_hw, mode='bilinear', align_corners=False)
+        if self.resize == 'bilinear':
+            x = F.interpolate(x, size=self.out_hw, mode='bilinear', align_corners=False)
         x = self.head(x)                                     # (B,out_c,H,W)
         # .contiguous(): permute leaves a non-contiguous view, and torchmetrics' MSE does
         # preds.view(-1), which requires contiguity. Only bites on the rgb path -- out_c == 1
@@ -181,15 +232,31 @@ class BoomboxModel(ComposerModel):
     and run.py work on it unchanged."""
     def __init__(self, d_model=1024, data_info=None, fuse_speakers=False,
                  loss_fn='mse', loss_alpha=0.5, count_loss_weight=0.0,
-                 freq_dropout=0.0, laser_dropout=0.0, encoder='single', fuse='concat'):
+                 freq_dropout=0.0, laser_dropout=0.0, encoder='single', fuse='concat',
+                 trim_pad=False, learned_collapse=False, freq_mult=1, freq_depth=1,
+                 resize='conv'):
         super().__init__()
+        # tokenize() zero-pads F up to a whole number of patches. That padding is justified for
+        # the transformer (FreqEncoder.embed sees the zeros at FIXED positions and absorbs them),
+        # but a conv slides across them and then averages them in, so here they are dead weight:
+        # 45/1280 bins at patch_size=64, 211/3072 at 256. Only Boombox trims -- tokenize() and
+        # the MDS cache keys are untouched, so the transformer path and every precomputed .npy
+        # stay valid.
+        self.n_freqs_real = data_info.get('n_freqs_real') if trim_pad else None
+        n_freqs = self.n_freqs_real or data_info.get('n_freqs')
         # 'single' is the v2 encoder and stays the default, so every existing command is
         # unchanged. 'two-stream' gives magnitude and phase separate frequency stacks.
         enc = TwoStreamEncoder if encoder == 'two-stream' else Encoder
         kw = dict(fuse=fuse) if encoder == 'two-stream' else {}
+        if learned_collapse:
+            if n_freqs is None:
+                raise ValueError("learned_collapse needs data_info['n_freqs'] to size the collapse")
+            kw['freq_width'] = _surviving_width(n_freqs)
+        kw.update(freq_mult=freq_mult, freq_depth=freq_depth)
         self.encoder = enc(data_info.get('n_channels', 2), d_model, data_info['n_laser_rows'],
                            data_info['n_laser_cols'], freq_dropout, laser_dropout, **kw)
-        self.decoder = Decoder(d_model, data_info['out_h'], data_info['out_w'], data_info.get('out_c', 1))
+        self.decoder = Decoder(d_model, data_info['out_h'], data_info['out_w'],
+                               data_info.get('out_c', 1), resize=resize)
         self.fuse_speakers = fuse_speakers
         self.empty_head = nn.Linear(d_model, 1)
         self.count_head = nn.Linear(d_model, N_COUNT_CLASSES)
@@ -213,11 +280,12 @@ class BoomboxModel(ComposerModel):
         return dict(mask_pred=mask_logits.sigmoid(), mask_logits=mask_logits,
                     empty_logit=self.empty_head(emb), count_logits=self.count_head(emb))
 
-    @staticmethod
-    def _to_conv(x):
-        """(B,L,P,PS,C) -> (B,C,L,P*PS)"""
+    def _to_conv(self, x):
+        """(B,L,P,PS,C) -> (B,C,L,P*PS), dropping tokenize()'s trailing zero-pad if enabled."""
         assert x.ndim == 5, f"expected (B,L,P,PS,C), got {tuple(x.shape)}"
-        return x.flatten(2, 3).permute(0, 3, 1, 2)
+        x = x.flatten(2, 3)
+        if self.n_freqs_real is not None: x = x[:, :, :self.n_freqs_real]
+        return x.permute(0, 3, 1, 2)
 
     def loss(self, outputs, batch):
         kw = dict(empty_logit=outputs['empty_logit']) if self.is_spatial_loss else {}
