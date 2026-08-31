@@ -158,9 +158,13 @@ def probe(sid: str, ch: str = "avg", laser: str = "avg", kind: str = "clean"):
 
 @app.get("/api/mode/{sid}")
 def mode(sid: str, fi: int = 0):
+    """The gradient field AND the height field it integrates to -- the quiver and the
+    surface are two views of one mode, so they ship together rather than costing a second
+    round trip when the view is switched."""
     _d(sid)
     U, V = data.mode(sid, fi)
-    return {"u": U.round(6).tolist(), "v": V.round(6).tolist()}
+    Z = data.surface(U, V)
+    return {"u": U.round(6).tolist(), "v": V.round(6).tolist(), "z": Z.round(6).tolist()}
 
 
 @app.get("/api/audio/{sid}.wav")

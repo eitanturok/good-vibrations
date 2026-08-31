@@ -235,3 +235,28 @@ def audio(sid, ch, laser):
     sig = np.fft.irfft(spec, n=n)
     out = resample(sig, int(22050 * len(sig) / fs))
     return (out / (np.abs(out).max() + 1e-8) * 32767).astype(np.int16), 22050
+
+
+def surface(U, V):
+    """Height field whose gradient is (U,V): Frankot-Chellappa, as in
+    figure_signals.ipynb's reconstruct_surface_from_gradients.
+
+    The quiver shows the gradient of the mode; this is the mode itself. Solved in the
+    Fourier domain -- one FFT pair, no iteration -- with a screened-Poisson term (lam)
+    that keeps the low frequencies from running away, since the DC component of a height
+    reconstructed from slopes alone is arbitrary.
+    """
+    R, C = U.shape
+    # U is the x-slope and V the y-slope, but the grid is indexed [row, col] = [y, x], so
+    # the ROW frequency pairs with V and the COLUMN frequency with U.
+    ky = 2 * np.pi * np.fft.fftfreq(R)[:, None]
+    kx = 2 * np.pi * np.fft.fftfreq(C)[None, :]
+    # Screened-Poisson term. The notebook's smoothing_length is in metres against a
+    # metre-spaced grid; here the spacing is one laser, so the equivalent is a fraction of
+    # the field -- a whole field width, which damps only the very longest wavelength (the
+    # one the boundary assumption gets wrong anyway) and leaves the mode shape intact.
+    lam = 2 * np.pi / max(R, C)
+    den = kx**2 + ky**2 + lam**2
+    den[0, 0] = np.inf                         # the arbitrary constant offset
+    Z = np.fft.ifft2((-1j * kx * np.fft.fft2(U) - 1j * ky * np.fft.fft2(V)) / den).real
+    return Z - Z.mean()

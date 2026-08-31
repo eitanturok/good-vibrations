@@ -10,6 +10,7 @@ const S = {
   fi: null, hoverFi: null,
   log: { spec: 1 },
   specMode: 'magphase', phmode: 'cos', fieldbg: false, kind: 'clean',
+  modeview: 'quiver',
   empty: false, anim: 0, asize: 1, frame: 0,
   f: { layouts: new Set(), nobj: new Set(), spk: new Set([1]) },  // empty == no filter
 };
@@ -355,6 +356,19 @@ function modeAxes() {
   svg.innerHTML = out;
 }
 
+/* The rail and the axes both mean different things per view: the size slider scales
+   arrows or height, the color fill is a quiver-only readout, and the row/column ticks
+   label a grid that the surface's camera has rotated away from. */
+function viewCtls() {
+  const q = S.modeview === 'quiver';
+  $('#asizelab').textContent = q ? 'arrow size' : 'height';
+  $('#modekey').hidden = !(q && S.fieldbg);
+  $('#modeax').style.display = q ? '' : 'none';
+  // Hidden rather than wrapped in a container: the rail is a flex column with its own
+  // gap, so a wrapper div would change the spacing of everything around it.
+  for (const e of document.querySelectorAll('.bgctl, .modewrap .mlab')) e.hidden = !q;
+}
+
 function drawMode() {
   fieldGrid();
   modeAxes();
@@ -368,18 +382,29 @@ function drawMode() {
     ...withMode.filter((p) => p.id === S.flash).map((p) => ({ m: p.mode, c: col(p, 0.9) })),
   ];
 
+  if (S.modeview === 'surface') {
+    if (!hasZ(sets)) return stale(g, w, h);
+    // Every set on ONE shared height scale, so an overlaid surface still compares
+    // amplitudes the way the overlaid quiver does.
+    surfaces(g, sets.map(surfCol), w, h, R, C, zmax(sets));
+    return;
+  }
   // The big plot always overlays every probe. Arrows from different probes share a cell
   // origin, so color alone would hide one under another: fan the tails around the centre.
   const k = (Math.min(cw, chh) * 0.42 * S.asize) / (maxOf(sets) || 1);
   arrows(g, sets, w, h, R, C, cw, chh, k, sets.length > 1 ? Math.min(cw, chh) * 0.15 : 0);
 }
 
-const maxOf = (sets) => {
+/* Peak of a quantity over any number of sets. `f` picks what a cell is worth: arrow
+   length for the quiver, |height| for the surface -- one reduction, two views. */
+const peakOf = (sets, f) => {
   let max = 0;
-  for (const s of sets) for (const row of s.m.u.keys()) for (const c of s.m.u[row].keys())
-    max = Math.max(max, Math.hypot(s.m.u[row][c], s.m.v[row][c]));
+  for (const s of sets) for (let r = 0; r < s.m.u.length; r++)
+    for (let c = 0; c < s.m.u[r].length; c++) max = Math.max(max, f(s.m, r, c));
   return max;
 };
+const maxOf = (sets) => peakOf(sets, (m, r, c) => Math.hypot(m.u[r][c], m.v[r][c]));
+const zmax = (sets) => peakOf(sets, (m, r, c) => Math.abs(m.z[r][c]));
 
 function arrows(g, sets, w, h, R, C, cw, chh, k, fan) {
   const t = Math.cos((S.frame / NFRAME) * 2 * Math.PI);
@@ -396,16 +421,273 @@ function arrows(g, sets, w, h, R, C, cw, chh, k, fan) {
   });
 }
 
+/* The height field comes from the server, so a server started before the surface view
+   existed serves modes with no `z`. Without this the draw throws and the canvas silently
+   keeps whatever the quiver last painted -- which looks exactly like a dead button. */
+const hasZ = (sets) => sets.length > 0 && sets.every((s) => s.m && s.m.z);
+
+function stale(g, w, h) {
+  g.save();
+  g.fillStyle = css('--ink3') || '#888';
+  g.font = '11px ui-monospace, monospace';
+  g.textAlign = 'center';
+  g.fillText('surface needs a server restart', w / 2, h / 2 - 6);
+  g.fillText('(/api/mode returned no z)', w / 2, h / 2 + 10);
+  g.restore();
+}
+
+/* ***** the surface view *****
+   The quiver draws the mode's GRADIENT; this draws the height field that gradient
+   integrates to (server-side, data.surface) -- the same pair figure_signals.ipynb puts
+   side by side, and the view most people actually picture when they hear "mode shape".
+
+   A 2-D surface embedded in 3-D, drawn with plain canvas: the grid is a height field seen
+   from ONE fixed direction, so quads sorted back-to-front composite correctly with no
+   z-buffer, and a quad's normal against a fixed light gives the notebook's shaded look.
+   Matches the notebook's camera (elev 25, azim -60) and light (az 315, alt 45). */
+const ELEV = 25 * Math.PI / 180, AZIM = -60 * Math.PI / 180;
+/* The notebook's set_zlim(global_z_lims), where the limit is the peak times 2: the box is
+   given twice the height it needs, so even a full-amplitude frame sits in the middle half
+   and never grazes the top. Fixed, not tracking the height slider -- see zbox below. */
+const ZBOX = 2.0;
+const LIGHT = (() => {                    // unit vector toward the lamp
+  const a = 315 * Math.PI / 180, e = 45 * Math.PI / 180;
+  return [Math.cos(e) * Math.cos(a), Math.cos(e) * Math.sin(a), Math.sin(e)];
+})();
+
+/* The live mode draws in --ink, which is near-black and unsaturated. That is right for a
+   line but wrong for a lit surface: with l~0.1 and s~0 there is no headroom for the height
+   ramp to brighten into and no saturation for it to shift, so the surface would render as
+   a flat dark blob. Give it the app's own blue instead -- near the notebook's steel blue,
+   and the one color here that is already "the current sample". Pinned probes keep their
+   own hue, which is what identifies them. */
+const surfCol = (s) => (s.c === css('--ink') ? { ...s, c: css('--accent') } : s);
+
+/* Grid cell + height -> a point in the camera's own units. Depth comes back too: it is
+   the sort key, and the only thing that makes the quads composite correctly. */
+function camera(c, r, z, C, R, zk) {
+  const x = c / (C - 1) - 0.5, y = 0.5 - r / (R - 1);
+  const ca = Math.cos(AZIM), sa = Math.sin(AZIM);
+  const px = x * ca - y * sa;                       // rotate about the vertical axis
+  const py = x * sa + y * ca;
+  return [px, -(py * Math.sin(ELEV) + z * zk), py];
+}
+
+/* The three axes, in the notebook's spirit: it blanks every pane, grid and tick label
+   (grid(False), panes fully transparent) and keeps only faint spines, so nothing competes
+   with the surface. These are drawn the same way -- one hairline per axis plus a single
+   letter -- but kept explicit and labelled, since the whole point of the box is to say
+   which way is row, which is column, and which is displacement.
+
+   Drawn BEFORE the quads, so the surface paints over the far edges and hides them exactly
+   as depth would. The near vertical edge is drawn after, in surfaces(), or the surface
+   would bury the one axis that carries the height. */
+function axes3d(g, scr, R, C, zlim, labels) {
+  const O = scr(0, R - 1, -zlim);                     // near-left-bottom corner: the origin
+  const ends = [
+    [scr(C - 1, R - 1, -zlim), 'col'],                // x: along the laser columns
+    [scr(0, 0, -zlim), 'row'],                        // y: along the laser rows
+    [scr(0, R - 1, zlim), 'z'],                       // z: displacement
+  ];
+  g.save();
+  g.strokeStyle = css('--ink3') || '#86867e';
+  g.fillStyle = css('--ink3') || '#86867e';
+  g.lineWidth = 1;
+  g.globalAlpha = 0.55;
+  g.font = '9px ui-monospace, monospace';
+  g.textAlign = 'center';
+  g.textBaseline = 'middle';
+  for (const [e, lab] of ends) {
+    g.beginPath();
+    g.moveTo(O[0], O[1]);
+    g.lineTo(e[0], e[1]);
+    g.stroke();
+    if (!labels) continue;
+    // Push the label a little past the end, along the axis, so it never sits on the line.
+    const dx = e[0] - O[0], dy = e[1] - O[1], n = Math.hypot(dx, dy) || 1;
+    g.fillText(lab, e[0] + (dx / n) * 9, e[1] + (dy / n) * 9);
+  }
+  g.restore();
+}
+
+/* Every set drawn into one scene. Quads from ALL of them share one depth sort, so an
+   overlaid surface interleaves correctly instead of one being painted flat on top. */
+function surfaces(g, sets, w, h, R, C, max) {
+  const t = Math.cos((S.frame / NFRAME) * 2 * Math.PI);
+  // Height in camera units, relative to the unit-square footprint. Shared by every set,
+  // so an overlay compares amplitudes rather than normalising them apart.
+  const zk = (0.55 * S.asize) / (max || 1);
+  /* The z box is measured at asize 1, NOT at the current asize. Letting it track the
+     slider made the fit zoom out as the slider came up -- at 3x the footprint collapsed to
+     26px against a 277px z axis, so "more height" actually shrank the surface. Fixed, the
+     slider does what it says: the box stays put and the relief inside it grows. */
+  // ...but never smaller than the surface itself: past asize ~2 the relief would grow out
+  // through the top of a box that ignored it. Below that the box is fixed and the slider
+  // just fills more of it, which is the notebook's behaviour.
+  const zbox = (0.55 * Math.max(ZBOX, S.asize)) / (max || 1);
+  // Slope in the same units the camera uses, so the normal is the SCREEN normal.
+  const gx = (C - 1) / (zk || 1), gy = (R - 1) / (zk || 1);
+
+  /* Fit the camera's output to the box instead of guessing a margin. The height slider
+     changes the extent by 10x, so a fixed scale either overflows at the top of its range
+     or wastes most of the box at the bottom. One pass over the corners of the height
+     envelope bounds every point that can be drawn. Measured on the fixed z BOX, so the
+     framing is the same whatever the slider and whatever the frame's amplitude. */
+  let x0 = Infinity, x1 = -Infinity, y0 = Infinity, y1 = -Infinity;
+  // The camera is affine in (c, r), so the extremes sit at the footprint's four corners --
+  // taken at both height extremes, that is 8 points, not R*C.
+  for (const [r, c] of [[0, 0], [0, C - 1], [R - 1, 0], [R - 1, C - 1]])
+    for (const z of [-max, max]) {
+      const [px, py] = camera(c, r, z, C, R, zbox);
+      x0 = Math.min(x0, px); x1 = Math.max(x1, px);
+      y0 = Math.min(y0, py); y1 = Math.max(y1, py);
+    }
+  const fitk = Math.min(w / (x1 - x0 || 1), h / (y1 - y0 || 1)) * 0.94;
+  const ox = w / 2 - ((x0 + x1) / 2) * fitk, oy = h / 2 - ((y0 + y1) / 2) * fitk;
+  const scr = (c, r, z) => {                  // the SURFACE: height follows the slider
+    const [px, py, d] = camera(c, r, z, C, R, zk);
+    return [ox + px * fitk, oy + py * fitk, d];
+  };
+  const scrBox = (c, r, z) => {                // the BOX: fixed, so the axes never move
+    const [px, py, d] = camera(c, r, z, C, R, zbox);
+    return [ox + px * fitk, oy + py * fitk, d];
+  };
+
+  /* Labels only on the big plot. On a 124px tile the col axis is 26px long and its label
+     lands on the frame edge -- and the tiles already carry a caption saying what they are,
+     so the letters would be clutter over the one thing the tiles exist to show. */
+  axes3d(g, scrBox, R, C, max, w > 200);
+
+  /* The notebook's compute_normalized_shading: how hard to shade THIS frame. The mode
+     oscillates through flat, so shading against the frame's own range would hold the
+     contrast constant and kill the pulse -- the surface would look like a rigid object
+     rocking rather than a membrane breathing. Measured against the GLOBAL amplitude
+     instead, a flat frame gets flat color and a peak frame gets full relief. The sqrt is
+     the notebook's, and it matters: it keeps the mid-cycle frames from washing out. */
+  const amp = Math.sqrt(Math.min(1, Math.abs(t)));
+
+  const quads = [];
+  sets.forEach((s) => {
+    const base = rgbOf(s.c);
+    const P = s.m.z.map((row, r) => row.map((z, c) => scr(c, r, z * t)));
+    for (let r = 0; r < R - 1; r++) for (let c = 0; c < C - 1; c++) {
+      const a = P[r][c], b = P[r][c + 1], d = P[r + 1][c + 1], e = P[r + 1][c];
+      // Central-ish differences on the cell, then Lambert against the fixed lamp.
+      const zc = s.m.z[r][c] * t, zr = s.m.z[r][c + 1] * t, zd = s.m.z[r + 1][c] * t;
+      const nx = -(zr - zc) / gx, ny = (zd - zc) / gy;
+      const len = Math.hypot(nx, ny, 1);
+      const lamb = (nx * LIGHT[0] + ny * LIGHT[1] + LIGHT[2]) / len;
+      // Height of the cell, signed and normalised to -1..1 -- crest vs trough.
+      const zn = max ? ((zc + zr + zd + s.m.z[r + 1][c + 1] * t) / 4) / max : 0;
+      quads.push({
+        pts: [a, b, d, e],
+        depth: (a[2] + b[2] + d[2] + e[2]) / 4,
+        rgb: shadeQuad(base, lamb, zn, amp),
+        alpha: sets.length > 1 ? 0.72 : 1,
+      });
+    }
+  });
+  quads.sort((p, q) => p.depth - q.depth);          // far first: painter's algorithm
+  for (const q of quads) {
+    const [r0, g0, b0] = q.rgb;
+    g.fillStyle = `rgba(${r0},${g0},${b0},${q.alpha})`;
+    g.strokeStyle = g.fillStyle;                    // hairline seam: kills the gaps
+    g.lineWidth = 0.6;
+    g.beginPath();
+    g.moveTo(q.pts[0][0], q.pts[0][1]);
+    for (let i = 1; i < 4; i++) g.lineTo(q.pts[i][0], q.pts[i][1]);
+    g.closePath();
+    g.fill(); g.stroke();
+    /* The wireframe. Only two of the four edges per quad, so each interior line is drawn
+       once rather than twice -- doubling would make it read as a hard mesh instead of the
+       faint ruling that just gives the eye the surface's curvature. */
+    g.strokeStyle = `rgba(255,255,255,${0.13 * q.alpha})`;
+    g.lineWidth = 0.5;
+    g.beginPath();
+    g.moveTo(q.pts[3][0], q.pts[3][1]);
+    g.lineTo(q.pts[0][0], q.pts[0][1]);
+    g.lineTo(q.pts[1][0], q.pts[1][1]);
+    g.stroke();
+  }
+
+  /* The z axis again, over the top. It stands at the near corner, so the surface would
+     otherwise bury the one axis that shows displacement -- the very thing this view is
+     for. The other two are left occluded, which is the correct depth cue. */
+  const O = scrBox(0, R - 1, -max), Z1 = scrBox(0, R - 1, max);
+  g.save();
+  g.strokeStyle = css('--ink3') || '#86867e';
+  g.globalAlpha = 0.55;
+  g.lineWidth = 1;
+  g.beginPath(); g.moveTo(O[0], O[1]); g.lineTo(Z1[0], Z1[1]); g.stroke();
+  g.restore();
+}
+
+/* One quad's color: the base carried through Lambert shading AND height.
+
+   HUE IS LEFT ALONE, deliberately. Hue is already spoken for -- hueForPos gives each
+   position a hue and shadeFor fans probes only +/-FAN/2 around it, narrower than the
+   137.5 deg between positions precisely so two probes never collide. Riding height on hue
+   too would spend that same budget twice: a crest could drift a probe into its
+   neighbour's slot, and the surface would stop saying which probe it is.
+
+   So height moves LIGHTNESS and saturation instead, which nothing else here uses. Crests
+   lighten and saturate, troughs darken and mute -- the ordering the eye already reads as
+   high/low, and it stays legible in one still frame. The range is wide (0.55x..1.45x
+   lightness) because it is now carrying the height signal alone.
+
+   Everything scales by `amp`, so a flat frame collapses to the flat base color exactly as
+   the notebook's blend toward uniform_color does. */
+function shadeQuad([r, g, b], lamb, zn, amp) {
+  const [hh, ss, ll] = rgbToHsl(r, g, b);
+  const lit = 0.45 + 0.7 * Math.max(0, lamb);                // Lambert, never pure black
+  // Height rides on lightness, about the base: crest up, trough down.
+  const l = ll * (1 - amp) + ll * lit * (1 + 0.45 * zn) * amp;
+  // ...and on saturation in the SAME direction, so a crest reads bright-and-vivid and a
+  // trough muted. Two channels agreeing makes the height readable at tile size.
+  const sat = ss * (1 - amp) + ss * (1 + 0.30 * zn) * amp;
+  return hslToRgb(hh, Math.max(0, Math.min(1, sat)), Math.max(0.04, Math.min(0.96, l)));
+}
+
+function rgbToHsl(r, g, b) {
+  r /= 255; g /= 255; b /= 255;
+  const mx = Math.max(r, g, b), mn = Math.min(r, g, b), d = mx - mn;
+  const l = (mx + mn) / 2;
+  if (!d) return [0, 0, l];
+  const s = d / (1 - Math.abs(2 * l - 1));
+  const h = mx === r ? ((g - b) / d + (g < b ? 6 : 0))
+          : mx === g ? (b - r) / d + 2 : (r - g) / d + 4;
+  return [h * 60, s, l];
+}
+
+function hslToRgb(h, s, l) {
+  const c = (1 - Math.abs(2 * l - 1)) * s, x = c * (1 - Math.abs(((h / 60) % 2) - 1));
+  const m = l - c / 2;
+  const [r, g, b] = h < 60 ? [c, x, 0] : h < 120 ? [x, c, 0] : h < 180 ? [0, c, x]
+                  : h < 240 ? [0, x, c] : h < 300 ? [x, 0, c] : [c, 0, x];
+  return [(r + m) * 255 | 0, (g + m) * 255 | 0, (b + m) * 255 | 0];
+}
+
+/* Any CSS color -> [r,g,b]. Probe colors are hsl() and --ink is a hex; assigning to
+   fillStyle and reading it back is the one thing that normalises both without a parser.
+   Memoised because it runs once per quad set per frame. */
+const _rgbCv = document.createElement('canvas').getContext('2d');
+const _rgbMemo = {};
+function rgbOf(css) {
+  if (!(css in _rgbMemo)) {
+    _rgbCv.fillStyle = css;                      // canvas normalises to #rrggbb or rgba()
+    const v = _rgbCv.fillStyle;
+    _rgbMemo[css] = v[0] === '#'
+      ? [1, 3, 5].map((i) => parseInt(v.slice(i, i + 2), 16))
+      : v.match(/[\d.]+/g).slice(0, 3).map(Number);
+  }
+  return _rgbMemo[css];
+}
+
 // Direction -> hue, magnitude -> lightness. (spatial_derivatives_to_hsv, reimplemented.)
 const fcol = (u, v, max) =>
   `hsl(${(Math.atan2(v, u) * 180) / Math.PI + 180} 70% ${18 + 52 * (Math.hypot(u, v) / (max || 1))}%)`;
 
-const peak = (m) => {
-  let max = 0;
-  for (const row of m.u.keys()) for (const c of m.u[row].keys())
-    max = Math.max(max, Math.hypot(m.u[row][c], m.v[row][c]));
-  return max;
-};
+const peak = (m) => maxOf([{ m }]);
 
 function field(g, w, h, m, R, C, max = peak(m)) {
   const cw = w / C, chh = h / R;
@@ -453,6 +735,11 @@ function fieldGrid() {
      invisible arrows and the shape, the only thing these tiles are for, would be lost. */
   box.querySelectorAll('figure canvas').forEach((cv, i) => {
     const [g, w, h] = fit(cv), cw = w / C, chh = h / R;
+    if (S.modeview === 'surface') {
+      if (!hasZ([sets[i]])) return stale(g, w, h);
+      surfaces(g, [surfCol(sets[i])], w, h, R, C, zmax([sets[i]]));
+      return;
+    }
     const max = maxOf([sets[i]]);
     if (S.fieldbg) field(g, w, h, sets[i].m, R, C, max);
     const k = (Math.min(cw, chh) * 0.42 * S.asize) / (max || 1);
@@ -1291,6 +1578,7 @@ function wire() {
   seg('#speclog', (v) => { S.log.spec = +v; drawSpec(); buildPeaks(); peakList(); cursors(); axes(); });
   seg('#kind', (v) => { S.kind = v; refresh(); });
   wheel($('#fkey2d'));                    // the square 2-D key, drawn once
+  seg('#modeview', (v) => { S.modeview = v; viewCtls(); drawMode(); });
   $('#fieldbg').onchange = (e) => {
     S.fieldbg = e.target.checked;
     $('#modekey').hidden = !S.fieldbg;      // the key only means something with the fill on
@@ -1360,6 +1648,7 @@ function wire() {
   // drawMode() before there is anything to draw.
   $('#asizenow').textContent = `${S.asize.toFixed(1)}x`;
   $('#framenow').textContent = `${S.frame + 1}/${NFRAME}`;
+  viewCtls();          // the rail matches S.modeview from the start, not just after a click
 
   addEventListener('keydown', (e) => {
     if (e.target.tagName === 'INPUT') return;

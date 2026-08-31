@@ -141,6 +141,9 @@ main { flex:1; display:grid; grid-template-columns:1fr 208px; gap:12px;
            overflow:visible; pointer-events:none; }
 .mode-ax .ml { font:9px var(--mono); fill:var(--ink3); text-anchor:end; }
 .mode-ax .ml.col { text-anchor:middle; }
+/* .mlab and .chk both set display, which would otherwise beat the hidden attribute the
+   mode view uses to swap the rail between quiver and surface controls. */
+[hidden] { display:none !important; }
 .mlab { position:absolute; font:9px var(--mono); font-style:normal; color:var(--ink3);
         letter-spacing:.04em; }
 .mlab.my { left:-4px; top:50%; transform:rotate(-90deg) translateX(50%);
