@@ -1,7 +1,7 @@
 """Candidate normalizations for the complex FFT, for the phase ablation grid.
 
 Everything here operates on the raw complex spectrum `(L, F, C)` loaded from
-`vibration/04_fft.npz` and returns a REAL feature array `(L, F, K)`, so the same
+`vibration/04_ffts.npz` and returns a REAL feature array `(L, F, K)`, so the same
 function can be plotted in notebook 70 and later dropped into
 `dataset.extract_signal`.
 

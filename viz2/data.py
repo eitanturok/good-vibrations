@@ -14,7 +14,7 @@ import numpy as np
 from scipy.ndimage import median_filter
 from scipy.signal import find_peaks, resample
 
-FFT = "vibration/04_fft.npz"
+FFT = "vibration/04_ffts.npz"
 SHIFTS = {"clean": "vibration/03_clean_shifts.npy", "raw": "vibration/02_raw_shifts.npy"}
 PHOTOS = ["image/02_cropped_overhead.png", "image/01_cropped.png"]
 MASKS = ["image/03_smask.npy", "image/02_smask.npy"]
