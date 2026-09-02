@@ -199,23 +199,35 @@ def main():
     def watch_loop(engine):
         seen_done = set()
         while True:
-            for npy_path in watch_path.rglob("**/vibration/01_raw_vibrations.npy"):
-                sample_dir = npy_path.parents[1]
-                sid = sample_dir.name
-                if sid in seen_done: continue
-                if not is_file_ready(npy_path): continue
-                if (sample_dir / "vibration/02_raw_shifts.npy").exists():
-                    # pclk already computed (e.g. from a prior watcher run, with the raw file
-                    # kept around) -- skip resubmitting, no need to recompute or re-upload
-                    print(f"⏭️  [sample {sid}] pclk already computed, skipping.")
+            # a whole tick is wrapped so one bad/deleted file never kills the watcher --
+            # e.g. rglob walking into a directory that gets deleted mid-scan raises here,
+            # not inside any per-sample try/except, and main() only catches KeyboardInterrupt
+            try:
+                for npy_path in watch_path.rglob("**/vibration/01_raw_vibrations.npy"):
+                    sample_dir = npy_path.parents[1]
+                    sid = sample_dir.name
+                    if sid in seen_done: continue
+                    if not is_file_ready(npy_path): continue
+                    if (sample_dir / "vibration/02_raw_shifts.npy").exists():
+                        # pclk already computed (e.g. from a prior watcher run, with the raw file
+                        # kept around) -- skip resubmitting, no need to recompute or re-upload
+                        print(f"⏭️  [sample {sid}] pclk already computed, skipping.")
+                        seen_done.add(sid)
+                        continue
+                    try:
+                        size_gb = npy_path.stat().st_size / 1e9
+                    except OSError:
+                        continue  # raw file vanished since is_file_ready checked it (e.g. deleted by hand) -- retry next tick, not in seen_done yet
+                    print(f"📥 [sample {sid}] raw ready ({size_gb:.2f} GB) -- pclk + {cleanup_raw_vibrations or 'keep'}. Queuing...")
+                    engine.submit(sample_dir)
+                    # mark as seen once queued, not on some "done" file -- the raw .npy only
+                    # disappears once _process_vibrations compresses/deletes it, and relying on
+                    # e.g. fft.npz existing missed samples processed before this step existed
                     seen_done.add(sid)
-                    continue
-                print(f"📥 [sample {sid}] raw ready ({npy_path.stat().st_size / 1e9:.2f} GB) -- pclk + {cleanup_raw_vibrations or 'keep'}. Queuing...")
-                engine.submit(sample_dir)
-                # mark as seen once queued, not on some "done" file -- the raw .npy only
-                # disappears once _process_vibrations compresses/deletes it, and relying on
-                # e.g. fft.npz existing missed samples processed before this step existed
-                seen_done.add(sid)
+            except (KeyboardInterrupt, SystemExit):
+                raise
+            except Exception as e:
+                print(f"⚠️  [scan] tick failed, will retry: {type(e).__name__}: {e}", file=sys.stderr)
             time.sleep(args.poll_rate)
 
     try:
