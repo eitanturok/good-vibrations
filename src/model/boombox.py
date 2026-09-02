@@ -33,6 +33,21 @@ def conv_block(c_in, c_out, kernel, stride, padding=0):
     return nn.Sequential(nn.Conv2d(c_in, c_out, kernel, stride=stride, padding=padding),
                          nn.BatchNorm2d(c_out), nn.LeakyReLU(0.2, inplace=True))
 
+def grid_stack(c_in, d_model, grid_shape):
+    """The paper's laser-grid head: two stride-2 convs, then one valid conv down to 1x1.
+
+    The final kernel is sized from the grid rather than fixed at 3, because a laser subset makes
+    the grid smaller than 10x10 -- an 8x5 selection reaches 2x2 here, where a 3x3 kernel does not
+    fit. At 10x10 this resolves to 3, i.e. exactly the original stack.
+    """
+    h, w = (-(-d // 4) for d in grid_shape)  # two stride-2, padding-1 convs: ceil(ceil(d/2)/2)
+    if min(h, w) < 1: raise ValueError(f"laser grid {grid_shape} is too small for the boombox grid stack")
+    return nn.Sequential(
+        conv_block(c_in, 512, 3, 2, 1),           # 10x10 -> 5x5
+        conv_block(512, 1024, 3, 2, 1),           # 5x5 -> 3x3
+        conv_block(1024, d_model, (h, w), 1, 0),  # 3x3 -> 1x1
+        )
+
 def freq_collapse(c, width, learned):
     """Collapse the surviving frequency width to 1. `learned` swaps the uniform mean for a
     per-channel weighted sum: AdaptiveAvgPool throws away WHERE in the spectrum a filter fired,
@@ -97,11 +112,7 @@ class Encoder(nn.Module):
         self.grid_shape = (n_laser_rows, n_laser_cols)
         self.freq_dropout, self.laser_dropout = freq_dropout, laser_dropout
         self.freq, c = freq_stack(n_channels, freq_width, freq_mult, freq_depth)
-        self.grid = nn.Sequential(
-            conv_block(c, 512, 3, 2, 1),         # 10x10 -> 5x5
-            conv_block(512, 1024, 3, 2, 1),      # 5x5 -> 3x3
-            conv_block(1024, d_model, 3, 1, 0),  # 3x3 -> 1x1
-            )
+        self.grid = grid_stack(c, d_model, self.grid_shape)
 
     def forward(self, x):
         x = _drop(x, self.laser_dropout, dim=2, training=self.training)  # whole lasers
@@ -159,11 +170,7 @@ class TwoStreamEncoder(nn.Module):
 
         # With no phase channels this degenerates to exactly the single-stream widths.
         c_fused = c_stream * (2 if self.n_phase > 0 else 1)
-        self.grid = nn.Sequential(
-            conv_block(c_fused, 512, 3, 2, 1),   # 10x10 -> 5x5
-            conv_block(512, 1024, 3, 2, 1),      # 5x5 -> 3x3
-            conv_block(1024, d_model, 3, 1, 0),  # 3x3 -> 1x1
-            )
+        self.grid = grid_stack(c_fused, d_model, self.grid_shape)
 
     def forward(self, x):
         x = _drop(x, self.laser_dropout, dim=2, training=self.training)  # whole lasers

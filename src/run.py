@@ -75,8 +75,7 @@ def get_parser():
     parser.add_argument("--split",                      type=str,   default="gastronorm", help="Which split method from SPLIT_METHODS to use (e.g. 'exp22', 'exp23').")
     parser.add_argument("--num-workers",                type=int,   default=4)
     parser.add_argument("--test-size",                  type=float, default=0.2)
-    parser.add_argument("--n-laser-rows",               type=int,   default=10)
-    parser.add_argument("--n-laser-cols",               type=int,   default=10)
+    parser.add_argument("--laser-cols",                 type=str,   default=None, help="Comma-separated laser column ids to train on, e.g. '0,1,2,3,4'. Whole columns across every row, so the kept lasers stay a rectangle. Default None = all. The selection is applied where the fft is read off disk, so every normalization and reference statistic is computed over exactly these lasers -- which means each selection gets its own MDS build.")
     parser.add_argument("--patch-size",                 type=int,   default=32)
 
     # data normalization
@@ -228,21 +227,29 @@ def run(**kwargs):
     if args.compile and args.verbose >= 2: torch._logging.set_logs(dynamo=logging.INFO)
 
     # dataset
+    laser_cols = [int(c) for c in args.laser_cols.split(",") if c.strip()] if args.laser_cols else None
     train_loader, eval_loaders, train_eval_loader = build_dataset(
         args.data_dir, batch_size=args.batch_size, eval_batch_size=args.eval_batch_size, num_workers=args.num_workers,
         split=args.split, test_size=args.test_size, speakers=args.speakers, n_objects=args.n_objects, box=args.box, n_samples=args.n_samples,
         out_h=args.out_h, out_w=args.out_w, rgb=bool(args.rgb), signal_mode=args.signal_mode, normalize_mode=args.normalize_mode, patch_size=args.patch_size, seed=args.seed,
         augment_fft=args.augment_fft, augment_mask=args.augment_mask, subtract_speaker_mean=bool(args.subtract_speaker_mean), subtract_empty_box=bool(args.subtract_empty_box), mag_recipe=args.mag_recipe, phase_arm=args.phase_arm, phase_weight=args.phase_weight,
-        force_rebuild_data=bool(args.force_rebuild_data), n_classes=N_COUNT_CLASSES, pair_speakers_mode=bool(args.pair_speakers))
+        force_rebuild_data=bool(args.force_rebuild_data), n_classes=N_COUNT_CLASSES, pair_speakers_mode=bool(args.pair_speakers),
+        laser_cols=laser_cols)
     boundary_loaders = eval_loaders + [Evaluator(label='train', dataloader=train_eval_loader)]
     ensure_viz(args.data_dir, port=args.viz_port, enabled=not args.no_viz)
 
     # read n_freqs, n_channels from the dataset
-    _, n_patches, patch_size, n_channels = train_loader.dataloader.dataset[0]['fft'].shape  # (L,P,PS,C)
+    n_lasers, n_patches, patch_size, n_channels = train_loader.dataloader.dataset[0]['fft'].shape  # (L,P,PS,C)
     # tokenize() zero-pads the frequency axis, so n_patches * patch_size is the padded length
     base = train_loader.dataloader.dataset.dataset  # Subset -> (PairedSpeakerDataset ->) VibrationDataset
-    n_freqs_real = len(getattr(base, "dataset", base).pk["freqs"])
-    data_info = dict(out_h=args.out_h, out_w=args.out_w, out_c=3 if args.rgb else 1, n_laser_rows=args.n_laser_rows, n_laser_cols=args.n_laser_cols, patch_size=args.patch_size, n_freqs=n_patches * patch_size, n_freqs_real=n_freqs_real, n_channels=n_channels)
+    base = getattr(base, "dataset", base)
+    n_freqs_real = len(base.pk["freqs"])
+    # the grid the model builds must match the tensor it is fed, so take it from the dataset, which
+    # recorded it after the laser selection was applied
+    n_laser_rows, n_laser_cols = base.grid_shape
+    assert n_laser_rows * n_laser_cols == n_lasers, f"grid {base.grid_shape} != {n_lasers} lasers"
+    data_info = dict(out_h=args.out_h, out_w=args.out_w, out_c=3 if args.rgb else 1, n_laser_rows=n_laser_rows, n_laser_cols=n_laser_cols, patch_size=args.patch_size, n_freqs=n_patches * patch_size, n_freqs_real=n_freqs_real, n_channels=n_channels)
+    print(f"laser grid: {n_laser_rows} rows x {n_laser_cols} cols = {n_lasers} lasers")
     print(f"{n_freqs_real} freq bins -> {n_patches} patches of {patch_size} = {n_patches * patch_size} ({n_patches * patch_size - n_freqs_real} padded)")
     if args.model == "boombox":
         model = BoomboxModel(args.d_model, data_info, loss_fn=args.loss_fn, loss_alpha=args.loss_alpha, count_loss_weight=args.count_loss_weight, freq_dropout=args.freq_dropout, laser_dropout=args.laser_dropout, encoder=args.encoder, fuse=args.fuse, trim_pad=args.trim_pad, learned_collapse=args.learned_collapse, freq_mult=args.freq_mult, freq_depth=args.freq_depth, resize=args.resize)
