@@ -1,41 +1,32 @@
 #!/usr/bin/env bash
-# Copy an experiment directory to batman, skipping the large raw vibration
-# captures (samples/<id>/vibration/01_raw_vibrations.npy, ~3GB each).
+# Copy an experiment directory from ironman to batman, dereferencing
+# symlinks (which point at local paths that don't resolve on batman) and
+# skipping the large raw vibration captures (.../vibration/01_raw_vibrations.npy).
 #
 # Streams a tar over a single SSH connection (fast) instead of scp-per-file.
-#
-# Usage: ./sync_to_batman.sh EXPERIMENT_NAME
-#   e.g. ./sync_to_batman.sh 31_07_2026_gastronorm_exp1
+# Run this ON IRONMAN, e.g. from Git Bash:
+#   ./sync_to_batman.sh D:/eturok/31_08_2026_green_plastic_two_laser_faces
 set -euo pipefail
 
-LOCAL_BASE_DIR="D:/eturok"
-
 if [ -z "${1:-}" ]; then
-    echo "Usage: $0 EXPERIMENT_NAME" >&2
+    echo "Usage: $0 SRC_DIR" >&2
     exit 1
 fi
-EXP_NAME="$1"
+SRC="$1"
+NAME="$(basename "$SRC")"
 HOST="batman"
 # Resolved with $() so the remote shell expands ~ itself (avoids shipping a
 # literal '~' inside single quotes to ssh, which some shells won't expand).
-REMOTE_EXPERIMENTS_DIR="$(ssh "$HOST" 'echo ~/workspace/good-vibrations/experiments')"
-
-SRC="${LOCAL_BASE_DIR}/${EXP_NAME}"
-mkdir -p "$SRC"
-
-REMOTE_DIR="${REMOTE_EXPERIMENTS_DIR}/${EXP_NAME}"
+REMOTE_DIR="$(ssh "$HOST" 'echo ~/workspace/good-vibrations/experiments')/${NAME}"
 
 echo "Using ${HOST}:${REMOTE_DIR}"
 ssh "$HOST" "mkdir -p '${REMOTE_DIR}'"
 
 TOTAL=$(find "$SRC" \( -type f -o -type l \) ! -name '01_raw_vibrations.npy' | wc -l)
 echo "Streaming ${TOTAL} files to ${HOST}:${REMOTE_DIR} (excluding 01_raw_vibrations.npy)..."
-# Symlinks in samples/ (audio, images, recovered_audio.wav, ...) are stored
-# with absolute paths rooted in the LOCAL filesystem (/d/eturok/... or
-# /c/Users/eitanturok/...), which don't resolve on batman at all. Plain tar
-# stores symlinks as symlinks (not the data they point to), so those links
-# arrive dangling on batman. -h/--dereference makes tar follow symlinks and
-# archive the actual file content instead, so batman gets real files.
+# Plain tar stores symlinks as symlinks (not the data they point to), so
+# links pointing at local-only paths arrive dangling on batman. -h makes
+# tar follow symlinks and archive the actual file content instead.
 # -v prints each archived filename to stderr (archive bytes stay on stdout,
 # so this is safe to pipe), giving live per-file progress.
 tar -C "$SRC" -h --exclude='01_raw_vibrations.npy' -cvf - . \
