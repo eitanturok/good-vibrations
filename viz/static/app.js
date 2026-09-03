@@ -45,7 +45,11 @@ const S = {
   sort: { run: null, metric: "comdist", dir: "worst" },
   // relative=false is the default on purpose: a fixed [0,1] domain is the only scale
   // under which two cells mean the same thing, which is the point of a comparison table.
-  view: { mode: "pred", background: true, relative: false },
+  // background is an on/off switch (the "b" key, the checkbox); bgOp is the level it
+  // returns to when switched back on, so the two are stored separately. maskOp scales
+  // the mask -- the cube -- alone, which is why it is applied as a canvas alpha and an
+  // <img> opacity rather than to the cell, whose backdrop must not move with it.
+  view: { mode: "pred", background: true, relative: false, bgOp: 1, maskOp: 1 },
   domain: {}, positions: [], activePos: -1, modalRow: -1,
   hidden: new Map(),  // filter key -> samples that ONLY that filter is holding back
   renderVersion: 0,   // from /api/runs; part of image URLs to defeat immutable caching
@@ -108,6 +112,10 @@ async function boot() {
   const [runs, samples, lut] = await Promise.all([
     api("/api/runs"), api("/api/samples"), api("/api/lut")]);
   S.lut = lut;
+  // The server composites its ground-truth PNGs at OVERLAY_GAIN over a backdrop; the
+  // canvases apply the same constant themselves. Exposed as a variable so the GT image,
+  // which is now composited by the browser, can match them without hardcoding 0.85.
+  document.documentElement.style.setProperty("--gt-gain", String(lut.gain ?? 1));
   // The cell box follows the SCENE's aspect, not the mask grid's. --mask-h is the fixed
   // dimension; width derives from it so a 20x40 and a 30x30 grid over the same room draw
   // the same shape and land on the same features. Set before readRowMetrics re-runs, and
@@ -694,8 +702,31 @@ function renderHeader() {
    drawn from /api/frames -- so this covers the ground-truth column and the modals. */
 function gtMaskURL(sid) {
   const [h, w] = gtShape();
-  return `/api/gt_mask.png?sid=${sid}&bg=${S.view.background ? 1 : 0}` +
+  // Always bg=0: the mask arrives with an alpha channel and the backdrop goes behind it
+  // in CSS, exactly as in the prediction cells. Baking the photo in would freeze both
+  // opacities into the cached image, and every slider notch would refetch the column.
+  return `/api/gt_mask.png?sid=${sid}&bg=0` +
          `&rel=${S.view.relative ? 1 : 0}&shape=${h}x${w}&v=${S.renderVersion}`;
+}
+
+/* The backdrop is a CSS background behind the canvas (or behind the ground-truth image)
+   rather than baked into the pixels: it is fetched once per sample and reused for every
+   run and every epoch, which is most of why scrubbing costs no bandwidth.
+
+   Two layers, not one: a flat veil of the cell colour sits OVER the photo and UNDER the
+   canvas content, so --bg-op fades the backdrop without touching the mask drawn on top.
+   Element `opacity` cannot do this -- it would take the mask down with the photo.
+
+   Versioned like every other image: this response is `immutable` for a year, so a change
+   to how the backdrop is sized would otherwise never reach a browser that already cached
+   the old dimensions. */
+function setBackdrop(el, sid) {
+  const want = S.view.background
+    ? `linear-gradient(var(--bd-veil), var(--bd-veil)), url(/api/backdrop/${sid}.jpg?v=${S.renderVersion})`
+    : "";
+  // Compared against a dataset copy rather than style.backgroundImage, which the browser
+  // normalises (quotes, colour syntax) and so never matches the string we wrote.
+  if (el.dataset.bd !== want) { el.style.backgroundImage = want; el.dataset.bd = want; }
 }
 
 function buildRow() {
@@ -704,7 +735,7 @@ function buildRow() {
   el.innerHTML = `<div class="cell idx sticky-1"><span class="idxn"></span></div>
     <div class="cell gt sticky-2 gtcell">
       <div class="ctitle gt-head"></div>
-      <img class="mask gtimg" loading="lazy" decoding="async" alt="">
+      <div class="mask gtwrap"><img class="gtimg" loading="lazy" decoding="async" alt=""></div>
       <div class="tags gt-foot"></div>
     </div>`;
   el._runCells = [];
@@ -750,11 +781,15 @@ function paintRow(el, rank) {
   // The ground-truth cell shows the same 20x40 target the runs predict, over the same
   // backdrop, so it is directly comparable with every prediction column. The speaker
   // view lives in the detail modal instead.
-  const img = el.querySelector(".gtimg");
-  img.className = "mask gtimg" + (S.view.background ? "" : " nobg");
+  // The wrapper carries the backdrop and the hover/tooltip identity; the <img> inside is
+  // the bare mask, so `opacity` fades the cube without touching the photo behind it.
+  const wrap = el.querySelector(".gtwrap");
+  const img = wrap.querySelector(".gtimg");
+  wrap.className = "mask gtwrap" + (S.view.background ? " bg" : " nobg");
+  setBackdrop(wrap, s.i);
   const src = gtMaskURL(s.i);
   if (img.getAttribute("src") !== src) img.setAttribute("src", src);
-  img.dataset.run = ""; img.dataset.sid = s.i;
+  wrap.dataset.run = ""; wrap.dataset.sid = s.i;
 
   // Split is a property of each run's dataloader, not of the sample, so it is shown per
   // run column rather than here.
@@ -808,7 +843,7 @@ function paintRow(el, rank) {
     if (!e) {
       chips.innerHTML = "";
       m.hidden = true;
-      m.style.backgroundImage = "";
+      m.style.backgroundImage = ""; m.dataset.bd = "";   // keep the cache flag honest
       if (!c._np) { c._np = document.createElement("div"); c._np.className = "nopred"; c.appendChild(c._np); }
       // Three different situations used to read "no prediction" alike, which made a
       // 250ms debounce look identical to data that was never written:
@@ -857,15 +892,7 @@ function paintRow(el, rank) {
     m.dataset.run = name; m.dataset.sid = s.i;
     m.onclick = () => openNeighbors(name, s.i);
     m.className = "mask predmask" + (S.view.background ? " bg" : " nobg");
-    // The backdrop is a CSS background behind the canvas rather than baked into the
-    // pixels: it is fetched once per sample and reused for every run and every epoch,
-    // which is most of why scrubbing costs no bandwidth.
-    // Versioned like every other image: this response is `immutable` for a year, so a
-    // change to how the backdrop is sized would otherwise never reach a browser that
-    // already cached the old dimensions.
-    const want = S.view.background
-      ? `url(/api/backdrop/${s.i}.jpg?v=${S.renderVersion})` : "";
-    if (m.style.backgroundImage !== want) m.style.backgroundImage = want;
+    setBackdrop(m, s.i);
     paintCanvas(m, name, s.i, epochFor(name));
 
     // Stacked: the target gets its own box directly below the prediction, so the two are
@@ -874,7 +901,7 @@ function paintRow(el, rank) {
     tm.hidden = S.view.mode !== "stacked";
     if (!tm.hidden) {
       tm.className = "mask truthmask" + (S.view.background ? " bg" : " nobg");
-      if (tm.style.backgroundImage !== want) tm.style.backgroundImage = want;
+      setBackdrop(tm, s.i);
       if (tm.width !== rw || tm.height !== rh) { tm.width = rw; tm.height = rh; }
       const truth = S.truthCache[truthKey(s.i, rh, rw)];
       if (truth) drawMask(tm, truth, "truth", null, [rh, rw]);
@@ -1427,6 +1454,9 @@ function drawMask(canvas, values, mode, truth, shape) {
     : [{ v: values, lut: soloLut, k: gain }];
 
   ctx.clearRect(0, 0, w, h);
+  // The cube slider scales every layer as it is composited, so the backdrop -- an element
+  // background, outside the canvas -- keeps whatever the background slider gave it.
+  ctx.globalAlpha = S.view.maskOp;
   for (const { v, lut, k } of layers) {
     // Per-sample domain, matching render.domain_of on the server. Computed per LAYER so
     // overlay scales truth and prediction independently, as the server does.
@@ -1458,6 +1488,7 @@ function drawMask(canvas, values, mode, truth, shape) {
     octx.putImageData(img, 0, 0);
     ctx.drawImage(off, 0, 0);
   }
+  ctx.globalAlpha = 1;
 }
 
 /* Paints one cell from locally-held frame data, fetching the run's frames for the
@@ -2101,12 +2132,40 @@ function bindUI() {
       refresh();
     };
   });
+  // On/off is deliberately separate from the level: "b" (and the checkbox) hides the
+  // backdrop and brings it back at whatever opacity the slider was last left on, so the
+  // two controls never have to be re-set against each other.
   const setBackground = (on) => {
     S.view.background = on;
     $("#bg-toggle").checked = on;          // keep the checkbox honest when "b" drives it
+    try { localStorage.setItem("viz.bg", on ? "1" : "0"); } catch (_) {}
     renderVisible();
   };
   $("#bg-toggle").onchange = (e) => setBackground(e.target.checked);
+
+  /* The two opacity sliders. Both write a CSS variable, which is all the backdrop needs
+     -- its veil is pure CSS, so dragging costs no repaint. The cube is drawn INTO the
+     canvases, so that one also has to repaint; the ground-truth image follows the
+     variable on its own. */
+  const opacity = (id, key, cssVar, repaint) => {
+    const el = $(id);
+    const out = el.parentElement.querySelector(".opval");
+    const set = (v, save) => {
+      S.view[key] = v;
+      document.documentElement.style.setProperty(cssVar, String(v));
+      el.value = Math.round(v * 100);
+      out.textContent = `${Math.round(v * 100)}%`;
+      if (save) { try { localStorage.setItem(`viz.${key}`, String(v)); } catch (_) {} }
+      if (repaint && save) renderVisible();   // nothing is painted yet at boot
+    };
+    el.oninput = (e) => set(+e.target.value / 100, true);
+    let stored = null;
+    try { stored = localStorage.getItem(`viz.${key}`); } catch (_) {}
+    set(stored == null ? S.view[key] : Math.min(1, Math.max(0, +stored || 0)), false);
+  };
+  opacity("#bg-opacity", "bgOp", "--bg-op", false);
+  opacity("#mask-opacity", "maskOp", "--mask-op", true);
+  try { if (localStorage.getItem("viz.bg") === "0") setBackground(false); } catch (_) {}
   $("#rel-toggle").onchange = (e) => { S.view.relative = e.target.checked; renderVisible(); };
 
   $("#epoch-slider").oninput = (e) => setEpochIdx(+e.target.value);

@@ -93,14 +93,6 @@ python src/run.py $COMMON --laser-cols 1,3,6,8 --phase-arm rel_laser_med \
 python src/run.py $COMMON --laser-cols 1,2,3,4,5,6,7,8 --phase-arm rel_laser_med \
     --run-name lasers-all-rel-laser-med-$TAG
 
-
-# ================================================================================================
-# Everything below has already run under TAG=v1. It is fed to `:` via a quoted heredoc so nothing
-# expands and nothing executes. Delete the `: <<'ALREADY_RAN'` line and the closing `ALREADY_RAN`
-# to bring the full 4-faces x 4-arms sweep back.
-# ================================================================================================
-: <<'ALREADY_RAN'
-
 # ***** baselines: magnitude only, one per face. Run FIRST -- nothing below is readable without them.
 
 python src/run.py $COMMON --laser-cols 1,2,3,4 \

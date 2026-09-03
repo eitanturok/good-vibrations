@@ -208,20 +208,30 @@ class Decoder(nn.Module):
     """
     SEED = (3, 4)
 
-    def __init__(self, d_model, out_h, out_w, out_c=1, resize='conv'):
+    def __init__(self, d_model, out_h, out_w, out_c=1, resize='conv', mult:float=1.0, num_res_blocks:int|None=None):
         super().__init__()
         self.out_hw, self.out_c, self.resize = (out_h, out_w), out_c, resize
-        self.project = nn.Linear(d_model, 512 * self.SEED[0] * self.SEED[1])
-        self.up = nn.Sequential(TwoBranchUp(512, 256), TwoBranchUp(256, 128), TwoBranchUp(128, 64))
+        base = int(512 * mult)
+        self.project = nn.Linear(d_model, base * self.SEED[0] * self.SEED[1])
+        # Default: 3 upsampling stages (512->256->128->64), optionally with res-blocks between
+        widths = [base, base // 2, base // 4, base // 8]
+        up_layers = []
+        for i in range(len(widths) - 1):
+            up_layers.append(TwoBranchUp(widths[i], widths[i + 1]))
+            if num_res_blocks:
+                for _ in range(num_res_blocks):
+                    up_layers.append(TwoBranchUp(widths[i + 1], widths[i + 1]))
+        self.up = nn.Sequential(*up_layers)
         up_h, up_w = self.SEED[0] * 8, self.SEED[1] * 8
+        head_in = widths[-1]  # final upsampling layer outputs this many channels
         if resize == 'conv':
             # valid-mode kernel k = margin + 1 collapses up_hw down to out_hw exactly
             k = (up_h - out_h + 1, up_w - out_w + 1)
             if k[0] < 1 or k[1] < 1:
                 raise ValueError(f"resize='conv' needs {up_h}x{up_w} >= {out_h}x{out_w}; use 'bilinear'")
-            first = nn.Conv2d(64, 32, k)
+            first = nn.Conv2d(head_in, 32, k)
         else:
-            first = nn.Conv2d(64, 32, 3, padding=1)
+            first = nn.Conv2d(head_in, 32, 3, padding=1)
         self.head = nn.Sequential(first, nn.ReLU(inplace=True), nn.Conv2d(32, out_c, 3, padding=1))
 
     def forward(self, emb):
@@ -237,7 +247,7 @@ class Decoder(nn.Module):
 class BoomboxModel(ComposerModel):
     """Same ComposerModel contract as VibrationTransformer, so callbacks, metrics
     and run.py work on it unchanged."""
-    def __init__(self, d_model=1024, data_info=None, fuse_speakers=False,
+    def __init__(self, d_model=512, data_info=None, fuse_speakers=False,
                  loss_fn='mse', loss_alpha=0.5, count_loss_weight=0.0,
                  freq_dropout=0.0, laser_dropout=0.0, encoder='single', fuse='concat',
                  trim_pad=False, learned_collapse=False, freq_mult=1, freq_depth=1,

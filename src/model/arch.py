@@ -241,10 +241,19 @@ LOSSES = {'mse': mse_loss, 'l1': l1_loss, 'iou': iou_loss, 'dice': dice_loss, 'm
 #***** 3 decoder *****
 
 class MLPDecoder(nn.Module):
-    def __init__(self, d_model, out_h, out_w, out_c=1):
+    def __init__(self, d_model, out_h, out_w, out_c=1, depth:int|None=None, hidden:int|None=None):
         super().__init__()
         self.out_h, self.out_w, self.out_c = out_h, out_w, out_c
-        self.net = nn.Sequential(nn.Linear(d_model, 256), nn.ReLU(), nn.Linear(256, out_h * out_w * out_c))
+        depth = depth or 2
+        hidden = hidden or 256
+        layers = []
+        in_dim = d_model
+        for i in range(depth - 1):
+            layers.append(nn.Linear(in_dim, hidden))
+            layers.append(nn.ReLU())
+            in_dim = hidden
+        layers.append(nn.Linear(in_dim, out_h * out_w * out_c))
+        self.net = nn.Sequential(*layers)
     def forward(self, cls): return self.net(cls).view(-1, self.out_h, self.out_w, self.out_c).squeeze(-1)
 
 class MLPMidDecoder(nn.Module):
@@ -286,14 +295,17 @@ class AttnDecoder(nn.Module):
         out = self.layers(queries, memory, memory_key_padding_mask=memory_key_padding_mask)  # (B,out_h*out_w,D)
         return self.head(out).view(B, self.out_h, self.out_w, self.out_c).squeeze(-1)
 
-def build_decoder(decoder, d_model, out_h, out_w, decoder_num_heads:int=2, decoder_num_layers:int=2, out_c:int=1, ffn_dim:int|None=None):
-    if decoder == 'mlp': return MLPDecoder(d_model, out_h, out_w, out_c)  # no attention, so ffn_dim does not apply
+def build_decoder(decoder, d_model, out_h, out_w, decoder_num_heads:int=2, decoder_num_layers:int=2, out_c:int=1, ffn_dim:int|None=None, mlp_dec_depth:int|None=None, mlp_dec_hidden:int|None=None, conv_dec_mult:float|None=None, conv_dec_res_blocks:int|None=None):
+    if decoder == 'mlp': return MLPDecoder(d_model, out_h, out_w, out_c, depth=mlp_dec_depth, hidden=mlp_dec_hidden)
     # boombox's transposed-conv stack on the transformer's cls token. Imported here, not at module
     # scope: boombox.py imports from this file, so a top-level import would be circular. Its
     # signature is already (B,D)->(B,H,W), the same contract as MLPDecoder, so nothing else changes.
     if decoder == 'conv':
         from model.boombox import Decoder as ConvDecoder
-        return ConvDecoder(d_model, out_h, out_w, out_c)
+        kwargs = {'d_model': d_model, 'out_h': out_h, 'out_w': out_w, 'out_c': out_c}
+        if conv_dec_mult is not None: kwargs['mult'] = conv_dec_mult
+        if conv_dec_res_blocks is not None: kwargs['num_res_blocks'] = conv_dec_res_blocks
+        return ConvDecoder(**kwargs)
     if decoder == 'mlp-mid': return MLPMidDecoder(d_model, out_h, out_w, out_c)
     if decoder == 'attn': return AttnDecoder(d_model, out_h, out_w, num_heads=decoder_num_heads, num_layers=decoder_num_layers, out_c=out_c, ffn_dim=ffn_dim)
     if decoder == 'attn-no-rope': return AttnDecoder(d_model, out_h, out_w, num_heads=decoder_num_heads, num_layers=decoder_num_layers, do_rope=False, out_c=out_c, ffn_dim=ffn_dim)
@@ -338,15 +350,18 @@ class FreqEncoder(nn.Module):
 #***** 5 model *****
 
 class VibrationTransformer(ComposerModel):
-    def __init__(self, d_model:int=128, pnt_num_heads:int=2, pnt_num_layers:int=2, seq_num_heads:int=2, seq_num_layers:int=2, data_info=None, decoder:str='mlp', decoder_num_heads:int=2, decoder_num_layers:int=2, freq_dropout:float=0.3, laser_dropout:float=0.3, loss_fn:str='mse', loss_alpha:float=0.5, count_loss_weight:float=0.0, ffn_dim:int|None=None):
+    def __init__(self, d_model:int=128, pnt_num_heads:int=2, pnt_num_layers:int=2, seq_num_heads:int=2, seq_num_layers:int=2, data_info=None, decoder:str='mlp', decoder_num_heads:int=2, decoder_num_layers:int=2, freq_dropout:float=0.3, laser_dropout:float=0.3, loss_fn:str='mse', loss_alpha:float=0.5, count_loss_weight:float=0.0, ffn_dim:int|None=None, enc_ffn_dim:int|None=None, dec_ffn_dim:int|None=None, mlp_dec_depth:int|None=None, mlp_dec_hidden:int|None=None):
         super().__init__()
 
         # ffn_dim=None keeps the 4*d_model default. It is worth setting explicitly: torch's own
         # default is a FIXED 2048, so runs from before that was pinned to 4*d_model had a 2048-wide
         # FFN at any width -- 16x d_model at d_model=128, not 4x.
+        # encoder FFN dimension: enc_ffn_dim overrides ffn_dim; ffn_dim is the fallback
+        _enc_ffn_dim = enc_ffn_dim if enc_ffn_dim is not None else ffn_dim
+        _dec_ffn_dim = dec_ffn_dim if dec_ffn_dim is not None else ffn_dim
         # encoder
-        self.freq_encoder = FreqEncoder(data_info['patch_size'], d_model, pnt_num_heads, pnt_num_layers, data_info['n_freqs'], freq_dropout, n_channels=data_info.get('n_channels', 2), ffn_dim=ffn_dim)
-        self.laser_encoder = nn.TransformerEncoder(nn.TransformerEncoderLayer(d_model=d_model, nhead=seq_num_heads, dim_feedforward=ffn_dim or 4 * d_model, batch_first=True), num_layers=seq_num_layers)
+        self.freq_encoder = FreqEncoder(data_info['patch_size'], d_model, pnt_num_heads, pnt_num_layers, data_info['n_freqs'], freq_dropout, n_channels=data_info.get('n_channels', 2), ffn_dim=_enc_ffn_dim)
+        self.laser_encoder = nn.TransformerEncoder(nn.TransformerEncoderLayer(d_model=d_model, nhead=seq_num_heads, dim_feedforward=_enc_ffn_dim or 4 * d_model, batch_first=True), num_layers=seq_num_layers)
         self.laser_dropout = laser_dropout
 
         self.cls_token = nn.Parameter(torch.zeros(1, 1, d_model))
@@ -356,7 +371,7 @@ class VibrationTransformer(ComposerModel):
         # decoder
         out_c = data_info.get('out_c', 1)
         assert out_c == 1 or loss_fn in ('mse', 'ce-pixel'), f"{loss_fn} is mask-only; use mse or ce-pixel with an rgb target"
-        self.decoder = build_decoder(decoder, d_model, data_info['out_h'], data_info['out_w'], decoder_num_heads, decoder_num_layers, out_c, ffn_dim=ffn_dim)
+        self.decoder = build_decoder(decoder, d_model, data_info['out_h'], data_info['out_w'], decoder_num_heads, decoder_num_layers, out_c, ffn_dim=_dec_ffn_dim, mlp_dec_depth=mlp_dec_depth, mlp_dec_hidden=mlp_dec_hidden)
 
         # loss and metrics
         self.empty_head = nn.Linear(d_model, 1)  # extra "empty box" class for the spatial losses

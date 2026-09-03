@@ -226,6 +226,31 @@ def downsample_mask(mask: Image.Image, out_h: int, out_w: int, rgb: bool = False
     out = np.array(mask.convert("RGB" if rgb else "F").resize((out_w, out_h), resample=Image.BOX), dtype=np.float32)
     return np.clip(out / 255.0, 0.0, 1.0)
 
+def upsample_mask(mask: np.ndarray, box_w: int, box_h: int, smooth: bool = False) -> np.ndarray:
+    """Inverse of downsample_mask: an (h,w) or (h,w,3) grid in [0,1] -> the box's own
+    (box_h, box_w) pixels, in [0,1].
+
+    Anisotropic on purpose. downsample_mask squashes every box into the SAME (out_h,out_w)
+    grid, so the two scale factors differ per box; applying them both here is what undoes the
+    squash and lands each cell back on the pixels it averaged.
+
+    This is HONEST, not lossless -- BOX destroyed information on the way down, and the block
+    boundaries sit at fractional pixels (1337/32 = 41.78), so BOX(upsample_mask(g)) returns g
+    only to ~1e-2 at those edges. What NEAREST does guarantee is that it invents nothing: the
+    result is piecewise constant with at most h*w distinct values, so it never shows a gradient
+    the lasers did not measure. smooth=True (BILINEAR) is cosmetic only. Never BICUBIC/LANCZOS
+    on probabilities -- they overshoot [0,1] and ring around blob edges.
+    """
+    resample = Image.BILINEAR if smooth else Image.NEAREST
+    arr = np.asarray(mask, dtype=np.float32)
+    if arr.ndim not in (2, 3): raise ValueError(f"expected (h,w) or (h,w,c), got {arr.shape}")
+    # resize in float ('F' mode, one channel at a time) rather than round-tripping through
+    # uint8: quantizing to 256 levels here would be a second, avoidable loss on top of BOX.
+    planes = [arr] if arr.ndim == 2 else [arr[..., c] for c in range(arr.shape[2])]
+    out = [np.array(Image.fromarray(pl, mode="F").resize((box_w, box_h), resample=resample), dtype=np.float32)
+           for pl in planes]
+    return np.clip(out[0] if arr.ndim == 2 else np.stack(out, axis=-1), 0.0, 1.0)
+
 def downsample_samples(samples: list[tuple[Path, dict]], out_h: int, out_w: int, verbose: int = 1, rgb: bool = False) -> None:
     """Downsample every sample's full-resolution target to (out_h, out_w). Only called when
     build_dataset's hashed mds_dir doesn't already exist, so no per-sample cache check here."""

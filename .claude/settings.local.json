@@ -36,7 +36,9 @@
       "Bash(pip index *)",
       "Bash(pip show *)",
       "PowerShell(jupyter kernelspec list 2>&1)",
-      "Bash(python -c ' *)"
+      "Bash(python -c ' *)",
+      "Bash(export PYTHONPATH=.)",
+      "Bash(PYTHONPATH=src python *)"
     ]
   }
 }

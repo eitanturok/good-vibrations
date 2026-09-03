@@ -112,6 +112,12 @@ def get_parser():
     parser.add_argument("--decoder-num-heads",          type=int,   default=2)
     parser.add_argument("--decoder-num-layers",         type=int,   default=2)
     parser.add_argument("--ffn-dim",                    type=int,   default=None, help="Width of every transformer FFN (freq encoder, laser encoder, attn decoder). Default None = 4*d_model. Torch's own default is a fixed 2048, so pre-2026-08 runs had a 2048-wide FFN regardless of d_model; pass 2048 to reproduce them. No effect on --model boombox.")
+    parser.add_argument("--enc-ffn-dim",                type=int,   default=None, help="FFN width for freq + laser encoders (overrides --ffn-dim for encoders only).")
+    parser.add_argument("--dec-ffn-dim",                type=int,   default=None, help="FFN width for the attn decoder (overrides --ffn-dim for decoder only).")
+    parser.add_argument("--mlp-dec-depth",              type=int,   default=None, help="Number of Linear layers in MLPDecoder (default: 2 for 2-layer MLP).")
+    parser.add_argument("--mlp-dec-hidden",             type=int,   default=None, help="Hidden width of MLPDecoder (default: 256).")
+    parser.add_argument("--conv-dec-mult",              type=float, default=None, help="Base-channel multiplier for boombox Decoder (base channels = 512*mult).")
+    parser.add_argument("--conv-dec-res-blocks",        type=int,   default=None, help="Residual blocks per TwoBranchUp scale in boombox Decoder.")
     parser.add_argument("--pnt-num-heads",              type=int,   default=2)
     parser.add_argument("--seq-num-heads",              type=int,   default=2)
     parser.add_argument("--pnt-num-layers",             type=int,   default=2)
@@ -254,7 +260,9 @@ def run(**kwargs):
     if args.model == "boombox":
         model = BoomboxModel(args.d_model, data_info, loss_fn=args.loss_fn, loss_alpha=args.loss_alpha, count_loss_weight=args.count_loss_weight, freq_dropout=args.freq_dropout, laser_dropout=args.laser_dropout, encoder=args.encoder, fuse=args.fuse, trim_pad=args.trim_pad, learned_collapse=args.learned_collapse, freq_mult=args.freq_mult, freq_depth=args.freq_depth, resize=args.resize)
     else:
-        model = VibrationTransformer(args.d_model, args.pnt_num_heads, args.pnt_num_layers, args.seq_num_heads, args.seq_num_layers, data_info, args.decoder, args.decoder_num_heads, args.decoder_num_layers, freq_dropout=args.freq_dropout, laser_dropout=args.laser_dropout, loss_fn=args.loss_fn, loss_alpha=args.loss_alpha, count_loss_weight=args.count_loss_weight, ffn_dim=args.ffn_dim)
+        enc_ffn_dim = args.enc_ffn_dim if args.enc_ffn_dim is not None else args.ffn_dim
+        dec_ffn_dim = args.dec_ffn_dim if args.dec_ffn_dim is not None else args.ffn_dim
+        model = VibrationTransformer(args.d_model, args.pnt_num_heads, args.pnt_num_layers, args.seq_num_heads, args.seq_num_layers, data_info, args.decoder, args.decoder_num_heads, args.decoder_num_layers, freq_dropout=args.freq_dropout, laser_dropout=args.laser_dropout, loss_fn=args.loss_fn, loss_alpha=args.loss_alpha, count_loss_weight=args.count_loss_weight, enc_ffn_dim=enc_ffn_dim, dec_ffn_dim=dec_ffn_dim, mlp_dec_depth=args.mlp_dec_depth, mlp_dec_hidden=args.mlp_dec_hidden)
     load_path = str(args.checkpoint_path) if args.checkpoint_path else None
 
     # logger
