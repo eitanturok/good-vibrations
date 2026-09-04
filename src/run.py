@@ -139,6 +139,7 @@ def get_parser():
 
     # train
     parser.add_argument("--batch-size",                 type=int,   default=128)
+    parser.add_argument("--device-train-microbatch-size", type=str, default="auto", help="Per-device microbatch size for training. 'auto' (default) lets composer probe for the largest microbatch that fits in memory and grad-accumulate up to --batch-size, retrying on OOM instead of crashing the run. Pass an int to pin it (disables auto-retry).")
     parser.add_argument("--lr",                         type=float, default=1e-4)
     parser.add_argument("--weight-decay",               type=float, default=1e-2)
     parser.add_argument("--scheduler",                  type=str,   default="cosine-warmup", choices=tuple(SCHEDULERS), help="LR schedule. 'constant' reproduces the old no-scheduler behavior.")
@@ -262,7 +263,7 @@ def run(**kwargs):
     else:
         enc_ffn_dim = args.enc_ffn_dim if args.enc_ffn_dim is not None else args.ffn_dim
         dec_ffn_dim = args.dec_ffn_dim if args.dec_ffn_dim is not None else args.ffn_dim
-        model = VibrationTransformer(args.d_model, args.pnt_num_heads, args.pnt_num_layers, args.seq_num_heads, args.seq_num_layers, data_info, args.decoder, args.decoder_num_heads, args.decoder_num_layers, freq_dropout=args.freq_dropout, laser_dropout=args.laser_dropout, loss_fn=args.loss_fn, loss_alpha=args.loss_alpha, count_loss_weight=args.count_loss_weight, enc_ffn_dim=enc_ffn_dim, dec_ffn_dim=dec_ffn_dim, mlp_dec_depth=args.mlp_dec_depth, mlp_dec_hidden=args.mlp_dec_hidden)
+        model = VibrationTransformer(args.d_model, args.pnt_num_heads, args.pnt_num_layers, args.seq_num_heads, args.seq_num_layers, data_info, args.decoder, args.decoder_num_heads, args.decoder_num_layers, freq_dropout=args.freq_dropout, laser_dropout=args.laser_dropout, loss_fn=args.loss_fn, loss_alpha=args.loss_alpha, count_loss_weight=args.count_loss_weight, enc_ffn_dim=enc_ffn_dim, dec_ffn_dim=dec_ffn_dim, mlp_dec_depth=args.mlp_dec_depth, mlp_dec_hidden=args.mlp_dec_hidden, conv_dec_mult=args.conv_dec_mult, conv_dec_res_blocks=args.conv_dec_res_blocks)
     load_path = str(args.checkpoint_path) if args.checkpoint_path else None
 
     # logger
@@ -285,7 +286,7 @@ def run(**kwargs):
 
     # callbacks
     callbacks = [VisualizeSMask(args.viz_interval), NaNMonitor(), LRMonitor(), SystemMetricsMonitor(), SpeedMonitor(1),
-                 OOMObserver(folder=f"runs/{{run_name}}/torch_traces", remote_file_name=None), RuntimeEstimator(skip_batches=64, time_unit="minutes"),
+                 OOMObserver(folder=f"runs/{{run_name}}/torch_traces", remote_file_name=None, overwrite=True), RuntimeEstimator(skip_batches=64, time_unit="minutes"),
                 OptimizerMonitor(log_optimizer_metrics=True, batch_log_interval=10)]
     if args.output_keys: callbacks.append(OutputSaver(args.eval_interval, f"runs/{{run_name}}/outputs_history", overwrite=True, output_keys=args.output_keys))
     if args.attribution: callbacks.append(AttributionSaver(args.eval_interval, f"runs/{{run_name}}/attribution", overwrite=True, ablate=bool(args.attribution_ablate)))
@@ -295,10 +296,15 @@ def run(**kwargs):
     schedulers = build_scheduler(args.scheduler, args.t_warmup) if not args.eval_only else None
 
     # trainer
+    # device_train_microbatch_size: "auto" lets composer probe the largest microbatch that fits and
+    # grad-accumulate up to --batch-size, halving and retrying on OOM instead of crashing the run.
+    device_train_microbatch_size = args.device_train_microbatch_size
+    if device_train_microbatch_size != "auto": device_train_microbatch_size = int(device_train_microbatch_size)
     trainer = Trainer(run_name=args.run_name, model=model, optimizers=optimizer, train_dataloader=train_loader, auto_log_hparams=False,
                     eval_dataloader=eval_loaders, max_duration=args.max_duration if not args.eval_only else None, seed=args.seed, eval_interval=args.eval_interval,
                     device=device, precision=args.precision if device == 'gpu' else 'fp32', save_metrics=True, log_to_console=True, progress_bar=False, load_path=load_path,
                     autoresume=True if not args.eval_only and args.run_name else None, save_folder=f"runs/{{run_name}}/checkpoints" if not args.eval_only else None, save_interval=args.checkpoint_interval,
+                    device_train_microbatch_size=device_train_microbatch_size,
                     schedulers=schedulers, loggers=loggers, callbacks=callbacks, profiler=profiler,
                     compile_config={"mode": args.compile_mode} if args.compile else None)
 

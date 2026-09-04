@@ -195,6 +195,20 @@ class TwoBranchUp(nn.Module):
 
     def forward(self, x): return self.out(torch.cat([self.a(x), self.b(x)], dim=1))
 
+class ResBlock(nn.Module):
+    """Same-resolution refinement block: y = x + f(x), two 3x3 convs (stride 1, 'same'
+    padding) with a skip connection. Unlike TwoBranchUp (which always upsamples via
+    stride-2 transposed convs even at equal in/out channels), this adds depth to the
+    decoder WITHOUT changing spatial size -- the "residual blocks per scale" the
+    ladder script (scripts/pm_size_ladder.sh) asks for between upsampling stages."""
+    def __init__(self, c):
+        super().__init__()
+        self.net = nn.Sequential(nn.Conv2d(c, c, 3, padding=1), nn.BatchNorm2d(c), nn.ReLU(inplace=True),
+                                  nn.Conv2d(c, c, 3, padding=1), nn.BatchNorm2d(c))
+        self.relu = nn.ReLU(inplace=True)
+
+    def forward(self, x): return self.relu(x + self.net(x))
+
 class Decoder(nn.Module):
     """(B,D) -> (B,out_h,out_w), or (B,out_h,out_w,out_c) when out_c > 1. Seeds a 3x4
     grid and doubles it three times to 24x32.
@@ -212,15 +226,19 @@ class Decoder(nn.Module):
         super().__init__()
         self.out_hw, self.out_c, self.resize = (out_h, out_w), out_c, resize
         base = int(512 * mult)
+        self.base = base  # store for use in forward()
         self.project = nn.Linear(d_model, base * self.SEED[0] * self.SEED[1])
-        # Default: 3 upsampling stages (512->256->128->64), optionally with res-blocks between
+        # Default: 3 upsampling stages (512->256->128->64). num_res_blocks adds that many
+        # same-resolution ResBlocks after each TwoBranchUp -- refinement depth, not more
+        # upsampling (TwoBranchUp itself always doubles spatial size via stride-2 transposed
+        # convs, even at equal in/out channels, so it can't be reused for this).
         widths = [base, base // 2, base // 4, base // 8]
         up_layers = []
         for i in range(len(widths) - 1):
             up_layers.append(TwoBranchUp(widths[i], widths[i + 1]))
             if num_res_blocks:
                 for _ in range(num_res_blocks):
-                    up_layers.append(TwoBranchUp(widths[i + 1], widths[i + 1]))
+                    up_layers.append(ResBlock(widths[i + 1]))
         self.up = nn.Sequential(*up_layers)
         up_h, up_w = self.SEED[0] * 8, self.SEED[1] * 8
         head_in = widths[-1]  # final upsampling layer outputs this many channels
@@ -235,7 +253,7 @@ class Decoder(nn.Module):
         self.head = nn.Sequential(first, nn.ReLU(inplace=True), nn.Conv2d(32, out_c, 3, padding=1))
 
     def forward(self, emb):
-        x = self.up(self.project(emb).view(-1, 512, *self.SEED))
+        x = self.up(self.project(emb).view(-1, self.base, *self.SEED))
         if self.resize == 'bilinear':
             x = F.interpolate(x, size=self.out_hw, mode='bilinear', align_corners=False)
         x = self.head(x)                                     # (B,out_c,H,W)

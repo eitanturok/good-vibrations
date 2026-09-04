@@ -1,18 +1,19 @@
 #!/usr/bin/env bash
-# Does the DECODER ARCHITECTURE matter, once the bottleneck, the encoder and the total
+# Does the DECODER ARCHITECTURE matter, once the bottleneck-per-size, the encoder and the total
 # parameter count are all held fixed?  Run on BOTH captures.
 #
 # scripts/hybrid_decoder.sh asked a nearby question but left three things confounded: H1/H2/H3
 # differ in encoder AND decoder AND parameter count all at once ("the conv decoder's
 # 512/256/128/64 stack dwarfs the mlp head"). This sweep controls all three:
 #
-#   * BOTTLENECK  --d-model 512 everywhere. The latent width -- the size of the single vector
-#                 handed from the laser encoder's cls token to the decoder. NOT the same knob
-#                 as FFN width, layer count or head count, which we vary to hit a budget.
+#   * BOTTLENECK  --d-model scales WITH size (128/256/512 for S/M/L) -- see note below, this is
+#                 a deliberate departure from the original fixed-512 design. Within a size class
+#                 d_model is identical across mlp/attn/conv, so the three decoder families are
+#                 still compared at matched bottleneck width -- just not matched ACROSS sizes.
 #   * ENCODER     freq encoder + laser encoder are identical across the three decoder families
 #                 within a (dataset, size). Only the decoder changes.
-#   * PARAMS      three size classes, ~10M / ~30M / ~100M total, matched across the three
-#                 decoder families to within a few % (except *-s-conv, see the note below).
+#   * PARAMS      three size classes, ~10M / ~30M / ~150M total, matched across the three
+#                 decoder families to within a few %.
 #
 # 3 decoder families x 3 sizes x 2 datasets = 18 runs, 2000 epochs each.
 #
@@ -45,44 +46,63 @@
 #
 # This task -- vibration spectrum -> spatial occupancy field -- is synthesis: the decoder
 # output is the product, and mapping a global latent to a coherent layout is the crux. So we
-# bias decoder-heavy (~60-70% of params in the decoder). Not MAE-style; not 3-4x either, since
-# the target is a tiny 21x30x1 field with no texture. If the --rgb target is used, push higher.
+# bias decoder-heavy (~65% of params in the decoder, ~78% at S -- see table). Not MAE-style;
+# not 3-4x either, since the target is a tiny 21x30x1 field with no texture.
 #
-# SCALE BY DEPTH, NOT WIDTH. d_model stays 512 for all 18. Encoder FFN grows 512 -> 768 -> 1024
-# (tops out at 1024); decoder widths stay in {512, 1024, 1536, 2048}. Size classes are reached
-# by STACKING LAYERS. Every width is a multiple of 256; the only dims that can't be rounded are
-# task-fixed (the 630 = 21x30 output, and the attn decoder's 630 queries).
+# ***** why d_model scales with size (departure from the original design) *****
+# The original version of this ladder held --d-model fixed at 512 for all three sizes and
+# scaled ONLY depth + decoder width, on the theory that the bottleneck is a separate knob from
+# "how much compute you spend either side of it". This version instead scales d_model itself
+# 128 -> 256 -> 512 across S -> M -> L, on request, to see whether the SAME decoder-architecture
+# comparison holds once the bottleneck is allowed to grow with size the way it would in a normal
+# capacity ladder. Known consequence: this confounds "decoder architecture" with "bottleneck
+# width" across size classes -- a difference between S and L now could be architecture, could be
+# d_model, could be both. Within a size class the comparison is still clean (d_model matched
+# across mlp/attn/conv). Read cross-size deltas with that caveat; within-size deltas are as
+# clean as the original design.
 #
-#   size  freq enc     laser enc    decoder                  ~enc / ~dec / ~total   dec%
-#   S     1L ffn512    1L ffn512    mlp  7 layers, h1024      3.2M / 6.4M / 9.6M     67
-#                                   attn 2L ffn512            3.2M / 5.6M / 8.8M     64
-#                                   conv base512, 0 res-blk   3.2M / 9.0M / 12.2M    74  (*)
-#   M     3L ffn768    3L ffn768    mlp  9 layers, h1536      11.1M / 18.3M / 29.4M  62
-#                                   attn 6L ffn1024           11.1M / 19.2M / 30.3M  63
-#                                   conv base512, 6 res-blk   11.1M / 18.3M / 29.4M  62
-#   L     8L ffn1024   8L ffn1024   mlp  17 layers, h2048     33.7M / 65.3M / 99.0M  66
-#                                   attn 21L ffn1024          33.7M / 66.6M / 100.2M 66
-#                                   conv base1024, 6 res-blk  33.7M / 66.9M / 100.5M 66
+# SCALE BY DEPTH AND d_model. Encoder FFN is always 2x d_model (256/512/1024 for S/M/L). Encoder
+# depth is 8 -> 10 -> 12 layers S -> M -> L -- NOT monotonic with d_model^2 cost alone: at
+# d_model=512, 8 layers (the OLD L's encoder depth) already costs ~100M by itself, so depth had
+# to come down relative to a d_model-512-everywhere design for the same layer count to fit a
+# ~150M total. 12 layers at d_model=512 (this L) still costs ~50M just for the encoder.
 #
-# (*) conv can't go below ~9M at d_model 512: the project Linear alone is 3.15M and the
-#     transposed-conv stack ~5.9M, before a single res-block. *-s-conv therefore runs
-#     ~12M / 74% decoder -- the one arm not cleanly matched at "small". Read it, don't drop it.
+# MLP decoder depth is monotonic by construction (14 -> 20 -> 24), not just whatever combo of
+# depth x hidden happened to land closest to the param target -- an earlier pass here picked
+# 14/10/24 (M *shallower* than S), which silently broke the "does depth help" story this ladder
+# exists to test. Fixed by constraining the M/L search to depth > previous size's depth.
 #
-# Depth over width for the decoder too: attn scales on --decoder-num-layers, conv on residual
-# blocks per scale (M widens nothing vs S -- it just adds 6 res-blocks). pm-*-l-attn is 8+8
-# encoder + 21 decoder = 37 transformer layers, all 512 wide.
+# heads scale WITH d_model (4/8/8 for S/M/L) to hold head_dim roughly fixed at 32 for S and M,
+# 64 for L, rather than letting it shrink to 16 at S if heads stayed fixed at 8 everywhere.
+# Free in param budget: attention's Q/K/V/out projections are d_model x d_model regardless of
+# how many heads that width is split into, so head count alone never changes a param count.
 #
-# ***** NEW FLAGS THIS SCRIPT NEEDS (not in run.py yet) *****
+#   size  d_model  heads  freq enc     laser enc    decoder                    ~enc / ~dec / ~total  dec%
+#   S     128      4      8L ffn256    8L ffn256    mlp  14 layers, h768       2.1M / 7.7M / 9.8M     78
+#                                                    attn 20L ffn1024          2.1M / 8.0M / 10.1M     79
+#                                                    conv mult0.75, 4 res-blk  2.1M / 7.4M / 9.5M      78
+#   M     256      8      10L ffn512   10L ffn512   mlp  20 layers, h1024     10.6M / 19.8M / 30.4M   65
+#                                                    attn 18L ffn1024         10.6M / 19.1M / 29.7M   64
+#                                                    conv mult1.25, 4 res-blk 10.6M / 20.8M / 31.4M   66
+#   L     512      8      12L ffn1024  12L ffn1024  mlp  24 layers, h2048     50.5M / 94.7M / 145.2M  65
+#                                                    attn 24L ffn2048         50.5M / 101.2M / 151.7M 67
+#                                                    conv mult2.5, 6 res-blk  50.5M / 102.6M / 153.1M 67
+#
+# All totals verified against the actual model classes (not hand-estimated); see conversation
+# history / git blame for the search script.
+#
+# ***** flags this script needs (added to run.py alongside this script) *****
 #   --enc-ffn-dim N          FFN width for freq + laser encoders (splits out of --ffn-dim)
 #   --dec-ffn-dim N          FFN width for the attn decoder      (splits out of --ffn-dim)
 #   --mlp-dec-depth N        number of Linear layers in MLPDecoder
 #   --mlp-dec-hidden N       hidden width of MLPDecoder
 #   --conv-dec-mult F        base-channel multiplier for boombox Decoder (base channels = 512*F)
-#   --conv-dec-res-blocks N  residual blocks per TwoBranchUp scale
+#   --conv-dec-res-blocks N  residual blocks per TwoBranchUp scale (same-resolution ResBlock,
+#                            not another TwoBranchUp -- that would upsample again, not refine)
 # --pnt-num-layers / --seq-num-layers / --decoder-num-layers already exist.
 #
 #   tmux new -s pm
-#   ./scripts/param_matched_decoder.sh 2>&1 | tee runs/pm_size_ladder.log
+#   ./scripts/pm_size_ladder.sh 2>&1 | tee runs/pm_size_ladder.log
 
 set -u  # NOT -e: one diverging arm should not kill the rest
 
@@ -92,28 +112,34 @@ export PYTHONPATH=.
 exec 9>/tmp/pm_size_ladder.sh.lock
 flock -n 9 || { echo "another copy of $(basename "$0") is already running; exiting" >&2; exit 1; }
 
-TAG=v1
-GROUP=pm-$TAG
+TAG=v2
 
 # ---- shared by all 18 runs ----
-COMMON="--model transformer --d-model 512 \
+COMMON="--model transformer \
         --out-h 21 --out-w 30 --augment-mask 0 --augment-fft 0 \
         --loss-fn ce-pixel --max-duration 2000ep \
-        --laser-dropout 0 --freq-dropout 0 \
-        --pnt-num-heads 8 --seq-num-heads 8 --decoder-num-heads 8 \
-        --wandb-group $GROUP"
+        --laser-dropout 0 --freq-dropout 0"
 
 # ---- per dataset ----
-GASTRO="--split gastronorm"   # uses run.py's default --data-dir (31_07_2026_gastronorm_exp1)
-GREEN="--data-dir experiments/31_08_2026_green_plastic_two_laser_faces --split green_plastic"
+# separate wandb groups per dataset (pm-$TAG-gastro / pm-$TAG-green) so the two capture
+# geometries -- 100 lasers/10x10 grid vs 80 lasers/two-face -- don't get plotted together
+GASTRO="--split gastronorm --wandb-group pm-$TAG-gastro"   # uses run.py's default --data-dir (31_07_2026_gastronorm_exp1)
+GREEN="--data-dir experiments/31_08_2026_green_plastic_two_laser_faces --split green_plastic --wandb-group pm-$TAG-green"
 
-# ---- per size: encoder (freq stack = laser stack), depth-scaled ----
-S_ENC="--pnt-num-layers 1 --seq-num-layers 1 --enc-ffn-dim 512"
-M_ENC="--pnt-num-layers 3 --seq-num-layers 3 --enc-ffn-dim 768"
-L_ENC="--pnt-num-layers 8 --seq-num-layers 8 --enc-ffn-dim 1024"
+# ---- per size: d_model + encoder (freq stack = laser stack), depth-scaled ----
+# heads scale WITH d_model to hold head_dim roughly fixed (32/32/64) rather than shrinking to
+# head_dim=16 at S if heads stayed fixed at 8 everywhere -- head_dim doesn't change param count
+# (Q/K/V/out projections are always d_model x d_model regardless of head split), so this is a
+# pure quality choice, free in parameter budget.
+S_ENC="--d-model 128 --pnt-num-layers 8  --seq-num-layers 8  --enc-ffn-dim 256  --pnt-num-heads 4 --seq-num-heads 4 --decoder-num-heads 4"
+M_ENC="--d-model 256 --pnt-num-layers 10 --seq-num-layers 10 --enc-ffn-dim 512  --pnt-num-heads 8 --seq-num-heads 8 --decoder-num-heads 8"
+L_ENC="--d-model 512 --pnt-num-layers 12 --seq-num-layers 12 --enc-ffn-dim 1024 --pnt-num-heads 8 --seq-num-heads 8 --decoder-num-heads 8"
 
-# S/M fit at batch 128; the ~100M L arms drop to 64 (the freq encoder's effective batch is
-# batch * n_lasers). Bump/cut per card.
+# S/M fit at batch 128; the ~150M L arms drop to 64 (the freq encoder's effective batch is
+# batch * n_lasers, and L's d_model=512 encoder is the same width as the old fixed-512 design
+# but deeper -- 12 layers vs 8). device-train-microbatch-size defaults to "auto" in run.py, so
+# a run that still doesn't fit at these batch sizes grad-accumulates down automatically instead
+# of crashing OOM. Bump/cut the batch sizes below per card regardless.
 
 # =====================================================================================
 # GASTRONORM  (100 lasers)
@@ -121,41 +147,41 @@ L_ENC="--pnt-num-layers 8 --seq-num-layers 8 --enc-ffn-dim 1024"
 
 # --- small (~10M) ---
 python src/run.py $COMMON $GASTRO $S_ENC --batch-size 128 \
-    --decoder mlp  --mlp-dec-depth 7 --mlp-dec-hidden 1024 \
+    --decoder mlp  --mlp-dec-depth 14 --mlp-dec-hidden 768 \
     --run-name pm-gastro-s-mlp-$TAG
 
 python src/run.py $COMMON $GASTRO $S_ENC --batch-size 128 \
-    --decoder attn --decoder-num-layers 2 --dec-ffn-dim 512 \
+    --decoder attn --decoder-num-layers 20 --dec-ffn-dim 1024 \
     --run-name pm-gastro-s-attn-$TAG
 
 python src/run.py $COMMON $GASTRO $S_ENC --batch-size 128 \
-    --decoder conv --conv-dec-mult 1.0 --conv-dec-res-blocks 0 \
+    --decoder conv --conv-dec-mult 0.75 --conv-dec-res-blocks 4 \
     --run-name pm-gastro-s-conv-$TAG
 
 # --- medium (~30M) ---
 python src/run.py $COMMON $GASTRO $M_ENC --batch-size 128 \
-    --decoder mlp  --mlp-dec-depth 9 --mlp-dec-hidden 1536 \
+    --decoder mlp  --mlp-dec-depth 20 --mlp-dec-hidden 1024 \
     --run-name pm-gastro-m-mlp-$TAG
 
 python src/run.py $COMMON $GASTRO $M_ENC --batch-size 128 \
-    --decoder attn --decoder-num-layers 6 --dec-ffn-dim 1024 \
+    --decoder attn --decoder-num-layers 18 --dec-ffn-dim 1024 \
     --run-name pm-gastro-m-attn-$TAG
 
 python src/run.py $COMMON $GASTRO $M_ENC --batch-size 128 \
-    --decoder conv --conv-dec-mult 1.0 --conv-dec-res-blocks 6 \
+    --decoder conv --conv-dec-mult 1.25 --conv-dec-res-blocks 4 \
     --run-name pm-gastro-m-conv-$TAG
 
-# --- large (~100M) ---
+# --- large (~150M) ---
 python src/run.py $COMMON $GASTRO $L_ENC --batch-size 64 \
-    --decoder mlp  --mlp-dec-depth 17 --mlp-dec-hidden 2048 \
+    --decoder mlp  --mlp-dec-depth 24 --mlp-dec-hidden 2048 \
     --run-name pm-gastro-l-mlp-$TAG
 
 python src/run.py $COMMON $GASTRO $L_ENC --batch-size 64 \
-    --decoder attn --decoder-num-layers 21 --dec-ffn-dim 1024 \
+    --decoder attn --decoder-num-layers 24 --dec-ffn-dim 2048 \
     --run-name pm-gastro-l-attn-$TAG
 
 python src/run.py $COMMON $GASTRO $L_ENC --batch-size 64 \
-    --decoder conv --conv-dec-mult 2.0 --conv-dec-res-blocks 6 \
+    --decoder conv --conv-dec-mult 2.5 --conv-dec-res-blocks 6 \
     --run-name pm-gastro-l-conv-$TAG
 
 # =====================================================================================
@@ -164,39 +190,39 @@ python src/run.py $COMMON $GASTRO $L_ENC --batch-size 64 \
 
 # --- small (~10M) ---
 python src/run.py $COMMON $GREEN $S_ENC --batch-size 128 \
-    --decoder mlp  --mlp-dec-depth 7 --mlp-dec-hidden 1024 \
+    --decoder mlp  --mlp-dec-depth 14 --mlp-dec-hidden 768 \
     --run-name pm-green-s-mlp-$TAG
 
 python src/run.py $COMMON $GREEN $S_ENC --batch-size 128 \
-    --decoder attn --decoder-num-layers 2 --dec-ffn-dim 512 \
+    --decoder attn --decoder-num-layers 20 --dec-ffn-dim 1024 \
     --run-name pm-green-s-attn-$TAG
 
 python src/run.py $COMMON $GREEN $S_ENC --batch-size 128 \
-    --decoder conv --conv-dec-mult 1.0 --conv-dec-res-blocks 0 \
+    --decoder conv --conv-dec-mult 0.75 --conv-dec-res-blocks 4 \
     --run-name pm-green-s-conv-$TAG
 
 # --- medium (~30M) ---
 python src/run.py $COMMON $GREEN $M_ENC --batch-size 128 \
-    --decoder mlp  --mlp-dec-depth 9 --mlp-dec-hidden 1536 \
+    --decoder mlp  --mlp-dec-depth 20 --mlp-dec-hidden 1024 \
     --run-name pm-green-m-mlp-$TAG
 
 python src/run.py $COMMON $GREEN $M_ENC --batch-size 128 \
-    --decoder attn --decoder-num-layers 6 --dec-ffn-dim 1024 \
+    --decoder attn --decoder-num-layers 18 --dec-ffn-dim 1024 \
     --run-name pm-green-m-attn-$TAG
 
 python src/run.py $COMMON $GREEN $M_ENC --batch-size 128 \
-    --decoder conv --conv-dec-mult 1.0 --conv-dec-res-blocks 6 \
+    --decoder conv --conv-dec-mult 1.25 --conv-dec-res-blocks 4 \
     --run-name pm-green-m-conv-$TAG
 
-# --- large (~100M) ---
+# --- large (~150M) ---
 python src/run.py $COMMON $GREEN $L_ENC --batch-size 64 \
-    --decoder mlp  --mlp-dec-depth 17 --mlp-dec-hidden 2048 \
+    --decoder mlp  --mlp-dec-depth 24 --mlp-dec-hidden 2048 \
     --run-name pm-green-l-mlp-$TAG
 
 python src/run.py $COMMON $GREEN $L_ENC --batch-size 64 \
-    --decoder attn --decoder-num-layers 21 --dec-ffn-dim 1024 \
+    --decoder attn --decoder-num-layers 24 --dec-ffn-dim 2048 \
     --run-name pm-green-l-attn-$TAG
 
 python src/run.py $COMMON $GREEN $L_ENC --batch-size 64 \
-    --decoder conv --conv-dec-mult 2.0 --conv-dec-res-blocks 6 \
+    --decoder conv --conv-dec-mult 2.5 --conv-dec-res-blocks 6 \
     --run-name pm-green-l-conv-$TAG
