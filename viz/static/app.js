@@ -26,9 +26,13 @@ function readRowMetrics() {
 }
 const rowH = () => (S.view.mode === "stacked" ? ROW_H_BASE + MASK_BOX : ROW_H_BASE);
 const METRICS = [
-  { key: "mse",     label: "MSE",      short: "mse", worst: "high" },
-  { key: "iou",     label: "Soft IoU", short: "iou", worst: "low"  },
-  { key: "comdist", label: "COM dist", short: "cd",  worst: "high" },
+  { key: "bce",            label: "BCE",     short: "bce",  worst: "high" },
+  { key: "iou",            label: "IoU",     short: "iou",  worst: "low"  },
+  { key: "localization",   label: "Loc",     short: "loc",  worst: "high" },
+  { key: "localization_x", label: "Loc x",   short: "locx", worst: "high" },
+  { key: "localization_y", label: "Loc y",   short: "locy", worst: "high" },
+  { key: "contour",        label: "Contour", short: "cnt",  worst: "low"  },
+  { key: "mass",           label: "Mass",    short: "mass", worst: "abs"  },
 ];
 
 const S = {
@@ -42,7 +46,7 @@ const S = {
     // exactly those samples/positions, unioned so both searches can be used at once.
     findSamples: new Set(), findPositions: new Set(),
   },
-  sort: { run: null, metric: "comdist", dir: "worst" },
+  sort: { run: null, metric: "localization", dir: "worst" },
   // relative=false is the default on purpose: a fixed [0,1] domain is the only scale
   // under which two cells mean the same thing, which is the point of a comparison table.
   // background is an on/off switch (the "b" key, the checkbox); bgOp is the level it
@@ -435,21 +439,23 @@ function applyFilters() {
 
   if (run && S.runs[run]) {
     const m = METRICS.find((x) => x.key === metric);
-    // "worst" means high for MSE/COM-distance but LOW for IoU; the direction button is
-    // labelled semantically so this inversion never lands on the user.
-    const desc = (m.worst === "high") === (dir === "worst");
+    // "worst" means high for BCE/localization, LOW for IoU/contour, and largest |value|
+    // for mass (over- and under-paint are both bad); the direction button is labelled
+    // semantically so this inversion never lands on the user.
+    const isAbs = m.worst === "abs";
+    const desc = isAbs ? dir === "worst" : (m.worst === "high") === (dir === "worst");
+    const key = (v) => (isAbs ? Math.abs(v) : v);
     const tbl = S.runs[run].samples;
     rows.sort((a, b) => {
       const x = tbl[a.i], y = tbl[b.i];
-      // A missing prediction, or a metric that is undefined for this sample (COM
-      // distance on an empty box), sinks to the end in BOTH directions -- neither is
-      // "best", and letting them float to the top would bury the real failures.
+      // A missing prediction, or a metric undefined for this sample (localization on an
+      // empty box), sinks to the end in BOTH directions.
       const xv = x && x[metric] != null ? x[metric] : null;
       const yv = y && y[metric] != null ? y[metric] : null;
       if (xv == null && yv == null) return a.i - b.i;
       if (xv == null) return 1;
       if (yv == null) return -1;
-      const d = (yv - xv) * (desc ? 1 : -1);
+      const d = (key(yv) - key(xv)) * (desc ? 1 : -1);
       return d || a.i - b.i;
     });
   }
@@ -652,11 +658,8 @@ function renderHeader() {
       ${skipped ? `<div class="hmeta">${skipped.replace(/^ · /, "")}</div>` : ""}
       <div class="hstats">${METRICS.map((m) => {
         const s = st[m.key];
-        // mse runs two orders of magnitude smaller than the others (3e-4 on a good run vs
-        // 4e-2 on a poor one), so 3dp collapses the good ones to "0.000±0.001".
-        const dp = m.key === "mse" ? 5 : 3;
-        return `<span><span class="k">${m.short}</span> <b>${s ? fmt(s.mean, dp) : "–"}</b>${
-          s ? `<span class="k">±${fmt(s.sd, dp)}</span>` : ""}</span>`;
+        return `<span><span class="k">${m.short}</span> <b>${s ? fmt(s.mean, 3) : "–"}</b>${
+          s ? `<span class="k">±${fmt(s.sd, 3)}</span>` : ""}</span>`;
       }).join("")}</div>
       <div class="hsort">
         <select>${METRICS.map((m) =>
@@ -883,7 +886,7 @@ function paintRow(el, rank) {
       METRICS.map((mm) => {
         const v = e[mm.key];
         return `<span class="tag"><span class="k">${mm.short}</span> <b>${
-          v == null ? "–" : fmt(v, mm.key === "mse" ? 5 : 3)}</b></span>`;
+          v == null ? "–" : fmt(v, 3)}</b></span>`;
       }).join("");
     m.hidden = false;
     // Match the canvas buffer to THIS run's grid. Rows are recycled across runs, so a
@@ -2061,9 +2064,8 @@ async function openNeighbors(run, sid) {
         <div><span class="k">predicted com</span><b>${dc(d.pred_com[0], d.pred_com[1])}</b></div>
         <div><span class="k">ground truth</span><b>${dc(d.gt_com[0], d.gt_com[1])}</b></div>
         <div><span class="k">offset</span><b>${fmt(off, 2)} cells</b></div>
-        ${e ? `<div><span class="k">mse</span><b>${fmt(e.mse, 5)}</b></div>
-               <div><span class="k">soft iou</span><b>${fmt(e.iou, 3)}</b></div>
-               <div><span class="k">com dist</span><b>${e.comdist == null ? "–" : fmt(e.comdist, 3)}</b></div>` : ""}
+        ${e ? METRICS.map((mm) => `<div><span class="k">${mm.short}</span><b>${
+              e[mm.key] == null ? "–" : fmt(e[mm.key], 3)}</b></div>`).join("") : ""}
       </div>
       <p class="note">Ground-truth scenes ranked by distance from this run's predicted
         center of mass, over ${d.n_candidates} samples with an object (empty boxes

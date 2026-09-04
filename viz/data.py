@@ -19,7 +19,10 @@ import numpy as np
 import torch
 
 from viz import config
-from utils.metrics import center_of_mass, soft_iou
+import torch.nn.functional as _F
+from utils.metrics import center_of_mass, soft_iou, mass_error, contour_f, localization
+
+METRIC_KEYS = ('bce', 'iou', 'localization', 'localization_x', 'localization_y', 'contour', 'mass')
 
 # ***** ground truth *****
 
@@ -429,9 +432,7 @@ class RunData:
     sample_ids: np.ndarray       # (M,) int
     masks: np.ndarray            # (M,20,40) float32, sigmoid probabilities
     splits: list[str]            # per row: "train" or the eval split name
-    mse: np.ndarray
-    iou: np.ndarray
-    comdist: np.ndarray
+    metrics: dict               # {name: (M,) array} -- see METRIC_KEYS
     com_pred: np.ndarray         # (M,2) grid-space, for display
     row_of: dict[int, int]
     skipped_files: list[str]
@@ -602,9 +603,9 @@ def load_run(name: str, runs_dir: Path, gt: GtIndex, family: str = "unknown",
         # even when nothing decoded, and the column has to be drawn at that size.
         out_shape = shape or (config.MASK_H, config.MASK_W)
         return RunData(name, epoch, np.zeros(0, dtype=np.int64),
-                       np.zeros((0, *out_shape), dtype=np.float32), [], empty_f, empty_f,
-                       empty_f, np.zeros((0, 2)), {}, skipped, family, out_shape,
-                       "no readable prediction files")
+                       np.zeros((0, *out_shape), dtype=np.float32), [],
+                       {k: empty_f for k in METRIC_KEYS}, np.zeros((0, 2)), {}, skipped, family,
+                       out_shape, "no readable prediction files")
 
     sample_ids = np.concatenate(ids)
     preds = np.concatenate(masks).astype(np.float32)
@@ -633,8 +634,8 @@ def load_run(name: str, runs_dir: Path, gt: GtIndex, family: str = "unknown",
 
     if len(sample_ids) == 0:
         empty_f = np.zeros(0, dtype=np.float64)
-        return RunData(name, epoch, sample_ids, preds, splits, empty_f, empty_f,
-                       empty_f, np.zeros((0, 2)), {}, skipped, family,
+        return RunData(name, epoch, sample_ids, preds, splits,
+                       {k: empty_f for k in METRIC_KEYS}, np.zeros((0, 2)), {}, skipped, family,
                        (preds.shape[-2], preds.shape[-1]),
                        "no predicted sample belongs to this dataset")
 
@@ -650,27 +651,24 @@ def load_run(name: str, runs_dir: Path, gt: GtIndex, family: str = "unknown",
         # with no explanation, which reads exactly like a broken run.
         empty_f = np.zeros(0, dtype=np.float64)
         return RunData(name, epoch, np.zeros(0, dtype=np.int64),
-                       np.zeros((0, *shape), dtype=np.float32), [], empty_f, empty_f,
-                       empty_f, np.zeros((0, 2)), {}, skipped, family, shape,
-                       f"no ground truth at {shape[0]}x{shape[1]}")
+                       np.zeros((0, *shape), dtype=np.float32), [],
+                       {k: empty_f for k in METRIC_KEYS}, np.zeros((0, 2)), {}, skipped, family,
+                       shape, f"no ground truth at {shape[0]}x{shape[1]}")
 
     pred = torch.from_numpy(preds)
     truth = torch.from_numpy(gt_masks[gt_rows])
 
-    # mask_pred is already sigmoid probabilities -- do not re-sigmoid.
-    mse = (pred - truth).square().mean(dim=(-2, -1)).numpy()
-    iou = soft_iou(pred, truth).numpy()
-    com_p = center_of_mass(pred, normalize=True, epsilon=config.EPSILON)
-    com_t = center_of_mass(truth, normalize=True, epsilon=config.EPSILON)
-    comdist = torch.linalg.norm(com_p - com_t, ord=2, dim=-1).numpy()
+    # pred is already sigmoid probabilities; viz never sees the logits, so bce is scored
+    # from clamped probs (negligibly different from logit-space).
+    loc = localization(pred, truth)
+    metrics = {
+        'bce': _F.binary_cross_entropy(pred.clamp(1e-6, 1 - 1e-6), truth, reduction='none').mean(dim=(-2, -1)).numpy(),
+        'iou': soft_iou(pred, truth).numpy(),
+        'contour': contour_f(pred, truth).numpy(),
+        'mass': mass_error(pred, truth).numpy(),
+        'localization': loc[0].numpy(), 'localization_x': loc[1].numpy(), 'localization_y': loc[2].numpy(),
+    }
     com_pred = center_of_mass(pred, epsilon=config.EPSILON).numpy()
-
-    # An empty ground-truth mask has no center of mass, so the distance to it is
-    # meaningless rather than large. The training metric skips these samples
-    # (CenterOfMassDistance.update filters mask_true.sum() > 0); marking them undefined
-    # keeps the aggregates identical AND stops degenerate empty boxes from monopolising
-    # the top of a "worst COM distance" sort, which is the tool's main workflow.
-    comdist = np.where(truth.sum(dim=(-2, -1)).numpy() > 0, comdist, np.nan)
 
     # Keyed by ROW, not sample id: every consumer (render._cached, /api/mask.png,
     # /api/values, /api/neighbors) resolves the id through _sid() at the HTTP edge and
@@ -678,7 +676,7 @@ def load_run(name: str, runs_dir: Path, gt: GtIndex, family: str = "unknown",
     # gt_rows[i] is the ground-truth row of sample_ids[i]. See SPEC.md 2.
     row_of = {int(r): i for i, r in enumerate(gt_rows)}
     return RunData(name, epoch, sample_ids, pred.numpy(), splits,
-                   mse, iou, comdist, com_pred, row_of, skipped, family, shape)
+                   metrics, com_pred, row_of, skipped, family, shape)
 
 
 # ***** registry *****

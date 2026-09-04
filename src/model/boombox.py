@@ -334,7 +334,7 @@ class BoomboxModel(ComposerModel):
 
     def update_metric(self, batch, outputs, metric):
         if isinstance(metric, CountAccuracy): metric.update(outputs['count_logits'], batch['info']['n_objects'])
-        else: metric.update(outputs['mask_pred'], batch['mask_true'])
+        else: metric.update(outputs['mask_logits'], outputs['mask_pred'], batch['mask_true'], batch['info']['n_objects'])
 
     def eval_forward(self, batch, outputs=None):
         return outputs if outputs is not None else self.forward(batch)

@@ -1,6 +1,8 @@
 """Metrics shared across the numpy (local/CPU) and torch (model training) pipelines."""
 
 import numpy as np
+import torch
+import torch.nn.functional as F
 from PIL import Image
 
 #***** center of mass *****
@@ -100,3 +102,73 @@ def soft_dice(mask_pred, mask_true, epsilon: float = 1e-6):
     except ImportError:
         pass
     return _soft_dice_numpy(np.asarray(mask_pred), np.asarray(mask_true), epsilon)
+
+
+#***** segmentation metrics *****
+# All take (B,H,W) probability / soft masks and return a (B,) or (n_objects,) tensor.
+
+THRESH = 0.5
+
+def mass_error(pred, true, eps=1e-6):
+    """Symmetric relative mass error in [-1, 1]; negative = under-paint."""
+    p, t = pred.sum((-2, -1)), true.sum((-2, -1))
+    return (p - t) / (p + t + eps)
+
+def _bin(x): return (x > THRESH).float()
+
+def _boundary(x):
+    return (x + F.max_pool2d(-x[:, None], 3, 1, 1)[:, 0]).clamp(min=0)
+
+def _reach(a, b, tol):
+    return a * (F.max_pool2d(b[:, None], 2 * tol + 1, 1, tol)[:, 0] > 0)
+
+def contour_f(pred, true, tol=1):
+    """Boundary F-score: fraction of each outline within `tol` cells of the other."""
+    bp, bt = _boundary(_bin(pred)), _boundary(_bin(true))
+    ap, at = bp.sum((-2, -1)), bt.sum((-2, -1))
+    prec = _reach(bp, bt, tol).sum((-2, -1)) / ap.clamp(min=1)
+    rec = _reach(bt, bp, tol).sum((-2, -1)) / at.clamp(min=1)
+    f = 2 * prec * rec / (prec + rec).clamp(min=1e-9)
+    return torch.where((ap == 0) & (at == 0), torch.ones_like(f), f)
+
+def _label(x, iters=64):
+    """(B,H,W) 0/1 mask -> (B,H,W) long component ids, 0 = background."""
+    _, h, w = x.shape
+    ids = torch.arange(1, h * w + 1, device=x.device).view(1, h, w) * x.long()
+    for _ in range(iters):
+        nxt = F.max_pool2d(ids[:, None].float(), 3, 1, 1)[:, 0].long() * x.long()
+        if torch.equal(nxt, ids): break
+        ids = nxt
+    return ids
+
+def _centroids(ids):
+    ls = ids.unique()
+    ls = ls[ls > 0]
+    if not len(ls): return ids.new_zeros((0, 2), dtype=torch.float32)
+    return torch.stack([(ids == l).nonzero().float().mean(0) for l in ls])
+
+def localization(pred, true):
+    """Centre-of-mass error in grid cells, matched greedily GT->pred, averaged over the
+    objects in each sample. Returns (err, err_x, err_y), each (B,); NaN where the sample
+    has no GT object. A GT object with no predicted blob scores (hypot(H,W), H, W)."""
+    h, w = pred.shape[-2:]
+    miss = (h * h + w * w) ** 0.5
+    P, T = _label(_bin(pred)).cpu(), _label(_bin(true)).cpu()
+    err, ex, ey = [], [], []
+    for pi, ti in zip(P, T):
+        pc, gc = _centroids(pi), _centroids(ti)
+        if not len(gc):
+            err.append(float('nan')); ex.append(float('nan')); ey.append(float('nan')); continue
+        used, es, xs, ys = set(), [], [], []
+        for g in gc:
+            free = [k for k in range(len(pc)) if k not in used]
+            if free:
+                k = min(free, key=lambda k: float((pc[k] - g).norm()))
+                used.add(k)
+                dr, dc = float(pc[k][0] - g[0]), float(pc[k][1] - g[1])
+                es.append((dr * dr + dc * dc) ** 0.5); xs.append(abs(dr)); ys.append(abs(dc))
+            else:
+                es.append(miss); xs.append(float(h)); ys.append(float(w))
+        err.append(sum(es) / len(es)); ex.append(sum(xs) / len(xs)); ey.append(sum(ys) / len(ys))
+    t = lambda v: torch.tensor(v, dtype=torch.float32)
+    return t(err), t(ex), t(ey)

@@ -92,7 +92,7 @@ def test_rendered_prediction_matches_its_metrics(registry):
         j = rd.row_of[row]                       # exactly what app.py/render.py do
         assert int(rd.sample_ids[j]) == sid
         assert rd.masks[j].argmax() == fingerprint(row).argmax()
-        assert rd.iou[j] > 0.8                   # mispaired fingerprints score ~0
+        assert rd.metrics['iou'][j] > 0.8        # mispaired fingerprints score ~0
 
 
 def test_backdrop_cache_not_poisoned(registry):

@@ -5,7 +5,7 @@ from composer import ComposerModel
 from torchmetrics import MeanSquaredError, Metric
 from torchmetrics.classification import MulticlassAccuracy
 
-from utils.metrics import center_of_mass, soft_iou, soft_dice
+from utils.metrics import soft_iou, soft_dice, mass_error, contour_f, localization
 
 #***** 0 rope *****
 
@@ -35,152 +35,52 @@ def apply_rope(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
 
 N_COUNT_CLASSES = 4  # n_objects observed in {0,1,2,3}
 
-def com_distances(mask_pred, mask_true, epsilon, normalize):
-    com_dist = center_of_mass(mask_pred, normalize=normalize, epsilon=epsilon) - center_of_mass(mask_true, normalize=normalize, epsilon=epsilon)
-    return torch.linalg.norm(com_dist, ord=2, dim=-1)
-
-def mses(mask_pred, mask_true):
-    return (mask_pred - mask_true).square().flatten(1).mean(-1)  # flatten, so an (B,H,W,3) rgb target reduces correctly too
-
-class CenterOfMassDistance(Metric):
-    def __init__(self, norm:int=2, epsilon:float=1e-6):
-        super().__init__()
-        self.p, self.epsilon = norm, epsilon
-        self.add_state("total", default=torch.tensor(0.0), dist_reduce_fx="sum")
-        self.add_state("count", default=torch.tensor(0), dist_reduce_fx="sum")
-
-    def update(self, mask_pred, mask_true):
-        valid = mask_true.sum((-2, -1)) > 0  # skip empty ground-truth masks
-        if not valid.any(): return
-        com_distances_ = com_distances(mask_pred[valid], mask_true[valid], self.epsilon, normalize=True)
-        self.total, self.count = self.total + com_distances_.sum(), self.count + valid.sum()
-
-    def compute(self): return self.total / self.count
-
-class SoftIoU(Metric):
-    def __init__(self, epsilon:float=1e-6):
-        super().__init__()
-        self.epsilon = epsilon
-        self.add_state("total", default=torch.tensor(0.0), dist_reduce_fx="sum")
-        self.add_state("count", default=torch.tensor(0), dist_reduce_fx="sum")
-
-    def update(self, mask_pred, mask_true):
-        ious = soft_iou(mask_pred, mask_true, self.epsilon)
-        self.total, self.count = self.total + ious.sum(), self.count + ious.numel()
-
-    def compute(self): return self.total / self.count
-
-class SoftDice(Metric):
-    def __init__(self, epsilon:float=1e-6):
-        super().__init__()
-        self.epsilon = epsilon
-        self.add_state("total", default=torch.tensor(0.0), dist_reduce_fx="sum")
-        self.add_state("count", default=torch.tensor(0), dist_reduce_fx="sum")
-
-    def update(self, mask_pred, mask_true):
-        dices = soft_dice(mask_pred, mask_true, self.epsilon)
-        self.total, self.count = self.total + dices.sum(), self.count + dices.numel()
-
-    def compute(self): return self.total / self.count
-
-# soft-iou fuses over- and under-prediction; these split them so a loss alpha sweep is readable.
-# precision = tp/(tp+fp) punishes over-painting, recall = tp/(tp+fn) punishes missing.
-class SoftPrecision(Metric):
-    def __init__(self, epsilon:float=1e-6):
-        super().__init__()
-        self.epsilon = epsilon
-        self.add_state("tp", default=torch.tensor(0.0), dist_reduce_fx="sum")
-        self.add_state("fp", default=torch.tensor(0.0), dist_reduce_fx="sum")
-
-    def update(self, mask_pred, mask_true):
-        self.tp = self.tp + torch.minimum(mask_pred, mask_true).sum()
-        self.fp = self.fp + (mask_pred - mask_true).clamp_min(0).sum()
-
-    def compute(self): return (self.tp + self.epsilon) / (self.tp + self.fp + self.epsilon)
-
-class SoftRecall(Metric):
-    def __init__(self, epsilon:float=1e-6):
-        super().__init__()
-        self.epsilon = epsilon
-        self.add_state("tp", default=torch.tensor(0.0), dist_reduce_fx="sum")
-        self.add_state("fn", default=torch.tensor(0.0), dist_reduce_fx="sum")
-
-    def update(self, mask_pred, mask_true):
-        self.tp = self.tp + torch.minimum(mask_pred, mask_true).sum()
-        self.fn = self.fn + (mask_true - mask_pred).clamp_min(0).sum()
-
-    def compute(self): return (self.tp + self.epsilon) / (self.tp + self.fn + self.epsilon)
-
 # scores the count head instead of the mask; update_metric dispatches on this type.
 # classes are imbalanced ({0:55, 1:624, 2:2288, 3:40}) so macro is the honest read.
 class CountAccuracy(MulticlassAccuracy): pass
 
-# Boombox's two metrics (arXiv 2105.08052), on BINARIZED masks -- the paper computes
-# them that way, so soft-iou is not comparable to its published numbers.
-def _bbox(mask):
-    """(B,H,W) bool -> (center_rc, extent_hw), both (B,2) float. NaN where mask is empty."""
-    rows, cols = mask.any(-1), mask.any(-2)
-    idx_r = torch.arange(mask.shape[-2], device=mask.device, dtype=torch.float32)
-    idx_c = torch.arange(mask.shape[-1], device=mask.device, dtype=torch.float32)
-    inf = torch.tensor(float('inf'), device=mask.device)
-    lo_r, hi_r = torch.where(rows, idx_r, inf).amin(-1), torch.where(rows, idx_r, -inf).amax(-1)
-    lo_c, hi_c = torch.where(cols, idx_c, inf).amin(-1), torch.where(cols, idx_c, -inf).amax(-1)
-    center = torch.stack([(lo_r + hi_r) / 2, (lo_c + hi_c) / 2], -1)
-    return center, torch.stack([hi_r - lo_r + 1, hi_c - lo_c + 1], -1)
+SEG_KEYS = ('bce', 'iou', 'localization', 'localization_x', 'localization_y', 'contour', 'mass')
 
-class LocalizationScore(Metric):
-    """Fraction of samples whose predicted box center lands within half the ground-truth
-    box diagonal of the true center. Boxes come from the masks, not metadata: this capture
-    has no per-object bboxes and info['x_com'/'y_com'] are the -1.0 sentinel.
-    An empty prediction gives inf/NaN and counts as a miss."""
-    def __init__(self, threshold: float = 0.5):
+# The 7 MaskMetrics see the same (logits, pred, true) each batch; compute the suite once.
+_seg_cache = {}
+def _seg_batch(logits, pred, true):
+    if _seg_cache.get('id') != id(pred):
+        b = len(pred)
+        loc = localization(pred, true)
+        nan = lambda v: (v[~v.isnan()].sum(), int((~v.isnan()).sum()))
+        _seg_cache.clear()
+        _seg_cache['id'] = id(pred)
+        _seg_cache['v'] = {
+            'bce': (F.binary_cross_entropy_with_logits(logits, true, reduction='sum'), true.numel()),
+            'iou': (soft_iou(pred, true).sum(), b),
+            'mass': (mass_error(pred, true).sum(), b),
+            'contour': (contour_f(pred, true).sum(), b),
+            'localization': nan(loc[0]),
+            'localization_x': nan(loc[1]),
+            'localization_y': nan(loc[2]),
+        }
+    return _seg_cache['v']
+
+class MaskMetric(Metric):
+    def __init__(self, key):
         super().__init__()
-        self.threshold = threshold
-        self.add_state("correct", default=torch.tensor(0.0), dist_reduce_fx="sum")
-        self.add_state("count", default=torch.tensor(0), dist_reduce_fx="sum")
-
-    def update(self, mask_pred, mask_true):
-        p, t = mask_pred > self.threshold, mask_true > self.threshold
-        valid = t.flatten(1).any(-1)  # an empty ground truth has no box to localize
-        if not valid.any(): return
-        c_p, _ = _bbox(p[valid])
-        c_t, extent = _bbox(t[valid])
-        hit = torch.linalg.norm(c_p - c_t, dim=-1) <= 0.5 * torch.linalg.norm(extent, dim=-1)
-        self.correct = self.correct + torch.nan_to_num(hit.float(), nan=0.0).sum()
-        self.count = self.count + valid.sum()
-
-    def compute(self): return self.correct / self.count
-
-class HardIoU(Metric):
-    """IoU on masks binarized at `threshold` -- the paper's IoU."""
-    def __init__(self, threshold: float = 0.5, epsilon: float = 1e-6):
-        super().__init__()
-        self.threshold, self.epsilon = threshold, epsilon
+        self.key = key
         self.add_state("total", default=torch.tensor(0.0), dist_reduce_fx="sum")
-        self.add_state("count", default=torch.tensor(0), dist_reduce_fx="sum")
+        self.add_state("count", default=torch.tensor(0.0), dist_reduce_fx="sum")
 
-    def update(self, mask_pred, mask_true):
-        p, t = (mask_pred > self.threshold).flatten(1), (mask_true > self.threshold).flatten(1)
-        ious = ((p & t).sum(-1) + self.epsilon) / ((p | t).sum(-1) + self.epsilon)
-        self.total, self.count = self.total + ious.sum(), self.count + ious.numel()
+    def update(self, mask_logits, mask_pred, mask_true, n_objects):
+        s, n = _seg_batch(mask_logits, mask_pred.float(), mask_true.float())[self.key]
+        self.total = self.total + s.to(self.total)
+        self.count = self.count + n
 
-    def compute(self): return self.total / self.count
+    def compute(self): return self.total / self.count.clamp(min=1)
 
 def create_metrics(data_info):
     counts = {'count-acc': CountAccuracy(num_classes=N_COUNT_CLASSES, average='micro'),
               'count-acc-macro': CountAccuracy(num_classes=N_COUNT_CLASSES, average='macro')}
     # the mask metrics read (H,W) as occupancy, which is meaningless on an rgb target
     if data_info.get('out_c', 1) != 1: return {"mse": MeanSquaredError()} | counts
-    return {
-    "mse": MeanSquaredError(),
-    'com-distance': CenterOfMassDistance(),
-    'soft-iou': SoftIoU(),
-    'soft-precision': SoftPrecision(),
-    'soft-recall': SoftRecall(),
-    'hard-iou': HardIoU(),
-    'localization': LocalizationScore(),
-    # 'soft-dice': SoftDice(),
-    } | counts
+    return {k: MaskMetric(k) for k in SEG_KEYS} | counts
 
 #***** 2 losses *****
 
@@ -435,7 +335,7 @@ class VibrationTransformer(ComposerModel):
 
     def update_metric(self, batch, outputs, metric):
         if isinstance(metric, CountAccuracy): metric.update(outputs['count_logits'], batch['info']['n_objects'])
-        else: metric.update(outputs['mask_pred'], batch['mask_true'])
+        else: metric.update(outputs['mask_logits'], outputs['mask_pred'], batch['mask_true'], batch['info']['n_objects'])
 
     def eval_forward(self, batch, outputs=None):
         return outputs if outputs is not None else self.forward(batch)

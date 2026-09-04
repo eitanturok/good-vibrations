@@ -8,8 +8,16 @@ from composer import Callback, Logger
 from composer.utils import format_name_with_dist
 from composer.loggers import WandBLogger
 
-from model.arch import com_distances, mses
 from model.attribution import capture_attention, ablate_lasers, ablate_freq_patches
+from utils.metrics import center_of_mass
+
+
+def mses(pred, true):
+    return (pred - true).square().flatten(1).mean(-1)
+
+def com_distances(pred, true, epsilon, normalize):
+    d = center_of_mass(pred, normalize=normalize, epsilon=epsilon) - center_of_mass(true, normalize=normalize, epsilon=epsilon)
+    return torch.linalg.norm(d, ord=2, dim=-1)
 
 
 MAX_WANDB_IMAGES = 108  # wandb.Image caps any single log_images call at this many items

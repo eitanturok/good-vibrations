@@ -141,10 +141,8 @@ def api_run(name: str, reload: int = 0, epoch: int | None = None):
     for i, sid in enumerate(rd.sample_ids):
         samples[int(sid)] = {
             "split": rd.splits[i],
-            "mse": _clean(rd.mse[i]),
-            "iou": _clean(rd.iou[i]),
-            "comdist": _clean(rd.comdist[i]),
             "com": [_clean(rd.com_pred[i][0]), _clean(rd.com_pred[i][1])],
+            **{k: _clean(rd.metrics[k][i]) for k in rd.metrics},
         }
     return {"name": rd.name, "epoch": rd.epoch, "family": rd.family,
             # The grid this run predicts at. The client sizes the column's canvas from it,
