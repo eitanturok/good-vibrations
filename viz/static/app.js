@@ -19,20 +19,29 @@ const cssPx = (name, fallback) => {
   const v = parseFloat(getComputedStyle(document.documentElement).getPropertyValue(name));
   return Number.isFinite(v) ? v : fallback;
 };
-let ROW_H_BASE = 206, MASK_BOX = 114;
+let ROW_H_BASE = 226, MASK_BOX = 114;
 function readRowMetrics() {
   ROW_H_BASE = cssPx("--row-h", ROW_H_BASE);
   MASK_BOX = cssPx("--mask-h", 110) + 4;   // mask box plus the gap above it
 }
 const rowH = () => (S.view.mode === "stacked" ? ROW_H_BASE + MASK_BOX : ROW_H_BASE);
+// Overlap / shape metrics first, then the six localization (centre-of-mass error) ones as
+// a block at the end -- they share a prefix and a scale, so they read as one group and
+// belong together after the metrics that judge the mask itself.
 const METRICS = [
   { key: "bce",            label: "BCE",     short: "bce",  worst: "high" },
   { key: "iou",            label: "IoU",     short: "iou",  worst: "low"  },
-  { key: "localization",   label: "Loc",     short: "loc",  worst: "high" },
-  { key: "localization_x", label: "Loc x",   short: "locx", worst: "high" },
-  { key: "localization_y", label: "Loc y",   short: "locy", worst: "high" },
   { key: "contour",        label: "Contour", short: "cnt",  worst: "low"  },
   { key: "mass",           label: "Mass",    short: "mass", worst: "abs"  },
+  // rel = fraction of the box (grid-independent, so 21x30 and 32x32 runs compare directly);
+  // raw = grid cells, kept so older runs stay readable. h is the vertical (row) error, w the
+  // horizontal (column) one -- these were _x/_y and read backwards.
+  { key: "localization_rel",   label: "Loc %",    short: "loc",   worst: "high" },
+  { key: "localization_rel_h", label: "Loc % h",  short: "loch",  worst: "high" },
+  { key: "localization_rel_w", label: "Loc % w",  short: "locw",  worst: "high" },
+  { key: "localization_raw",   label: "Loc px",   short: "locr",  worst: "high" },
+  { key: "localization_raw_h", label: "Loc px h", short: "locrh", worst: "high" },
+  { key: "localization_raw_w", label: "Loc px w", short: "locrw", worst: "high" },
 ];
 
 const S = {
@@ -46,14 +55,14 @@ const S = {
     // exactly those samples/positions, unioned so both searches can be used at once.
     findSamples: new Set(), findPositions: new Set(),
   },
-  sort: { run: null, metric: "localization", dir: "worst" },
+  sort: { run: null, metric: "localization_rel", dir: "worst" },
   // relative=false is the default on purpose: a fixed [0,1] domain is the only scale
   // under which two cells mean the same thing, which is the point of a comparison table.
   // background is an on/off switch (the "b" key, the checkbox); bgOp is the level it
   // returns to when switched back on, so the two are stored separately. maskOp scales
   // the mask -- the cube -- alone, which is why it is applied as a canvas alpha and an
   // <img> opacity rather than to the cell, whose backdrop must not move with it.
-  view: { mode: "pred", background: true, relative: false, bgOp: 1, maskOp: 1 },
+  view: { mode: "pred", background: true, relative: false, coms: true, bgOp: 1, maskOp: 1 },
   domain: {}, positions: [], activePos: -1, modalRow: -1,
   hidden: new Map(),  // filter key -> samples that ONLY that filter is holding back
   renderVersion: 0,   // from /api/runs; part of image URLs to defeat immutable caching
@@ -61,11 +70,22 @@ const S = {
   epochIdx: null,     // null = each run's latest; otherwise an index into the epoch list
   playing: false,
   frozenOrder: null,  // sid -> rank, pinned while scrubbing so rows hold their places
+  modalComs: null,    // {coms} for the open modal, so "m" can repaint it
   frameData: {},      // run -> fp16 masks for the visible rows, all epochs
   truthCache: {},     // sid -> ground-truth values, for client-side diff
 };
 
 const fmt = (v, n = 4) => (v == null || !isFinite(v) ? "–" : v.toFixed(n));
+
+/* Parameter count for the column header: 21_268_372 -> "21.3M". One decimal below 100M,
+   none above, so the chip stays the same width whatever the model size. */
+function fmtParams(n) {
+  if (n == null || !isFinite(n)) return null;
+  if (n >= 1e9) return (n / 1e9).toFixed(n >= 1e11 ? 0 : 2) + "B";
+  if (n >= 1e6) return (n / 1e6).toFixed(n >= 1e8 ? 0 : 1) + "M";
+  if (n >= 1e3) return (n / 1e3).toFixed(0) + "K";
+  return String(n);
+}
 
 /* Run state, styled like a CI/W&B badge: green while training, blue once finished,
    red if it died. Colours carry a text label too -- never colour alone. */
@@ -120,18 +140,28 @@ async function boot() {
   // canvases apply the same constant themselves. Exposed as a variable so the GT image,
   // which is now composited by the browser, can match them without hardcoding 0.85.
   document.documentElement.style.setProperty("--gt-gain", String(lut.gain ?? 1));
+  S.meta = runs;
+  S.renderVersion = runs.render_version ?? 0;
+  S.samples = samples.samples;
   // The cell box follows the SCENE's aspect, not the mask grid's. --mask-h is the fixed
   // dimension; width derives from it so a 20x40 and a 30x30 grid over the same room draw
   // the same shape and land on the same features. Set before readRowMetrics re-runs, and
   // before any row is measured, since --mask-h/--mask-w drive the virtualizer's geometry.
-  if (lut.aspect) {
+  //
+  // The COLUMN is sized by the WIDEST box loaded, and each row letterboxes its own mask
+  // inside it (see paintRow's --row-mask-w). Sizing per row instead would give every box a
+  // different column width and break the alignment the table exists for; sizing everything
+  // at one aspect -- what lut.aspect alone did -- draws the narrower box stretched, sliding
+  // its prediction off the features it refers to. lut.aspect stays the fallback for a
+  // sample whose backdrop is missing.
+  {
     const mh = cssPx("--mask-h", 110);
-    document.documentElement.style.setProperty("--mask-w", `${Math.round(mh * lut.aspect)}px`);
-    readRowMetrics();
+    const asp = Math.max(...S.samples.map((x) => x.aspect || 0), lut.aspect || 0);
+    if (asp > 0) {
+      document.documentElement.style.setProperty("--mask-w", `${Math.round(mh * asp)}px`);
+      readRowMetrics();
+    }
   }
-  S.meta = runs;
-  S.renderVersion = runs.render_version ?? 0;
-  S.samples = samples.samples;
   buildPositions();
   initFilters();
   bindFind();
@@ -653,6 +683,8 @@ function renderHeader() {
       <div class="hchips">
         <span class="hep">${epochLabel(name)}</span>
         ${statusChip(status)}
+        ${fmtParams(r.n_params) ? `<span class="pchip" title="${
+          r.n_params.toLocaleString()} trainable parameters">${fmtParams(r.n_params)}<span class="k">&nbsp;params</span></span>` : ""}
       </div>
       ${why}
       ${skipped ? `<div class="hmeta">${skipped.replace(/^ · /, "")}</div>` : ""}
@@ -738,7 +770,7 @@ function buildRow() {
   el.innerHTML = `<div class="cell idx sticky-1"><span class="idxn"></span></div>
     <div class="cell gt sticky-2 gtcell">
       <div class="ctitle gt-head"></div>
-      <div class="mask gtwrap"><img class="gtimg" loading="lazy" decoding="async" alt=""></div>
+      <div class="mask gtwrap"><img class="gtimg" loading="lazy" decoding="async" alt=""><canvas class="gtcoms"></canvas></div>
       <div class="tags gt-foot"></div>
     </div>`;
   el._runCells = [];
@@ -786,6 +818,18 @@ function paintRow(el, rank) {
   // view lives in the detail modal instead.
   // The wrapper carries the backdrop and the hover/tooltip identity; the <img> inside is
   // the bare mask, so `opacity` fades the cube without touching the photo behind it.
+  // Target object marks over the server-rendered GT image. The image is a PNG, not a
+  // canvas, so the marks need their own layer; it carries X's only, since there is no
+  // prediction in this column to pair them with.
+  {
+    const gcv = el.querySelector(".gtcoms");
+    const [gh, gw] = gtShape();
+    sizeMaskCanvas(gcv, gw, gh);
+    const g2 = gcv.getContext("2d");
+    g2.clearRect(0, 0, gcv.width, gcv.height);
+    if (S.view.coms && s.obj_com && s.obj_com.length)
+      drawComs(g2, gcv.width, gcv.height, { missed: s.obj_com }, true);
+  }
   const wrap = el.querySelector(".gtwrap");
   const img = wrap.querySelector(".gtimg");
   wrap.className = "mask gtwrap" + (S.view.background ? " bg" : " nobg");
@@ -810,6 +854,13 @@ function paintRow(el, rank) {
   el.querySelector(".gtcell").onclick = () => {
     if (!document.body.classList.contains("nogt")) openModal(rank);
   };
+
+  // Every .mask in this row -- ground truth and each run column -- is drawn at THIS
+  // sample's box aspect and centred in the --mask-w column box. One row-level variable
+  // rather than a per-element style so the GT and the predictions beside it can never
+  // disagree about the frame they are drawn in.
+  el.style.setProperty("--row-mask-w",
+    s.aspect > 0 ? `${Math.round(cssPx("--mask-h", 110) * s.aspect)}px` : "var(--mask-w)");
 
   syncRowCells(el);
   // Hoisted: depends only on S.runOrder, so computing it per cell rebuilt a Set ~140
@@ -866,21 +917,18 @@ function paintRow(el, rank) {
       return;
     }
     if (c._np) c._np.hidden = true;
-    // Below the image, in reading order: first WHICH FRAME this is (the split this run
-    // filed the sample under, and the epoch shown), then what it scored. The frame line
-    // comes first because it qualifies everything after it -- a good MSE means something
-    // different on a train sample than on a held-out one. Both chips sit at the natural
-    // left edge with the rest of the metadata; nothing here is right-aligned, so the
-    // column reads as a single left-hand stack instead of two drifting apart.
-    // Predicted centre of mass then gets its own line, then the three metrics. All
-    // four at full size do not fit 224px on one line, and shrinking them to fit made the
-    // numbers hard to scan -- which is the one thing this column exists for. Splitting
-    // keeps the metrics aligned across every run column at a readable size.
+    // Below the image, in reading order: one line saying WHICH FRAME this is -- the split
+    // this run filed the sample under, the epoch shown, and the predicted centre of mass --
+    // then the metrics wrapped below it. The frame line comes first because it qualifies
+    // everything after it: a good score means something different on a train sample than on
+    // a held-out one. Everything sits at the natural left edge; nothing is right-aligned,
+    // so the column reads as one left-hand stack. The metrics move to their own lines
+    // because all of them plus the frame line do not fit one row at a readable size.
     chips.innerHTML =
       `${splitChip(split)}` +
       `<span class="epchip${latest ? "" : " scrub"}" title="epoch ${shownEp ?? "?"}${
         latest ? " (latest saved)" : " (scrubbed)"}"><b>${shownEp ?? "–"}</b>` +
-      `<span class="k">ep</span></span>${gs}<i class="brk"></i>` +
+      `<span class="k">ep</span></span>${gs}` +
       `<span class="tag com" title="predicted center of mass (row, col) in grid coords">${
         fmt(e.com[0], 1)}, ${fmt(e.com[1], 1)}</span><i class="brk"></i>` +
       METRICS.map((mm) => {
@@ -891,7 +939,7 @@ function paintRow(el, rank) {
     m.hidden = false;
     // Match the canvas buffer to THIS run's grid. Rows are recycled across runs, so a
     // pooled cell can arrive still sized for a column of a different resolution.
-    if (m.width !== rw || m.height !== rh) { m.width = rw; m.height = rh; }
+    sizeMaskCanvas(m, rw, rh);
     m.dataset.run = name; m.dataset.sid = s.i;
     m.onclick = () => openNeighbors(name, s.i);
     m.className = "mask predmask" + (S.view.background ? " bg" : " nobg");
@@ -905,9 +953,11 @@ function paintRow(el, rank) {
     if (!tm.hidden) {
       tm.className = "mask truthmask" + (S.view.background ? " bg" : " nobg");
       setBackdrop(tm, s.i);
-      if (tm.width !== rw || tm.height !== rh) { tm.width = rw; tm.height = rh; }
+      sizeMaskCanvas(tm, rw, rh);
       const truth = S.truthCache[truthKey(s.i, rh, rw)];
-      if (truth) drawMask(tm, truth, "truth", null, [rh, rw]);
+      // The stacked target half shows the target's own objects and nothing else: the
+      // prediction marks and the connecting lines belong on the prediction above it.
+      if (truth) drawMask(tm, truth, "truth", null, [rh, rw], comsFor(name, s.i), true);
       else ensureTruth(s.i, rh, rw);
     }
   });
@@ -1431,13 +1481,108 @@ function sampleDomain(v, truth, mode, n) {
 
 /* Draws a (20,40) mask into a canvas using the server's own LUT, so a cell looks
    identical whether the client painted it or the server rendered a PNG. */
-function drawMask(canvas, values, mode, truth, shape) {
+/* Mask canvases are supersampled: the buffer is the grid times an integer factor rather
+   than the grid itself. The mask still draws EXACTLY as before -- integer scale with
+   imageSmoothingEnabled off is the same pixelated result CSS was producing -- but it gives
+   the crosshairs real pixels to be crisp in. Without this they would be drawn into a 30x21
+   buffer and stretched into unreadable blocks.
+
+   ~300px of buffer width is about 2x the on-screen mask box, which is enough for a clean
+   1.5px line and costs ~250KB a canvas; the table keeps ~140 pooled canvases alive. */
+const bufScale = (w) => Math.max(4, Math.ceil(300 / w));
+
+/* Crosshair geometry for one (run, sample), or null when the marks are switched off.
+   Served by /api/run as normalized [0,1] coordinates, so it needs no grid conversion and
+   is valid whatever resolution the column predicts at. */
+function comsFor(run, sid) {
+  if (!S.view.coms) return null;
+  const r = S.runs[run];
+  return (r && r.samples && r.samples[sid] && r.samples[sid].coms) || null;
+}
+
+function sizeMaskCanvas(cv, gw, gh) {
+  const k = bufScale(gw), W = gw * k, H = gh * k;
+  if (cv.width !== W || cv.height !== H) { cv.width = W; cv.height = H; }
+}
+
+/* Object-level centre-of-mass marks.
+
+   Encodes exactly two things, because a 130x110 box cannot carry three at once:
+     ROLE     -- colour AND shape, redundantly: target is an X in the target colour,
+                 prediction a circle in the prediction colour. Both are taken from the very
+                 LUTs the masks are painted with, so a mark can never suggest a different
+                 role than the fill beneath it, and the shape carries the distinction on its
+                 own when the colours are hard to tell apart.
+     IDENTITY -- the connecting line, not a per-object hue. The line IS the pairing, its
+                 length IS the localization error, and it costs no extra colour vocabulary.
+   So an X with no line is an object the run missed, and a lone circle a blob it invented
+   (which `localization` does not charge for -- see match_objects).
+
+   Every stroke is laid over a white halo so the marks survive both the photo backdrop and
+   a saturated mask fill underneath. */
+function drawComs(ctx, W, H, coms, gtOnly) {
+  if (!coms) return;
+  // Fixed colours, NOT the mask LUTs. Taking the LUT end-stops put each mark in the exact
+  // colour of the fill it sits on -- a navy circle on the blue prediction, a near-black X
+  // on the green target -- so both vanished into their own layer. These are picked to
+  // clear BOTH fills: amber is nowhere in the blue prediction ramp, and the bright mint is
+  // far lighter than any part of the green target ramp.
+  const cTruth = "#00e5a0", cPred = "#ffab1a";
+  const r = Math.max(3.2, Math.min(W, H) * 0.042);
+  const lw = Math.max(1.4, r * 0.34);
+  const X = (fc) => fc * W, Y = (fr) => fr * H;   // coms are [0,1] (row, col) fractions
+
+  const halo = (draw, width) => {
+    ctx.lineCap = "round"; ctx.lineJoin = "round";
+    ctx.strokeStyle = "rgba(255,255,255,.92)"; ctx.lineWidth = width + Math.max(1.6, r * 0.3);
+    draw();
+    ctx.stroke();
+  };
+  const mark = (draw, width, col) => {
+    halo(draw, width);
+    ctx.strokeStyle = col; ctx.lineWidth = width;
+    draw();
+    ctx.stroke();
+  };
+  const xMark = (x, y) => mark(() => {
+    ctx.beginPath();
+    ctx.moveTo(x - r, y - r); ctx.lineTo(x + r, y + r);
+    ctx.moveTo(x + r, y - r); ctx.lineTo(x - r, y + r);
+  }, lw, cTruth);
+  const oMark = (x, y) => mark(() => {
+    ctx.beginPath(); ctx.arc(x, y, r * 0.85, 0, Math.PI * 2);
+  }, lw, cPred);
+
+  ctx.save();
+  // Lines first so the marks sit on top of their own connector rather than under it.
+  // Drawn thicker than the mark strokes: the line is the error, so it should read first.
+  if (!gtOnly) for (const [pr, pc, gr, gc] of coms.pairs || []) {
+    mark(() => { ctx.beginPath(); ctx.moveTo(X(pc), Y(pr)); ctx.lineTo(X(gc), Y(gr)); },
+         lw * 1.15, "#12161c");
+  }
+  // Every TARGET object gets an X, matched or not -- `missed` alone would mark only the
+  // ones the run failed to find, so the target half of a stacked cell would go blank the
+  // moment the run got it right, which reads as "no object here".
+  for (const [gr, gc] of coms.missed || []) xMark(X(gc), Y(gr));
+  for (const q of coms.pairs || []) xMark(X(q[3]), Y(q[2]));
+  if (!gtOnly) {
+    for (const q of coms.pairs || []) oMark(X(q[1]), Y(q[0]));
+    for (const [pr, pc] of coms.extra || []) oMark(X(pc), Y(pr));
+  }
+  ctx.restore();
+}
+
+function drawMask(canvas, values, mode, truth, shape, coms, gtOnly) {
   const { gamma, gain } = S.lut;
   // Grid comes from the CALLER, not the global default: runs trained at different
   // resolutions share one table, so each column draws at its own size.
   const [h, w] = shape || [S.lut.h, S.lut.w];
   const n = w * h;
   const ctx = canvas.getContext("2d");
+  // The buffer is the grid supersampled (see bufScale); the mask is still drawn as exact
+  // integer-scaled blocks, the extra pixels exist for the crosshairs.
+  sizeMaskCanvas(canvas, w, h);
+  const CW = canvas.width, CH = canvas.height;
 
   // Reused buffers: at ~36 cells x 5 fps a fresh ImageData per cell is pure GC churn.
   const off = drawMask._off || (drawMask._off = document.createElement("canvas"));
@@ -1456,7 +1601,10 @@ function drawMask(canvas, values, mode, truth, shape) {
     ? [{ v: truth, lut: S.lut.truth, k: 0.72 }, { v: values, lut: S.lut.pred, k: 0.82 }]
     : [{ v: values, lut: soloLut, k: gain }];
 
-  ctx.clearRect(0, 0, w, h);
+  ctx.clearRect(0, 0, CW, CH);
+  // Off: the mask must stay hard-edged blocks. This is the same rendering CSS's
+  // image-rendering:pixelated was doing, just moved into the buffer.
+  ctx.imageSmoothingEnabled = false;
   // The cube slider scales every layer as it is composited, so the backdrop -- an element
   // background, outside the canvas -- keeps whatever the background slider gave it.
   ctx.globalAlpha = S.view.maskOp;
@@ -1489,9 +1637,14 @@ function drawMask(canvas, values, mode, truth, shape) {
     // putImageData ignores compositing and would overwrite the layer beneath, so stage
     // on the offscreen canvas and drawImage, which composites.
     octx.putImageData(img, 0, 0);
-    ctx.drawImage(off, 0, 0);
+    ctx.drawImage(off, 0, 0, CW, CH);
   }
   ctx.globalAlpha = 1;
+  // Marks are NOT scaled by the cube-opacity slider: they are annotation, not mask, and
+  // fading them with the fill would hide the thing being measured exactly when the fill
+  // is turned down to see underneath it.
+  ctx.imageSmoothingEnabled = true;
+  drawComs(ctx, CW, CH, coms, gtOnly);
 }
 
 /* Paints one cell from locally-held frame data, fetching the run's frames for the
@@ -1539,7 +1692,7 @@ function paintCanvas(cv, run, sid, epoch) {
   const tkey = truthKey(sid, rh, rw);
   const truth = wantTruth ? S.truthCache[tkey] : null;
   if (wantTruth && !truth) { blank(); ensureTruth(sid, rh, rw); return; }
-  drawMask(cv, buf, mode, truth, [rh, rw]);
+  drawMask(cv, buf, mode, truth, [rh, rw], comsFor(run, sid));
 }
 
 /* Fetch frames for whatever rows are on screen, once per run.
@@ -1923,6 +2076,47 @@ async function valuesFor(run, sid, mode) {
   return valueCache.get(k);   // {v} or, in overlay/stacked mode, {v, t}
 }
 
+/* Distance from the cursor to each prediction<->target connector, in CSS px. Returns the
+   label for the closest one within HIT_PX, or null. */
+const HIT_PX = 7;
+function hitConnector(el, ev, b) {
+  if (!S.view.coms || !el.dataset.run) return null;
+  const coms = comsFor(el.dataset.run, +el.dataset.sid);
+  if (!coms || !coms.pairs || !coms.pairs.length) return null;
+  const [mh, mw] = runShape(el.dataset.run);
+  const px = ev.clientX - b.left, py = ev.clientY - b.top;
+  let best = null, bestD = HIT_PX;
+  for (const [pr, pc, gr, gc] of coms.pairs) {
+    const x1 = pc * b.width, y1 = pr * b.height, x2 = gc * b.width, y2 = gr * b.height;
+    const dx = x2 - x1, dy = y2 - y1;
+    const len2 = dx * dx + dy * dy;
+    // Projection parameter clamped to [0,1] so a coincident pair (len2 = 0) degrades to
+    // "distance to the point" instead of dividing by zero.
+    const t = len2 > 0 ? Math.max(0, Math.min(1, ((px - x1) * dx + (py - y1) * dy) / len2)) : 0;
+    const d = Math.hypot(px - (x1 + t * dx), py - (y1 + t * dy));
+    if (d < bestD) {
+      bestD = d;
+      // Normalized L2 -- the same quantity localization_rel averages over a sample's
+      // objects -- plus the raw cell distance, which is the unit the grid is read in.
+      const fr = Math.hypot(pr - gr, pc - gc);
+      const cells = Math.hypot((pr - gr) * mh, (pc - gc) * mw);
+      best = `L2 ${fr.toFixed(4)} of box · ${cells.toFixed(2)} cells (${(fr * 100).toFixed(2)}%)`;
+    }
+  }
+  return best;
+}
+
+/* One switch for both surfaces. The table and the modal draw the marks from the same
+   S.view.coms, so flipping it has to repaint both -- an open modal sits ON TOP of the
+   table, and repainting only what is underneath reads as the toggle being dead. */
+function setComs(on) {
+  S.view.coms = !!on;
+  const cb = $("#com-toggle");
+  if (cb) cb.checked = S.view.coms;
+  renderVisible();
+  syncModalComs();
+}
+
 function bindTooltip() {
   const tip = $("#tooltip");
   let cur = null;
@@ -1931,6 +2125,20 @@ function bindTooltip() {
     const img = ev.target.closest?.(".mask");
     if (!img || img.dataset.sid === undefined) { tip.hidden = true; cur = null; return; }
     const b = img.getBoundingClientRect();
+    // A connector line takes priority over the cell value: the line IS the localization
+    // error, so hovering it should report that error rather than whatever cell happens to
+    // sit under the cursor. Distance is measured in CSS pixels, not in the [0,1] fractions
+    // the coordinates arrive in -- the box is not square, so a fraction-space radius would
+    // make the line easier to hit horizontally than vertically.
+    const lineHit = hitConnector(img, ev, b);
+    if (lineHit) {
+      tip.hidden = false;
+      tip.textContent = lineHit;
+      tip.style.left = `${ev.clientX + 12}px`;
+      tip.style.top = `${ev.clientY + 14}px`;
+      cur = null;                 // force a refetch when the cursor leaves the line
+      return;
+    }
     // The hovered cell's OWN grid: every cell is stretched to the same box, so a 30x30
     // column and a 20x40 one need different divisors to turn a cursor position into
     // [row, col]. Using the global default indexed the wrong cell on any run whose grid
@@ -1960,6 +2168,56 @@ function bindTooltip() {
     tip.style.top = `${ev.clientY + 14}px`;
   });
   $("#scroller").addEventListener("mouseleave", () => { tip.hidden = true; });
+}
+
+/* Object-COM marks on the modal's three panels.
+
+   Kept in S.modalComs and repainted from here rather than drawn once at open time, so the
+   marks respond to the same toggle the table uses -- the modal covers the table, and a
+   switch that only worked underneath it would look broken. Panels are server-rendered
+   PNGs, so each gets its own overlay canvas; the ground-truth panel is marked gtOnly and
+   shows target X's without the prediction circles or connectors. */
+function syncModalComs() {
+  const nb = document.querySelector(".nbviews");
+  if (!nb) return;
+  // Re-measure whenever a panel's box changes. One rAF after building the modal is too
+  // early: the <img> has not loaded, so it is still ~0 tall and every mark landed squashed
+  // into a strip along the top edge. The observer catches the load, the aspect-ratio
+  // resolving, and a window resize with the same code path. Canvases are absolutely
+  // positioned, so sizing them cannot itself trigger the observer.
+  if (syncModalComs._nb !== nb) {
+    syncModalComs._nb = nb;
+    const ro = (syncModalComs._ro = syncModalComs._ro || new ResizeObserver(() => syncModalComs()));
+    ro.disconnect();
+    nb.querySelectorAll("figure[data-coms] img").forEach((im) => ro.observe(im));
+  }
+  const st = S.modalComs;
+  nb.querySelectorAll("figure[data-coms]").forEach((fig) => {
+    let cv = fig.querySelector("canvas.nbcoms");
+    if (!cv) {
+      cv = document.createElement("canvas");
+      cv.className = "nbcoms";
+      fig.insertBefore(cv, fig.querySelector("figcaption"));
+    }
+    const img = fig.querySelector("img");
+    const box = img.getBoundingClientRect();
+    // Buffer follows the rendered panel, which is far larger than a table cell, so the
+    // marks get proportionally the same weight rather than being scaled up from a
+    // cell-sized buffer.
+    const W = Math.round(box.width), H = Math.round(box.height);
+    if (W < 8 || H < 8) return;          // not laid out yet; the observer will call back
+    if (cv.width !== W || cv.height !== H) { cv.width = W; cv.height = H; }
+    // Pinned to the IMG's own box, not the figure's, so the caption below it cannot shift
+    // the marks off the mask they annotate.
+    cv.style.left = `${img.offsetLeft}px`;
+    cv.style.top = `${img.offsetTop}px`;
+    cv.style.width = `${W}px`;
+    cv.style.height = `${H}px`;
+    const ctx = cv.getContext("2d");
+    ctx.clearRect(0, 0, W, H);
+    if (S.view.coms && st && st.coms)
+      drawComs(ctx, W, H, st.coms, fig.dataset.coms === "gt");
+  });
 }
 
 /* ***** detail modal ***** */
@@ -2048,16 +2306,17 @@ async function openNeighbors(run, sid) {
   const e = S.runs[run] && S.runs[run].samples[sid];
 
   const rel = S.view.relative ? 1 : 0;
+  S.modalComs = { coms: comsFor(run, sid) || (S.runs[run] && S.runs[run].samples[sid] || {}).coms || null };
   $("#m-title").innerHTML = `Sample ${+d.sample_id} — <span class="mrun">${run}</span>`;
   $("#m-body").innerHTML = `
     <div class="msec">
       <h3>This prediction</h3>
       <div class="nbviews">
-        <figure><img src="/api/mask.png?run=${encodeURIComponent(run)}&sid=${sid}&mode=pred&bg=1&rel=${rel}&${v}${ep}" alt="">
+        <figure data-coms="pred"><img src="/api/mask.png?run=${encodeURIComponent(run)}&sid=${sid}&mode=pred&bg=1&rel=${rel}&${v}${ep}" alt="">
           <figcaption>predicted</figcaption></figure>
-        <figure><img src="/api/gt_mask.png?sid=${sid}&bg=1&rel=${rel}&shape=${d.shape[0]}x${d.shape[1]}&${v}" alt="">
+        <figure data-coms="gt"><img src="/api/gt_mask.png?sid=${sid}&bg=1&rel=${rel}&shape=${d.shape[0]}x${d.shape[1]}&${v}" alt="">
           <figcaption>ground truth</figcaption></figure>
-        <figure><img src="/api/mask.png?run=${encodeURIComponent(run)}&sid=${sid}&mode=diff&bg=1&rel=${rel}&${v}${ep}" alt="">
+        <figure data-coms="pred"><img src="/api/mask.png?run=${encodeURIComponent(run)}&sid=${sid}&mode=diff&bg=1&rel=${rel}&${v}${ep}" alt="">
           <figcaption>difference</figcaption></figure>
       </div>
       <div class="nbhead">
@@ -2067,6 +2326,9 @@ async function openNeighbors(run, sid) {
         ${e ? METRICS.map((mm) => `<div><span class="k">${mm.short}</span><b>${
               e[mm.key] == null ? "–" : fmt(e[mm.key], 3)}</b></div>`).join("") : ""}
       </div>
+      <p class="note">X marks each target object, a circle each predicted one, and the line
+        between a matched pair is that object's localization error — hover it for the L2.
+        Press <kbd>c</kbd> to hide or show them.</p>
       <p class="note">Ground-truth scenes ranked by distance from this run's predicted
         center of mass, over ${d.n_candidates} samples with an object (empty boxes
         excluded). One entry per physical position.</p>
@@ -2075,6 +2337,15 @@ async function openNeighbors(run, sid) {
       <div class="msec"><h3>Most similar to the prediction</h3><ul class="nblist">${list(d.most_similar, "near")}</ul></div>
       <div class="msec"><h3>Least similar</h3><ul class="nblist">${list(d.least_similar, "far")}</ul></div>
     </div>`;
+  // The modal shows ONE sample, so its panels take that sample's own box aspect rather
+  // than --mask-w, which is sized to the widest box loaded.
+  {
+    const nb = $(".nbviews"), smp = S.samples.find((x) => x.i === +sid);
+    if (nb && smp && smp.aspect > 0)
+      nb.style.setProperty("--row-mask-w", `${Math.round(cssPx("--mask-h", 110) * smp.aspect)}px`);
+  }
+  // After layout, so each overlay canvas can size itself from its rendered panel.
+  requestAnimationFrame(syncModalComs);
 
   // Each neighbour opens its own ground-truth detail, if it is on screen.
   $("#m-body").querySelectorAll(".nb").forEach((li) => {
@@ -2169,6 +2440,7 @@ function bindUI() {
   opacity("#mask-opacity", "maskOp", "--mask-op", true);
   try { if (localStorage.getItem("viz.bg") === "0") setBackground(false); } catch (_) {}
   $("#rel-toggle").onchange = (e) => { S.view.relative = e.target.checked; renderVisible(); };
+  $("#com-toggle").onchange = (e) => setComs(e.target.checked);
 
   $("#epoch-slider").oninput = (e) => setEpochIdx(+e.target.value);
   $("#epoch-play").onclick = togglePlay;
@@ -2240,6 +2512,14 @@ function bindUI() {
     if (!$("#modal").hidden) {
       if (e.key === "ArrowLeft") { e.preventDefault(); stepModal(-1); }
       if (e.key === "ArrowRight") { e.preventDefault(); stepModal(1); }
+      // "c" works in here too: the modal DRAWS the object marks, so a switch that only
+      // reached the table underneath would look broken exactly where the marks are
+      // biggest. The sidebar checkbox is behind the overlay, so this is the only way to
+      // reach it without closing the modal first.
+      if (e.key === "c" && !e.ctrlKey && !e.metaKey && !e.altKey) {
+        e.preventDefault();
+        setComs(!S.view.coms);
+      }
       return;
     }
     // Bare "f" toggles the filter panel -- but not while typing in the id searches, and
@@ -2260,6 +2540,11 @@ function bindUI() {
     if (e.key === "b" && !typing && !e.ctrlKey && !e.metaKey && !e.altKey) {
       e.preventDefault();
       setBackground(!S.view.background);
+    }
+    // Bare "c" toggles the object COM marks, same terms again.
+    if (e.key === "c" && !typing && !e.ctrlKey && !e.metaKey && !e.altKey) {
+      e.preventDefault();
+      setComs(!S.view.coms);
     }
     // Bare "g" collapses/restores the ground-truth column, same terms again.
     if (e.key === "g" && !typing && !e.ctrlKey && !e.metaKey && !e.altKey) {

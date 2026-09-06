@@ -20,9 +20,9 @@ import torch
 
 from viz import config
 import torch.nn.functional as _F
-from utils.metrics import center_of_mass, soft_iou, mass_error, contour_f, localization
+from utils.metrics import center_of_mass, object_centroids, soft_iou, mass_error, contour_f, localization, LOC_KEYS
 
-METRIC_KEYS = ('bce', 'iou', 'localization', 'localization_x', 'localization_y', 'contour', 'mass')
+METRIC_KEYS = ('bce', 'iou', *LOC_KEYS, 'contour', 'mass')
 
 # ***** ground truth *****
 
@@ -63,6 +63,11 @@ class GtIndex:
     masks: np.ndarray            # (N,20,40) float32, contiguous
     meta: list[dict]
     com_gt: np.ndarray           # (N,2) grid-space COM of the target mask
+    # Per-OBJECT centroids: [(K_i,2)] in grid coords, one array per row. Distinct from
+    # com_gt, which is ONE probability-weighted point for the whole mask and therefore
+    # lands between the cubes on a multi-object sample. These are what `localization`
+    # matches on, so a crosshair drawn from them agrees with the metric beside it.
+    obj_com: list
     avg_com: np.ndarray          # (N,2) full-res image coords, for the position scatter
     layout: config.Layout        # which per-sample filenames this experiment uses
     # sample id -> row. Ids are NOT an identity map into the arrays: the gastronorm
@@ -179,8 +184,8 @@ def load_gt(experiment_dir: Path) -> GtIndex:
     com_gt = np.asarray(center_of_mass(masks), dtype=np.float64)
     avg_com = np.asarray([parse_com(m.get("avg_com")) for m in meta], dtype=np.float64)
     row_of = {int(s): i for i, s in enumerate(ids)}
-    return GtIndex(ids, masks, meta, com_gt, avg_com, layout, row_of,
-                   experiment_dir=experiment_dir)
+    return GtIndex(ids, masks, meta, com_gt, object_centroids(masks), avg_com, layout,
+                   row_of, experiment_dir=experiment_dir)
 
 
 # ***** run scanning *****
@@ -422,6 +427,59 @@ def scan_runs(runs_dir: Path, gt: GtIndex) -> list[RunEntry]:
     return entries
 
 
+# ***** parameter count *****
+
+# BatchNorm keeps these in its state_dict, but they are running statistics, not learned
+# weights -- counting them inflates the number the header reports as "params".
+_BN_BUFFER_SUFFIXES = ("running_mean", "running_var", "num_batches_tracked")
+
+# Keyed on (path, mtime, size): a checkpoint that has been counted will not change, and a
+# run still training writes a NEW file (new mtime), so its count refreshes on its own.
+_PARAM_CACHE: dict[tuple[str, float, int], int | None] = {}
+
+
+def _checkpoint_file(run_dir: Path) -> Path | None:
+    """The newest checkpoint for a run, or None if it kept none."""
+    ckpt = run_dir / "checkpoints"
+    latest = ckpt / "latest-rank0.pt"
+    if latest.exists():
+        return latest.resolve()
+    try:
+        pts = [p for p in ckpt.iterdir() if p.suffix == ".pt"]
+    except OSError:
+        return None
+    return max(pts, key=_epoch_of) if pts else None
+
+
+def param_count(name: str, runs_dir: Path) -> int | None:
+    """Trainable parameters in a run's model, from its newest checkpoint.
+
+    Composer stores the model state_dict under state.model; sum numel over it, minus the
+    BatchNorm running buffers. Loaded with mmap=True so a 250MB checkpoint costs a few ms
+    -- numel reads shape metadata only and never touches the storage -- and the result is
+    cached on the file's identity so a still-training run re-counts only when it saves.
+    """
+    p = _checkpoint_file(runs_dir / name)
+    if p is None:
+        return None
+    try:
+        stat = p.stat()
+    except OSError:
+        return None
+    key = (str(p), stat.st_mtime, stat.st_size)
+    if key not in _PARAM_CACHE:
+        n: int | None = None
+        try:
+            obj = torch.load(p, map_location="cpu", weights_only=False, mmap=True)
+            model = obj.get("state", {}).get("model", {}) or {}
+            n = sum(int(v.numel()) for k, v in model.items()
+                    if hasattr(v, "numel") and not k.endswith(_BN_BUFFER_SUFFIXES))
+        except Exception:
+            n = None
+        _PARAM_CACHE[key] = n
+    return _PARAM_CACHE[key]
+
+
 # ***** per-run predictions + metrics *****
 
 
@@ -447,6 +505,13 @@ class RunData:
     # that size exist on disk) and still score nothing, and an empty column with no
     # explanation is indistinguishable from a bug. Surfaced by /api/run.
     reason: str | None = None
+    # Crosshair geometry per row: matched pred/target object centroids and the unmatched
+    # ones, normalized to [0,1]. See com_pairs(). Last, and defaulted, so the three
+    # empty-column return paths need not pass it.
+    com_pairs: list = field(default_factory=list)
+    # Trainable parameter count, read from the newest checkpoint (see param_count). None
+    # when the run kept no checkpoint. Shown in the column header.
+    n_params: int | None = None
 
 
 def _split_dirs(outputs: Path) -> list[tuple[str, Path]]:
@@ -660,13 +725,16 @@ def load_run(name: str, runs_dir: Path, gt: GtIndex, family: str = "unknown",
 
     # pred is already sigmoid probabilities; viz never sees the logits, so bce is scored
     # from clamped probs (negligibly different from logit-space).
-    loc = localization(pred, truth)
+    # One call, not two: geometry=True returns the crosshair geometry from the SAME
+    # labelling/matching pass that produces the numbers, which halves the scoring cost of a
+    # run and makes it impossible for a drawn line to disagree with its metric.
+    loc, geom = localization(pred, truth, geometry=True)
     metrics = {
         'bce': _F.binary_cross_entropy(pred.clamp(1e-6, 1 - 1e-6), truth, reduction='none').mean(dim=(-2, -1)).numpy(),
         'iou': soft_iou(pred, truth).numpy(),
         'contour': contour_f(pred, truth).numpy(),
         'mass': mass_error(pred, truth).numpy(),
-        'localization': loc[0].numpy(), 'localization_x': loc[1].numpy(), 'localization_y': loc[2].numpy(),
+        **{k: v.numpy() for k, v in loc.items()},
     }
     com_pred = center_of_mass(pred, epsilon=config.EPSILON).numpy()
 
@@ -676,7 +744,8 @@ def load_run(name: str, runs_dir: Path, gt: GtIndex, family: str = "unknown",
     # gt_rows[i] is the ground-truth row of sample_ids[i]. See SPEC.md 2.
     row_of = {int(r): i for i, r in enumerate(gt_rows)}
     return RunData(name, epoch, sample_ids, pred.numpy(), splits,
-                   metrics, com_pred, row_of, skipped, family, shape)
+                   metrics, com_pred, row_of, skipped, family, shape,
+                   com_pairs=geom)
 
 
 # ***** registry *****
@@ -725,8 +794,9 @@ class Registry:
         if reload:
             self._runs.pop(key, None)
         if key not in self._runs:
-            self._runs[key] = load_run(name, self.runs_dir, self.gt, entry.family, epoch,
-                                       entry.shape)
+            rd = load_run(name, self.runs_dir, self.gt, entry.family, epoch, entry.shape)
+            rd.n_params = param_count(name, self.runs_dir)
+            self._runs[key] = rd
             # Each RunData is ~5MB, and scrubbing a 200-epoch run would otherwise pin a
             # gigabyte. Latest-epoch entries (epoch=None) are what the table always needs,
             # so evict scrubbed ones first, oldest first.

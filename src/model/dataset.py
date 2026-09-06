@@ -54,6 +54,7 @@ def laser_indices(laser_cols, n_laser_rows: int, n_laser_cols: int) -> np.ndarra
     return np.array([r * n_laser_cols + c for r in range(n_laser_rows) for c in cols])
 
 LASER_GRID_FILE = "laser_grid.json"
+BOX_GEOM_FILE = "box_geometry.json"
 
 def infer_laser_grid(samples: list[tuple[Path, dict]], n_lasers: int) -> tuple[int, int]:
     """(rows, cols) of the recorded laser grid, read off the per-laser ROI boxes.
@@ -219,6 +220,28 @@ def convert_to_mds(mds_dir: Path, samples: list[tuple[Path, dict]], out_h: int, 
 def source_name(rgb: bool) -> str: return "02_cropped_overhead.png" if rgb else "03_smask.png"
 def target_name(rgb: bool, out_h: int, out_w: int) -> str: return f"04_downsampled_{'overhead' if rgb else 'smask'}_{out_h}h_{out_w}w"
 
+def collect_box_geometry(samples: list[tuple[Path, dict]]) -> dict[str, list[int]]:
+    """{box_name: [w, h]} of the full-resolution cropped overhead -- one PNG header read per
+    distinct box, not per sample.
+
+    This is the only thing downstream needs in order to undo downsample_mask's squash.
+    downsample_mask forces every box into the SAME (out_h, out_w), so the two scale factors
+    differ per box, and a cell's real-space shape -- hence the aspect any renderer must draw
+    it at -- is recoverable only from the box's own pixel size. Without this, wandb and viz
+    draw every box at the grid's aspect: a 19% horizontal stretch on gastronorm today, and a
+    *different* wrong stretch per box the moment two are in one run.
+
+    Read off the PNG rather than recomputed from the capture-time crop fractions: this file is
+    the image that was actually downsampled, and the fractions round.
+    """
+    geom: dict[str, list[int]] = {}
+    for sample_dir, meta in samples:
+        box = meta.get("box")
+        if box is None or box in geom: continue
+        with Image.open(sample_dir / f"image/{source_name(rgb=True)}") as im:
+            geom[box] = list(im.size)  # PIL .size is (w, h)
+    return geom
+
 def downsample_mask(mask: Image.Image, out_h: int, out_w: int, rgb: bool = False) -> np.ndarray:
     # BOX resampling area-averages over the full H x W mask
     # Convert to float FIRST so BOX
@@ -234,11 +257,13 @@ def upsample_mask(mask: np.ndarray, box_w: int, box_h: int, smooth: bool = False
     grid, so the two scale factors differ per box; applying them both here is what undoes the
     squash and lands each cell back on the pixels it averaged.
 
-    This is HONEST, not lossless -- BOX destroyed information on the way down, and the block
-    boundaries sit at fractional pixels (1337/32 = 41.78), so BOX(upsample_mask(g)) returns g
-    only to ~1e-2 at those edges. What NEAREST does guarantee is that it invents nothing: the
-    result is piecewise constant with at most h*w distinct values, so it never shows a gradient
-    the lasers did not measure. smooth=True (BILINEAR) is cosmetic only. Never BICUBIC/LANCZOS
+    This is HONEST, not lossless -- BOX destroyed information on the way down and no inverse
+    recovers it. What IS exact, measured in notebooks/75: BOX(upsample_mask(g)) == g to 0.0e+00
+    for both real boxes at 21x30 and 32x32. The fractional block boundaries (1337/32 = 41.78, so
+    cells get 41 or 42 px) only bite when a grid dimension is a large fraction of the source --
+    ~2e-2 at ~3 px/cell, where the real boxes are 35-60. What NEAREST additionally guarantees is
+    that it invents nothing: the result is piecewise constant with at most h*w distinct values,
+    so it never shows a gradient the lasers did not measure. smooth=True (BILINEAR) is cosmetic only. Never BICUBIC/LANCZOS
     on probabilities -- they overshoot [0,1] and ring around blob edges.
     """
     resample = Image.BILINEAR if smooth else Image.NEAREST
@@ -562,6 +587,10 @@ class VibrationDataset(StreamingDataset):
         self.pk = dict(process_kwargs, freqs=torch.from_numpy(np.load(Path(local) / "freqs.npy")))
         # (rows, cols) of the lasers actually in X -- the model builds its grid from this
         self.grid_shape = tuple(json.loads((Path(local) / LASER_GRID_FILE).read_text()))
+        # {box: [w, h]} full-res pixels, for un-squashing the grid at display time. Missing on
+        # MDS dirs built before this sidecar existed; __getitem__ emits 0 there, see below.
+        geom_path = Path(local) / BOX_GEOM_FILE
+        self.box_geom = json.loads(geom_path.read_text()) if geom_path.exists() else {}
         # only needed on the raw-fft path; the precomputed path already applied both offline
         raw = not self.pk["mds_precomputed_fft"]
         means_path, stats_path = Path(local) / SPEAKER_MEANS_FILE, Path(local) / DATASET_STATS_FILE
@@ -577,7 +606,12 @@ class VibrationDataset(StreamingDataset):
         n_classes = self.pk["n_classes"]
         assert 0 <= s["n_objects"] < n_classes, f'n_objects={s["n_objects"]} outside the {n_classes} count classes'
         n_objects = torch.tensor(s["n_objects"], dtype=torch.long, device=self.pk["device"])
-        info = dict(sample_id=s["sample_id"], position_id=s["position_id"], n_objects=n_objects, speaker=s["speaker"], box=s["box"], is_empty_box=s["is_empty_box"], x_com=s["downsampled_com_x"], y_com=s["downsampled_com_y"])
+        # box_w/box_h are the box's FULL-RES pixel size, carried so wandb and viz can draw the
+        # (out_h,out_w) grid at the box's true aspect instead of as square cells. 0 means
+        # "unknown" (pre-sidecar MDS dir) -- renderers must check for it and fall back to the
+        # grid's own aspect rather than dividing by it.
+        box_w, box_h = self.box_geom.get(str(s["box"]), (0, 0))
+        info = dict(sample_id=s["sample_id"], position_id=s["position_id"], n_objects=n_objects, speaker=s["speaker"], box=s["box"], is_empty_box=s["is_empty_box"], x_com=s["downsampled_com_x"], y_com=s["downsampled_com_y"], box_w=box_w, box_h=box_h)
         speaker_mean = self.speaker_means[int(s["speaker"])].to(self.pk["device"]) if self.speaker_means is not None else None
         ref = self.empty_box_ref[int(s["speaker"])].to(self.pk["device"]) if self.empty_box_ref is not None else None
         fft = X if self.pk["mds_precomputed_fft"] else process_vibration(X, self.pk["freqs"], self.pk["signal_mode"], self.pk["normalize_mode"], self.pk["patch_size"], augment=self.pk["augment_fft"], speaker_mean=speaker_mean, stats=self.stats, empty_box_ref=ref, mag_recipe=self.pk.get("mag_recipe"), phase_arm=self.pk.get("phase_arm"), phase_weight=self.pk.get("phase_weight", 1.0))
@@ -1024,6 +1058,7 @@ def build_dataset(data_dir: str | Path, split: str = "exp25", batch_size: int = 
     elif verbose:
         print(f"Reusing existing MDS at {mds_dir}")
     (mds_dir / LASER_GRID_FILE).write_text(json.dumps(grid))
+    (mds_dir / BOX_GEOM_FILE).write_text(json.dumps(collect_box_geometry(samples)))
 
     splits = SPLIT_METHODS[split](mds_dir, seed=seed, verbose=verbose, **split_kwargs)
 

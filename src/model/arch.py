@@ -2,10 +2,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from composer import ComposerModel
-from torchmetrics import MeanSquaredError, Metric
-from torchmetrics.classification import MulticlassAccuracy
+from torchmetrics import Metric
 
-from utils.metrics import soft_iou, soft_dice, mass_error, contour_f, localization
+from utils.metrics import soft_iou, soft_dice, mass_error, contour_f, localization, LOC_KEYS
 
 #***** 0 rope *****
 
@@ -35,13 +34,9 @@ def apply_rope(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
 
 N_COUNT_CLASSES = 4  # n_objects observed in {0,1,2,3}
 
-# scores the count head instead of the mask; update_metric dispatches on this type.
-# classes are imbalanced ({0:55, 1:624, 2:2288, 3:40}) so macro is the honest read.
-class CountAccuracy(MulticlassAccuracy): pass
+SEG_KEYS = ('bce', 'iou', *LOC_KEYS, 'contour', 'mass')
 
-SEG_KEYS = ('bce', 'iou', 'localization', 'localization_x', 'localization_y', 'contour', 'mass')
-
-# The 7 MaskMetrics see the same (logits, pred, true) each batch; compute the suite once.
+# The 10 MaskMetrics see the same (logits, pred, true) each batch; compute the suite once.
 _seg_cache = {}
 def _seg_batch(logits, pred, true):
     if _seg_cache.get('id') != id(pred):
@@ -55,9 +50,7 @@ def _seg_batch(logits, pred, true):
             'iou': (soft_iou(pred, true).sum(), b),
             'mass': (mass_error(pred, true).sum(), b),
             'contour': (contour_f(pred, true).sum(), b),
-            'localization': nan(loc[0]),
-            'localization_x': nan(loc[1]),
-            'localization_y': nan(loc[2]),
+            **{k: nan(v) for k, v in loc.items()},
         }
     return _seg_cache['v']
 
@@ -76,11 +69,9 @@ class MaskMetric(Metric):
     def compute(self): return self.total / self.count.clamp(min=1)
 
 def create_metrics(data_info):
-    counts = {'count-acc': CountAccuracy(num_classes=N_COUNT_CLASSES, average='micro'),
-              'count-acc-macro': CountAccuracy(num_classes=N_COUNT_CLASSES, average='macro')}
     # the mask metrics read (H,W) as occupancy, which is meaningless on an rgb target
-    if data_info.get('out_c', 1) != 1: return {"mse": MeanSquaredError()} | counts
-    return {k: MaskMetric(k) for k in SEG_KEYS} | counts
+    if data_info.get('out_c', 1) != 1: return {}
+    return {k: MaskMetric(k) for k in SEG_KEYS}
 
 #***** 2 losses *****
 
@@ -334,8 +325,7 @@ class VibrationTransformer(ComposerModel):
         return self.train_metrics if is_train else self.val_metrics
 
     def update_metric(self, batch, outputs, metric):
-        if isinstance(metric, CountAccuracy): metric.update(outputs['count_logits'], batch['info']['n_objects'])
-        else: metric.update(outputs['mask_logits'], outputs['mask_pred'], batch['mask_true'], batch['info']['n_objects'])
+        metric.update(outputs['mask_logits'], outputs['mask_pred'], batch['mask_true'], batch['info']['n_objects'])
 
     def eval_forward(self, batch, outputs=None):
         return outputs if outputs is not None else self.forward(batch)

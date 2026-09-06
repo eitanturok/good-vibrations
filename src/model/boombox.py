@@ -17,7 +17,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from composer import ComposerModel
 
-from model.arch import LOSSES, count_loss, create_metrics, CountAccuracy, N_COUNT_CLASSES
+from model.arch import LOSSES, count_loss, create_metrics, N_COUNT_CLASSES
 
 def _drop(x, p, dim, training):
     """Zero whole slices along `dim` of (B,C,L,F), rescaling survivors so the mean is
@@ -333,8 +333,7 @@ class BoomboxModel(ComposerModel):
     def get_metrics(self, is_train=False): return self.train_metrics if is_train else self.val_metrics
 
     def update_metric(self, batch, outputs, metric):
-        if isinstance(metric, CountAccuracy): metric.update(outputs['count_logits'], batch['info']['n_objects'])
-        else: metric.update(outputs['mask_logits'], outputs['mask_pred'], batch['mask_true'], batch['info']['n_objects'])
+        metric.update(outputs['mask_logits'], outputs['mask_pred'], batch['mask_true'], batch['info']['n_objects'])
 
     def eval_forward(self, batch, outputs=None):
         return outputs if outputs is not None else self.forward(batch)
