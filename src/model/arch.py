@@ -2,10 +2,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from composer import ComposerModel
-from torchmetrics import MeanSquaredError, Metric
-from torchmetrics.classification import MulticlassAccuracy
+from torchmetrics import Metric
 
-from utils.metrics import center_of_mass, soft_iou, soft_dice
+from utils.metrics import soft_iou, soft_dice, mass_error, contour_f, localization, LOC_KEYS
 
 #***** 0 rope *****
 
@@ -35,152 +34,44 @@ def apply_rope(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
 
 N_COUNT_CLASSES = 4  # n_objects observed in {0,1,2,3}
 
-def com_distances(mask_pred, mask_true, epsilon, normalize):
-    com_dist = center_of_mass(mask_pred, normalize=normalize, epsilon=epsilon) - center_of_mass(mask_true, normalize=normalize, epsilon=epsilon)
-    return torch.linalg.norm(com_dist, ord=2, dim=-1)
+SEG_KEYS = ('bce', 'iou', *LOC_KEYS, 'contour', 'mass')
 
-def mses(mask_pred, mask_true):
-    return (mask_pred - mask_true).square().flatten(1).mean(-1)  # flatten, so an (B,H,W,3) rgb target reduces correctly too
+# The 10 MaskMetrics see the same (logits, pred, true) each batch; compute the suite once.
+_seg_cache = {}
+def _seg_batch(logits, pred, true):
+    if _seg_cache.get('id') != id(pred):
+        b = len(pred)
+        loc = localization(pred, true)
+        nan = lambda v: (v[~v.isnan()].sum(), int((~v.isnan()).sum()))
+        _seg_cache.clear()
+        _seg_cache['id'] = id(pred)
+        _seg_cache['v'] = {
+            'bce': (F.binary_cross_entropy_with_logits(logits, true, reduction='sum'), true.numel()),
+            'iou': (soft_iou(pred, true).sum(), b),
+            'mass': (mass_error(pred, true).sum(), b),
+            'contour': (contour_f(pred, true).sum(), b),
+            **{k: nan(v) for k, v in loc.items()},
+        }
+    return _seg_cache['v']
 
-class CenterOfMassDistance(Metric):
-    def __init__(self, norm:int=2, epsilon:float=1e-6):
+class MaskMetric(Metric):
+    def __init__(self, key):
         super().__init__()
-        self.p, self.epsilon = norm, epsilon
+        self.key = key
         self.add_state("total", default=torch.tensor(0.0), dist_reduce_fx="sum")
-        self.add_state("count", default=torch.tensor(0), dist_reduce_fx="sum")
+        self.add_state("count", default=torch.tensor(0.0), dist_reduce_fx="sum")
 
-    def update(self, mask_pred, mask_true):
-        valid = mask_true.sum((-2, -1)) > 0  # skip empty ground-truth masks
-        if not valid.any(): return
-        com_distances_ = com_distances(mask_pred[valid], mask_true[valid], self.epsilon, normalize=True)
-        self.total, self.count = self.total + com_distances_.sum(), self.count + valid.sum()
+    def update(self, mask_logits, mask_pred, mask_true, n_objects):
+        s, n = _seg_batch(mask_logits, mask_pred.float(), mask_true.float())[self.key]
+        self.total = self.total + s.to(self.total)
+        self.count = self.count + n
 
-    def compute(self): return self.total / self.count
-
-class SoftIoU(Metric):
-    def __init__(self, epsilon:float=1e-6):
-        super().__init__()
-        self.epsilon = epsilon
-        self.add_state("total", default=torch.tensor(0.0), dist_reduce_fx="sum")
-        self.add_state("count", default=torch.tensor(0), dist_reduce_fx="sum")
-
-    def update(self, mask_pred, mask_true):
-        ious = soft_iou(mask_pred, mask_true, self.epsilon)
-        self.total, self.count = self.total + ious.sum(), self.count + ious.numel()
-
-    def compute(self): return self.total / self.count
-
-class SoftDice(Metric):
-    def __init__(self, epsilon:float=1e-6):
-        super().__init__()
-        self.epsilon = epsilon
-        self.add_state("total", default=torch.tensor(0.0), dist_reduce_fx="sum")
-        self.add_state("count", default=torch.tensor(0), dist_reduce_fx="sum")
-
-    def update(self, mask_pred, mask_true):
-        dices = soft_dice(mask_pred, mask_true, self.epsilon)
-        self.total, self.count = self.total + dices.sum(), self.count + dices.numel()
-
-    def compute(self): return self.total / self.count
-
-# soft-iou fuses over- and under-prediction; these split them so a loss alpha sweep is readable.
-# precision = tp/(tp+fp) punishes over-painting, recall = tp/(tp+fn) punishes missing.
-class SoftPrecision(Metric):
-    def __init__(self, epsilon:float=1e-6):
-        super().__init__()
-        self.epsilon = epsilon
-        self.add_state("tp", default=torch.tensor(0.0), dist_reduce_fx="sum")
-        self.add_state("fp", default=torch.tensor(0.0), dist_reduce_fx="sum")
-
-    def update(self, mask_pred, mask_true):
-        self.tp = self.tp + torch.minimum(mask_pred, mask_true).sum()
-        self.fp = self.fp + (mask_pred - mask_true).clamp_min(0).sum()
-
-    def compute(self): return (self.tp + self.epsilon) / (self.tp + self.fp + self.epsilon)
-
-class SoftRecall(Metric):
-    def __init__(self, epsilon:float=1e-6):
-        super().__init__()
-        self.epsilon = epsilon
-        self.add_state("tp", default=torch.tensor(0.0), dist_reduce_fx="sum")
-        self.add_state("fn", default=torch.tensor(0.0), dist_reduce_fx="sum")
-
-    def update(self, mask_pred, mask_true):
-        self.tp = self.tp + torch.minimum(mask_pred, mask_true).sum()
-        self.fn = self.fn + (mask_true - mask_pred).clamp_min(0).sum()
-
-    def compute(self): return (self.tp + self.epsilon) / (self.tp + self.fn + self.epsilon)
-
-# scores the count head instead of the mask; update_metric dispatches on this type.
-# classes are imbalanced ({0:55, 1:624, 2:2288, 3:40}) so macro is the honest read.
-class CountAccuracy(MulticlassAccuracy): pass
-
-# Boombox's two metrics (arXiv 2105.08052), on BINARIZED masks -- the paper computes
-# them that way, so soft-iou is not comparable to its published numbers.
-def _bbox(mask):
-    """(B,H,W) bool -> (center_rc, extent_hw), both (B,2) float. NaN where mask is empty."""
-    rows, cols = mask.any(-1), mask.any(-2)
-    idx_r = torch.arange(mask.shape[-2], device=mask.device, dtype=torch.float32)
-    idx_c = torch.arange(mask.shape[-1], device=mask.device, dtype=torch.float32)
-    inf = torch.tensor(float('inf'), device=mask.device)
-    lo_r, hi_r = torch.where(rows, idx_r, inf).amin(-1), torch.where(rows, idx_r, -inf).amax(-1)
-    lo_c, hi_c = torch.where(cols, idx_c, inf).amin(-1), torch.where(cols, idx_c, -inf).amax(-1)
-    center = torch.stack([(lo_r + hi_r) / 2, (lo_c + hi_c) / 2], -1)
-    return center, torch.stack([hi_r - lo_r + 1, hi_c - lo_c + 1], -1)
-
-class LocalizationScore(Metric):
-    """Fraction of samples whose predicted box center lands within half the ground-truth
-    box diagonal of the true center. Boxes come from the masks, not metadata: this capture
-    has no per-object bboxes and info['x_com'/'y_com'] are the -1.0 sentinel.
-    An empty prediction gives inf/NaN and counts as a miss."""
-    def __init__(self, threshold: float = 0.5):
-        super().__init__()
-        self.threshold = threshold
-        self.add_state("correct", default=torch.tensor(0.0), dist_reduce_fx="sum")
-        self.add_state("count", default=torch.tensor(0), dist_reduce_fx="sum")
-
-    def update(self, mask_pred, mask_true):
-        p, t = mask_pred > self.threshold, mask_true > self.threshold
-        valid = t.flatten(1).any(-1)  # an empty ground truth has no box to localize
-        if not valid.any(): return
-        c_p, _ = _bbox(p[valid])
-        c_t, extent = _bbox(t[valid])
-        hit = torch.linalg.norm(c_p - c_t, dim=-1) <= 0.5 * torch.linalg.norm(extent, dim=-1)
-        self.correct = self.correct + torch.nan_to_num(hit.float(), nan=0.0).sum()
-        self.count = self.count + valid.sum()
-
-    def compute(self): return self.correct / self.count
-
-class HardIoU(Metric):
-    """IoU on masks binarized at `threshold` -- the paper's IoU."""
-    def __init__(self, threshold: float = 0.5, epsilon: float = 1e-6):
-        super().__init__()
-        self.threshold, self.epsilon = threshold, epsilon
-        self.add_state("total", default=torch.tensor(0.0), dist_reduce_fx="sum")
-        self.add_state("count", default=torch.tensor(0), dist_reduce_fx="sum")
-
-    def update(self, mask_pred, mask_true):
-        p, t = (mask_pred > self.threshold).flatten(1), (mask_true > self.threshold).flatten(1)
-        ious = ((p & t).sum(-1) + self.epsilon) / ((p | t).sum(-1) + self.epsilon)
-        self.total, self.count = self.total + ious.sum(), self.count + ious.numel()
-
-    def compute(self): return self.total / self.count
+    def compute(self): return self.total / self.count.clamp(min=1)
 
 def create_metrics(data_info):
-    counts = {'count-acc': CountAccuracy(num_classes=N_COUNT_CLASSES, average='micro'),
-              'count-acc-macro': CountAccuracy(num_classes=N_COUNT_CLASSES, average='macro')}
     # the mask metrics read (H,W) as occupancy, which is meaningless on an rgb target
-    if data_info.get('out_c', 1) != 1: return {"mse": MeanSquaredError()} | counts
-    return {
-    "mse": MeanSquaredError(),
-    'com-distance': CenterOfMassDistance(),
-    'soft-iou': SoftIoU(),
-    'soft-precision': SoftPrecision(),
-    'soft-recall': SoftRecall(),
-    'hard-iou': HardIoU(),
-    'localization': LocalizationScore(),
-    # 'soft-dice': SoftDice(),
-    } | counts
+    if data_info.get('out_c', 1) != 1: return {}
+    return {k: MaskMetric(k) for k in SEG_KEYS}
 
 #***** 2 losses *****
 
@@ -241,10 +132,19 @@ LOSSES = {'mse': mse_loss, 'l1': l1_loss, 'iou': iou_loss, 'dice': dice_loss, 'm
 #***** 3 decoder *****
 
 class MLPDecoder(nn.Module):
-    def __init__(self, d_model, out_h, out_w, out_c=1):
+    def __init__(self, d_model, out_h, out_w, out_c=1, depth:int|None=None, hidden:int|None=None):
         super().__init__()
         self.out_h, self.out_w, self.out_c = out_h, out_w, out_c
-        self.net = nn.Sequential(nn.Linear(d_model, 256), nn.ReLU(), nn.Linear(256, out_h * out_w * out_c))
+        depth = depth or 2
+        hidden = hidden or 256
+        layers = []
+        in_dim = d_model
+        for i in range(depth - 1):
+            layers.append(nn.Linear(in_dim, hidden))
+            layers.append(nn.ReLU())
+            in_dim = hidden
+        layers.append(nn.Linear(in_dim, out_h * out_w * out_c))
+        self.net = nn.Sequential(*layers)
     def forward(self, cls): return self.net(cls).view(-1, self.out_h, self.out_w, self.out_c).squeeze(-1)
 
 class MLPMidDecoder(nn.Module):
@@ -286,14 +186,17 @@ class AttnDecoder(nn.Module):
         out = self.layers(queries, memory, memory_key_padding_mask=memory_key_padding_mask)  # (B,out_h*out_w,D)
         return self.head(out).view(B, self.out_h, self.out_w, self.out_c).squeeze(-1)
 
-def build_decoder(decoder, d_model, out_h, out_w, decoder_num_heads:int=2, decoder_num_layers:int=2, out_c:int=1, ffn_dim:int|None=None):
-    if decoder == 'mlp': return MLPDecoder(d_model, out_h, out_w, out_c)  # no attention, so ffn_dim does not apply
+def build_decoder(decoder, d_model, out_h, out_w, decoder_num_heads:int=2, decoder_num_layers:int=2, out_c:int=1, ffn_dim:int|None=None, mlp_dec_depth:int|None=None, mlp_dec_hidden:int|None=None, conv_dec_mult:float|None=None, conv_dec_res_blocks:int|None=None):
+    if decoder == 'mlp': return MLPDecoder(d_model, out_h, out_w, out_c, depth=mlp_dec_depth, hidden=mlp_dec_hidden)
     # boombox's transposed-conv stack on the transformer's cls token. Imported here, not at module
     # scope: boombox.py imports from this file, so a top-level import would be circular. Its
     # signature is already (B,D)->(B,H,W), the same contract as MLPDecoder, so nothing else changes.
     if decoder == 'conv':
         from model.boombox import Decoder as ConvDecoder
-        return ConvDecoder(d_model, out_h, out_w, out_c)
+        kwargs = {'d_model': d_model, 'out_h': out_h, 'out_w': out_w, 'out_c': out_c}
+        if conv_dec_mult is not None: kwargs['mult'] = conv_dec_mult
+        if conv_dec_res_blocks is not None: kwargs['num_res_blocks'] = conv_dec_res_blocks
+        return ConvDecoder(**kwargs)
     if decoder == 'mlp-mid': return MLPMidDecoder(d_model, out_h, out_w, out_c)
     if decoder == 'attn': return AttnDecoder(d_model, out_h, out_w, num_heads=decoder_num_heads, num_layers=decoder_num_layers, out_c=out_c, ffn_dim=ffn_dim)
     if decoder == 'attn-no-rope': return AttnDecoder(d_model, out_h, out_w, num_heads=decoder_num_heads, num_layers=decoder_num_layers, do_rope=False, out_c=out_c, ffn_dim=ffn_dim)
@@ -316,7 +219,9 @@ class FreqEncoder(nn.Module):
     def __init__(self, patch_size:int, d_model:int, num_heads:int, num_layers:int, signal_length:int, freq_dropout:float, n_channels:int=2, ffn_dim:int|None=None):
         super().__init__()
         self.embed = nn.Linear(patch_size * n_channels, d_model)
-        self.speakers_embed = nn.Embedding(4, d_model)
+        # no self.speakers_embed: dataset.py never produces a 'speakers_encoded' batch key, so
+        # `speaker` below is always None -- a real speaker-conditioning embedding would need that
+        # wired up in dataset.py first.
         self.layers = nn.TransformerEncoder(nn.TransformerEncoderLayer(d_model=d_model, nhead=num_heads, dim_feedforward=ffn_dim or 4 * d_model, batch_first=True), num_layers=num_layers)
         self.cls_token = nn.Parameter(torch.zeros(1, 1, d_model))
         self.register_buffer("freqs_cis", precompute_freqs_cis(d_model, signal_length // patch_size))
@@ -330,7 +235,7 @@ class FreqEncoder(nn.Module):
         # drop entire freq patches by setting them to zero, don't actually remove them
         x, keep = dropout(x, (B_L, P), self.freq_dropout, self.training)        # (B_L,P,D)             -> (B_L,P,D), (B_L,P)
         x = apply_rope(x, self.freqs_cis)                                       # (B_L,P,D)             -> (B_L,P,D)
-        if speaker is not None: x += self.speakers_embed(speaker).unsqueeze(1)  # (B_L,P,D), (B_L,1,D)  -> (B_L,P,D)
+        assert speaker is None, "speaker conditioning has no embedding to apply it with (see __init__)"
         x = torch.cat((self.cls_token.expand(B_L, -1, -1), x), dim=1)           # (B_L,P,D)             -> (B_L,P+1,D)
         output = self.layers(x, src_key_padding_mask=pad_mask(keep, B_L))       # (B_L,P+1,D)           -> (B_L,P+1,D)
         return output[:, 0, :]  # (B_L,P+1,D) -> (B_L,D)
@@ -338,15 +243,18 @@ class FreqEncoder(nn.Module):
 #***** 5 model *****
 
 class VibrationTransformer(ComposerModel):
-    def __init__(self, d_model:int=128, pnt_num_heads:int=2, pnt_num_layers:int=2, seq_num_heads:int=2, seq_num_layers:int=2, data_info=None, decoder:str='mlp', decoder_num_heads:int=2, decoder_num_layers:int=2, freq_dropout:float=0.3, laser_dropout:float=0.3, loss_fn:str='mse', loss_alpha:float=0.5, count_loss_weight:float=0.0, ffn_dim:int|None=None):
+    def __init__(self, d_model:int=128, pnt_num_heads:int=2, pnt_num_layers:int=2, seq_num_heads:int=2, seq_num_layers:int=2, data_info=None, decoder:str='mlp', decoder_num_heads:int=2, decoder_num_layers:int=2, freq_dropout:float=0.3, laser_dropout:float=0.3, loss_fn:str='mse', loss_alpha:float=0.5, count_loss_weight:float=0.0, ffn_dim:int|None=None, enc_ffn_dim:int|None=None, dec_ffn_dim:int|None=None, mlp_dec_depth:int|None=None, mlp_dec_hidden:int|None=None, conv_dec_mult:float|None=None, conv_dec_res_blocks:int|None=None):
         super().__init__()
 
         # ffn_dim=None keeps the 4*d_model default. It is worth setting explicitly: torch's own
         # default is a FIXED 2048, so runs from before that was pinned to 4*d_model had a 2048-wide
         # FFN at any width -- 16x d_model at d_model=128, not 4x.
+        # encoder FFN dimension: enc_ffn_dim overrides ffn_dim; ffn_dim is the fallback
+        _enc_ffn_dim = enc_ffn_dim if enc_ffn_dim is not None else ffn_dim
+        _dec_ffn_dim = dec_ffn_dim if dec_ffn_dim is not None else ffn_dim
         # encoder
-        self.freq_encoder = FreqEncoder(data_info['patch_size'], d_model, pnt_num_heads, pnt_num_layers, data_info['n_freqs'], freq_dropout, n_channels=data_info.get('n_channels', 2), ffn_dim=ffn_dim)
-        self.laser_encoder = nn.TransformerEncoder(nn.TransformerEncoderLayer(d_model=d_model, nhead=seq_num_heads, dim_feedforward=ffn_dim or 4 * d_model, batch_first=True), num_layers=seq_num_layers)
+        self.freq_encoder = FreqEncoder(data_info['patch_size'], d_model, pnt_num_heads, pnt_num_layers, data_info['n_freqs'], freq_dropout, n_channels=data_info.get('n_channels', 2), ffn_dim=_enc_ffn_dim)
+        self.laser_encoder = nn.TransformerEncoder(nn.TransformerEncoderLayer(d_model=d_model, nhead=seq_num_heads, dim_feedforward=_enc_ffn_dim or 4 * d_model, batch_first=True), num_layers=seq_num_layers)
         self.laser_dropout = laser_dropout
 
         self.cls_token = nn.Parameter(torch.zeros(1, 1, d_model))
@@ -356,7 +264,7 @@ class VibrationTransformer(ComposerModel):
         # decoder
         out_c = data_info.get('out_c', 1)
         assert out_c == 1 or loss_fn in ('mse', 'ce-pixel'), f"{loss_fn} is mask-only; use mse or ce-pixel with an rgb target"
-        self.decoder = build_decoder(decoder, d_model, data_info['out_h'], data_info['out_w'], decoder_num_heads, decoder_num_layers, out_c, ffn_dim=ffn_dim)
+        self.decoder = build_decoder(decoder, d_model, data_info['out_h'], data_info['out_w'], decoder_num_heads, decoder_num_layers, out_c, ffn_dim=_dec_ffn_dim, mlp_dec_depth=mlp_dec_depth, mlp_dec_hidden=mlp_dec_hidden, conv_dec_mult=conv_dec_mult, conv_dec_res_blocks=conv_dec_res_blocks)
 
         # loss and metrics
         self.empty_head = nn.Linear(d_model, 1)  # extra "empty box" class for the spatial losses
@@ -400,16 +308,24 @@ class VibrationTransformer(ComposerModel):
         kw = dict(empty_logit=outputs['empty_logit']) if self.is_spatial_loss else {}
         if self.is_asym_loss: kw = dict(alpha=self.loss_alpha)
         total = self.loss_fn(outputs['mask_logits'], outputs['mask_pred'], batch['mask_true'], **kw)
+        # count_head and empty_head stay always-on free probes (count-acc metrics, viz dashboard,
+        # OutputSaver all read them regardless of loss_fn/count_loss_weight -- see their __init__
+        # comments), so when count_loss_weight==0 or the loss isn't spatial, add their output at
+        # weight 0: same total loss value, but keeps them in the backward graph so AdamW always
+        # has state for them and a checkpoint can strictly resume.
         if self.count_loss_weight:
             total = total + self.count_loss_weight * count_loss(outputs['count_logits'], batch['info']['n_objects'])
+        else:
+            total = total + 0 * outputs['count_logits'].sum()
+        if not self.is_spatial_loss:
+            total = total + 0 * outputs['empty_logit'].sum()
         return total
 
     def get_metrics(self, is_train=False):
         return self.train_metrics if is_train else self.val_metrics
 
     def update_metric(self, batch, outputs, metric):
-        if isinstance(metric, CountAccuracy): metric.update(outputs['count_logits'], batch['info']['n_objects'])
-        else: metric.update(outputs['mask_pred'], batch['mask_true'])
+        metric.update(outputs['mask_logits'], outputs['mask_pred'], batch['mask_true'], batch['info']['n_objects'])
 
     def eval_forward(self, batch, outputs=None):
         return outputs if outputs is not None else self.forward(batch)

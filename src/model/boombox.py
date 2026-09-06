@@ -17,7 +17,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from composer import ComposerModel
 
-from model.arch import LOSSES, count_loss, create_metrics, CountAccuracy, N_COUNT_CLASSES
+from model.arch import LOSSES, count_loss, create_metrics, N_COUNT_CLASSES
 
 def _drop(x, p, dim, training):
     """Zero whole slices along `dim` of (B,C,L,F), rescaling survivors so the mean is
@@ -32,6 +32,21 @@ def _drop(x, p, dim, training):
 def conv_block(c_in, c_out, kernel, stride, padding=0):
     return nn.Sequential(nn.Conv2d(c_in, c_out, kernel, stride=stride, padding=padding),
                          nn.BatchNorm2d(c_out), nn.LeakyReLU(0.2, inplace=True))
+
+def grid_stack(c_in, d_model, grid_shape):
+    """The paper's laser-grid head: two stride-2 convs, then one valid conv down to 1x1.
+
+    The final kernel is sized from the grid rather than fixed at 3, because a laser subset makes
+    the grid smaller than 10x10 -- an 8x5 selection reaches 2x2 here, where a 3x3 kernel does not
+    fit. At 10x10 this resolves to 3, i.e. exactly the original stack.
+    """
+    h, w = (-(-d // 4) for d in grid_shape)  # two stride-2, padding-1 convs: ceil(ceil(d/2)/2)
+    if min(h, w) < 1: raise ValueError(f"laser grid {grid_shape} is too small for the boombox grid stack")
+    return nn.Sequential(
+        conv_block(c_in, 512, 3, 2, 1),           # 10x10 -> 5x5
+        conv_block(512, 1024, 3, 2, 1),           # 5x5 -> 3x3
+        conv_block(1024, d_model, (h, w), 1, 0),  # 3x3 -> 1x1
+        )
 
 def freq_collapse(c, width, learned):
     """Collapse the surviving frequency width to 1. `learned` swaps the uniform mean for a
@@ -97,11 +112,7 @@ class Encoder(nn.Module):
         self.grid_shape = (n_laser_rows, n_laser_cols)
         self.freq_dropout, self.laser_dropout = freq_dropout, laser_dropout
         self.freq, c = freq_stack(n_channels, freq_width, freq_mult, freq_depth)
-        self.grid = nn.Sequential(
-            conv_block(c, 512, 3, 2, 1),         # 10x10 -> 5x5
-            conv_block(512, 1024, 3, 2, 1),      # 5x5 -> 3x3
-            conv_block(1024, d_model, 3, 1, 0),  # 3x3 -> 1x1
-            )
+        self.grid = grid_stack(c, d_model, self.grid_shape)
 
     def forward(self, x):
         x = _drop(x, self.laser_dropout, dim=2, training=self.training)  # whole lasers
@@ -159,11 +170,7 @@ class TwoStreamEncoder(nn.Module):
 
         # With no phase channels this degenerates to exactly the single-stream widths.
         c_fused = c_stream * (2 if self.n_phase > 0 else 1)
-        self.grid = nn.Sequential(
-            conv_block(c_fused, 512, 3, 2, 1),   # 10x10 -> 5x5
-            conv_block(512, 1024, 3, 2, 1),      # 5x5 -> 3x3
-            conv_block(1024, d_model, 3, 1, 0),  # 3x3 -> 1x1
-            )
+        self.grid = grid_stack(c_fused, d_model, self.grid_shape)
 
     def forward(self, x):
         x = _drop(x, self.laser_dropout, dim=2, training=self.training)  # whole lasers
@@ -188,6 +195,20 @@ class TwoBranchUp(nn.Module):
 
     def forward(self, x): return self.out(torch.cat([self.a(x), self.b(x)], dim=1))
 
+class ResBlock(nn.Module):
+    """Same-resolution refinement block: y = x + f(x), two 3x3 convs (stride 1, 'same'
+    padding) with a skip connection. Unlike TwoBranchUp (which always upsamples via
+    stride-2 transposed convs even at equal in/out channels), this adds depth to the
+    decoder WITHOUT changing spatial size -- the "residual blocks per scale" the
+    ladder script (scripts/pm_size_ladder.sh) asks for between upsampling stages."""
+    def __init__(self, c):
+        super().__init__()
+        self.net = nn.Sequential(nn.Conv2d(c, c, 3, padding=1), nn.BatchNorm2d(c), nn.ReLU(inplace=True),
+                                  nn.Conv2d(c, c, 3, padding=1), nn.BatchNorm2d(c))
+        self.relu = nn.ReLU(inplace=True)
+
+    def forward(self, x): return self.relu(x + self.net(x))
+
 class Decoder(nn.Module):
     """(B,D) -> (B,out_h,out_w), or (B,out_h,out_w,out_c) when out_c > 1. Seeds a 3x4
     grid and doubles it three times to 24x32.
@@ -201,24 +222,38 @@ class Decoder(nn.Module):
     """
     SEED = (3, 4)
 
-    def __init__(self, d_model, out_h, out_w, out_c=1, resize='conv'):
+    def __init__(self, d_model, out_h, out_w, out_c=1, resize='conv', mult:float=1.0, num_res_blocks:int|None=None):
         super().__init__()
         self.out_hw, self.out_c, self.resize = (out_h, out_w), out_c, resize
-        self.project = nn.Linear(d_model, 512 * self.SEED[0] * self.SEED[1])
-        self.up = nn.Sequential(TwoBranchUp(512, 256), TwoBranchUp(256, 128), TwoBranchUp(128, 64))
+        base = int(512 * mult)
+        self.base = base  # store for use in forward()
+        self.project = nn.Linear(d_model, base * self.SEED[0] * self.SEED[1])
+        # Default: 3 upsampling stages (512->256->128->64). num_res_blocks adds that many
+        # same-resolution ResBlocks after each TwoBranchUp -- refinement depth, not more
+        # upsampling (TwoBranchUp itself always doubles spatial size via stride-2 transposed
+        # convs, even at equal in/out channels, so it can't be reused for this).
+        widths = [base, base // 2, base // 4, base // 8]
+        up_layers = []
+        for i in range(len(widths) - 1):
+            up_layers.append(TwoBranchUp(widths[i], widths[i + 1]))
+            if num_res_blocks:
+                for _ in range(num_res_blocks):
+                    up_layers.append(ResBlock(widths[i + 1]))
+        self.up = nn.Sequential(*up_layers)
         up_h, up_w = self.SEED[0] * 8, self.SEED[1] * 8
+        head_in = widths[-1]  # final upsampling layer outputs this many channels
         if resize == 'conv':
             # valid-mode kernel k = margin + 1 collapses up_hw down to out_hw exactly
             k = (up_h - out_h + 1, up_w - out_w + 1)
             if k[0] < 1 or k[1] < 1:
                 raise ValueError(f"resize='conv' needs {up_h}x{up_w} >= {out_h}x{out_w}; use 'bilinear'")
-            first = nn.Conv2d(64, 32, k)
+            first = nn.Conv2d(head_in, 32, k)
         else:
-            first = nn.Conv2d(64, 32, 3, padding=1)
+            first = nn.Conv2d(head_in, 32, 3, padding=1)
         self.head = nn.Sequential(first, nn.ReLU(inplace=True), nn.Conv2d(32, out_c, 3, padding=1))
 
     def forward(self, emb):
-        x = self.up(self.project(emb).view(-1, 512, *self.SEED))
+        x = self.up(self.project(emb).view(-1, self.base, *self.SEED))
         if self.resize == 'bilinear':
             x = F.interpolate(x, size=self.out_hw, mode='bilinear', align_corners=False)
         x = self.head(x)                                     # (B,out_c,H,W)
@@ -230,7 +265,7 @@ class Decoder(nn.Module):
 class BoomboxModel(ComposerModel):
     """Same ComposerModel contract as VibrationTransformer, so callbacks, metrics
     and run.py work on it unchanged."""
-    def __init__(self, d_model=1024, data_info=None, fuse_speakers=False,
+    def __init__(self, d_model=512, data_info=None, fuse_speakers=False,
                  loss_fn='mse', loss_alpha=0.5, count_loss_weight=0.0,
                  freq_dropout=0.0, laser_dropout=0.0, encoder='single', fuse='concat',
                  trim_pad=False, learned_collapse=False, freq_mult=1, freq_depth=1,
@@ -298,8 +333,7 @@ class BoomboxModel(ComposerModel):
     def get_metrics(self, is_train=False): return self.train_metrics if is_train else self.val_metrics
 
     def update_metric(self, batch, outputs, metric):
-        if isinstance(metric, CountAccuracy): metric.update(outputs['count_logits'], batch['info']['n_objects'])
-        else: metric.update(outputs['mask_pred'], batch['mask_true'])
+        metric.update(outputs['mask_logits'], outputs['mask_pred'], batch['mask_true'], batch['info']['n_objects'])
 
     def eval_forward(self, batch, outputs=None):
         return outputs if outputs is not None else self.forward(batch)

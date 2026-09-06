@@ -34,8 +34,21 @@
     </div>
     <div id="legend"></div>
     <div class="checks">
-      <label class="check"><input type="checkbox" id="bg-toggle" checked><span>Background</span></label>
+      <label class="check"><input type="checkbox" id="bg-toggle" checked><span title="Show the overhead photo behind every mask (B). The slider below keeps its level, so switching it back on restores the same opacity.">Background (B)</span></label>
+      <label class="check"><input type="checkbox" id="com-toggle" checked><span title="Draw each object&#39;s centre of mass: an X on every target object, a circle on every predicted one, and a line joining the pairs the localization metric matched. The line&#39;s length IS that error. An X with no line is an object the run missed; a lone circle is a blob it invented.">Object COMs (C)</span></label>
       <label class="check"><input type="checkbox" id="rel-toggle"><span title="Off: one fixed [0,1] colour scale, so cells are comparable across samples and runs. On: each mask is scaled to its own min/max, which reveals structure in a faint prediction but makes colours meaningless between cells.">Color per sample</span></label>
+    </div>
+    <div class="opacities">
+      <label class="oprow" title="How strongly the overhead photo reads behind the masks. Independent of the Background switch: turning the backdrop off and on again comes back at this level.">
+        <span class="opk">Background</span>
+        <input id="bg-opacity" type="range" min="0" max="100" step="1" value="100">
+        <b class="opval">100%</b>
+      </label>
+      <label class="oprow" title="Opacity of the mask itself — the cube — over whatever is behind it.">
+        <span class="opk">Cube</span>
+        <input id="mask-opacity" type="range" min="0" max="100" step="1" value="100">
+        <b class="opval">100%</b>
+      </label>
     </div>
   </section>
 

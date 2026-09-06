@@ -271,11 +271,22 @@ def _pad_to(x, n_freqs: int):
     import torch.nn.functional as F_
     return F_.pad(x, (0, 0, 0, n_freqs - x.shape[-2])) if x.shape[-2] < n_freqs else x
 
-def torch_relative_laser(fft, weighted: bool):
-    """exp(i(theta_l - theta_ref)) against the magnitude-weighted mean phasor over lasers.
+def torch_relative_laser(fft, weighted: bool, ref: str = "mean"):
+    """exp(i(theta_l - theta_ref)) against a laser-pooled reference phasor.
     Cancels every term constant across lasers -- chirp phase, speaker transfer, trigger
-    jitter -- exactly, whatever its shape in f."""
-    z_ref = fft.sum(dim=1, keepdim=True)
+    jitter -- exactly, whatever its shape in f.
+
+    ref='mean'   magnitude-weighted mean phasor over lasers (the sum), lower variance.
+    ref='median' per-(f,c) componentwise median of Re/Im over lasers. Robust to a
+                 handful of outlier lasers -- one sitting on a node, one glitched --
+                 that drag the mean phasor but not the median.
+    """
+    import torch
+    if ref == "median":
+        z_ref = torch.complex(fft.real.median(dim=1, keepdim=True).values,
+                              fft.imag.median(dim=1, keepdim=True).values)
+    else:
+        z_ref = fft.sum(dim=1, keepdim=True)
     return _phasor_cos_sin(fft * z_ref.conj(), weight=fft.abs() if weighted else None)
 
 def torch_group_delay(fft, weighted: bool):
@@ -294,9 +305,12 @@ def _both(fft, weighted: bool):
     return torch.cat([torch_relative_laser(fft, weighted), torch_group_delay(fft, weighted)], dim=-1)
 
 # name -> (fn, weighted). 'none' is absent on purpose: it is the no-op, handled by phase=None.
+from functools import partial as _partial
 PHASE_ARMS = {
     'rel_laser':          (torch_relative_laser, False),
     'rel_laser_w':        (torch_relative_laser, True),
+    'rel_laser_med':      (_partial(torch_relative_laser, ref="median"), False),
+    'rel_laser_med_w':    (_partial(torch_relative_laser, ref="median"), True),
     'group_delay':        (torch_group_delay,    False),
     'group_delay_w':      (torch_group_delay,    True),
     'both':               (_both,                False),

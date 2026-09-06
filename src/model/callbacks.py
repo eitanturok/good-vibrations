@@ -8,8 +8,16 @@ from composer import Callback, Logger
 from composer.utils import format_name_with_dist
 from composer.loggers import WandBLogger
 
-from model.arch import com_distances, mses
 from model.attribution import capture_attention, ablate_lasers, ablate_freq_patches
+from utils.metrics import center_of_mass
+
+
+def mses(pred, true):
+    return (pred - true).square().flatten(1).mean(-1)
+
+def com_distances(pred, true, epsilon, normalize):
+    d = center_of_mass(pred, normalize=normalize, epsilon=epsilon) - center_of_mass(true, normalize=normalize, epsilon=epsilon)
+    return torch.linalg.norm(d, ord=2, dim=-1)
 
 
 MAX_WANDB_IMAGES = 108  # wandb.Image caps any single log_images call at this many items
@@ -38,11 +46,29 @@ class VisualizeSMask(Callback):
         fonts = (ImageFont.load_default(size=s) for s in range(max_size, min_size, -1))
         return next((f for f in fonts if f.getlength(text) <= max_width), ImageFont.load_default(size=min_size))
 
-    def _render(self, pred: np.ndarray, true: np.ndarray, caption: str, target_w: int = 640, sep: int = 4) -> np.ndarray:
-        """Two mask panels side by side under a caption, sized to ~target_w at any out_h/out_w."""
+    def _render(self, pred: np.ndarray, true: np.ndarray, caption: str, aspect: float | None = None,
+                target_w: int = 640, sep: int = 4) -> np.ndarray:
+        """Two mask panels side by side under a caption, sized to ~target_w at any out_h/out_w.
+
+        `aspect` is the BOX's width/height, and it is what un-squashes the grid. downsample_mask
+        forces every box into the same (out_h,out_w), so drawing that grid with square cells shows
+        it at the GRID's aspect (30/21 = 1.43) rather than the box's (gastronorm: 1.205) -- a 19%
+        horizontal stretch today, and a *different* wrong stretch per box once a run has two. Pass
+        None to keep the old square-cell behaviour; that is the fallback when info carries no box
+        geometry (an MDS dir built before the box_geometry.json sidecar existed).
+
+        The un-squash is a SHAPE change, not a resolution one: panels stay ~target_w. Rendering at
+        the box's native 1337x1110 would inflate all MAX_WANDB_IMAGES PNGs for no added information
+        -- a NEAREST upsample holds exactly what the grid plus this one float already holds. The
+        resize below is NEAREST in both axes, so the result stays piecewise constant either way.
+        """
         h, w = pred.shape[:2]  # (H,W) mask or (H,W,3) rgb; Image.fromarray handles both
-        scale = max(1, (target_w - sep) // (2 * w))
-        ph, pw = h * scale, w * scale
+        pw = max(1, (target_w - sep) // 2)
+        if aspect is None or not aspect > 0:
+            scale = max(1, (target_w - sep) // (2 * w))   # integer, isotropic: cells stay square
+            ph, pw = h * scale, w * scale
+        else:
+            ph = max(1, round(pw / aspect))
         canvas_w = pw * 2 + sep
 
         caption_font = self._fit_font(caption, canvas_w - 2 * sep, max_size=max(7, canvas_w // 24))
@@ -63,12 +89,18 @@ class VisualizeSMask(Callback):
         is_rgb = mask_pred.ndim == 4  # center of mass is an occupancy notion, so skip it on rgb targets
         com_dists = None if is_rgb else com_distances(mask_pred, mask_true, epsilon=1e-6, normalize=True).numpy()
         mse_vals = mses(mask_pred, mask_true).numpy()
-        captions = [f"pos {info['position_id'][i]}  spk {info['speaker'][i]} (smp {info['sample_id'][i]})  objs={info['n_objects'][i]}  "
+        captions = [f"{info['box'][i]}  pos {info['position_id'][i]}  spk {info['speaker'][i]} (smp {info['sample_id'][i]})  objs={info['n_objects'][i]}  "
                     f"mse={mse_vals[i]:.4f}"
                     + ("" if is_rgb else f"  com=({info['x_com'][i]:.1f},{info['y_com'][i]:.1f})  com_dist={com_dists[i]:.4f}")
                     + (f"  p(empty)={p_empty[i]:.3f}" if p_empty is not None else "")
                     for i in range(len(mask_pred))]
-        return [self._render(p, t, c) for p, t, c in zip(mask_pred.numpy(), mask_true.numpy(), captions)]
+        # box geometry rides along in info (dataset.py); 0 means the MDS dir predates the sidecar,
+        # in which case aspect=None and _render falls back to today's square cells.
+        bw, bh = info.get('box_w'), info.get('box_h')
+        aspects = [float(bw[i]) / float(bh[i]) if bw is not None and bh is not None
+                   and float(bh[i]) > 0 and float(bw[i]) > 0 else None for i in range(len(mask_pred))]
+        return [self._render(p, t, c, a)
+                for p, t, c, a in zip(mask_pred.numpy(), mask_true.numpy(), captions, aspects)]
 
     def visualize(self, state: State, logger: Logger, data_name: str):
         """Render the batch's first MAX_WANDB_IMAGES samples straight from in-memory state, so viz

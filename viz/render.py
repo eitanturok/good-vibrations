@@ -164,19 +164,55 @@ OVERLAY_GAIN = 0.85
 
 
 @lru_cache(maxsize=1)
-def scene_aspect() -> float:
-    """Width/height of the cropped frame the masks tile: the ONE number that defines the
-    display box, for every grid size and whether or not the photo is drawn.
+def aspect_by_box() -> dict:
+    """{box_name: width/height} of the cropped frame each box's masks tile.
 
-    Probes real samples rather than trusting a constant, and falls back to the primary
-    grid's own ratio only when no backdrop is on disk at all. Cached for the process
-    lifetime, like the backdrops it reads -- the sample set cannot change under a running
-    server.
+    Keyed on the BOX, not the sample: downsample_mask squashes every box into the same
+    (out_h,out_w), so the aspect a grid must be drawn at is a property of the enclosure and
+    is identical for every sample inside it. That also makes this one PNG header read per
+    box rather than per sample -- `Image.open().size` parses the header without decoding,
+    unlike _backdrop, which keeps whole frames in memory.
+
+    Cached for the process lifetime, like the backdrops it mirrors: the sample set cannot
+    change under a running server.
     """
     from viz.app import registry
-    # Rows, not sample ids: _backdrop takes a row, and its cache is keyed on one. Passing
-    # ids here read the wrong photos AND poisoned that shared cache with off-by-N entries,
-    # so a later legitimate row lookup got served someone else's scene.
+    out: dict = {}
+    for row in range(len(registry.gt)):
+        # Rows, not sample ids: sample_dir takes a row. Passing ids read the wrong photos
+        # on any dataset whose ids do not start at zero.
+        box = registry.gt.meta[row].get("box")
+        if box in out: continue
+        p = registry.sample_dir(row) / registry.gt.layout.backdrop
+        if not p.exists(): continue
+        with Image.open(p) as im:
+            w, h = im.size
+        out[box] = w / h
+    return out
+
+
+def row_aspect(row: int) -> float:
+    """Width/height of the frame THIS row's masks tile.
+
+    Per row rather than one global number, because a dataset holding two boxes has no
+    single answer: gastronorm is 1.204 and green-plastic 1.120, and drawing both at one
+    aspect slides every prediction off the features it refers to in at least one of them.
+    Falls back to the dataset-wide aspect when the row's box has no backdrop on disk.
+    """
+    from viz.app import registry
+    a = aspect_by_box().get(registry.gt.meta[row].get("box"))
+    return a if a is not None else scene_aspect()
+
+
+@lru_cache(maxsize=1)
+def scene_aspect() -> float:
+    """Dataset-wide FALLBACK aspect, for callers with no row in hand.
+
+    Correct only while the dataset holds one box; `row_aspect` is what layout should use.
+    Kept because canvas_size can be called with neither a backdrop nor an explicit aspect,
+    and /api/lut needs a value to seed the client before any sample has loaded.
+    """
+    from viz.app import registry
     for row in range(min(25, len(registry.gt))):
         im = _backdrop(row)
         if im is not None:

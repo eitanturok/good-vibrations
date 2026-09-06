@@ -121,6 +121,17 @@ def api_samples():
             # on empty-box samples means "no position"
             "avg_com": [_clean(com[0]), _clean(com[1])],
             "com_gt": [_clean(gt.com_gt[i][0]), _clean(gt.com_gt[i][1])],
+            # Width/height of the frame THIS sample's grid tiles. Per sample because the
+            # grid is a fixed (out_h,out_w) for every box, so the aspect it must be drawn
+            # at is the only thing that says which box it came from. /api/lut's `aspect`
+            # is a dataset-wide fallback and is wrong the moment two boxes are loaded.
+            "aspect": render.row_aspect(i),
+            # Target object centroids, normalized [0,1] cell centres, for the ground-truth
+            # column's crosshairs. The run columns carry their own (see /api/run "coms"),
+            # matched against the target at THEIR grid rather than this one.
+            "obj_com": [[round(float(r + 0.5) / gt.masks.shape[1], 4),
+                         round(float(c + 0.5) / gt.masks.shape[2], 4)]
+                        for r, c in (gt.obj_com[i] if i < len(gt.obj_com) else [])],
         })
     return {"samples": out}
 
@@ -141,10 +152,12 @@ def api_run(name: str, reload: int = 0, epoch: int | None = None):
     for i, sid in enumerate(rd.sample_ids):
         samples[int(sid)] = {
             "split": rd.splits[i],
-            "mse": _clean(rd.mse[i]),
-            "iou": _clean(rd.iou[i]),
-            "comdist": _clean(rd.comdist[i]),
             "com": [_clean(rd.com_pred[i][0]), _clean(rd.com_pred[i][1])],
+            # Crosshair geometry: matched prediction/target object centroids, plus the
+            # unmatched ones. Normalized [0,1] so the client draws it at any grid size.
+            # Same pairing localization scores with, so lines and numbers agree.
+            "coms": rd.com_pairs[i] if i < len(rd.com_pairs) else None,
+            **{k: _clean(rd.metrics[k][i]) for k in rd.metrics},
         }
     return {"name": rd.name, "epoch": rd.epoch, "family": rd.family,
             # The grid this run predicts at. The client sizes the column's canvas from it,
@@ -153,6 +166,8 @@ def api_run(name: str, reload: int = 0, epoch: int | None = None):
             # Why the column is empty, when it is. A run can classify compatible and still
             # score nothing, and an unexplained empty column looks like a bug in viz.
             "reason": rd.reason,
+            # Trainable parameter count from the newest checkpoint, for the column header.
+            "n_params": rd.n_params,
             "skipped_files": rd.skipped_files, "n": len(rd.sample_ids),
             "epochs": registry.epochs(name),   # drives the epoch slider
             "samples": samples}

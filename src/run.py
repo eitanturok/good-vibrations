@@ -75,8 +75,7 @@ def get_parser():
     parser.add_argument("--split",                      type=str,   default="gastronorm", help="Which split method from SPLIT_METHODS to use (e.g. 'exp22', 'exp23').")
     parser.add_argument("--num-workers",                type=int,   default=4)
     parser.add_argument("--test-size",                  type=float, default=0.2)
-    parser.add_argument("--n-laser-rows",               type=int,   default=10)
-    parser.add_argument("--n-laser-cols",               type=int,   default=10)
+    parser.add_argument("--laser-cols",                 type=str,   default=None, help="Comma-separated laser column ids to train on, e.g. '0,1,2,3,4'. Whole columns across every row, so the kept lasers stay a rectangle. Default None = all. The selection is applied where the fft is read off disk, so every normalization and reference statistic is computed over exactly these lasers -- which means each selection gets its own MDS build.")
     parser.add_argument("--patch-size",                 type=int,   default=32)
 
     # data normalization
@@ -90,11 +89,11 @@ def get_parser():
     parser.add_argument("--signal-mode",                type=str,   default="magnitude", choices=["magnitude", "log_magnitude", "complex", "mag_phase", "mag_trig_phase"])
     parser.add_argument("--normalize-mode",             type=str,   default="std", help="Per-sample: std, z, per_laser_z. Train-split statistics: per_bin_z. Append '+token-mean' for token-level normalization.")
     parser.add_argument("--augment-mask",               type=float, default=0.5, help="Probability a sample gets mask augmentation (blur+noise). 0 disables.")
-    parser.add_argument("--rgb",                        type=int,   default=0, choices=(0, 1), nargs="?", const=1, help="Predict the downsampled (out_h,out_w,3) overhead photo instead of the segmentation mask. Bare flag means 1. Forces --loss-fn mse/ce-pixel, disables --augment-mask, and drops the mask-only metrics (soft-iou, com-distance, ...). Not supported by --attribution or the viz/ dashboard.")
+    parser.add_argument("--rgb",                        type=int,   default=0, choices=(0, 1), nargs="?", const=1, help="Predict the downsampled (out_h,out_w,3) overhead photo instead of the segmentation mask. Bare flag means 1. Forces --loss-fn mse/ce-pixel, disables --augment-mask, and drops the mask-only metrics (iou, localization, contour, mass, ...). Not supported by --attribution or the viz/ dashboard.")
     parser.add_argument("--augment-fft",                type=float, default=0, help="Probability a sample gets FFT frequency-gain augmentation. 0 disables.")
     parser.add_argument("--subtract-speaker-mean",      type=int,   default=0, choices=(0, 1), nargs="?", const=1, help="Subtract each speaker's offline mean spectrum (computed over train samples only) after the magnitude and before normalization. Bare flag means 1. Requires --signal-mode magnitude or log_magnitude.")
     parser.add_argument("--mag-recipe",                 type=str,   default=None, help="One of the 14 magnitude arms in normalizations MAG_RECIPES")
-    parser.add_argument("--phase-arm",                  type=str,   default=None, help="Concatenate phase channels onto the magnitude block. One of normalizations PHASE_ARMS: rel_laser[_w], group_delay[_w], both[_w], raw_phase. Orthogonal to --signal-mode: phase is read off the complex fft directly. Doubles/quadruples n_channels, which the model picks up automatically.")
+    parser.add_argument("--phase-arm",                  type=str,   default=None, help="Concatenate phase channels onto the magnitude block. One of normalizations PHASE_ARMS: rel_laser[_w], rel_laser_med[_w] (median laser reference instead of mean), group_delay[_w], both[_w], raw_phase. Orthogonal to --signal-mode: phase is read off the complex fft directly. Doubles/quadruples n_channels, which the model picks up automatically.")
     parser.add_argument("--phase-weight",               type=float, default=1.0, help="Scale on the phase block relative to the std-normalized magnitude block. Only meaningful with --phase-arm.")
     parser.add_argument("--subtract-empty-box",         type=int,   default=0, choices=(0, 1), nargs="?", const=1, help="Subtract each speaker's mean empty-box spectrum, i.e. divide out the box's own transfer function. Requires --signal-mode log_magnitude, where subtracting a log reference IS dividing by it (safe at anti-resonances, unlike linear division). Combines with --subtract-speaker-mean: the empty-box reference is applied first and the speaker mean is then computed on referenced signal. Bare flag means 1.")
     parser.add_argument("--force-rebuild-data",         type=int,   default=0, choices=(0, 1), nargs="?", const=1, help="Discard the cached MDS and rebuild it, re-running mask downsampling and fft precomputation. Bare flag means 1. Needed when the preprocessing code changes, since the cache key only covers the config, not the code.")
@@ -113,6 +112,12 @@ def get_parser():
     parser.add_argument("--decoder-num-heads",          type=int,   default=2)
     parser.add_argument("--decoder-num-layers",         type=int,   default=2)
     parser.add_argument("--ffn-dim",                    type=int,   default=None, help="Width of every transformer FFN (freq encoder, laser encoder, attn decoder). Default None = 4*d_model. Torch's own default is a fixed 2048, so pre-2026-08 runs had a 2048-wide FFN regardless of d_model; pass 2048 to reproduce them. No effect on --model boombox.")
+    parser.add_argument("--enc-ffn-dim",                type=int,   default=None, help="FFN width for freq + laser encoders (overrides --ffn-dim for encoders only).")
+    parser.add_argument("--dec-ffn-dim",                type=int,   default=None, help="FFN width for the attn decoder (overrides --ffn-dim for decoder only).")
+    parser.add_argument("--mlp-dec-depth",              type=int,   default=None, help="Number of Linear layers in MLPDecoder (default: 2 for 2-layer MLP).")
+    parser.add_argument("--mlp-dec-hidden",             type=int,   default=None, help="Hidden width of MLPDecoder (default: 256).")
+    parser.add_argument("--conv-dec-mult",              type=float, default=None, help="Base-channel multiplier for boombox Decoder (base channels = 512*mult).")
+    parser.add_argument("--conv-dec-res-blocks",        type=int,   default=None, help="Residual blocks per TwoBranchUp scale in boombox Decoder.")
     parser.add_argument("--pnt-num-heads",              type=int,   default=2)
     parser.add_argument("--seq-num-heads",              type=int,   default=2)
     parser.add_argument("--pnt-num-layers",             type=int,   default=2)
@@ -134,6 +139,7 @@ def get_parser():
 
     # train
     parser.add_argument("--batch-size",                 type=int,   default=128)
+    parser.add_argument("--device-train-microbatch-size", type=str, default="auto", help="Per-device microbatch size for training. 'auto' (default) lets composer probe for the largest microbatch that fits in memory and grad-accumulate up to --batch-size, retrying on OOM instead of crashing the run. Pass an int to pin it (disables auto-retry).")
     parser.add_argument("--lr",                         type=float, default=1e-4)
     parser.add_argument("--weight-decay",               type=float, default=1e-2)
     parser.add_argument("--scheduler",                  type=str,   default="cosine-warmup", choices=tuple(SCHEDULERS), help="LR schedule. 'constant' reproduces the old no-scheduler behavior.")
@@ -228,26 +234,36 @@ def run(**kwargs):
     if args.compile and args.verbose >= 2: torch._logging.set_logs(dynamo=logging.INFO)
 
     # dataset
+    laser_cols = [int(c) for c in args.laser_cols.split(",") if c.strip()] if args.laser_cols else None
     train_loader, eval_loaders, train_eval_loader = build_dataset(
         args.data_dir, batch_size=args.batch_size, eval_batch_size=args.eval_batch_size, num_workers=args.num_workers,
         split=args.split, test_size=args.test_size, speakers=args.speakers, n_objects=args.n_objects, box=args.box, n_samples=args.n_samples,
         out_h=args.out_h, out_w=args.out_w, rgb=bool(args.rgb), signal_mode=args.signal_mode, normalize_mode=args.normalize_mode, patch_size=args.patch_size, seed=args.seed,
         augment_fft=args.augment_fft, augment_mask=args.augment_mask, subtract_speaker_mean=bool(args.subtract_speaker_mean), subtract_empty_box=bool(args.subtract_empty_box), mag_recipe=args.mag_recipe, phase_arm=args.phase_arm, phase_weight=args.phase_weight,
-        force_rebuild_data=bool(args.force_rebuild_data), n_classes=N_COUNT_CLASSES, pair_speakers_mode=bool(args.pair_speakers))
+        force_rebuild_data=bool(args.force_rebuild_data), n_classes=N_COUNT_CLASSES, pair_speakers_mode=bool(args.pair_speakers),
+        laser_cols=laser_cols)
     boundary_loaders = eval_loaders + [Evaluator(label='train', dataloader=train_eval_loader)]
     ensure_viz(args.data_dir, port=args.viz_port, enabled=not args.no_viz)
 
     # read n_freqs, n_channels from the dataset
-    _, n_patches, patch_size, n_channels = train_loader.dataloader.dataset[0]['fft'].shape  # (L,P,PS,C)
+    n_lasers, n_patches, patch_size, n_channels = train_loader.dataloader.dataset[0]['fft'].shape  # (L,P,PS,C)
     # tokenize() zero-pads the frequency axis, so n_patches * patch_size is the padded length
     base = train_loader.dataloader.dataset.dataset  # Subset -> (PairedSpeakerDataset ->) VibrationDataset
-    n_freqs_real = len(getattr(base, "dataset", base).pk["freqs"])
-    data_info = dict(out_h=args.out_h, out_w=args.out_w, out_c=3 if args.rgb else 1, n_laser_rows=args.n_laser_rows, n_laser_cols=args.n_laser_cols, patch_size=args.patch_size, n_freqs=n_patches * patch_size, n_freqs_real=n_freqs_real, n_channels=n_channels)
+    base = getattr(base, "dataset", base)
+    n_freqs_real = len(base.pk["freqs"])
+    # the grid the model builds must match the tensor it is fed, so take it from the dataset, which
+    # recorded it after the laser selection was applied
+    n_laser_rows, n_laser_cols = base.grid_shape
+    assert n_laser_rows * n_laser_cols == n_lasers, f"grid {base.grid_shape} != {n_lasers} lasers"
+    data_info = dict(out_h=args.out_h, out_w=args.out_w, out_c=3 if args.rgb else 1, n_laser_rows=n_laser_rows, n_laser_cols=n_laser_cols, patch_size=args.patch_size, n_freqs=n_patches * patch_size, n_freqs_real=n_freqs_real, n_channels=n_channels)
+    print(f"laser grid: {n_laser_rows} rows x {n_laser_cols} cols = {n_lasers} lasers")
     print(f"{n_freqs_real} freq bins -> {n_patches} patches of {patch_size} = {n_patches * patch_size} ({n_patches * patch_size - n_freqs_real} padded)")
     if args.model == "boombox":
         model = BoomboxModel(args.d_model, data_info, loss_fn=args.loss_fn, loss_alpha=args.loss_alpha, count_loss_weight=args.count_loss_weight, freq_dropout=args.freq_dropout, laser_dropout=args.laser_dropout, encoder=args.encoder, fuse=args.fuse, trim_pad=args.trim_pad, learned_collapse=args.learned_collapse, freq_mult=args.freq_mult, freq_depth=args.freq_depth, resize=args.resize)
     else:
-        model = VibrationTransformer(args.d_model, args.pnt_num_heads, args.pnt_num_layers, args.seq_num_heads, args.seq_num_layers, data_info, args.decoder, args.decoder_num_heads, args.decoder_num_layers, freq_dropout=args.freq_dropout, laser_dropout=args.laser_dropout, loss_fn=args.loss_fn, loss_alpha=args.loss_alpha, count_loss_weight=args.count_loss_weight, ffn_dim=args.ffn_dim)
+        enc_ffn_dim = args.enc_ffn_dim if args.enc_ffn_dim is not None else args.ffn_dim
+        dec_ffn_dim = args.dec_ffn_dim if args.dec_ffn_dim is not None else args.ffn_dim
+        model = VibrationTransformer(args.d_model, args.pnt_num_heads, args.pnt_num_layers, args.seq_num_heads, args.seq_num_layers, data_info, args.decoder, args.decoder_num_heads, args.decoder_num_layers, freq_dropout=args.freq_dropout, laser_dropout=args.laser_dropout, loss_fn=args.loss_fn, loss_alpha=args.loss_alpha, count_loss_weight=args.count_loss_weight, enc_ffn_dim=enc_ffn_dim, dec_ffn_dim=dec_ffn_dim, mlp_dec_depth=args.mlp_dec_depth, mlp_dec_hidden=args.mlp_dec_hidden, conv_dec_mult=args.conv_dec_mult, conv_dec_res_blocks=args.conv_dec_res_blocks)
     load_path = str(args.checkpoint_path) if args.checkpoint_path else None
 
     # logger
@@ -270,7 +286,7 @@ def run(**kwargs):
 
     # callbacks
     callbacks = [VisualizeSMask(args.viz_interval), NaNMonitor(), LRMonitor(), SystemMetricsMonitor(), SpeedMonitor(1),
-                 OOMObserver(folder=f"runs/{{run_name}}/torch_traces", remote_file_name=None), RuntimeEstimator(skip_batches=64, time_unit="minutes"),
+                 OOMObserver(folder=f"runs/{{run_name}}/torch_traces", remote_file_name=None, overwrite=True), RuntimeEstimator(skip_batches=64, time_unit="minutes"),
                 OptimizerMonitor(log_optimizer_metrics=True, batch_log_interval=10)]
     if args.output_keys: callbacks.append(OutputSaver(args.eval_interval, f"runs/{{run_name}}/outputs_history", overwrite=True, output_keys=args.output_keys))
     if args.attribution: callbacks.append(AttributionSaver(args.eval_interval, f"runs/{{run_name}}/attribution", overwrite=True, ablate=bool(args.attribution_ablate)))
@@ -280,10 +296,15 @@ def run(**kwargs):
     schedulers = build_scheduler(args.scheduler, args.t_warmup) if not args.eval_only else None
 
     # trainer
+    # device_train_microbatch_size: "auto" lets composer probe the largest microbatch that fits and
+    # grad-accumulate up to --batch-size, halving and retrying on OOM instead of crashing the run.
+    device_train_microbatch_size = args.device_train_microbatch_size
+    if device_train_microbatch_size != "auto": device_train_microbatch_size = int(device_train_microbatch_size)
     trainer = Trainer(run_name=args.run_name, model=model, optimizers=optimizer, train_dataloader=train_loader, auto_log_hparams=False,
                     eval_dataloader=eval_loaders, max_duration=args.max_duration if not args.eval_only else None, seed=args.seed, eval_interval=args.eval_interval,
                     device=device, precision=args.precision if device == 'gpu' else 'fp32', save_metrics=True, log_to_console=True, progress_bar=False, load_path=load_path,
                     autoresume=True if not args.eval_only and args.run_name else None, save_folder=f"runs/{{run_name}}/checkpoints" if not args.eval_only else None, save_interval=args.checkpoint_interval,
+                    device_train_microbatch_size=device_train_microbatch_size,
                     schedulers=schedulers, loggers=loggers, callbacks=callbacks, profiler=profiler,
                     compile_config={"mode": args.compile_mode} if args.compile else None)
 

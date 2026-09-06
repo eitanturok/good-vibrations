@@ -5,6 +5,9 @@
   --surface-0: #f5f5f3;
   --surface-1: #fcfcfb;
   --surface-2: #eeeeeb;
+  /* Same colour as --surface-2, as components: the backdrop veil needs a variable alpha,
+     which a hex literal cannot carry. Keep the two in step. */
+  --surface-2-rgb: 238, 238, 235;
   --line:      #e0e0dc;
   --line-firm: #c9c9c3;
   --ink:       #1a1a19;
@@ -17,13 +20,16 @@
   --warn:      #8a6d1f;
   --warn-sf:   #fbf3dc;
 
-  /* Fixed row height drives the virtualizer. Budget: 8 padding + 26 two-line title
-     + 4 gap + 110 mask + 4 gap + 57 three-line chips + 8 padding = 217, plus slack.
+  /* Fixed row height drives the virtualizer. Budget: 8 padding + 26 two-line title + 4
+     gap + 110 mask + 4 gap + 15 frame line (split/epoch/com) + ~57 three metric lines
+     + 8 padding = 232, plus a few px slack. Sized to exactly this content -- there is no
+     spare band at the bottom of a cell.
      The title is two 13px lines: the run name, then the sample identity. A long run name
      shrinks its font to fit rather than taking a second line (see .ctitle .t1.run).
-     The run column needs three chip lines below the mask -- split + epoch, then com,
-     then the three metrics; the ground-truth column uses one and has headroom. */
-  --row-h: 225px;
+     The metrics (~10 of them) wrap to three short lines at a reduced font (see
+     .subtags .tag). The ground-truth column uses one line below its mask and has
+     headroom to spare. */
+  --row-h: 226px;
   /* --mask-w is overwritten at boot from the scene's aspect (see app.js boot): the cell
      box tracks the photo, not the mask grid. This literal is the 20x40 fallback used
      until /api/lut answers. The column widths derive from it so they never clip a wider
@@ -37,6 +43,15 @@
   --idx-w: 52px;
   --gt-w: max(200px, calc(var(--mask-w) + 20px));
 
+  /* Set from the sidebar sliders. --bg-op fades the backdrop by veiling it with the cell
+     colour (see setBackdrop in app.js); --mask-op scales the mask alone. --gt-gain is the
+     server's OVERLAY_GAIN, written at boot, so the browser-composited ground-truth image
+     sits at the same strength over a photo as the canvases beside it. */
+  --bg-op: 1;
+  --mask-op: 1;
+  --gt-gain: 1;
+  --bd-veil: rgba(var(--surface-2-rgb), calc(1 - var(--bg-op)));
+
   --r: 6px;
   --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
   --sans: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
@@ -47,6 +62,7 @@
     --surface-0: #141413;
     --surface-1: #1a1a19;
     --surface-2: #242422;
+    --surface-2-rgb: 36, 36, 34;
     --line:      #33332f;
     --line-firm: #4a4a45;
     --ink:       #f0efec;
@@ -217,12 +233,21 @@ body.nosidebar #sidebar {
    size, so a 16x16 and a 30x30 column already align over the same backdrop. `pixelated`
    because the cell grid is real -- the hover tooltip reads one value per cell. */
 canvas.mask { image-rendering: pixelated; }
-canvas.mask.bg { background-size: 100% 100%; background-repeat: no-repeat; background-color: var(--surface-2); }
+/* Not canvas-only: the ground-truth cell is an <img> over the same CSS backdrop. */
+.mask.bg { background-size: 100% 100%; background-repeat: no-repeat; background-color: var(--surface-2); }
 
 /* Both toggles on one line. Wraps rather than overflowing when the sidebar is narrow. */
 .checks { display: flex; flex-wrap: wrap; column-gap: 14px; row-gap: 6px; margin-top: 10px; }
 .check { display: flex; align-items: center; gap: 7px; font-size: 11.5px; cursor: pointer; }
 .check input { accent-color: var(--accent); }
+
+/* Opacity sliders sit under the toggles they qualify: label, track, then the value, with
+   the numbers tabular so the row does not twitch while dragging. */
+.opacities { margin-top: 9px; display: flex; flex-direction: column; gap: 5px; }
+.oprow { display: flex; align-items: center; gap: 8px; font-size: 11.5px; color: var(--ink-2); cursor: pointer; }
+.oprow .opk { flex: none; width: 66px; }
+.oprow input[type="range"] { flex: 1; accent-color: var(--accent); min-width: 0; }
+.oprow .opval { flex: none; width: 32px; text-align: right; font-family: var(--mono); font-size: 10px; color: var(--ink-3); font-variant-numeric: tabular-nums; }
 
 #legend { margin-top: 9px; }
 #legend img { width: 100%; height: 12px; display: block; border-radius: 2px; image-rendering: auto; }
@@ -363,7 +388,7 @@ body.stacked .row { height: calc(var(--row-h) + 114px); }
 .truthmask { margin-top: 4px; }
 /* The run cells put the target in their LOWER box, so the ground-truth column drops by
    exactly one box + gap to sit on the same line rather than floating above it. */
-body.stacked .gtimg { margin-top: 114px; }
+body.stacked .gtwrap { margin-top: 114px; }
 /* Rows are absolutely positioned and the virtualizer RECYCLES their nodes, so DOM order
    does not track visual order -- without this the row that happens to come later in the
    pool paints over the hovered row's mask outline, which reads as the cell below
@@ -374,7 +399,11 @@ body.stacked .gtimg { margin-top: 114px; }
 .cell { flex: none; padding: 8px 10px; border-right: 1px solid var(--line); }
 .cell.idx { width: var(--idx-w); }
 .cell.gt  { width: var(--gt-w); }
-.cell.run { width: var(--col-w); }
+/* Clip at the cell edge so a row whose metrics wrap one line further than budgeted can
+   never paint down into the row below -- the row height is fixed for the virtualizer, so
+   there is no growing to accommodate it. --row-h carries enough slack that this only ever
+   bites a genuine overflow. */
+.cell.run { width: var(--col-w); overflow: hidden; }
 
 /* first two columns stay put when scrolling horizontally across many runs */
 .sticky-1 { position: sticky; left: 0; z-index: 20; background: var(--surface-1); }
@@ -410,7 +439,7 @@ body.stacked .gtimg { margin-top: 114px; }
    are one, two or three lines tall (.hname wraps). Without it the chips would step up and
    down across the row and the header would read as ragged. */
 .hchips {
-  display: flex; align-items: center; gap: 5px;
+  display: flex; align-items: center; flex-wrap: wrap; gap: 4px 5px;
   margin-top: auto; padding-top: 3px; overflow: hidden;
 }
 /* Takes the whole line except the grip and close button. Run names differ at the END
@@ -556,6 +585,18 @@ body.dragging-col .hgrip { cursor: grabbing; }
   border-color: var(--accent); background: var(--accent-sf);
 }
 .epchip.scrub b, .epchip.scrub .k { color: var(--accent); }
+
+/* Model size, on the header chip line after the epoch and status. Quieter than either --
+   no fill, no border -- because it is a fixed fact about the run, not state: it sits
+   beside them as plain mono text so it reads as a caption, not a third badge competing
+   for attention. */
+.hchips .pchip {
+  flex: none; white-space: nowrap;
+  font-family: var(--mono); font-size: 9.5px;
+  color: var(--ink-2); font-variant-numeric: tabular-nums;
+}
+.hchips .pchip .k { color: var(--ink-3); }
+
 /* In "x/y ep" only y is a control: clicking it pins every column to this run's endpoint. */
 .epchip b.goep { cursor: pointer; text-decoration: underline dotted; text-underline-offset: 2px; }
 .epchip b.goep:hover { color: var(--accent); }
@@ -575,8 +616,13 @@ body.dragging-col .hgrip { cursor: grabbing; }
 }
 
 /* mask images */
+/* --row-mask-w is set per row by paintRow from that sample's BOX aspect; --mask-w (the
+   widest box loaded) is the column box it sits in, and the fallback for a row with no
+   aspect. LEFT-aligned inside that box, not centred: every mask then starts on the same
+   vertical edge, so a narrower box reads as narrower rather than as shifted. */
 .mask {
-  width: var(--mask-w); height: var(--mask-h); display: block; border-radius: 3px;
+  width: var(--row-mask-w, var(--mask-w)); height: var(--mask-h);
+  display: block; border-radius: 3px;
   image-rendering: pixelated;                 /* keep mask grid cells crisp */
   background: var(--surface-2);
 }
@@ -585,10 +631,23 @@ body.dragging-col .hgrip { cursor: grabbing; }
    line up across the row and can be compared directly. Uses the same variables as .mask
    rather than repeating the numbers -- --mask-w is set from the scene aspect at boot, and
    a literal here would silently desync the GT column from every prediction beside it. */
-.gtimg { width: var(--mask-w); height: var(--mask-h); }
+/* position:relative so .gtcoms can sit exactly over the GT image. */
+.gtwrap { overflow: hidden; position: relative; }
+/* Target-object marks over the server-rendered GT PNG. Not part of .gtimg, so the cube
+   opacity slider fades the mask without fading the annotation on top of it. */
+.gtcoms { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
+/* The mask fills its wrapper, which owns the size and the backdrop. Its own opacity is
+   the cube slider -- applied here rather than to .gtwrap, whose backdrop must stay put.
+   Over a photo it also carries the server's overlay gain, matching the canvas cells. */
+.gtimg {
+  width: 100%; height: 100%; display: block; border-radius: 3px;
+  image-rendering: pixelated;
+  opacity: var(--mask-op);
+}
+.gtwrap.bg .gtimg { opacity: calc(var(--mask-op) * var(--gt-gain)); }
 
 .gtcell { cursor: pointer; }
-.gtcell:hover .gtimg { outline: 2px solid var(--accent); outline-offset: 1px; }
+.gtcell:hover .gtwrap { outline: 2px solid var(--accent); outline-offset: 1px; }
 
 /* ***** collapsing the ground-truth column *****
    The toggle lives in the index column's otherwise-empty header cell, so it stays put and
@@ -675,8 +734,6 @@ body.nogt .cell.gt > *, body.nogt .hcell.gt > * { display: none; }
    and a chip floating at the far edge reads as belonging to the next column over. */
 .subtags .epchip { height: 15px; line-height: 13px; font-size: 9px; padding: 0 6px; }
 .subtags .gsz { font-weight: 400; color: var(--ink-3); }
-/* Split and epoch own the first line, above the com chip. */
-.subtags .epchip + .brk, .subtags .gsz + .brk { flex-basis: 100%; height: 0; }
 
 /* One chip style for every field in the grid -- metrics, COM, layout -- so the columns
    read as one system. */
@@ -693,24 +750,30 @@ body.nogt .cell.gt > *, body.nogt .hcell.gt > * { display: none; }
   font-variant-numeric: tabular-nums; white-space: nowrap;
 }
 .tag.strong { font-family: var(--mono); font-weight: 600; color: var(--ink); }
-/* Prediction chips, three lines: split + epoch, then com, then mse/iou/com-dist. The
-   metrics are what gets scanned down the column, so they get a line to themselves at a
-   readable size; the frame line above them says what that reading is OF. */
-.subtags { gap: 3px; }
-/* Split and epoch hug their text like every other chip -- neither stretches to the column
-   edge, so the whole footer stays a single left-aligned stack. */
-.subtags .spchip, .subtags .epchip { flex: none; }
-/* The com chip owns its own line but must still hug its text. A flex item cannot do both,
-   so the LINE BREAK comes from a zero-height spacer after it and the chip itself stays
-   auto-width. */
-.subtags .com { flex: none; }
+/* Prediction chips, in reading order: one frame line -- split, epoch, com -- then the
+   ~10 metrics wrapped across three short lines below it. The frame line above them says
+   what that reading is OF. The metric chips are a notch smaller than the frame chips
+   (see .subtags .tag) so those three lines clear the fixed row height with nothing to
+   spare -- the row is sized to exactly this, no more. */
+.subtags { gap: 2px 3px; }
+/* Split, epoch and com hug their text like every other chip -- none stretches to the
+   column edge, so the frame line stays a single left-aligned run. */
+.subtags .spchip, .subtags .epchip, .subtags .com { flex: none; }
+/* com closes the frame line and forces the wrap to the metrics: a flex item cannot both
+   hug its text and break the line, so the break is a zero-height spacer after it. Kept at
+   the frame chips' size, not pulled down to the smaller metric size by .subtags .tag. */
+.subtags .com { font-size: 9px; padding: 1px 4px; }
 .subtags .com + .brk { flex-basis: 100%; height: 0; }
-.subtags .tag { font-family: var(--mono); padding: 1px 4px; }
+/* The metric chips run ~10 wide and wrap to three lines; a smaller face and tighter
+   padding keep those lines inside the fixed row height and fit more per line. */
+.subtags .tag { font-family: var(--mono); font-size: 8.5px; padding: 1px 3px; line-height: 13px; }
 .subtags .k { color: var(--ink-3); }
 .subtags b { font-weight: 600; color: var(--ink); }
 
+/* Letterboxes with the mask it stands in for: a placeholder at full column width beside a
+   narrower box would read as a prediction of a different shape. */
 .nopred {
-  width: var(--mask-w); height: var(--mask-h);
+  width: var(--row-mask-w, var(--mask-w)); height: var(--mask-h);
   border: 1px dashed var(--line-firm); border-radius: 3px;
   display: flex; align-items: center; justify-content: center;
   font-size: 10.5px; color: var(--ink-3);
@@ -833,11 +896,18 @@ body.nogt .cell.gt > *, body.nogt .hcell.gt > * { display: none; }
 /* Prediction, target and their difference at the top of the modal -- the same three
    views the table offers, so the offset can be seen and not just read as a number. */
 .nbviews { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-bottom: 14px; }
-.nbviews figure { margin: 0; }
+.nbviews figure { margin: 0; position: relative; }
+/* Object-COM marks over the server-rendered panel PNG. Absolute so it does not affect the
+   figure's layout, and pointer-events:none so it never eats a click meant for the image.
+   Position and size are set in JS from the IMG's own box -- `inset: 0` would stretch it
+   over the figcaption too, sliding every mark upward by half a caption. */
+.nbcoms { position: absolute; pointer-events: none; }
 /* Same aspect as the table's cells: --mask-w/--mask-h are set at boot from the scene, so
-   a hardcoded ratio here stretched the modal's panels (1.20 scene shown at 2:1). */
+   a hardcoded ratio here stretched the modal's panels (1.20 scene shown at 2:1). The modal
+   shows ONE sample, so openNeighbors sets --row-mask-w on .nbviews to that sample's own
+   box rather than the widest one loaded. */
 .nbviews img {
-  width: 100%; aspect-ratio: var(--mask-w) / var(--mask-h); display: block;
+  width: 100%; aspect-ratio: var(--row-mask-w, var(--mask-w)) / var(--mask-h); display: block;
   border-radius: 4px; image-rendering: pixelated; background: var(--surface-2);
 }
 .nbviews figcaption {
