@@ -62,6 +62,8 @@ SCHEDULERS = {
     }
 def build_scheduler(scheduler: str, t_warmup: str): return SCHEDULERS[scheduler](t_warmup)
 
+def microbatch(v: str) -> str | int: return v if v == "auto" else int(v)  # "auto" stays a string, an int pins it
+
 
 def get_parser():
     parser = argparse.ArgumentParser()
@@ -124,8 +126,8 @@ def get_parser():
     parser.add_argument("--seq-num-layers",             type=int,   default=2)
     parser.add_argument("--freq-dropout",               type=float, default=0.0)
     parser.add_argument("--laser-dropout",              type=float, default=0.0)
-    parser.add_argument("--out-h",                      type=int,   default=21)
-    parser.add_argument("--out-w",                      type=int,   default=30)
+    parser.add_argument("--out-h",                      type=int,   default=32, help="Output mask grid height. Standardized to 32 so every box trains/evaluates on the same grid and metrics are cross-box comparable; renderers (wandb VisualizeSMask, viz/) redraw at the box's true aspect from box_geometry.json. Pass 21 to reproduce pre-standardization gastronorm runs.")
+    parser.add_argument("--out-w",                      type=int,   default=32, help="Output mask grid width. See --out-h.")
 
     # train faster
     parser.add_argument("--precision",                  type=str,   default="amp_bf16", choices=["fp32", "amp_fp16", "amp_bf16"], help="bf16 matches fp16's tensor-core throughput on Blackwell but keeps fp32's exponent range, so no loss scaling and no underflow on wide-dynamic-range FFT magnitudes.")
@@ -149,6 +151,7 @@ def get_parser():
     # eval
     parser.add_argument("--eval-only",                  type=int,   default=0, choices=(0, 1), help="Skip training, just eval a loaded checkpoint (requires --checkpoint-path).")
     parser.add_argument("--eval-batch-size",            type=int,   default=108) # wandb caps images logged in a single call to 108, so eval batch size should be <= 108 to log all images
+    parser.add_argument("--device-eval-microbatch-size", type=str,  default="auto", help="Per-device microbatch size for eval. 'auto' (default) lets composer probe for the largest microbatch that fits and split the eval batch down to it, retrying on OOM instead of crashing the run. Pass an int to pin it (disables auto-retry).")
     parser.add_argument("--eval-interval",              type=str,   default="50ep")
     parser.add_argument("--viz-interval",               type=str,   default="50ep", help="How often VisualizeSMask logs predicted-vs-true mask images to wandb.")
     parser.add_argument("--eval-before-train",          type=int,   default=1, choices=(0, 1), help="Run the boundary eval pass before training starts.")
@@ -241,8 +244,9 @@ def run(**kwargs):
         out_h=args.out_h, out_w=args.out_w, rgb=bool(args.rgb), signal_mode=args.signal_mode, normalize_mode=args.normalize_mode, patch_size=args.patch_size, seed=args.seed,
         augment_fft=args.augment_fft, augment_mask=args.augment_mask, subtract_speaker_mean=bool(args.subtract_speaker_mean), subtract_empty_box=bool(args.subtract_empty_box), mag_recipe=args.mag_recipe, phase_arm=args.phase_arm, phase_weight=args.phase_weight,
         force_rebuild_data=bool(args.force_rebuild_data), n_classes=N_COUNT_CLASSES, pair_speakers_mode=bool(args.pair_speakers),
-        laser_cols=laser_cols)
-    boundary_loaders = eval_loaders + [Evaluator(label='train', dataloader=train_eval_loader)]
+        laser_cols=laser_cols, device_eval_microbatch_size=microbatch(args.device_eval_microbatch_size))
+    boundary_loaders = eval_loaders + [Evaluator(label='train', dataloader=train_eval_loader,
+                                                 device_eval_microbatch_size=microbatch(args.device_eval_microbatch_size))]
     ensure_viz(args.data_dir, port=args.viz_port, enabled=not args.no_viz)
 
     # read n_freqs, n_channels from the dataset
@@ -298,13 +302,12 @@ def run(**kwargs):
     # trainer
     # device_train_microbatch_size: "auto" lets composer probe the largest microbatch that fits and
     # grad-accumulate up to --batch-size, halving and retrying on OOM instead of crashing the run.
-    device_train_microbatch_size = args.device_train_microbatch_size
-    if device_train_microbatch_size != "auto": device_train_microbatch_size = int(device_train_microbatch_size)
+    # (the eval-side equivalent is set per-Evaluator in build_dataset / on the boundary loaders.)
     trainer = Trainer(run_name=args.run_name, model=model, optimizers=optimizer, train_dataloader=train_loader, auto_log_hparams=False,
                     eval_dataloader=eval_loaders, max_duration=args.max_duration if not args.eval_only else None, seed=args.seed, eval_interval=args.eval_interval,
                     device=device, precision=args.precision if device == 'gpu' else 'fp32', save_metrics=True, log_to_console=True, progress_bar=False, load_path=load_path,
                     autoresume=True if not args.eval_only and args.run_name else None, save_folder=f"runs/{{run_name}}/checkpoints" if not args.eval_only else None, save_interval=args.checkpoint_interval,
-                    device_train_microbatch_size=device_train_microbatch_size,
+                    device_train_microbatch_size=microbatch(args.device_train_microbatch_size),
                     schedulers=schedulers, loggers=loggers, callbacks=callbacks, profiler=profiler,
                     compile_config={"mode": args.compile_mode} if args.compile else None)
 

@@ -12,12 +12,14 @@ What changes here:
 * No depth head: this dataset has no depth target.
 """
 
+import warnings
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from composer import ComposerModel
 
-from model.arch import LOSSES, count_loss, create_metrics, N_COUNT_CLASSES
+from model.arch import LOSSES, count_loss, create_metrics, CHEAP_SEG_KEYS, N_COUNT_CLASSES
 
 def _drop(x, p, dim, training):
     """Zero whole slices along `dim` of (B,C,L,F), rescaling survivors so the mean is
@@ -210,17 +212,21 @@ class ResBlock(nn.Module):
     def forward(self, x): return self.relu(x + self.net(x))
 
 class Decoder(nn.Module):
-    """(B,D) -> (B,out_h,out_w), or (B,out_h,out_w,out_c) when out_c > 1. Seeds a 3x4
-    grid and doubles it three times to 24x32.
+    """(B,D) -> (B,out_h,out_w), or (B,out_h,out_w,out_c) when out_c > 1. Seeds a 4x4
+    grid and doubles it three times to 32x32 -- the standardized output grid (run.py
+    --out-h/--out-w default to 32, so the conv head below is a no-op 1x1 in the common case).
 
-    21x30 isn't a power of two, so something has to absorb the 3-row/2-col margin. `resize`
-    picks how. 'conv' (default) makes the head's first conv valid-mode with a kernel sized to
-    eat exactly the margin: no interpolation, and the head convs then run on real feature-map
-    pixels rather than resampled ones. It is also not the asymmetric *crop* the old comment
-    warned about -- a conv sees every input position, so no edge is discarded. 'bilinear' is
-    the original behaviour, kept because checkpoints trained with it need it to load.
+    An out_h x out_w that is smaller than 32x32 (a box run at 21x30, say) needs the 32x32
+    feature map reconciled with it. `resize` picks how. 'conv' (default) makes the head's
+    first conv valid-mode with a kernel sized to eat exactly the 32 - out margin: no
+    interpolation, and the head convs then run on real feature-map pixels rather than
+    resampled ones. It is not the asymmetric *crop* the old comment warned about -- a conv
+    sees every input position, so no edge is discarded. 'conv' needs 32x32 >= out_h x out_w;
+    for an output over 32 in some axis it can't, so the decoder falls back to 'bilinear' with
+    a warning. 'bilinear' is the original behaviour, kept because checkpoints trained with it
+    need it to load.
     """
-    SEED = (3, 4)
+    SEED = (4, 4)
 
     def __init__(self, d_model, out_h, out_w, out_c=1, resize='conv', mult:float=1.0, num_res_blocks:int|None=None):
         super().__init__()
@@ -242,11 +248,14 @@ class Decoder(nn.Module):
         self.up = nn.Sequential(*up_layers)
         up_h, up_w = self.SEED[0] * 8, self.SEED[1] * 8
         head_in = widths[-1]  # final upsampling layer outputs this many channels
+        if resize == 'conv' and (up_h - out_h + 1 < 1 or up_w - out_w + 1 < 1):
+            warnings.warn(f"resize='conv' needs {up_h}x{up_w} >= {out_h}x{out_w}; falling back to 'bilinear'")
+            resize = 'bilinear'
+        self.resize = resize  # may have been downgraded to 'bilinear' just above
         if resize == 'conv':
             # valid-mode kernel k = margin + 1 collapses up_hw down to out_hw exactly
+            # (k = (1, 1), i.e. a plain channel projection, at the standardized 32x32)
             k = (up_h - out_h + 1, up_w - out_w + 1)
-            if k[0] < 1 or k[1] < 1:
-                raise ValueError(f"resize='conv' needs {up_h}x{up_w} >= {out_h}x{out_w}; use 'bilinear'")
             first = nn.Conv2d(head_in, 32, k)
         else:
             first = nn.Conv2d(head_in, 32, 3, padding=1)
@@ -300,7 +309,8 @@ class BoomboxModel(ComposerModel):
         self.is_spatial_loss = loss_fn.startswith('ce-spatial')
         self.is_asym_loss = loss_fn.endswith('-asym')
         self.loss_alpha = loss_alpha
-        self.train_metrics, self.val_metrics = create_metrics(data_info), create_metrics(data_info)
+        self.train_metrics = create_metrics(data_info, CHEAP_SEG_KEYS)  # cheap subset per step
+        self.val_metrics = create_metrics(data_info)                   # full suite on eval loaders
 
     def forward(self, batch):
         # dataset gives patched tokens (B,L,P,PS,C); a conv wants the frequency axis

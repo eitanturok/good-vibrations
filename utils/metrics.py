@@ -131,14 +131,33 @@ def contour_f(pred, true, tol=1):
     f = 2 * prec * rec / (prec + rec).clamp(min=1e-9)
     return torch.where((ap == 0) & (at == 0), torch.ones_like(f), f)
 
-def _label(x, iters=64):
-    """(B,H,W) 0/1 mask -> (B,H,W) long component ids, 0 = background."""
+def _label(x, iters=None):
+    """(B,H,W) 0/1 mask -> (B,H,W) long component ids, 0 = background.
+
+    Iterative label propagation: every on-pixel repeatedly adopts the largest id in its
+    3x3 (8-connected) neighbourhood, so each component's largest id floods it one ring
+    per round. It has converged once that id has crossed the component's internal
+    diameter; further rounds are a no-op (fixed point).
+
+    `iters` rounds run UNCONDITIONALLY -- there is no torch.equal() early-exit. That
+    check compared two (B,H,W) tensors every round, which on CUDA is a device sync, and
+    it fired once per round, twice per localization() call, on every train batch. A round
+    is a single tiny max_pool2d (microseconds, no sync), so running a fixed safe number
+    is far cheaper than syncing to detect convergence. See scripts/bench_metrics.py.
+
+    Default iters = 2 * (H + W): a component that fits in the grid has an 8-connected
+    internal diameter <= max(H-1, W-1) when convex; the larger 2*(H+W) budget covers
+    non-convex shapes (rings, C's) and the ragged multi-blob masks a half-trained model
+    predicts. Measured worst case on real GT masks, real model predictions and synthetic
+    rings is comfortably inside this (scripts/bench_metrics.py). It is cheap to be
+    generous: a round is one tiny max_pool2d with no sync, and with change #2 this only
+    runs on the eval loaders."""
     _, h, w = x.shape
-    ids = torch.arange(1, h * w + 1, device=x.device).view(1, h, w) * x.long()
+    if iters is None: iters = 2 * (h + w)
+    xl = x.long()
+    ids = torch.arange(1, h * w + 1, device=x.device).view(1, h, w) * xl
     for _ in range(iters):
-        nxt = F.max_pool2d(ids[:, None].float(), 3, 1, 1)[:, 0].long() * x.long()
-        if torch.equal(nxt, ids): break
-        ids = nxt
+        ids = F.max_pool2d(ids[:, None].float(), 3, 1, 1)[:, 0].long() * xl
     return ids
 
 def _centroids_batch(ids):

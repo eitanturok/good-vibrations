@@ -932,13 +932,158 @@ def green_plastic(mds_path, test_size=0.2, seed=42, speakers=None, n_objects=Non
     return splits
 
 
+# ***** per-box grid splits *****
+#
+# Each box is captured by placing an object at every position of a raster "grid", then
+# repeating with the object moved to a fresh grid: the layouts "<obj>-grid1..4" are four such
+# passes over the same region. To keep every position covered in train we hold whole grids
+# there and take the eval set out of the last grid only:
+#
+#   empty-box      -> train (no object to localise; teaches the box's own resonances)
+#   grids 1..N-1   -> train
+#   grid N         -> ~test_size of its positions -> eval, the rest back to train
+#   loose one-offs -> their own eval/ood-<layout> set (clampless rigs, a stray sneaker)
+#
+# Held out by whole position_id so a position is never in both train and eval. When grid N is
+# itself under test_size of the object's data (cardboard's grid4 is 7.6%) grid N-1 is pulled
+# in too. A group with one layout (a lone red-cube) just splits that layout by position.
+#
+# `groups` is one entry per (label, n_objects, [grids]): the 1-object and 2-object scenes are
+# separate groups, each with its own grid hold-out and its own eval set (eval/1-cube,
+# eval/2-cubes, eval/<object>), so a box with both counts is split independently per count and
+# the counts are never mixed. Membership is filtered on the row's `n_objects`, not just the
+# layout name -- the two can disagree (gastronorm's x-shift/y-shift are 2-object layouts).
+
+def _load_index(mds_path, index):
+    if index is not None: return index
+    return [json.loads(l) for l in (Path(mds_path) / "metadata.jsonl").read_text().splitlines() if l]
+
+
+def _split_positions(index, idxs, frac, seed):
+    """`frac` of the distinct position_ids in `idxs` go to eval, the rest to train."""
+    by_pos = {}
+    for i in idxs: by_pos.setdefault(index[i]["position_id"], []).append(i)
+    positions = sorted(by_pos)
+    random.Random(seed).shuffle(positions)
+    eval_pos = set(positions[:round(frac * len(positions))])
+    train = [i for i in idxs if index[i]["position_id"] not in eval_pos]
+    evl = [i for i in idxs if index[i]["position_id"] in eval_pos]
+    return sorted(train), sorted(evl)
+
+
+def _grid_box_split(mds_path, groups, ood_layouts, test_size, seed, speakers, n_objects, box,
+                    n_samples, verbose, index):
+    index = _load_index(mds_path, index)
+    keep = [i for i, r in enumerate(index) if _matches(r, speakers, n_objects, box)]
+    if n_samples is not None: keep = keep[:n_samples]
+
+    train = [i for i in keep if str(index[i].get("layout")).startswith(EMPTY_BOX_LAYOUT)]
+    evals = {}
+    for label, n_obj, grids in groups:
+        idxs = [i for i in keep if index[i]["layout"] in grids and index[i]["n_objects"] == n_obj]
+        if not idxs: continue
+        target = test_size * len(idxs)
+        # take grids from the top until we have enough to hold `target` out of them; the
+        # grids below that go straight to train.
+        hold = []
+        for g in reversed(grids):
+            g_idx = [i for i in idxs if index[i]["layout"] == g]
+            if len(hold) >= target: train += g_idx
+            else: hold += g_idx
+        tr, evl = _split_positions(index, hold, min(1.0, target / len(hold)), seed)
+        train += tr
+        if evl: evals[f"eval/{label}"] = evl
+
+    for lay in ood_layouts:
+        idxs = [i for i in keep if index[i]["layout"] == lay]
+        if idxs: evals[f"eval/ood-{lay}"] = idxs
+
+    splits = {"train": sorted(train), **evals}
+    if verbose:
+        for label, idxs in splits.items(): print(f"{label}: {len(idxs)} samples")
+    return splits
+
+
+TWO_CUBES = [f"two-cubes-grid{k}" for k in (1, 2, 3, 4)]
+
+def plastic(mds_path, test_size=0.15, seed=42, speakers=None, n_objects=None, box=None, n_samples=None, verbose=1, index=None):
+    groups = [("1-cube", 1, ["red-cube"]), ("2-cubes", 2, TWO_CUBES)]
+    return _grid_box_split(mds_path, groups, (), test_size, seed, speakers, n_objects, box, n_samples, verbose, index)
+
+def wood(mds_path, test_size=0.15, seed=42, speakers=None, n_objects=None, box=None, n_samples=None, verbose=1, index=None):
+    groups = [("1-cube", 1, ["one-cube-grid1"]), ("2-cubes", 2, TWO_CUBES)]
+    return _grid_box_split(mds_path, groups, (), test_size, seed, speakers, n_objects, box, n_samples, verbose, index)
+
+def cardboard(mds_path, test_size=0.15, seed=42, speakers=None, n_objects=None, box=None, n_samples=None, verbose=1, index=None):
+    groups = [("2-cubes", 2, TWO_CUBES)]
+    return _grid_box_split(mds_path, groups, (), test_size, seed, speakers, n_objects, box, n_samples, verbose, index)
+
+def shoebox(mds_path, test_size=0.15, seed=42, speakers=None, n_objects=None, box=None, n_samples=None, verbose=1, index=None):
+    groups = [(o, 1, [f"{o}-grid{k}" for k in (1, 2, 3, 4)]) for o in ("cube", "cylinder", "mug", "ring")]
+    ood = ("cube-clampless", "cylinder-clampless", "sneaker")
+    # shoebox was captured with speakers 1/3/5; speaker 7 is 14 stray captures (10 empty-box,
+    # + a handful on ring-grid1/cylinder-grid3/sneaker) -- drop it so every layout has the same
+    # 3 speakers and the split isn't skewed by one position with a 4th.
+    speakers = [1, 3, 5] if speakers is None else [s for s in speakers if s != 7]
+    return _grid_box_split(mds_path, groups, ood, test_size, seed, speakers, n_objects, box, n_samples, verbose, index)
+
+
+# one shoebox object -> one model. speaker 7 (14 stray captures) always dropped.
+#   train              -> empty-box + this object's grids, minus the held-out eval positions
+#   eval/<obj>-grid<N> -> ~test_size of the last grid's positions, held out by whole position_id
+#   eval/other-<thing> -> every remaining layout (the other objects, the clampless rigs, the
+#                         sneaker), one bucket per object/rig. Not what the model is scored on,
+#                         but kept in the split -- deliberately wider than the other boxes'
+#                         splits -- so viz and post-hoc eval can display the whole box, not
+#                         just this one object.
+def _shoebox_object_split(mds_path, obj, test_size, seed, speakers, n_objects, box, n_samples, verbose, index):
+    index = _load_index(mds_path, index)
+    speakers = [1, 3, 5] if speakers is None else [s for s in speakers if s != 7]
+    keep = [i for i, r in enumerate(index) if _matches(r, speakers, n_objects, box)]
+    if n_samples is not None: keep = keep[:n_samples]
+
+    grids = [f"{obj}-grid{k}" for k in (1, 2, 3, 4)]
+    is_empty = lambda i: str(index[i].get("layout")).startswith(EMPTY_BOX_LAYOUT)
+    obj_idx = {i for i in keep if index[i]["layout"] in grids}
+    eval_grid = next(g for g in reversed(grids) if any(index[i]["layout"] == g for i in obj_idx))
+    hold = [i for i in obj_idx if index[i]["layout"] == eval_grid]
+    _, evl = _split_positions(index, hold, min(1.0, test_size * len(obj_idx) / len(hold)), seed)
+    evl = set(evl)
+
+    splits = {"train": sorted(i for i in keep if (is_empty(i) or i in obj_idx) and i not in evl),
+              f"eval/{eval_grid}": sorted(evl)}
+    other = {}
+    for i in keep:
+        if is_empty(i) or i in obj_idx: continue
+        other.setdefault(f"eval/other-{index[i]['layout'].split('-grid')[0]}", []).append(i)
+    splits.update(sorted(other.items()))
+    if verbose:
+        for k, v in splits.items(): print(f"{k}: {len(v)} samples")
+    return splits
+
+def shoebox_cube(mds_path, test_size=0.15, seed=42, speakers=None, n_objects=None, box=None, n_samples=None, verbose=1, index=None):
+    return _shoebox_object_split(mds_path, "cube", test_size, seed, speakers, n_objects, box, n_samples, verbose, index)
+
+def shoebox_cylinder(mds_path, test_size=0.15, seed=42, speakers=None, n_objects=None, box=None, n_samples=None, verbose=1, index=None):
+    return _shoebox_object_split(mds_path, "cylinder", test_size, seed, speakers, n_objects, box, n_samples, verbose, index)
+
+def shoebox_mug(mds_path, test_size=0.15, seed=42, speakers=None, n_objects=None, box=None, n_samples=None, verbose=1, index=None):
+    return _shoebox_object_split(mds_path, "mug", test_size, seed, speakers, n_objects, box, n_samples, verbose, index)
+
+def shoebox_ring(mds_path, test_size=0.15, seed=42, speakers=None, n_objects=None, box=None, n_samples=None, verbose=1, index=None):
+    return _shoebox_object_split(mds_path, "ring", test_size, seed, speakers, n_objects, box, n_samples, verbose, index)
+
+
 #***** 8 build dataloaders *****
 
 SPLIT_METHODS = {"exp25": exp25_split, "gastronorm": gastronorm, "gastronorm_one_cube": gastronorm_one_cube,
                  "gastronorm_train1_eval2": gastronorm_train1_eval2, "gastronorm_train2_eval1": gastronorm_train2_eval1,
                  "gastronorm_train12_eval12": gastronorm_train12_eval12,
                  "gastronorm_train12_eval12_full": gastronorm_train12_eval12_full,
-                 "green_plastic": green_plastic}
+                 "green_plastic": green_plastic,
+                 "plastic": plastic, "wood": wood, "cardboard": cardboard, "shoebox": shoebox,
+                 "shoebox_cube": shoebox_cube, "shoebox_cylinder": shoebox_cylinder,
+                 "shoebox_mug": shoebox_mug, "shoebox_ring": shoebox_ring}
 
 #***** 7 pair two speakers into one sample *****
 
@@ -977,7 +1122,7 @@ def build_dataset(data_dir: str | Path, split: str = "exp25", batch_size: int = 
                    subtract_speaker_mean: bool = False, subtract_empty_box: bool = False, n_classes: int = 4, verbose: int = 1,
                    mag_recipe: str | None = None, pair_speakers_mode: bool = False, rgb: bool = False,
                    phase_arm: str | None = None, phase_weight: float = 1.0,
-                   laser_cols=None, **split_kwargs):
+                   laser_cols=None, device_eval_microbatch_size: str | int = "auto", **split_kwargs):
 
     # A recipe owns the domain and the operation, so it OVERRIDES signal_mode and both
     # subtract_* flags. Deriving signal_mode here is what guarantees the references are
@@ -1080,6 +1225,9 @@ def build_dataset(data_dir: str | Path, split: str = "exp25", batch_size: int = 
 
     train_loader = loader(train_dataset, splits["train"], batch_size, num_workers, generator, shuffle=True, drop_last=True)
     train_eval_loader = loader(eval_datasets["train"], splits["train"], eval_batch_size, num_workers, generator)
-    eval_loaders = [Evaluator(label=label, dataloader=loader(eval_datasets[label], idxs, eval_batch_size, num_workers, generator)) for label, idxs in splits.items() if label != "train"]
+    # device_eval_microbatch_size="auto" -> composer shrinks the eval microbatch and retries on OOM
+    # instead of crashing the run (the big decoders OOM'd on the eval pass otherwise). Must be a
+    # constructor arg, not a post-hoc attr, or Evaluator.auto_microbatching stays False.
+    eval_loaders = [Evaluator(label=label, dataloader=loader(eval_datasets[label], idxs, eval_batch_size, num_workers, generator), device_eval_microbatch_size=device_eval_microbatch_size) for label, idxs in splits.items() if label != "train"]
 
     return train_loader, eval_loaders, train_eval_loader
