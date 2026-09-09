@@ -11,6 +11,9 @@ const S = {
   log: { spec: 1 },
   specMode: 'magphase', phmode: 'cos', fieldbg: false, kind: 'clean',
   modeview: 'quiver',
+  // Per-plot box-zoom windows, as fractions [0..1] of each axis (see the zoom section).
+  zoom: { p1: fullView(), p2: fullView(), p3: fullView() },
+  dragging: false,
   empty: false, anim: 0, asize: 1, frame: 0,
   f: { layouts: new Set(), nobj: new Set(), spk: new Set([1]) },  // empty == no filter
 };
@@ -97,15 +100,44 @@ const css = (n) => getComputedStyle(document.body).getPropertyValue(n).trim();
 
 /* ***** boot ***** */
 (async function () {
-  const j = await api('/api/samples');
-  S.all = j.samples; S.info = j.info; S.rv = j.rv;
+  loadPayload(await api('/api/samples'));
+  wire(); phVis();
+  await firstSample();
+})();
+
+/* Swap in another experiment (box). The samples, positions, speaker ring, grid and
+   scales are all per-box, so this is a full reload of everything except the workbench --
+   pinned probes keep their own box tag and stay. */
+async function switchExperiment(name) {
+  if (name === S.info.experiment || !S.experiments.includes(name)) return;
+  loadPayload(await api(`/api/switch/${name}`));
+  for (const t of ['p1', 'p2', 'p3']) S.zoom[t] = fullView();   // firstSample() redraws
+  await firstSample();
+}
+
+function loadPayload(j) {
+  S.all = j.samples; S.info = j.info; S.rv = j.rv; S.experiments = j.experiments;
+  S.byId = {}; S.byPos = {};
   for (const s of j.samples) {
     S.byId[s.id] = s;
     (S.byPos[s.pos] ??= {})[s.spk] = s.id;
   }
-  buildFilters(); buildScatter(); buildSpk(); buildGrid(); wire(); phVis(); applyFilter();
-  await select(S.all.find((s) => !s.empty)?.id || S.all[0].id);
-})();
+  $('#exp').value = j.experiment;
+  buildFilters(); buildScatter(); buildSpk(); buildGrid(); sizeModePanel(); applyFilter();
+}
+
+const firstSample = () => select(S.all.find((s) => !s.empty)?.id || S.all[0].id);
+
+/* Each box renders at its own aspect ratio and its own size: the mode panel is scaled by
+   the box's cropped-overhead pixels against the largest box in the set, so a physically
+   bigger box stays visibly bigger. */
+function sizeModePanel() {
+  const [ow, oh] = S.info.overhead, big = Math.max(...S.info.max_overhead);
+  const k = 460 / big;                    // 460px for the largest box's long side
+  const root = document.documentElement.style;
+  root.setProperty('--mw', `${Math.round(ow * k)}px`);
+  root.setProperty('--mh', `${Math.round(oh * k)}px`);
+}
 
 /* ***** selection ***** */
 async function select(sid) {
@@ -159,8 +191,13 @@ function paintAll() {
 }
 
 /* ***** curves: live probe + pinned probes in one axes ***** */
+// A workbench probe can be toggled off without unpinning it -- everything that draws a
+// probe reads this, so hiding it clears the curve, the mode arrows, its ticks and its
+// mask in one go while the card stays put.
+const shownProbes = () => S.probes.filter((p) => !p.hidden);
+
 function series() {
-  const pinned = S.probes.flatMap((p) => {
+  const pinned = shownProbes().flatMap((p) => {
     const c = col(p, S.hot && S.hot !== p ? 0.18 : 0.9);
     const w = p.id === S.flash ? 2.6 : 1.6;
     // A "both" probe is one probe drawn as two curves: same colour, x solid / y dashed.
@@ -234,15 +271,24 @@ function vals(d, key) {
 function multi(cv, key) {
   const [g, w, h] = fit(cv), ss = series().filter((s) => s.d);
   if (!ss.length) return;
-  const [lo, hi] = span(ss, key), k = h / ((hi - lo) || 1);
+  const [flo, fhi] = span(ss, key), z = S.zoom[cv.id];
+  const N = Math.max(...ss.map((s) => vals(s.d, key).length));
+  const a = z.x0 * (N - 1), b = z.x1 * (N - 1);          // visible index window
+  const lo = flo + z.y0 * (fhi - flo), hi = flo + z.y1 * (fhi - flo);
+  const k = h / ((hi - lo) || 1), sx = w / ((b - a) || 1);
   S.rng[cv.id] = { lo, hi };                  // so the y axis can label the same scale
-  if (cv.id === 'p1') S.p1 = { lo, hi, h };   // so peak markers can sit ON the curve
+  if (cv.id === 'p1') S.p1 = { lo, hi, h };   // peak markers sit ON the curve
+  g.save();
+  g.beginPath(); g.rect(0, 0, w, h); g.clip();         // a zoomed y must not spill the frame
   for (const s of ss) {
     const y = vals(s.d, key);
     g.beginPath();
+    let pen = false;
     for (let i = 0; i < y.length; i++) {
-      const X = (i / (y.length - 1)) * w, Y = h - (y[i] - lo) * k;
-      i ? g.lineTo(X, Y) : g.moveTo(X, Y);
+      const X = (i - a) * sx, Y = h - (y[i] - lo) * k;
+      if (X < -sx || X > w + sx) { pen = false; continue; }   // skip offscreen, break the path
+      pen ? g.lineTo(X, Y) : g.moveTo(X, Y);
+      pen = true;
     }
     g.globalAlpha = s.dim ? 0.28 : 1;
     g.setLineDash(s.dash || []);
@@ -250,6 +296,7 @@ function multi(cv, key) {
     g.setLineDash([]);
     g.globalAlpha = 1;
   }
+  g.restore();
 }
 
 // The same two ramps as viz2/render.py, so the colorbars match the PNGs exactly.
@@ -344,6 +391,11 @@ function fmtTick(v) {
 }
 
 /* ***** mode shape ***** */
+// A probe kept from another box may have a different laser grid; its mode field can only
+// be overlaid on a box with the same dims.
+const fitsGrid = (p) => p.mode
+  && p.mode.u.length === S.info.rows && p.mode.u[0]?.length === S.info.cols;
+
 function modeAxes() {
   const svg = $('#modeax');
   if (!svg) return;
@@ -375,7 +427,7 @@ function drawMode() {
   const cv = $('#mode'), [g, w, h] = fit(cv);
   if (!S.mode) return;
   const R = S.info.rows, C = S.info.cols, cw = w / C, chh = h / R;
-  const withMode = S.probes.filter((p) => p.mode);
+  const withMode = shownProbes().filter(fitsGrid);
   const sets = [
     ...withMode.filter((p) => p.id !== S.flash).map((p) => ({ m: p.mode, c: col(p, 0.9) })),
     ...(S.muted && S.probes.length ? [] : [{ m: S.mode, c: css('--ink') }]),
@@ -710,7 +762,7 @@ function fieldGrid() {
   const cap = (m, hzv) => `<b>${fmt(hzv)} Hz</b><i>${shortId(m.id)}  pos ${m.pos}  spk ${m.spk}</i>`;
   const sets = [
     ...(S.mode && lm ? [{ m: S.mode, c: css('--ink'), id: 0, t: cap(lm, hz(S.fi)) }] : []),
-    ...S.probes.filter((p) => p.mode)
+    ...shownProbes().filter(fitsGrid)
       .map((p) => ({ m: p.mode, c: col(p), id: p.id, t: cap(p.meta, p.hzv) })),
   ];
   // Draw even for a single set. The tiles are not only a comparison: the lone tile is the
@@ -762,6 +814,88 @@ function wheel(cv) {
    The nodes are built once and then only moved. Rebuilding innerHTML on pointermove
    would destroy the peak dots out from under a click that is already in flight. */
 const OVS = ['#p1ov', '#p2ov'];
+
+/* ***** box zoom on the signal plots *****
+   Drag a rectangle to zoom into it, the way Plotly and W&B do; double-click (or the reset
+   button) restores the full view. A near-stationary press is left alone, so tapping a peak
+   still selects its frequency. The window is kept as fractions [0..1] of each axis, so
+   zooms just compose and no drawing code needs the data length. p1 and p2 are one
+   frequency axis, so an x-zoom on either is written to both. */
+function fullView() { return { x0: 0, x1: 1, y0: 0, y1: 1 }; }
+const xGroup = (id) => (id === 'p3' ? ['p3'] : ['p1', 'p2']);
+const zoomed = () => ['p1', 'p2', 'p3'].some((id) => {
+  const z = S.zoom[id];
+  return z.x0 > 0 || z.x1 < 1 || z.y0 > 0 || z.y1 < 1;
+});
+
+// Where bin i sits on the visible p1/p2 axis, 0..1 (outside that on a zoom).
+const specFrac = (i) => {
+  const z = S.zoom.p1, f = i / ((S.d ? S.d.freqs.length : 1) - 1);
+  return (f - z.x0) / (z.x1 - z.x0);
+};
+const specX = (i) => specFrac(i) * 100;
+const inSpecX = (i) => specFrac(i) >= -1e-9 && specFrac(i) <= 1 + 1e-9;
+
+function resetZoom(id) {
+  for (const t of id ? xGroup(id) : ['p1', 'p2', 'p3']) S.zoom[t] = fullView();
+  drawSpec(); drawShifts(); cursors(); axes();
+}
+
+// Fold a sub-range (fractions of what is currently shown) into the stored window.
+function applyZoom(id, axis, lo, hi) {
+  for (const t of axis === 'x' ? xGroup(id) : [id]) {
+    const z = S.zoom[t], a = z[axis + '0'], span = z[axis + '1'] - a;
+    z[axis + '0'] = a + lo * span;
+    z[axis + '1'] = a + hi * span;
+  }
+}
+
+function zoomable(plot, id) {
+  const ov = plot.querySelector('.ov');       // the overlay exactly covers the data area
+  let start = null, band = null;
+  const frac = (e) => {
+    const r = ov.getBoundingClientRect();
+    const c = (v) => Math.max(0, Math.min(1, v));
+    return [c((e.clientX - r.left) / r.width), c((e.clientY - r.top) / r.height)];
+  };
+
+  plot.addEventListener('pointerdown', (e) => {
+    if (e.button || S.live.laser === 'all' || e.target.closest('.pk')) return;
+    start = frac(e); S.dragging = true;
+    plot.setPointerCapture(e.pointerId);
+  });
+  plot.addEventListener('pointermove', (e) => {
+    if (!start) return;
+    const [x, y] = frac(e);
+    if (!band) {
+      band = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
+      band.setAttribute('class', 'zband');
+      ov.appendChild(band);
+    }
+    band.setAttribute('x', `${Math.min(start[0], x) * 100}%`);
+    band.setAttribute('y', `${Math.min(start[1], y) * 100}%`);
+    band.setAttribute('width', `${Math.abs(x - start[0]) * 100}%`);
+    band.setAttribute('height', `${Math.abs(y - start[1]) * 100}%`);
+  });
+  const end = (e) => {
+    if (!start) return;
+    const [sx, sy] = start; start = null; S.dragging = false;
+    band?.remove(); band = null;
+    try { plot.releasePointerCapture(e.pointerId); } catch (_) {}
+    const [x, y] = frac(e), dx = Math.abs(x - sx), dy = Math.abs(y - sy);
+    if (dx < 0.01 && dy < 0.01) return;                // a click, not a drag -- leave it
+    plot._drag = true;                                 // ...but a drag must not also select
+    if (dx > 0.02) applyZoom(id, 'x', Math.min(sx, x), Math.max(sx, x));
+    if (dy > 0.04) applyZoom(id, 'y', 1 - Math.max(sy, y), 1 - Math.min(sy, y));
+    drawSpec(); drawShifts(); cursors(); axes();
+  };
+  plot.addEventListener('pointerup', end);
+  plot.addEventListener('pointercancel', end);
+  plot.addEventListener('click', (e) => {
+    if (plot._drag) { e.stopPropagation(); plot._drag = false; }
+  }, true);
+  plot.addEventListener('dblclick', () => resetZoom(id));
+}
 
 /* Axes. Ticks are drawn into the same SVG overlay as the cursor, so they cost nothing
    extra and stay pinned to the plot regardless of canvas resolution. */
@@ -856,10 +990,9 @@ function buildPeaks() {
   if (!g) return;
   // The markers ride the magnitude curve; with an image in its place they have no y.
   const pk = S.live.laser === 'all' ? [] : (S.probe?.peaks || []);
-  const n = S.d ? S.d.freqs.length : 1;
   let lastX = -99, up = true;
   g.innerHTML = pk.map((i) => {
-    const x = (i / (n - 1)) * 100;
+    const x = specX(i);
     up = (x - lastX) < 6 ? !up : true;       // too close to the previous label -> flip
     lastX = x;
     return `<circle class="pk" r="3.4" data-fi="${i}"/>` +
@@ -874,25 +1007,28 @@ function buildPeaks() {
 
 function cursors() {
   probeTicks();
-  const n = S.d ? S.d.freqs.length : 1;
-  const at = (i) => `${(i / (n - 1)) * 100}%`;
+  const at = (i) => `${specX(i)}%`;           // through the shared frequency zoom window
   for (const id of OVS) {
     const svg = $(id);
     const sel = svg.querySelector('.sel'), hov = svg.querySelector('.hov');
     sel.setAttribute('x1', at(S.fi)); sel.setAttribute('x2', at(S.fi));
-    const show = S.hoverFi != null && S.hoverFi !== S.fi && S.live.laser !== 'all';
+    sel.style.display = inSpecX(S.fi) ? '' : 'none';
+    const show = S.hoverFi != null && S.hoverFi !== S.fi && S.live.laser !== 'all'
+                 && inSpecX(S.hoverFi);
     hov.style.display = show ? '' : 'none';
     if (show) { hov.setAttribute('x1', at(S.hoverFi)); hov.setAttribute('x2', at(S.hoverFi)); }
   }
   $('#p1ov').querySelectorAll('.pk').forEach((c) => {
     const i = +c.dataset.fi;
     c.setAttribute('cx', at(i)); c.setAttribute('cy', peakY(i));
+    c.style.display = inSpecX(i) ? '' : 'none';
     c.classList.toggle('on', i === S.fi);
   });
   $('#p1ov').querySelectorAll('.pklab').forEach((tx) => {
     const i = +tx.dataset.fi;
     tx.setAttribute('x', at(i)); tx.setAttribute('y', peakY(i));
     tx.setAttribute('dy', tx.dataset.up === '1' ? -8 : 15);
+    tx.style.display = inSpecX(i) ? '' : 'none';
     tx.classList.toggle('on', i === S.fi);
   });
 }
@@ -946,7 +1082,6 @@ function stepGrid(dx, dy) {
    A tick per probe, in its color, makes position -- the most precise visual channel --
    do the separating, which is what rescues several probes of the SAME sample. */
 function probeTicks() {
-  const n = S.d ? S.d.freqs.length : 1;
   for (const id of OVS) {
     const svg = $(id);
     let g = svg.querySelector('.pticks');
@@ -955,8 +1090,8 @@ function probeTicks() {
       g.setAttribute('class', 'pticks');
       svg.insertBefore(g, svg.firstChild);
     }
-    g.innerHTML = S.probes.map((p) => {
-      const x = (p.fi / (n - 1)) * 100;
+    g.innerHTML = shownProbes().filter((p) => inSpecX(p.fi)).map((p) => {
+      const x = specX(p.fi);
       const dim = S.hot && S.hot !== p;
       const dash = p.dash?.length ? p.dash.join(' ') : '5 3';
       return `<line class="ptick" x1="${x}%" x2="${x}%" y1="0" y2="100%" ` +
@@ -967,12 +1102,21 @@ function probeTicks() {
 
 function axes() {
   if (!S.d) return;
-  const f = S.d.freqs, lo = f[0], hi = f[f.length - 1];
+  const f = S.d.freqs, N = f.length, z = S.zoom.p1;
+  // Interpolate the freq array at a fraction of the axis, so a zoom that lands between
+  // bins still labels itself with the frequency it actually shows.
+  const fAt = (fr) => {
+    const c = fr * (N - 1), l = Math.floor(c), r = Math.min(N - 1, l + 1);
+    return f[l] + (f[r] - f[l]) * (c - l);
+  };
   const HZ = 'frequency (Hz)';
-  xAxis($('#p1ov'), lo, hi, HZ, false);       // top of the frequency pair: grid only
-  xAxis($('#p2ov'), lo, hi, HZ, true);        // bottom of the pair carries the numbers
+  xAxis($('#p1ov'), fAt(z.x0), fAt(z.x1), HZ, false);   // top of the pair: grid only
+  xAxis($('#p2ov'), fAt(z.x0), fAt(z.x1), HZ, true);    // bottom carries the numbers
   // Shifts sits above them on a time axis of its own, so it labels itself.
-  if (S.probe) xAxis($('#p3ov'), 0, S.probe.dur, 'time (s)', true);
+  if (S.probe) {
+    const zp = S.zoom.p3, dur = S.probe.dur;
+    xAxis($('#p3ov'), zp.x0 * dur, zp.x1 * dur, 'time (s)', true);
+  }
 
   const mp = S.specMode === 'magphase';
   // In all-lasers view every plot's y axis is the laser index, not the quantity.
@@ -980,14 +1124,18 @@ function axes() {
   yLabel('#y1', all ? 'laser' : mp ? (S.log.spec ? 'log |FFT|' : '|FFT|') : 'real');
   yLabel('#y2', all ? 'laser' : mp ? (S.phmode === 'cos' ? 'cos(phase)' : 'phase (rad)') : 'imag');
   yLabel('#y3', all ? 'laser' : 'shift (px)');
+  $('#sigreset')?.classList.toggle('show', zoomed());
 }
 
 function freqAxis(el) {
   el.style.cursor = 'crosshair';
   el.addEventListener('pointermove', (e) => {
+    if (S.dragging) return;                   // a box-zoom drag is in progress -- not a hover
     const b = el.getBoundingClientRect();
-    const n = S.d.freqs.length;
-    S.hoverFi = Math.max(0, Math.min(n - 1, Math.round(((e.clientX - b.left) / b.width) * (n - 1))));
+    const n = S.d.freqs.length, z = S.zoom.p1;
+    const seen = (e.clientX - b.left) / b.width;         // 0..1 across the visible plot
+    const f = z.x0 + seen * (z.x1 - z.x0);               // -> fraction of the full axis
+    S.hoverFi = Math.max(0, Math.min(n - 1, Math.round(f * (n - 1))));
     cursors();
     readout();
     previewMode(S.hoverFi);
@@ -1118,6 +1266,21 @@ function pickSample(id) {
   if (!S.byId[id]) return;
   if (!pass(S.byId[id])) { S.f.layouts.clear(); S.f.nobj.clear(); applyFilter(); }
   select(id);
+}
+
+/* The box picker: a typeable list of experiments, same shape as the sample combo. */
+function renderExpList(q = '') {
+  const el = $('#explist');
+  const m = S.experiments.filter((n) => n.toLowerCase().includes(q.toLowerCase()));
+  el.innerHTML = m.map((n) =>
+    `<button class="opt${n === S.info.experiment ? ' on' : ''}" data-n="${n}">${n}</button>`
+  ).join('') || '<div class="more">no match</div>';
+  el.querySelectorAll('.opt').forEach((b) => (b.onmousedown = (e) => {
+    e.preventDefault();
+    switchExperiment(b.dataset.n);
+    el.hidden = true;
+    $('#exp').blur();
+  }));
 }
 
 function applyFilter() {
@@ -1377,6 +1540,7 @@ function pin() {
   const p = {
     ...S.live, fi: S.fi, hzv: hz(S.fi), id: Date.now(),
     pos: S.byId[S.live.sid].pos,          // the fan is grouped by position
+    box: S.info.box,                      // the box this probe was measured in
     dash: DASH[S.live.ch] || [],
     data: S.probe, dataY: S.probeY, mode: S.mode,
     meta: S.byId[S.live.sid],
@@ -1395,7 +1559,7 @@ function identity(p) {
   const m = p.meta;
   return {
     sid: shortId(p.sid),
-    line1: `pos ${m.pos}  spk ${m.spk}`,
+    line1: `${m.box}  pos ${m.pos}  spk ${m.spk}`,
     line2: m.layout,
     // "L42 y  1000 Hz" -- the widest this can get still fits the column without wrapping,
     // which is what keeps the card from changing height as you hover.
@@ -1421,6 +1585,13 @@ function renderNow() {
      <span class="id"><b>${i.sid}${prev ? ' <u>preview</u>' : ''}</b>${i.line1}<br>${i.line2}<br>${i.line3}</span>`;
 }
 
+// Open eye / eye with a slash. The slash is always in the markup; CSS shows it only on
+// a hidden card, so the icon never has to be rebuilt to change state.
+const EYE = '<svg class="eyei" viewBox="0 0 22 14">' +
+  '<path class="lid" d="M1 7C3.5 2.5 6.7 1 11 1s7.5 1.5 10 6c-2.5 4.5-5.7 6-10 6S3.5 11.5 1 7Z"/>' +
+  '<circle class="pupil" cx="11" cy="7" r="2.7"/>' +
+  '<line class="slash" x1="2.5" y1="12.5" x2="19.5" y2="1.5"/></svg>';
+
 function renderProbes() {
 
   // The header always states the one gesture that fills this column, so it reads the same
@@ -1430,11 +1601,12 @@ function renderProbes() {
     const m = p.meta;
     // Two lines, not four: the coloured left border already identifies the probe, so the
     // swatch is redundant, and the layout name belongs in the tooltip rather than a row.
-    return `<div class="probe card2" data-id="${p.id}" style="--c:${col(p)}"
-      title="${shortId(p.sid)}  pos ${m.pos}  spk ${m.spk}  ${m.layout}">
+    return `<div class="probe card2${p.hidden ? ' off' : ''}" data-id="${p.id}" style="--c:${col(p)}"
+      title="${m.box}  ${shortId(p.sid)}  pos ${m.pos}  spk ${m.spk}  ${m.layout}${p.hidden ? '  (hidden — click to show)' : '  (click to hide from plots)'}">
       <img class="thumb mask" src="/api/masks.png?ids=${p.sid}&colors=${probeHex(p)}&v=${S.rv}" alt="">
       <div class="meta">
-        <div class="ln1"><b>${shortId(p.sid)}</b><span class="sub">p${m.pos} s${m.spk}</span>
+        <div class="ln1"><b>${shortId(p.sid)}</b><span class="sub${m.box !== S.info.box ? ' foreign' : ''}">${m.box} p${m.pos} s${m.spk}</span>
+          <span class="eye" aria-hidden="true">${EYE}</span>
           <button class="x" data-x="${p.id}">×</button></div>
         <div class="ln3">L${p.laser} ${p.ch}  ${fmt(p.hzv)} Hz</div>
       </div>
@@ -1442,7 +1614,18 @@ function renderProbes() {
   }).join('');
   $('#plist').querySelectorAll('.probe').forEach((el) => {
     const p = S.probes.find((q) => q.id === +el.dataset.id);
-    el.onmouseenter = () => { S.hot = p; drawSpec(); drawShifts(); markHot(); probeTicks(); fieldGrid(); };
+    // Click the card (anywhere but ×) to drop it from the plots and back; the eye in the
+    // row shows which state it is in.
+    el.onclick = (e) => {
+      if (e.target.closest('.x')) return;
+      p.hidden = !p.hidden;
+      S.hot = null;
+      paintAll(); multiples();
+    };
+    el.onmouseenter = () => {
+      if (p.hidden) return;                 // a hidden probe has nothing to bring forward
+      S.hot = p; drawSpec(); drawShifts(); markHot(); probeTicks(); fieldGrid();
+    };
     el.onmouseleave = () => { S.hot = null; drawSpec(); drawShifts(); markHot(); probeTicks(); fieldGrid(); };
   });
   $('#plist').querySelectorAll('.x').forEach((b) => (b.onclick = (e) => {
@@ -1466,7 +1649,7 @@ function allMasks() {
   if (!S.muted && S.live.sid) seen.set(S.live.sid, '1a1a19');    // live = ink, drawn first
   // Pinned probes overwrite the live entry for the same scene, and are appended after it,
   // so a just-pinned probe shows its own color instead of hiding under the black mask.
-  for (const p of S.probes) { seen.delete(p.sid); seen.set(p.sid, probeHex(p)); }
+  for (const p of shownProbes()) { seen.delete(p.sid); seen.set(p.sid, probeHex(p)); }
   if (!seen.size) { $('#maskfig').hidden = true; return; }
   $('#maskfig').hidden = false;
   const ids = [...seen.keys()].join(','), cols = [...seen.values()].join(',');
@@ -1498,7 +1681,7 @@ function legends() {
         ` — current  L${S.live.laser}</span>`
       : `<span data-live="1">${swatch(ink, DASH[S.live.ch])}` +
         `current — L${S.live.laser}  ${S.live.ch}</span>`);
-  const rows = S.probes.map((p) => {
+  const rows = shownProbes().map((p) => {
     const c = col(p), tail = `${fmt(p.hzv)} Hz  ${shortId(p.sid)}  L${p.laser}`;
     return p.dataY
       ? `<span data-id="${p.id}">${swatch(c, DASH.x)}x ${swatch(c, DASH.y)}y  ${tail}</span>`
@@ -1556,6 +1739,13 @@ function seg(id, fn) {
 function wire() {
   buildOverlays();
   document.querySelectorAll('#p1, #p2').forEach((el) => freqAxis(el.parentElement));
+  ['p1', 'p2', 'p3'].forEach((id) => zoomable($('#' + id).parentElement, id));
+  $('#sigreset').onclick = () => resetZoom();
+
+  const exp = $('#exp'), elist = $('#explist');
+  exp.oninput = () => { renderExpList(exp.value.trim()); elist.hidden = false; };
+  exp.onfocus = () => { renderExpList(exp.value.trim()); elist.hidden = false; };
+  exp.onblur = () => setTimeout(() => (elist.hidden = true), 120);
 
   const sid = $('#sid'), slist = $('#sidlist');
   sid.oninput = () => { renderSidList(sid.value.trim()); slist.hidden = false; };

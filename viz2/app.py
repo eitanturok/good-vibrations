@@ -54,9 +54,24 @@ def _wav(pcm, sr):
     return b.getvalue()
 
 
+def _payload():
+    return {"samples": list(data.META.values()), "info": data.INFO, "rv": RENDER_V,
+            "experiments": sorted(data.EXPERIMENTS), "experiment": data.CURRENT}
+
+
 @app.get("/api/samples")
 def samples():
-    return {"samples": list(data.META.values()), "info": data.INFO, "rv": RENDER_V}
+    return _payload()
+
+
+@app.get("/api/switch/{name}")
+def switch(name: str):
+    """Load a different experiment (box) and hand back the same shape as /api/samples."""
+    try:
+        data.switch(name)
+    except KeyError:
+        raise HTTPException(404, "unknown experiment")
+    return _payload()
 
 
 @app.get("/api/sample/{sid}")

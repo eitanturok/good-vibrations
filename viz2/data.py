@@ -11,13 +11,20 @@ from functools import lru_cache
 from pathlib import Path
 
 import numpy as np
+from PIL import Image
 from scipy.ndimage import median_filter
 from scipy.signal import find_peaks, resample
 
-FFT = "vibration/04_ffts.npz"
+# Older experiments name the FFT file singular; everything else about the payload matches.
+FFTS = ["vibration/04_ffts.npz", "vibration/04_fft.npz"]
 SHIFTS = {"clean": "vibration/03_clean_shifts.npy", "raw": "vibration/02_raw_shifts.npy"}
 PHOTOS = ["image/02_cropped_overhead.png", "image/01_cropped.png"]
 MASKS = ["image/03_smask.npy", "image/02_smask.npy"]
+
+EXPERIMENTS: dict[str, Path] = {}   # experiment name -> its dir (the one holding samples/)
+CURRENT: str = ""                   # which experiment is loaded right now
+MAX_OVERHEAD = [1, 1]               # largest cropped-overhead [w, h] over ALL experiments,
+                                    # so the client can size every box against the biggest
 
 DIRS: dict[str, Path] = {}   # sample id -> dir; the only id->path map
 META: dict[str, dict] = {}
@@ -48,15 +55,76 @@ def _first(d: Path, names):
     return next((n for n in names if (d / n).exists()), None)
 
 
-def init(exp: Path) -> int:
-    """Scan once. Keep only samples that really have an FFT -- this is what drops
-    gastronorm's 000009 (images but no vibration data), with no special case."""
-    exp = Path(exp)
+def _fft(d: Path) -> Path | None:
+    n = _first(d, FFTS)
+    return d / n if n else None
+
+
+def _loadable(exp: Path) -> bool:
+    """An experiment viz2 can actually open: at least one sample with an FFT. Drops
+    older-format experiments (e.g. experiment-25) with no special case."""
+    sm = exp / "samples"
+    return sm.is_dir() and any(_fft(d) for d in sm.iterdir())
+
+
+def _overhead_size(exp: Path):
+    """[w, h] of the first sample's cropped-overhead photo -- the box's real pixel size,
+    which is what makes one box render bigger than another. Falls back to [1, 1]."""
     for d in sorted((exp / "samples").iterdir()):
-        if (d / FFT).exists():
+        p = _first(d, PHOTOS)
+        if p:
+            with Image.open(d / p) as im:
+                return list(im.size)          # PIL .size is (w, h)
+    return [1, 1]
+
+
+def init(root: Path) -> int:
+    """Point viz2 at either one experiment dir (has samples/) or a parent dir of them.
+
+    Every experiment becomes a pickable box; the first is loaded now, the rest on demand
+    via switch(). Returns the experiment count."""
+    root = Path(root)
+    cands = [root] if (root / "samples").is_dir() else sorted(root.iterdir())
+    for c in cands:
+        if _loadable(c):
+            EXPERIMENTS[c.name] = c
+    if not EXPERIMENTS:
+        raise SystemExit(f"no loadable experiments (a samples/ dir with an FFT) under {root}")
+
+    # The biggest box across everything, measured once, so the client scales them together.
+    w = h = 1
+    for exp in EXPERIMENTS.values():
+        ow, oh = _overhead_size(exp)
+        w, h = max(w, ow), max(h, oh)
+    MAX_OVERHEAD[:] = [w, h]
+
+    _load(next(iter(EXPERIMENTS)))
+    return len(EXPERIMENTS)
+
+
+def switch(name: str) -> int:
+    """Load a different experiment. Returns its sample count."""
+    if name not in EXPERIMENTS:
+        raise KeyError(name)
+    _load(name)
+    return len(DIRS)
+
+
+def _load(name: str) -> None:
+    """(Re)populate DIRS / META / INFO for one experiment. Keep only samples that really
+    have an FFT -- this is what drops gastronorm's 000009 (images but no vibration data),
+    with no special case."""
+    global CURRENT
+    CURRENT = name
+    exp = EXPERIMENTS[name]
+    DIRS.clear(); META.clear()
+    fft.cache_clear(); shifts.cache_clear()
+
+    for d in sorted((exp / "samples").iterdir()):
+        if _fft(d):
             DIRS[d.name] = d
     if not DIRS:
-        raise SystemExit(f"no samples with {FFT} under {exp}/samples")
+        raise SystemExit(f"no samples with an FFT under {exp}/samples")
 
     for sid, d in DIRS.items():
         m = _meta(d)
@@ -68,21 +136,25 @@ def init(exp: Path) -> int:
             "n": int(m.get("n_objects") or 0),
             "empty": bool(m.get("is_empty_box")),
             "com": com(m.get("avg_com")),
+            "box": m.get("box") or name,                 # carried onto every pinned probe
         }
 
     d0 = DIRS[next(iter(DIRS))]
     m0 = _meta(d0)
-    z = np.load(d0 / FFT)
+    z = np.load(_fft(d0))
     n_lasers = z["fft"].shape[1]
     rows = m0.get("n_rows") or m0.get("n_laser_rows") or int(round(n_lasers ** 0.5))
+    ow, oh = _overhead_size(exp)
+    INFO.clear()
     INFO.update(
+        experiment=name, box=m0.get("box") or name,
         rows=int(rows), cols=int(n_lasers // int(rows)), n_lasers=int(n_lasers),
         fps=float(m0.get("fps") or 2500), n_samples=int(z["n_samples"]),
         min_freq=float(m0.get("min_freq") or 50), max_freq=float(m0.get("max_freq") or 1000),
         photo=_first(d0, PHOTOS), mask=_first(d0, MASKS),
+        overhead=[ow, oh], max_overhead=list(MAX_OVERHEAD),
     )
     INFO["scale"] = _scales()
-    return len(DIRS)
 
 
 # Signed quantities vary ~5x between samples and log magnitude shifts by ~0.7 decades, so
@@ -156,7 +228,7 @@ def d(sid: str) -> Path:
 
 @lru_cache(maxsize=64)
 def fft(sid):
-    z = np.load(d(sid) / FFT)
+    z = np.load(_fft(d(sid)))
     return z["fft"][0], z["freqs"].astype(float)      # (L,F,C) complex64, (F,)
 
 

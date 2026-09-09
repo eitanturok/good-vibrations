@@ -77,6 +77,18 @@ h2 em { font-style:normal; color:var(--accent); font-family:var(--mono);
 #sidlist .opt b { font:600 12px var(--mono); color:var(--ink); }
 #sidlist .opt i { font:9px var(--sans); font-style:normal; color:var(--ink3); }
 #sidlist .more { font:9px var(--mono); color:var(--ink3); padding:5px 6px; }
+
+/* The experiment (box) picker: same combo as #sid, one line per box. */
+#exp { width:150px; font:13px var(--mono); padding:5px 7px; border:1px solid var(--firm);
+       border-radius:var(--r); background:var(--s0); color:var(--ink); }
+#explist { position:absolute; top:calc(100% + 3px); left:0; z-index:40; width:230px;
+           max-height:280px; overflow-y:auto; background:var(--s1); border:1px solid var(--firm);
+           border-radius:var(--r); box-shadow:0 6px 20px rgba(0,0,0,.13); padding:3px; }
+#explist .opt { display:block; width:100%; text-align:left; border:0; background:none;
+                padding:5px 6px; border-radius:4px; cursor:pointer; font:12px var(--mono); color:var(--ink); }
+#explist .opt:hover { background:var(--s2); }
+#explist .opt.on { background:var(--accent-sf); font-weight:600; }
+#explist .more { font:9px var(--mono); color:var(--ink3); padding:5px 6px; }
 #scatter { width:250px; height:78px; background:var(--s2);
            border:1px solid var(--firm); border-radius:4px; }
 #spk { width:126px; height:78px; }
@@ -124,7 +136,17 @@ main { flex:1; display:grid; grid-template-columns:1fr 208px; gap:12px;
 .lasercol .mt { margin-top:10px; }
 .chsel { width:150px; }
 .chsel button { flex:1; padding:4px 0; font-size:12px; }
-.lf { flex:1; min-width:0; }
+.lf { flex:1; min-width:0; position:relative; }
+
+/* Box zoom: the rubber-band rectangle, and the reset affordance that only appears
+   once a plot is actually zoomed. */
+.ov rect.zband { fill:var(--accent); fill-opacity:.12; stroke:var(--accent);
+                 stroke-width:1; stroke-dasharray:3 2; }
+.zreset { position:absolute; right:0; top:-26px; z-index:3; display:none;
+          padding:3px 8px; font:10px var(--mono); border:1px solid var(--firm);
+          border-radius:4px; background:var(--s1); color:var(--ink2); }
+.zreset.show { display:inline-block; }
+.zreset:hover { color:var(--ink); border-color:var(--accent); }
 .audio { display:flex; align-items:center; justify-content:center; gap:10px; }
 .audio audio { height:34px; width:min(520px,100%); }
 #heldaudio { display:flex; flex-direction:column; gap:5px; align-items:center;
@@ -134,10 +156,13 @@ main { flex:1; display:grid; grid-template-columns:1fr 208px; gap:12px;
 .ha .tag { font:10px var(--mono); color:var(--c); min-width:120px; text-align:right; }
 .ha audio { height:28px; width:min(420px,60vw); }
 
+/* --mw / --mh are the mode canvas size: set per box by sizeModePanel() so each box keeps
+   its true aspect ratio, scaled so a physically bigger box draws bigger. */
+:root { --mw:460px; --mh:460px; }
 .modewrap { position:relative; padding:0 0 22px 64px; flex:none; }
-.modeleft canvas { width:460px; height:460px; display:block; flex:none;
+.modeleft canvas { width:var(--mw); height:var(--mh); display:block; flex:none;
                    border:1px solid var(--line); border-radius:4px; background:var(--s0); }
-.mode-ax { position:absolute; left:64px; top:0; width:460px; height:460px;
+.mode-ax { position:absolute; left:64px; top:0; width:var(--mw); height:var(--mh);
            overflow:visible; pointer-events:none; }
 .mode-ax .ml { font:9px var(--mono); fill:var(--ink3); text-anchor:end; }
 .mode-ax .ml.col { text-anchor:middle; }
@@ -148,7 +173,7 @@ main { flex:1; display:grid; grid-template-columns:1fr 208px; gap:12px;
         letter-spacing:.04em; }
 .mlab.my { left:-4px; top:50%; transform:rotate(-90deg) translateX(50%);
            transform-origin:left center; white-space:nowrap; }
-.mlab.mx { left:26px; width:320px; bottom:2px; text-align:center; }
+.mlab.mx { left:64px; width:var(--mw); bottom:2px; text-align:center; }
 
 
 .card { background:var(--s1); border:1px solid var(--line); border-radius:var(--r);
@@ -369,7 +394,7 @@ h2 em.soft { color:var(--ink3); font-weight:400; margin-left:auto; }
    .modeleft is pinned to the canvas width (320 + 34 label gutter): otherwise the legend,
    which grows with every probe, widened this column and walked the grid rightwards. */
 .modesplit { display:flex; gap:20px; align-items:flex-start; }
-.modeleft { flex:none; width:524px; }
+.modeleft { flex:none; width:calc(var(--mw) + 64px); }
 /* One legend spanning the whole step, so it labels the overlay plot and the per-probe
    tiles at once. Vertical, so a long probe list reads down a single narrow column rather
    than wrapping into rows that push the plots around. */
@@ -398,10 +423,24 @@ h2 em.soft { color:var(--ink3); font-weight:400; margin-left:auto; }
 .card2 .ln1 { display:flex; align-items:baseline; gap:4px; }
 .card2 .ln1 b { font-size:11px; color:var(--ink); font-weight:600; }
 .card2 .sub { font-size:9px; color:var(--ink3); }
+.card2 .sub.foreign { color:var(--accent); }   /* probe kept from another box */
 .card2 .ln3 { font-size:9.5px; color:var(--ink2); white-space:nowrap; }
 .card2 .x { border:0; background:none; color:var(--ink3); font-size:13px;
-            line-height:1; padding:0 1px; margin-left:auto; cursor:pointer; }
+            line-height:1; padding:0 1px; margin-left:2px; cursor:pointer; }
 .card2 .x:hover { color:var(--ink); }
+
+/* Show / hide toggle. The whole card is the hit target; this eye just reports which
+   state it is in. Slash and hollow pupil appear together on a hidden card. */
+.card2 .eye { margin-left:auto; display:inline-flex; align-items:center; color:var(--ink3); }
+.card2:hover .eye { color:var(--ink2); }
+.eyei { width:16px; height:auto; display:block; overflow:visible; }
+.eyei .lid { fill:none; stroke:currentColor; stroke-width:1.4; }
+.eyei .pupil { fill:currentColor; stroke:none; }
+.eyei .slash { display:none; stroke:currentColor; stroke-width:1.7; stroke-linecap:round; }
+.probe.off { opacity:.6; }
+.probe.off .thumb { filter:grayscale(1); opacity:.55; }
+.probe.off .eyei .slash { display:block; }
+.probe.off .eyei .pupil { fill:none; stroke:currentColor; stroke-width:1.4; }
 
 /* The list scrolls inside the column instead of growing the page. */
 #plist { max-height:58vh; overflow-y:auto; overscroll-behavior:contain; }
