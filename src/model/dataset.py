@@ -18,15 +18,7 @@ _NDArray._int2value_dtype |= {100: "complex64", 101: "complex128"}
 _NDArray._value_dtype2int |= {"complex64": 100, "complex128": 101}
 
 
-# captures disagree on the spelling: 04_ffts.npz is what the pipeline writes now, 04_fft.npz is
-# what older captures have. Same contents, so resolve per sample rather than forcing one name.
-FFT_FILES = ("vibration/04_ffts.npz", "vibration/04_fft.npz")
-REQUIRED_FILES = ["image/03_smask.npy", "metadata.jsonl"]
-
-def fft_path(sample_dir: Path) -> Path:
-    for name in FFT_FILES:
-        if (sample_dir / name).exists(): return sample_dir / name
-    raise FileNotFoundError(f"{sample_dir}: none of {FFT_FILES}")
+REQUIRED_FILES = ["image/03_smask.npy", "vibration/04_ffts.npz", "metadata.jsonl"]
 LID_LAYOUT = 'lid-purple-cube'
 EMPTY_BOX_LAYOUT = "empty-box"
 
@@ -167,8 +159,9 @@ def convert_to_mds(mds_dir: Path, samples: list[tuple[Path, dict]], out_h: int, 
         # the precomputed array was already written from the selected lasers, so it is sliced
         # once (here or there), never twice
         if not augment_fft:
-            return np.load(sample_dir / precomputed_fft_name(signal_mode, normalize_mode, patch_size, subtract_speaker_mean, subtract_empty_box, phase_arm, phase_weight, laser_cols))
-        return load_fft(sample_dir, laser_idx)
+            return np.load(sample_dir / precomputed_fft_name(signal_mode, normalize_mode, patch_size, subtract_speaker_mean, subtract_empty_box, phase_arm, phase_weight))
+        X = np.load(sample_dir / "vibration/04_ffts.npz")["fft"]  # (1, L, F, C) complex64
+        return np.squeeze(X, axis=0) if X.ndim == 4 and X.shape[0] == 1 else X
 
     x_shape = load_X(samples[0][0]).shape
     y_shape = (out_h, out_w, 3) if rgb else (out_h, out_w)  # y: the downsampled mask, or the downsampled rgb photo
@@ -205,7 +198,7 @@ def convert_to_mds(mds_dir: Path, samples: list[tuple[Path, dict]], out_h: int, 
         os.chdir(cwd)
 
     # freqs is identical across every sample (same fft grid) -- one sidecar, not duplicated per-row
-    freqs = np.load(fft_path(samples[0][0]))["freqs"]
+    freqs = np.load(samples[0][0] / "vibration/04_ffts.npz")["freqs"]
     np.save(mds_dir / "freqs.npy", freqs)
 
     # save metadata as a sidecar for loader-side filtering
@@ -486,7 +479,9 @@ EMPTY_BOX_REF_FILE = "empty_box_ref.npz"
 
 def load_signal(sample_dir: Path, signal_mode: str, laser_idx: np.ndarray | None = None) -> torch.Tensor:
     """(1,L,F,C) raw fft off disk -> extract_signal, in float64 so long sums don't drift."""
-    return extract_signal(torch.from_numpy(load_fft(sample_dir, laser_idx)).unsqueeze(0), signal_mode).double()
+    X = np.load(sample_dir / "vibration/04_ffts.npz")["fft"]  # (1, L, F, C) complex64
+    X = np.squeeze(X, axis=0) if X.ndim == 4 and X.shape[0] == 1 else X
+    return extract_signal(torch.from_numpy(X).unsqueeze(0), signal_mode).double()
 
 def _keep(samples, keep_idxs):
     if keep_idxs is None: return samples
@@ -569,10 +564,12 @@ def load_dataset_stats(path: Path) -> dict[str, torch.Tensor]:
     d = np.load(path)
     return {k: torch.from_numpy(d[k]).unsqueeze(0) for k in d.files}
 
-def precompute_vibration_samples(samples: list[tuple[Path, dict]], signal_mode: str, normalize_mode: str, patch_size: int, verbose: int = 1, speaker_means: dict[int, torch.Tensor] | None = None, stats: dict[str, torch.Tensor] | None = None, empty_box_ref: dict[int, torch.Tensor] | None = None, mag_recipe: str | None = None, phase_arm: str | None = None, phase_weight: float = 1.0, laser_idx: np.ndarray | None = None, laser_cols=None) -> None:
-    freqs = torch.from_numpy(np.load(fft_path(samples[0][0]))["freqs"])
+def precompute_vibration_samples(samples: list[tuple[Path, dict]], signal_mode: str, normalize_mode: str, patch_size: int, verbose: int = 1, speaker_means: dict[int, torch.Tensor] | None = None, stats: dict[str, torch.Tensor] | None = None, empty_box_ref: dict[int, torch.Tensor] | None = None, mag_recipe: str | None = None, phase_arm: str | None = None, phase_weight: float = 1.0) -> None:
+    freqs = torch.from_numpy(np.load(samples[0][0] / "vibration/04_ffts.npz")["freqs"])
     for sample_dir, meta in tqdm(samples, desc="precomputing fft", disable=not verbose):
-        X = torch.from_numpy(load_fft(sample_dir, laser_idx)).unsqueeze(0)
+        X = np.load(sample_dir / "vibration/04_ffts.npz")["fft"]  # (1, L, F, C) complex64
+        X = np.squeeze(X, axis=0) if X.ndim == 4 and X.shape[0] == 1 else X
+        X = torch.from_numpy(X).unsqueeze(0)
         speaker = int(meta.get("speaker", -1))
         speaker_mean = speaker_means[speaker] if speaker_means is not None else None
         ref = empty_box_ref[speaker] if empty_box_ref is not None else None

@@ -200,8 +200,8 @@ def _process_vibrations(sample_dir:Path, raw_vibrations:np.ndarray=None, min_fre
     with Timing(f"[sample {sample_id}] fft shifts: ", enabled=verbose >= 2):
         fft, freqs, n_samples = get_fft_shifts(clean_shifts, fps, min_freq, max_freq) # (B,L,T,2) -> (B,L,F,2), (F,) (,)
         logger.debug(f'[sample {sample_id}] {fft.shape=}=(batch, lasers, freq bins, x/y)\n[sample {sample_id}] {freqs.shape=}=(freq bins)\n[sample {sample_id}] {n_samples=}')
-        save({'fft': fft, 'freqs': freqs, 'n_samples': n_samples}, sample_dir / 'vibration/04_fft.npz', do_save)
-        plot_fft(freqs, fft[0, 0 if laser_idx is not None else recovered_laser, :, xy_idx], sample_dir / f'vibration/04_fft{file_suffix}.png',
+        save({'fft': fft, 'freqs': freqs, 'n_samples': n_samples}, sample_dir / 'vibration/04_ffts.npz', do_save)
+        plot_fft(freqs, fft[0, 0 if laser_idx is not None else recovered_laser, :, xy_idx], sample_dir / f'vibration/04_ffts{file_suffix}.png',
                  title=f'Recovered FFT, Laser {recovered_laser}, {axis_label}-axis', max_freq=max_freq, enabled=do_save)
         append({"fft_shifts": datetime.now(timezone.utc).isoformat()}, sample_dir / "times.jsonl", do_save)
 
@@ -265,7 +265,7 @@ def _process_vibrations_modal(sample_dir_name: str, **kwargs):
     _process_vibrations(VOLUME_PATH / sample_dir_name, **kwargs)
     volume.commit()
 
-PROCESSED_FILES = ["02_raw_shifts.npy", "03_clean_shifts.npy", "04_fft.npz"]
+PROCESSED_FILES = ["02_raw_shifts.npy", "03_clean_shifts.npy", "04_ffts.npz"]
 
 def process_vibrations(sample_dir:Path, raw_vibrations:np.ndarray=None, use_modal:bool=False, pclk_mode:str='batched_optimized', pclk_batch_size:int=256, do_save:bool=True, verbose:int=1, cleanup_raw_vibrations:str|None=None, spectrogram_video:bool=True, laser_idx:int|None=None, xy_idx:int=0, use_PC:bool=True):
     sample_id = sample_dir.name
@@ -289,7 +289,7 @@ def process_vibrations(sample_dir:Path, raw_vibrations:np.ndarray=None, use_moda
     recovered_laser = laser_idx if laser_idx is not None else DEFAULT_RECOVERY_LASER_IDX
     axis_label = 'x' if xy_idx == 0 else 'y'
     file_suffix = f'_laser{recovered_laser}_{axis_label}'
-    vibration_files = PROCESSED_FILES + [f'04_fft{file_suffix}.png', f'05_recovered_audio{file_suffix}.wav', f'06_spectrogram{file_suffix}.npz', f'06_spectrogram{file_suffix}.png'] + ([f'06_spectrogram{file_suffix}.mp4'] if spectrogram_video else [])
+    vibration_files = PROCESSED_FILES + [f'04_ffts{file_suffix}.png', f'05_recovered_audio{file_suffix}.wav', f'06_spectrogram{file_suffix}.npz', f'06_spectrogram{file_suffix}.png'] + ([f'06_spectrogram{file_suffix}.mp4'] if spectrogram_video else [])
     with Timing(f'[sample {sample_id}] download processed vibrations modal_volume->DISK::{sample_dir}: ', enabled=verbose >= 1):
         for f in vibration_files: modal_download(volume, f"{sample_dir.name}/vibration/{f}", sample_dir / f"vibration/{f}")
         fix_symlinks(sample_dir, [("recovered_audio.wav", f"vibration/05_recovered_audio{file_suffix}.wav")])
@@ -299,7 +299,7 @@ def process_vibrations(sample_dir:Path, raw_vibrations:np.ndarray=None, use_moda
     # TODO: doesn't modal remote return this dictionary already? out = f.remote() ?
     # TODO: can we read in these values from sample_dir? Do we really need process_vbrations to return them?
     # same return contract as the local path, loaded from the files we just downloaded
-    fft_data = load(sample_dir / 'vibration/04_fft.npz')
+    fft_data = load(sample_dir / 'vibration/04_ffts.npz')
     recovered_audio, audio_sample_rate = load(sample_dir / f'vibration/05_recovered_audio{file_suffix}.wav')
     spec_freqs, spec_times, Sxx = load(sample_dir / f'vibration/06_spectrogram{file_suffix}.npz', keys=['freqs', 'times', 'Sxx'])
     return {'fft': fft_data['fft'], 'freqs': fft_data['freqs'], 'n_samples': fft_data['n_samples'], 'recovered_audio': recovered_audio,
@@ -415,8 +415,8 @@ def process_vibrations_3(sample_dir, raw_vibrations, pclk_batch_size, pclk_laser
     save(clean_shifts, sample_dir / 'vibration/03_clean_shifts.npy', do_save)
 
     # fft
-    save({'fft': fft, 'freqs': freqs, 'n_samples': n_samples}, sample_dir / f'vibration/04_fft{file_suffix}.npz', do_save)
-    plot_fft(freqs, fft[0, recovery_laser, :, recovery_xy], sample_dir / f'vibration/04_fft{file_suffix}.png', title=f'Recovered FFT, Laser {recovery_laser}, {axis_label}-axis', max_freq=max_freq, enabled=do_save)
+    save({'fft': fft, 'freqs': freqs, 'n_samples': n_samples}, sample_dir / f'vibration/04_ffts{file_suffix}.npz', do_save)
+    plot_fft(freqs, fft[0, recovery_laser, :, recovery_xy], sample_dir / f'vibration/04_ffts{file_suffix}.png', title=f'Recovered FFT, Laser {recovery_laser}, {axis_label}-axis', max_freq=max_freq, enabled=do_save)
 
     # recovered audio
     audio_path = sample_dir / f'vibration/05_recovered_audio{file_suffix}.wav'
