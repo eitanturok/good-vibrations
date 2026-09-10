@@ -35,43 +35,53 @@ def apply_rope(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
 N_COUNT_CLASSES = 4  # n_objects observed in {0,1,2,3}
 
 SEG_KEYS = ('bce', 'iou', *LOC_KEYS, 'contour', 'mass')
+# Per-train-batch subset: pure GPU reductions, no connected-component labelling, no
+# per-sample Python loop, no device sync. The full suite -- localization* (labels +
+# greedy centroid match) and contour (morphology) -- runs on the eval loaders, where
+# it is paid once per --eval-interval instead of on every step. `metrics/train/*` for
+# the omitted keys then only appear from the boundary `train` evaluator; add an
+# Evaluator(label='train') to eval_loaders in run.py to get them at eval cadence.
+CHEAP_SEG_KEYS = ('bce', 'iou', 'mass')
 
-# The 10 MaskMetrics see the same (logits, pred, true) each batch; compute the suite once.
+# The MaskMetrics sharing a batch see the same (logits, pred, true); compute the suite
+# once and cache it. `want` is the key set this caller needs -- localization()/contour_f()
+# only run when a wanted key needs them, so the cheap train set skips them entirely.
 _seg_cache = {}
-def _seg_batch(logits, pred, true):
-    if _seg_cache.get('id') != id(pred):
+def _seg_batch(logits, pred, true, want=SEG_KEYS):
+    want = frozenset(want)
+    if _seg_cache.get('id') != id(pred) or not want <= _seg_cache.get('want', frozenset()):
         b = len(pred)
-        loc = localization(pred, true)
-        nan = lambda v: (v[~v.isnan()].sum(), int((~v.isnan()).sum()))
+        v = {}
+        if 'bce' in want:     v['bce'] = (F.binary_cross_entropy_with_logits(logits, true, reduction='sum'), true.numel())
+        if 'iou' in want:     v['iou'] = (soft_iou(pred, true).sum(), b)
+        if 'mass' in want:    v['mass'] = (mass_error(pred, true).sum(), b)
+        if 'contour' in want: v['contour'] = (contour_f(pred, true).sum(), b)
+        if want & set(LOC_KEYS):
+            nan = lambda t: (t[~t.isnan()].sum(), int((~t.isnan()).sum()))
+            v.update({k: nan(t) for k, t in localization(pred, true).items()})
         _seg_cache.clear()
-        _seg_cache['id'] = id(pred)
-        _seg_cache['v'] = {
-            'bce': (F.binary_cross_entropy_with_logits(logits, true, reduction='sum'), true.numel()),
-            'iou': (soft_iou(pred, true).sum(), b),
-            'mass': (mass_error(pred, true).sum(), b),
-            'contour': (contour_f(pred, true).sum(), b),
-            **{k: nan(v) for k, v in loc.items()},
-        }
+        _seg_cache.update(id=id(pred), want=want, v=v)
     return _seg_cache['v']
 
 class MaskMetric(Metric):
-    def __init__(self, key):
+    def __init__(self, key, group=SEG_KEYS):
         super().__init__()
         self.key = key
+        self.group = tuple(group)  # the full key set to compute together on the shared batch
         self.add_state("total", default=torch.tensor(0.0), dist_reduce_fx="sum")
         self.add_state("count", default=torch.tensor(0.0), dist_reduce_fx="sum")
 
     def update(self, mask_logits, mask_pred, mask_true, n_objects):
-        s, n = _seg_batch(mask_logits, mask_pred.float(), mask_true.float())[self.key]
+        s, n = _seg_batch(mask_logits, mask_pred.float(), mask_true.float(), self.group)[self.key]
         self.total = self.total + s.to(self.total)
         self.count = self.count + n
 
     def compute(self): return self.total / self.count.clamp(min=1)
 
-def create_metrics(data_info):
+def create_metrics(data_info, keys=SEG_KEYS):
     # the mask metrics read (H,W) as occupancy, which is meaningless on an rgb target
     if data_info.get('out_c', 1) != 1: return {}
-    return {k: MaskMetric(k) for k in SEG_KEYS}
+    return {k: MaskMetric(k, keys) for k in keys}
 
 #***** 2 losses *****
 
@@ -275,7 +285,8 @@ class VibrationTransformer(ComposerModel):
         self.is_spatial_loss = loss_fn.startswith('ce-spatial')
         self.is_asym_loss = loss_fn.endswith('-asym')
         self.loss_alpha = loss_alpha
-        self.train_metrics, self.val_metrics = create_metrics(data_info), create_metrics(data_info)
+        self.train_metrics = create_metrics(data_info, CHEAP_SEG_KEYS)  # cheap subset per step
+        self.val_metrics = create_metrics(data_info)                   # full suite on eval loaders
 
     def forward(self, batch):
         # B=batch size, L=n_lasers, C=n_coordinates=2, PS=patch_size, D=d_model
