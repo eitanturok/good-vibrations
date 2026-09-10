@@ -54,9 +54,46 @@ def _wav(pcm, sr):
     return b.getvalue()
 
 
+def _payload():
+    return {"samples": list(data.META.values()), "info": data.INFO, "rv": RENDER_V,
+            "datasets": sorted(data.DATASETS), "dataset": data.CURRENT,
+            "dataset_counts": data.COUNTS}
+
+
 @app.get("/api/samples")
 def samples():
-    return {"samples": list(data.META.values()), "info": data.INFO, "rv": RENDER_V}
+    return _payload()
+
+
+@app.get("/api/switch/{name}")
+def switch(name: str):
+    """Load a different dataset (box) and hand back the same shape as /api/samples."""
+    try:
+        data.switch(name)
+    except KeyError:
+        raise HTTPException(404, "unknown dataset")
+    return _payload()
+
+
+@app.get("/api/box/{name}.jpg")
+def box_thumb(name: str):
+    """Row icon for the dataset picker: the bare box (an empty-box sample if there is one)."""
+    if name not in data.DATASETS:
+        raise HTTPException(404, "unknown dataset")
+    p = data.box_photo(name)
+    if not p:
+        raise HTTPException(404, "no photo")
+    return Response(render.thumb(p), media_type="image/jpeg", headers=CACHE)
+
+
+@app.get("/api/thumb/{sid}.jpg")
+def sample_thumb(sid: str):
+    """Row icon for the sample picker: that sample's cropped-overhead photo."""
+    _d(sid)
+    p = data.sample_photo(sid)
+    if not p:
+        raise HTTPException(404, "no photo")
+    return Response(render.thumb(p), media_type="image/jpeg", headers=CACHE)
 
 
 @app.get("/api/sample/{sid}")

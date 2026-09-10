@@ -1,4 +1,4 @@
-"""Loading and numpy. Everything is derived from the experiment dir -- nothing hardcoded.
+"""Loading and numpy. Everything is derived from the dataset dir -- nothing hardcoded.
 
 Sample ids stay strings end to end; viz2 never builds a cross-sample array, so unlike viz/
 there is no row space and no id->row conversion to get wrong.
@@ -11,13 +11,22 @@ from functools import lru_cache
 from pathlib import Path
 
 import numpy as np
+from PIL import Image
 from scipy.ndimage import median_filter
 from scipy.signal import find_peaks, resample
 
-FFT = "vibration/04_ffts.npz"
+# Older experiments name the FFT file singular; everything else about the payload matches.
+FFTS = ["vibration/04_ffts.npz", "vibration/04_fft.npz"]
 SHIFTS = {"clean": "vibration/03_clean_shifts.npy", "raw": "vibration/02_raw_shifts.npy"}
 PHOTOS = ["image/02_cropped_overhead.png", "image/01_cropped.png"]
 MASKS = ["image/03_smask.npy", "image/02_smask.npy"]
+
+DATASETS: dict[str, Path] = {}      # dataset name -> its dir (the one holding samples/)
+COUNTS: dict[str, int] = {}         # dataset name -> its sample count (scanned once at init)
+CURRENT: str = ""                   # which dataset is loaded right now
+MAX_OVERHEAD = [1, 1]               # largest cropped-overhead [w, h] over ALL datasets,
+                                    # so the client can size every box against the biggest
+DEFAULT = "gastro"                  # substring of the dataset to open first
 
 DIRS: dict[str, Path] = {}   # sample id -> dir; the only id->path map
 META: dict[str, dict] = {}
@@ -48,15 +57,100 @@ def _first(d: Path, names):
     return next((n for n in names if (d / n).exists()), None)
 
 
-def init(exp: Path) -> int:
-    """Scan once. Keep only samples that really have an FFT -- this is what drops
-    gastronorm's 000009 (images but no vibration data), with no special case."""
-    exp = Path(exp)
-    for d in sorted((exp / "samples").iterdir()):
-        if (d / FFT).exists():
+def _fft(d: Path) -> Path | None:
+    n = _first(d, FFTS)
+    return d / n if n else None
+
+
+def sample_photo(sid: str) -> Path | None:
+    p = _first(d(sid), PHOTOS)
+    return d(sid) / p if p else None
+
+
+@lru_cache(maxsize=32)
+def box_photo(name: str) -> Path | None:
+    """A cropped-overhead shot that stands for a whole dataset: an empty-box sample's if
+    the dataset has one (so the picker shows the bare box), otherwise the first sample's."""
+    first = None
+    for sd in sorted((DATASETS[name] / "samples").iterdir()):
+        p = _first(sd, PHOTOS)
+        if not p:
+            continue
+        if first is None:
+            first = sd / p
+        if _meta(sd).get("is_empty_box"):
+            return sd / p
+    return first
+
+
+def _sample_count(ds: Path) -> int:
+    """How many samples with an FFT the dataset holds -- 0 means viz2 cannot open it
+    (older-format datasets like experiment-25 land here with no special case)."""
+    sm = ds / "samples"
+    return sum(1 for d in sm.iterdir() if _fft(d)) if sm.is_dir() else 0
+
+
+def _overhead_size(ds: Path):
+    """[w, h] of the first sample's cropped-overhead photo -- the box's real pixel size,
+    which is what makes one box render bigger than another. Falls back to [1, 1]."""
+    for d in sorted((ds / "samples").iterdir()):
+        p = _first(d, PHOTOS)
+        if p:
+            with Image.open(d / p) as im:
+                return list(im.size)          # PIL .size is (w, h)
+    return [1, 1]
+
+
+def init(root: Path) -> int:
+    """Point viz2 at either one dataset dir (has samples/) or a parent dir of them.
+
+    Every dataset becomes a pickable box; DEFAULT (or the first) is loaded now, the rest
+    on demand via switch(). Returns the dataset count."""
+    root = Path(root)
+    cands = [root] if (root / "samples").is_dir() else sorted(root.iterdir())
+    for c in cands:
+        n = _sample_count(c)
+        if n:
+            DATASETS[c.name] = c
+            COUNTS[c.name] = n
+    if not DATASETS:
+        raise SystemExit(f"no loadable datasets (a samples/ dir with an FFT) under {root}")
+
+    # The biggest box across everything, measured once, so the client scales them together.
+    w = h = 1
+    for ds in DATASETS.values():
+        ow, oh = _overhead_size(ds)
+        w, h = max(w, ow), max(h, oh)
+    MAX_OVERHEAD[:] = [w, h]
+
+    first = next((n for n in DATASETS if DEFAULT in n.lower()), next(iter(DATASETS)))
+    _load(first)
+    return len(DATASETS)
+
+
+def switch(name: str) -> int:
+    """Load a different dataset. Returns its sample count."""
+    if name not in DATASETS:
+        raise KeyError(name)
+    _load(name)
+    return len(DIRS)
+
+
+def _load(name: str) -> None:
+    """(Re)populate DIRS / META / INFO for one dataset. Keep only samples that really
+    have an FFT -- this is what drops gastronorm's 000009 (images but no vibration data),
+    with no special case."""
+    global CURRENT
+    CURRENT = name
+    ds = DATASETS[name]
+    DIRS.clear(); META.clear()
+    fft.cache_clear(); shifts.cache_clear()
+
+    for d in sorted((ds / "samples").iterdir()):
+        if _fft(d):
             DIRS[d.name] = d
     if not DIRS:
-        raise SystemExit(f"no samples with {FFT} under {exp}/samples")
+        raise SystemExit(f"no samples with an FFT under {ds}/samples")
 
     for sid, d in DIRS.items():
         m = _meta(d)
@@ -66,23 +160,29 @@ def init(exp: Path) -> int:
             "spk": int(m.get("speaker") or 0),
             "layout": m.get("layout") or "",
             "n": int(m.get("n_objects") or 0),
+            # distinct object TYPES in the box, regardless of how many of each
+            "objects": sorted((m.get("objects") or {}).keys()),
             "empty": bool(m.get("is_empty_box")),
             "com": com(m.get("avg_com")),
+            "box": m.get("box") or name,                 # carried onto every pinned probe
         }
 
     d0 = DIRS[next(iter(DIRS))]
     m0 = _meta(d0)
-    z = np.load(d0 / FFT)
+    z = np.load(_fft(d0))
     n_lasers = z["fft"].shape[1]
     rows = m0.get("n_rows") or m0.get("n_laser_rows") or int(round(n_lasers ** 0.5))
+    ow, oh = _overhead_size(ds)
+    INFO.clear()
     INFO.update(
+        dataset=name, box=m0.get("box") or name,
         rows=int(rows), cols=int(n_lasers // int(rows)), n_lasers=int(n_lasers),
         fps=float(m0.get("fps") or 2500), n_samples=int(z["n_samples"]),
         min_freq=float(m0.get("min_freq") or 50), max_freq=float(m0.get("max_freq") or 1000),
         photo=_first(d0, PHOTOS), mask=_first(d0, MASKS),
+        overhead=[ow, oh], max_overhead=list(MAX_OVERHEAD),
     )
     INFO["scale"] = _scales()
-    return len(DIRS)
 
 
 # Signed quantities vary ~5x between samples and log magnitude shifts by ~0.7 decades, so
@@ -156,7 +256,7 @@ def d(sid: str) -> Path:
 
 @lru_cache(maxsize=64)
 def fft(sid):
-    z = np.load(d(sid) / FFT)
+    z = np.load(_fft(d(sid)))
     return z["fft"][0], z["freqs"].astype(float)      # (L,F,C) complex64, (F,)
 
 
