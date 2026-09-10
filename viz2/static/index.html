@@ -12,43 +12,47 @@
 <main>
 <div id="flow">
 
-  <!-- 1 . which recording -->
+  <!-- 1 . which recording: filter -> search -> current -->
   <section class="card step">
     <h2><b>1</b> sample</h2>
-    <div class="stepbody">
-      <div class="pickers">
-        <div class="pk"><span>experiment</span>
-          <div class="combo">
-            <input id="exp" autocomplete="off" spellcheck="false" placeholder="type a box">
-            <div id="explist" hidden></div>
+    <div class="s1v">
+
+      <!-- one long row of filters: one dataset, many object / n_objects / layout / speaker -->
+      <div class="s1frow">
+        <div class="pk pb ds"><span>dataset</span>
+          <div class="pickbox" id="datasetbox"></div>
+        </div>
+        <div class="pk pb"><span>object <span class="an"><button class="link" data-all="objects">all</button><button class="link" data-none="objects">none</button></span></span>
+          <div class="pickbox" id="objectbox"></div>
+        </div>
+        <div class="pk pb nb"><span>n_objects <span class="an"><button class="link" data-all="nobj">all</button><button class="link" data-none="nobj">none</button></span></span>
+          <div class="pickbox" id="nobjbox"></div>
+        </div>
+        <div class="pk pb ly"><span>layout <span class="an"><button class="link" data-all="layouts">all</button><button class="link" data-none="layouts">none</button></span></span>
+          <div class="pickbox" id="layoutbox"></div>
+        </div>
+        <div class="pk sp"><span>speaker <span class="an"><button class="link" data-all="spk">all</button><button class="link" data-none="spk">none</button></span></span>
+          <svg id="spk" tabindex="0"></svg>
+        </div>
+        <div class="s1count"><b id="nmatch">0</b><span><span id="nmatchsub">of 0</span> samples<br>after filter</span></div>
+      </div>
+
+      <div id="filterchips"></div>
+
+      <div class="s1block s1search">
+        <div class="s1srow">
+          <div class="pk pos"><span>position <button id="empty" class="tog">empty box</button>
+            <em id="poscount"></em></span>
+            <input id="posjump" class="pbq" type="number" min="1" placeholder="jump to position #">
+            <svg id="scatter" tabindex="0"></svg>
+            <div id="repeats" hidden></div>
           </div>
-          <em class="note">the box being measured</em>
-        </div>
-        <div class="pk"><span>sample <em id="nmatch"></em></span>
-          <div class="combo">
-            <input id="sid" autocomplete="off" spellcheck="false" placeholder="type an id">
-            <div id="sidlist" hidden></div>
+          <div class="pk pb samp"><span>sample id</span>
+            <div class="pickbox" id="samplebox"></div>
           </div>
-          <em class="note">overrides the filters</em>
-        </div>
-        <div class="pk"><span>objects <button class="link" data-all="nobj">all</button><button class="link" data-none="nobj">none</button></span>
-          <div class="chips nobj" id="nobjchips"></div>
-        </div>
-        <div class="pk lay"><span>layout <button class="link" data-all="layouts">all</button><button class="link" data-none="layouts">none</button></span>
-          <div class="chips" id="layoutchips"></div>
-        </div>
-        <div class="pk"><span>speaker <button class="link" data-all="spk">all</button><button class="link" data-none="spk">none</button></span>
-          <svg id="spk" tabindex="0"></svg></div>
-        <div class="pk"><span>position <button id="empty" class="tog">empty</button>
-          <em id="poscount"></em></span>
-          <svg id="scatter" tabindex="0"></svg>
-          <div id="repeats" hidden></div>
         </div>
       </div>
-      <div class="scenes">
-        <figure><img id="scene" alt=""><figcaption>overhead</figcaption></figure>
-        <figure><img id="smask" alt=""><figcaption>segmentation mask</figcaption></figure>
-      </div>
+
     </div>
   </section>
 
@@ -151,11 +155,19 @@
 </div>
 
 <aside id="probes">
-  <h2>masks</h2>
-  <figure id="maskfig"><img id="allmasks" alt=""><figcaption>current + pinned</figcaption></figure>
-  <h2>current</h2>
-  <div id="now" class="probe live"></div>
-  <h2 id="heldh">workbench <em class="addhint">press <kbd>Enter</kbd> to add</em><button id="clear" class="link">clear</button></h2>
+
+  <section id="cursample">
+    <div class="scenefig"><img id="scene" alt=""><svg id="scenering" aria-hidden="true"></svg></div>
+    <dl id="curmeta"></dl>
+  </section>
+
+  <h2 class="asidetitle">workbench</h2>
+
+  <h3 class="asidesub">masks <em>current + pinned</em></h3>
+  <figure id="maskfig"><img id="allmasks" alt=""></figure>
+
+  <h3 class="asidesub" id="heldh">probes <em class="addhint">press <kbd>Enter</kbd> to add</em><button id="clear" class="link">clear</button></h3>
+  <div id="nowrow" class="probe live"></div>
   <div id="plist"></div>
 </aside>
 </main>

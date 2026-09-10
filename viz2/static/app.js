@@ -15,18 +15,62 @@ const S = {
   zoom: { p1: fullView(), p2: fullView(), p3: fullView() },
   dragging: false,
   empty: false, anim: 0, asize: 1, frame: 0,
-  f: { layouts: new Set(), nobj: new Set(), spk: new Set([1]) },  // empty == no filter
+  // empty set == no constraint. `objects` matches on object TYPE (a sample lists several),
+  // `nobj` on the object COUNT -- independent axes.
+  f: { objects: new Set(), layouts: new Set(), nobj: new Set(), spk: new Set([1]) },
 };
 
 window.__S = S;
+const hasObj = (s) => s.objects.some((o) => S.f.objects.has(o));
 /* One filter, applied everywhere downstream: the sample list, the position scatter and
    the speaker ring all read from this, so they can never disagree about what exists. */
 function pass(s) {
-  return (!S.f.layouts.size || S.f.layouts.has(s.layout)) &&
+  return (!S.f.objects.size || hasObj(s)) &&
+         (!S.f.layouts.size || S.f.layouts.has(s.layout)) &&
          (!S.f.nobj.size || S.f.nobj.has(s.n)) &&
          (!S.f.spk.size || S.f.spk.has(s.spk));
 }
 const matches = () => S.all.filter(pass);
+
+/* Faceted counts: every filter list shows its row counts measured against the OTHER
+   filters, not itself. So with "1 object" chosen, the layout list still shows a number
+   for every layout -- how many 1-object samples that layout has -- and picking a speaker
+   updates all of them. `skip` is the facet whose own constraint is dropped. */
+function passExcept(s, skip) {
+  return (skip === 'objects' || !S.f.objects.size || hasObj(s)) &&
+         (skip === 'layouts' || !S.f.layouts.size || S.f.layouts.has(s.layout)) &&
+         (skip === 'nobj' || !S.f.nobj.size || S.f.nobj.has(s.n)) &&
+         (skip === 'spk' || !S.f.spk.size || S.f.spk.has(s.spk));
+}
+function facetTally(field, skip) {
+  const c = new Map();
+  for (const s of S.all)
+    if (passExcept(s, skip)) c.set(s[field], (c.get(s[field]) || 0) + 1);
+  return c;                                   // facet value -> count under the other filters
+}
+// Object TYPE is multivalued per sample, so it tallies membership, not a single key.
+function facetObjTally() {
+  const c = new Map();
+  for (const s of S.all)
+    if (passExcept(s, 'objects')) for (const o of s.objects) c.set(o, (c.get(o) || 0) + 1);
+  return c;
+}
+const objectValues = () => [...new Set(S.all.flatMap((s) => s.objects))].sort();
+
+/* Filters are per-dataset: a layout name, object count or speaker held over from the old
+   box may not exist in the new one, which would leave every picker (scatter, speaker
+   ring, sample list) matching nothing. Drop any stored value the new dataset lacks -- an
+   emptied set just means "no constraint", so a switch can never land on zero matches. */
+function pruneFilters() {
+  const have = {
+    objects: new Set(S.all.flatMap((s) => s.objects)),
+    layouts: new Set(S.all.map((s) => s.layout)),
+    nobj: new Set(S.all.map((s) => s.n)),
+    spk: new Set(S.all.map((s) => s.spk)),
+  };
+  for (const k of ['objects', 'layouts', 'nobj', 'spk'])
+    for (const v of [...S.f[k]]) if (!have[k].has(v)) S.f[k].delete(v);
+}
 
 const shortId = (id) => String(id).replace(/^0+(?=\d)/, '');
 
@@ -105,28 +149,32 @@ const css = (n) => getComputedStyle(document.body).getPropertyValue(n).trim();
   await firstSample();
 })();
 
-/* Swap in another experiment (box). The samples, positions, speaker ring, grid and
-   scales are all per-box, so this is a full reload of everything except the workbench --
-   pinned probes keep their own box tag and stay. */
-async function switchExperiment(name) {
-  if (name === S.info.experiment || !S.experiments.includes(name)) return;
+/* Swap in another dataset (box). The samples, positions, speaker ring, grid and scales
+   are all per-box, so this is a full reload of everything except the workbench -- pinned
+   probes keep their own box tag and stay. */
+async function switchDataset(name) {
+  if (name === S.info.dataset || !S.datasets.includes(name)) return;
   loadPayload(await api(`/api/switch/${name}`));
   for (const t of ['p1', 'p2', 'p3']) S.zoom[t] = fullView();   // firstSample() redraws
   await firstSample();
 }
 
 function loadPayload(j) {
-  S.all = j.samples; S.info = j.info; S.rv = j.rv; S.experiments = j.experiments;
+  S.all = j.samples; S.info = j.info; S.rv = j.rv; S.datasets = j.datasets;
+  S.dsCounts = j.dataset_counts || {};        // per-dataset sample totals, for the picker
   S.byId = {}; S.byPos = {};
   for (const s of j.samples) {
     S.byId[s.id] = s;
     (S.byPos[s.pos] ??= {})[s.spk] = s.id;
   }
-  $('#exp').value = j.experiment;
+  pruneFilters();
   buildFilters(); buildScatter(); buildSpk(); buildGrid(); sizeModePanel(); applyFilter();
 }
 
-const firstSample = () => select(S.all.find((s) => !s.empty)?.id || S.all[0].id);
+// Prefer a sample that passes the current filter, so a switch lands on a state the
+// pickers actually agree with; fall back to any non-empty sample, then anything.
+const firstSample = () => select(
+  (S.all.find((s) => !s.empty && pass(s)) || S.all.find((s) => !s.empty) || S.all[0]).id);
 
 /* Each box renders at its own aspect ratio and its own size: the mode panel is scaled by
    the box's cropped-overhead pixels against the largest box in the set, so a physically
@@ -143,7 +191,7 @@ function sizeModePanel() {
 async function select(sid) {
   if (!S.byId[sid]) return;
   S.live.sid = sid;
-  $('#sid').value = shortId(sid);
+  $('#samplebox')?._draw?.();               // move the highlight to the chosen row
   S.d = await api(`/api/sample/${sid}`);
   // A new sample resonates at its OWN frequencies, so carrying the previous bin over
   // usually lands on noise. Clearing it makes refresh() snap to this sample's strongest
@@ -152,13 +200,12 @@ async function select(sid) {
   await refresh();
 }
 
-async function refresh() {
+async function refresh(paint = true) {
   const { sid, ch } = S.live;
   // "all" is a rendering of every laser, not a laser: the curves and the audio behind it
   // stay the average, so the peak list and the readout still mean something.
   const laser = S.live.laser === 'all' ? 'avg' : S.live.laser;
   $('#scene').src = `/api/scene/${sid}.jpg?v=${S.rv}`;
-  $('#smask').src = `/api/mask/${sid}.png?v=${S.rv}`;
   $('#audio').src = `/api/audio/${sid}.wav?ch=${audioCh(ch)}&laser=${laser}`;
   // "both" is x and y in one axes. The endpoint serves one channel, so ask twice and let
   // the dash pattern -- the channel's own visual channel already -- tell them apart.
@@ -174,8 +221,26 @@ async function refresh() {
     S.peakMode = true;               // so the arrows walk peaks straight away
   }
   await loadMode();
-  paintAll();
+  if (paint) paintAll();
 }
+
+/* Channel and raw/clean are global view settings, not part of a probe's identity, so a
+   change to either re-fetches every pinned probe too -- otherwise the workbench would be
+   left showing half its curves in the previous channel. Each probe keeps its sample,
+   laser and frequency. */
+async function reprobePinned() {
+  const { ch } = S.live, kind = S.kind;
+  await Promise.all(S.probes.map(async (p) => {
+    const laser = p.laser === 'all' ? 'avg' : p.laser;
+    const get = (c) => api(`/api/probe/${p.sid}?ch=${c}&laser=${laser}&kind=${kind}`);
+    if (ch === 'both') [p.data, p.dataY] = await Promise.all([get('x'), get('y')]);
+    else { p.data = await get(ch); p.dataY = null; }
+    p.ch = ch;
+    p.dash = DASH[ch] || [];
+  }));
+}
+
+const reviewChannel = async () => { await refresh(false); await reprobePinned(); paintAll(); };
 
 async function loadMode() {
   S.mode = await api(`/api/mode/${S.live.sid}?fi=${S.fi}`);
@@ -187,7 +252,7 @@ function paintAll() {
     `${shortId(s.id)}  pos ${s.pos}  spk ${s.spk}  ${s.layout}  L${S.live.laser}  ${S.live.ch}`;
   buildPeaks(); peakList(); allMasks(); drawSpec(); drawShifts(); drawMode(); cursors(); axes(); legends();
   readout();
-  renderScatter(); renderSpk(); renderGrid(); renderProbes();
+  renderScatter(); renderSpk(); renderSpkRing(); renderGrid(); renderProbes();
 }
 
 /* ***** curves: live probe + pinned probes in one axes ***** */
@@ -251,8 +316,18 @@ function line(g, y, w, h, c, lw) {
    would rescale the axis on every sample change, so identical curve heights would mean
    different physical values and the axis would appear to drift as you browse.
 
-   Falls back to the drawn data for any quantity without a global entry. */
+   Falls back to the drawn data for any quantity without a global entry.
+
+   `mag` is the exception: its global range is the single tallest resonance in the whole
+   dataset (~90x a typical peak), so every ordinary linear spectrum is a flat line on the
+   floor and a channel switch looks like nothing changed. It autoscales to what's drawn,
+   with the zero line kept in view since magnitude is a distance from zero. */
 function span(list, key) {
+  if (key === 'mag') {
+    let hi = 0;
+    for (const s of list) for (const v of vals(s.d, key)) if (v > hi) hi = v;
+    return [-0.02 * hi, hi * 1.05 || 1];
+  }
   const g = S.info?.scale?.[key];
   if (g) return [g[0], g[1]];
   let lo = Infinity, hi = -Infinity;
@@ -1214,85 +1289,197 @@ async function previewLaser(i) {
   drawSpec(); drawShifts(); legends();
 }
 
-/* ***** filters ***** */
-// A stable hue per value, so a chip keeps its color no matter what else is selected.
-const chipHue = (n) => (28 + n * 47) % 360;
+/* ***** filters *****
+   Every step-1 picker is the same control: a search box over a scrollable list. `opts()`
+   yields the rows {v, label, count?}, `on(v)` marks a row selected, `pick(v)` handles a
+   click. Single-select lists (dataset, sample) light one row; multi-select ones (layout,
+   objects) toggle, and an empty selection means "no filter". */
+const escRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+const toggle = (set, v) => (set.has(v) ? set.delete(v) : set.add(v));
 
-function buildFilters() {
-  const layouts = [...new Set(S.all.map((s) => s.layout))]
-    .sort((a, b) => S.all.filter((s) => s.layout === b).length -
-                    S.all.filter((s) => s.layout === a).length);
-  const nobj = [...new Set(S.all.map((s) => s.n))].sort((a, b) => a - b);
-  const chip = (k, v, lab, n, h) =>
-    `<button class="chip" data-k="${k}" data-v="${v}" style="--h:${h}">` +
-    `<span class="dot"></span>${lab}<i>${n}</i></button>`;
-  $('#layoutchips').innerHTML = layouts.map((l, i) =>
-    chip('layouts', l, l, S.all.filter((s) => s.layout === l).length, chipHue(i))).join('');
-  $('#nobjchips').innerHTML = nobj.map((n, i) =>
-    chip('nobj', n, `${n} obj`, S.all.filter((s) => s.n === n).length, chipHue(i * 3 + 1))).join('');
-  document.querySelectorAll('.chips .chip').forEach((b) => (b.onclick = () => {
-    const set = S.f[b.dataset.k];
-    const v = b.dataset.k === 'nobj' ? +b.dataset.v : b.dataset.v;
-    set.has(v) ? set.delete(v) : set.add(v);
-    applyFilter();
-  }));
-  document.querySelectorAll('[data-all],[data-none]').forEach((b) => (b.onclick = () => {
-    const k = b.dataset.all || b.dataset.none;
-    S.f[k].clear();                             // "all" == no constraint
-    if (b.dataset.none) S.f[k].add(Symbol('none'));   // impossible value -> zero matches
-    applyFilter();
-  }));
+/* Two shapes of picker, each showing its state the native way:
+   - single-select (dataset, sample): the field RESTS on the current choice as a label and
+     only filters while focused (it clears on focus), and that choice is pinned to the top
+     of the list -- so you always see what's picked and every other option at once.
+   - multi-select (layout, n_objects): the active values sit as removable chips in a strip
+     between the field and the list; an empty strip means "all". The list stays put. */
+function pickbox(host, { opts, on, pick, multi = false, current, cap = 400, placeholder = 'filter', chips = true, restBlank = false }) {
+  host.innerHTML =
+    (multi && chips ? '<div class="pbsel"></div>' : '') +   // the active-value chip lane, above the field
+    `<input class="pbq" spellcheck="false" autocomplete="off" placeholder="${placeholder}">` +
+    '<div class="pblist"></div>';
+  const q = host.querySelector('.pbq');
+  const selbar = host.querySelector('.pbsel');
+  const list = host.querySelector('.pblist');
+  const focused = () => document.activeElement === q;
+
+  host._draw = () => {
+    if (!multi && !focused()) q.value = restBlank ? '' : (current?.()?.label ?? '');
+    const s = focused() ? q.value.trim().toLowerCase() : '';
+
+    if (multi && selbar) {
+      const picked = opts().filter((o) => on(o.v));
+      selbar.innerHTML = picked.map((o) => {
+        const dot = o.hue == null ? '' : `<span class="pbdot" style="--h:${o.hue}"></span>`;
+        return `<button class="pbchip" data-v="${o.v}" title="remove">${dot}${o.label}<b>×</b></button>`;
+      }).join('');
+      selbar.querySelectorAll('.pbchip').forEach((b) =>
+        (b.onmousedown = (e) => { e.preventDefault(); pick(b.dataset.v); }));
+    }
+
+    let hits = opts().filter((o) => !s || o.label.toLowerCase().includes(s));
+    let pinnedCur = false;
+    if (!multi && !s) {                         // pin the current choice to the top
+      const i = hits.findIndex((o) => on(o.v));
+      if (i >= 0) { if (i > 0) hits = [hits[i], ...hits.slice(0, i), ...hits.slice(i + 1)]; pinnedCur = true; }
+    }
+    list.innerHTML = hits.slice(0, cap).map((o, idx) => {
+      const lab = s ? o.label.replace(new RegExp(`(${escRe(s)})`, 'ig'), '<mark>$1</mark>') : o.label;
+      const img = o.img ? `<img class="pbimg" src="${o.img}" alt="" loading="lazy">` : '';
+      const dot = o.hue == null ? '' : `<span class="pbdot" style="--h:${o.hue}"></span>`;
+      // The pinned current row gets a heavy divider under it, marking off "what I'm
+      // looking at" from the rest -- which still scrolls beneath it.
+      const cls = `pbrow${on(o.v) ? ' on' : ''}${pinnedCur && idx === 0 ? ' pbcur' : ''}`;
+      return `<button class="${cls}" data-v="${o.v}">` +
+             `${img}${dot}<span class="pbl">${lab}</span>${o.count == null ? '' : `<i>${o.count}</i>`}</button>`;
+    }).join('')
+      + (hits.length > cap ? `<div class="pbmore">+${hits.length - cap} more — keep typing</div>` : '')
+      + (hits.length ? '' : '<div class="pbmore">no match</div>');
+    list.querySelectorAll('.pbrow').forEach((b) => (b.onmousedown = (e) => {
+      e.preventDefault();            // don't blur the field mid-click and rebuild the list
+      pick(b.dataset.v);
+      if (!multi) q.blur();
+    }));
+    // Keep the current pick visible: when the list is resting (not being typed in) and the
+    // selection changed under it -- e.g. an arrow-key step or a scatter click -- scroll
+    // that row into view so "what's selected" is always on screen at the top-ish.
+    if (!multi && !focused()) list.querySelector('.pbrow.on')?.scrollIntoView({ block: 'nearest' });
+  };
+
+  q.oninput = host._draw;
+  q.onfocus = () => { if (!multi) q.value = ''; host._draw(); };
+  q.onblur = () => host._draw();
+  host._draw();
 }
 
-/* A real dropdown under the field: a native <datalist> pops where the browser wants and
-   cannot be styled or made to show the short ids. */
-function renderSidList(q = '') {
-  const el = $('#sidlist');
-  const m = matches().filter((s) => !q || shortId(s.id).startsWith(q) || s.id.startsWith(q));
-  el.innerHTML = m.slice(0, 200).map((s) =>
-    `<button class="opt${s.id === S.live.sid ? ' on' : ''}" data-id="${s.id}">` +
-    `<b>${shortId(s.id)}</b><i>pos ${s.pos}  spk ${s.spk}  ${s.layout}</i></button>`).join('') +
-    (m.length > 200 ? `<div class="more">+${m.length - 200} more — keep typing</div>` : '') +
-    (m.length ? '' : '<div class="more">no match</div>');
-  el.querySelectorAll('.opt').forEach((b) => (b.onmousedown = (e) => {
-    e.preventDefault();
-    pickSample(b.dataset.id);
-    el.hidden = true;
-    $('#sid').blur();
+// Distinct values of `key` across the loaded samples with their counts, commonest first.
+const tally = (key) => {
+  const c = new Map();
+  for (const s of S.all) c.set(s[key], (c.get(s[key]) || 0) + 1);
+  return [...c].sort((a, b) => b[1] - a[1]);
+};
+// A distinct, stable hue per index/value -- the coloured dot beside a layout or count.
+const hueOf = (n) => (28 + n * 47) % 360;
+
+function buildFilters() {
+  pickbox($('#datasetbox'), {
+    // Each row carries a thumbnail of the bare box, so the datasets are told apart at a
+    // glance rather than by reading long names.
+    opts: () => S.datasets.map((n) => ({
+      v: n, label: n, img: `/api/box/${n}.jpg?v=${S.rv}`, count: S.dsCounts[n] })),
+    on: (v) => v === S.info.dataset,
+    pick: (v) => switchDataset(v),
+    current: () => ({ v: S.info.dataset, label: S.info.dataset }),
+    placeholder: 'change dataset',
+  });
+  pickbox($('#samplebox'), {
+    opts: () => matches().map((s) => ({
+      v: s.id, img: `/api/thumb/${s.id}.jpg?v=${S.rv}`,
+      label: `${shortId(s.id)}  pos ${s.pos}  spk ${s.spk}  ${s.layout}` })),
+    on: (v) => v === S.live.sid,
+    pick: (v) => pickSample(v),
+    // The field rests empty (the current sample shows in the pinned right column, and as
+    // the divided top row of this list) -- so it reads as a search box, not a label.
+    restBlank: true, cap: 200, placeholder: 'jump to sample id',
+  });
+  pickbox($('#objectbox'), {
+    // Object TYPE, regardless of count. Multi-select: a sample passes if it holds ANY of
+    // the picked types. Count is faceted against the other filters.
+    opts: () => {
+      const f = facetObjTally();
+      return objectValues().map((o, i) =>
+        ({ v: o, label: o, count: f.get(o) || 0, hue: hueOf(i * 2 + 1) }));
+    },
+    on: (v) => S.f.objects.has(v),
+    pick: (v) => { toggle(S.f.objects, v); applyFilter(); },
+    multi: true, placeholder: 'filter objects',
+  });
+  pickbox($('#nobjbox'), {
+    // Order fixed by the dataset-wide total (tally); the COUNT is faceted -- how many
+    // samples with that object count survive the layout + speaker filters.
+    opts: () => {
+      const f = facetTally('n', 'nobj');
+      return tally('n').map(([n]) => n).sort((a, b) => a - b)
+        .map((n) => ({ v: n, label: String(n), count: f.get(n) || 0, hue: hueOf(n) }));
+    },
+    on: (v) => S.f.nobj.has(+v),
+    pick: (v) => { toggle(S.f.nobj, +v); applyFilter(); },
+    multi: true,
+  });
+  pickbox($('#layoutbox'), {
+    opts: () => {
+      const f = facetTally('layout', 'layouts');
+      return tally('layout').map(([l], i) =>
+        ({ v: l, label: l, count: f.get(l) || 0, hue: hueOf(i) }));
+    },
+    on: (v) => S.f.layouts.has(v),
+    pick: (v) => { toggle(S.f.layouts, v); applyFilter(); },
+    multi: true, placeholder: 'filter layouts',
+  });
+  document.querySelectorAll('[data-all],[data-none]').forEach((b) => (b.onclick = () => {
+    const k = b.dataset.all || b.dataset.none;
+    // "all" == no constraint (empty set); "none" == an impossible value so nothing matches.
+    // Speakers behave like the other two now: an empty set already lights the whole ring.
+    S.f[k].clear();
+    if (b.dataset.none) S.f[k].add(Symbol('none'));
+    applyFilter();
   }));
 }
 
 function pickSample(id) {
   if (!S.byId[id]) return;
-  if (!pass(S.byId[id])) { S.f.layouts.clear(); S.f.nobj.clear(); applyFilter(); }
+  if (!pass(S.byId[id])) { S.f.objects.clear(); S.f.layouts.clear(); S.f.nobj.clear(); applyFilter(); }
   select(id);
 }
 
-/* The box picker: a typeable list of experiments, same shape as the sample combo. */
-function renderExpList(q = '') {
-  const el = $('#explist');
-  const m = S.experiments.filter((n) => n.toLowerCase().includes(q.toLowerCase()));
-  el.innerHTML = m.map((n) =>
-    `<button class="opt${n === S.info.experiment ? ' on' : ''}" data-n="${n}">${n}</button>`
-  ).join('') || '<div class="more">no match</div>';
-  el.querySelectorAll('.opt').forEach((b) => (b.onmousedown = (e) => {
-    e.preventDefault();
-    switchExperiment(b.dataset.n);
-    el.hidden = true;
-    $('#exp').blur();
-  }));
+const drawPickers = () =>
+  ['#datasetbox', '#samplebox', '#objectbox', '#nobjbox', '#layoutbox']
+    .forEach((id) => $(id)?._draw?.());
+
+const FILTER_KEYS = ['objects', 'layouts', 'nobj', 'spk'];
+
+/* Per-value chips now live in each filter's own lane (the .pbsel strip above its search
+   box), and picked speakers show lit on the ring -- so this shared bar is just the
+   summary and the one "clear all" that spans every filter. Fixed to a single line, so
+   adding filters never nudges step 2 below it. */
+function renderFilterChips() {
+  const el = $('#filterchips');
+  if (!el) return;
+  const n = FILTER_KEYS.reduce(
+    (a, k) => a + [...S.f[k]].filter((v) => typeof v !== 'symbol').length, 0);
+  const blocked = FILTER_KEYS.some((k) => [...S.f[k]].some((v) => typeof v === 'symbol'));
+  if (!n && !blocked) {
+    el.innerHTML = '<span class="fnone">no filters — every sample in this dataset</span>';
+    return;
+  }
+  el.innerHTML =
+    `<span class="fnone">${blocked
+      ? 'a “none” filter is set — 0 samples'
+      : `${n} filter value${n === 1 ? '' : 's'} applied`}</span>` +
+    '<button class="fchip clr" id="fclear">clear all filters</button>';
+  $('#fclear').onclick = () => {
+    FILTER_KEYS.forEach((k) => S.f[k].clear());
+    applyFilter();
+  };
 }
 
 function applyFilter() {
   const m = matches();
-  document.querySelectorAll('.chips .chip').forEach((b) => {
-    const set = S.f[b.dataset.k];
-    const v = b.dataset.k === 'nobj' ? +b.dataset.v : b.dataset.v;
-    b.classList.toggle('on', set.has(v));
-    b.classList.toggle('off', set.size > 0 && !set.has(v));
-  });
-  renderSidList();
-  $('#nmatch').textContent = `${m.length} of ${S.all.length}`;
+  drawPickers();
+  renderFilterChips();
+  $('#nmatch').textContent = m.length;
+  $('#nmatchsub').textContent = `of ${S.all.length}`;
+  $('#nmatch').title = `${m.length} of ${S.all.length} samples in this dataset pass the filter`;
   buildScatter();
   // Keep the current sample if it still passes; otherwise jump to the first that does.
   if (m.length && !pass(S.byId[S.live.sid] || {})) select(m[0].id);
@@ -1384,9 +1571,14 @@ function neighbour(s, [dx, dy]) {
   return best;                                    // null at the edge: stay put
 }
 
+/* Pick a sample AT this position from within the filtered set -- the scatter selects, it
+   does not filter. Prefer one on the current sample's speaker so stepping around the box
+   holds the speaker steady; fall back to any filtered sample there. */
 function goPos(pos) {
-  const spk = S.byId[S.live.sid].spk;
-  select(S.byPos[pos][spk] ?? Object.values(S.byPos[pos])[0]);
+  const spk = S.byId[S.live.sid]?.spk;
+  const at = matches().filter((s) => s.pos === pos && !s.empty);
+  const s = at.find((x) => x.spk === spk) || at[0];
+  if (s) select(s.id);
 }
 
 function renderScatter() {
@@ -1409,38 +1601,63 @@ function renderScatter() {
 const SPK = { 1: [1, 0], 2: [1, .7], 3: [.8, 1], 4: [.6, 1], 5: [.4, 1], 6: [.2, 1], 7: [0, .7], 8: [0, 0] };
 
 function buildSpk() {
-  const svg = $('#spk'), W = 126, H = 78, M = 20, bw = W - 2 * M, bh = H - 2 * M;
+  const svg = $('#spk'), W = 126, H = 78, M = 20, bw = W - 2 * M, bh = H - 2 * M, r = 8;
   svg.setAttribute('viewBox', `0 0 ${W} ${H}`);
   svg.innerHTML = `<rect class="box" x="${M}" y="${M}" width="${bw}" height="${bh}" rx="3"/>` +
     Object.entries(SPK).map(([id, [xf, yf]]) => {
       const cx = M + xf * bw + (xf === 1 ? 12 : xf === 0 ? -12 : 0);
       const cy = M + (1 - yf) * bh + (yf === 0 ? 12 : yf === 1 ? -12 : 0);
-      return `<g class="s" data-s="${id}"><circle cx="${cx}" cy="${cy}" r="8"/><text x="${cx}" y="${cy}">${id}</text></g>`;
+      // The X is only shown for a speaker the whole dataset lacks (renderSpk adds .absent).
+      return `<g class="s" data-s="${id}"><circle cx="${cx}" cy="${cy}" r="${r}"/>` +
+             `<text x="${cx}" y="${cy}">${id}</text>` +
+             `<line class="xm" x1="${cx - r + 2}" y1="${cy - r + 2}" x2="${cx + r - 2}" y2="${cy + r - 2}"/>` +
+             `<line class="xm" x1="${cx - r + 2}" y1="${cy + r - 2}" x2="${cx + r - 2}" y2="${cy - r + 2}"/></g>`;
     }).join('');
-  svg.onclick = (e) => { const g = e.target.closest('.s'); if (g) goSpk(+g.dataset.s); svg.focus(); };
-  svg.onkeydown = (e) => {
-    const d = { ArrowRight: 1, ArrowDown: 1, ArrowLeft: -1, ArrowUp: -1 }[e.key];
-    if (!d) return;
-    e.preventDefault();
-    goSpk(((S.byId[S.live.sid].spk - 1 + d + 8) % 8) + 1);
+  svg.onclick = (e) => {
+    const g = e.target.closest('.s');
+    if (g && !g.classList.contains('absent')) toggleSpk(+g.dataset.s);
   };
 }
 
-async function goSpk(spk) {
-  S.f.spk = new Set([spk]);        // picking a speaker is also filtering to it
-  const cur = S.byId[S.live.sid];
-  const at = S.byPos[cur.pos];
-  if (at?.[spk]) await select(at[spk]);
+// The speaker ring is a pure multi-select filter now (like layout / n_objects): a click
+// toggles that speaker in or out of the candidate set, it never jumps to a sample. Use
+// the scatter or the sample list to actually pick one.
+function toggleSpk(spk) {
+  toggle(S.f.spk, spk);
   applyFilter();
+}
+
+/* The 8-speaker ring drawn AROUND the overhead in the "current" panel -- a static readout
+   of where this sample's active speaker sat, in the same layout as the filter ring
+   (1,2 right / 3-6 top / 7,8 left). */
+function renderSpkRing() {
+  const svg = $('#scenering');
+  if (!svg) return;
+  const spk = S.byId[S.live.sid]?.spk;
+  const W = 200, M = 22, bw = W - 2 * M, bh = W - 2 * M;   // square, matches .scenefig
+  svg.setAttribute('viewBox', `0 0 ${W} ${W}`);
+  svg.innerHTML =
+    `<rect class="ring-box" x="${M}" y="${M}" width="${bw}" height="${bh}" rx="4"/>` +
+    Object.entries(SPK).map(([id, [xf, yf]]) => {
+      const cx = M + xf * bw + (xf === 1 ? 13 : xf === 0 ? -13 : 0);
+      const cy = M + (1 - yf) * bh + (yf === 0 ? 13 : yf === 1 ? -13 : 0);
+      return `<g class="rs${+id === spk ? ' on' : ''}">` +
+             `<circle cx="${cx}" cy="${cy}" r="9"/><text x="${cx}" y="${cy}">${id}</text></g>`;
+    }).join('');
 }
 
 function renderSpk() {
   const cur = S.byId[S.live.sid], at = S.byPos[cur?.pos] || {};
+  const noFilter = !S.f.spk.size;
+  const present = new Set(S.all.map((s) => s.spk));       // speakers the dataset has at all
   $('#spk').querySelectorAll('.s').forEach((g) => {
     const s = +g.dataset.s;
-    g.classList.toggle('on', s === cur?.spk);
+    const absent = !present.has(s);                         // X'd: this dataset has none
+    g.classList.toggle('absent', absent);
+    g.classList.toggle('on', !absent && (noFilter || S.f.spk.has(s)));   // blue = passes the filter
+    g.classList.toggle('cur', s === cur?.spk);              // outlined = current sample's
     // dimmed when the speaker filter excludes it, or this position has no such sample
-    g.classList.toggle('off', (S.f.spk.size && !S.f.spk.has(s)) || !at[s]);
+    g.classList.toggle('off', !absent && ((S.f.spk.size && !S.f.spk.has(s)) || !at[s]));
   });
 }
 
@@ -1531,7 +1748,7 @@ function renderRepeats() {
   const spk = S.byId[S.live.sid].spk;
   const reps = matches().filter((s) => s.empty && s.spk === spk).sort((a, b) => a.pos - b.pos);
   $('#repeats').innerHTML = reps.map((s) =>
-    `<button class="rep${s.id === S.live.sid ? ' on' : ''}" data-id="${s.id}">${s.pos}<i>${s.layout}</i></button>`).join('');
+    `<button class="rep${s.id === S.live.sid ? ' on' : ''}" data-id="${s.id}">pos ${s.pos}</button>`).join('');
   $('#repeats').querySelectorAll('.rep').forEach((b) => (b.onclick = () => select(b.dataset.id)));
 }
 
@@ -1567,22 +1784,41 @@ function identity(p) {
   };
 }
 
-function liveIdentity() {
-  const m = S.byId[S.live.sid];
-  if (!m) return null;
+/* The current sample shows in three places, all fed from here: the metadata list at the
+   top of the pinned column (#curmeta), the live row above the pinned probes (#nowrow),
+   and -- unchanged -- the one-line header (#summary). laser/channel/frequency is the
+   FIRST metadata row because it is the part that moves as you hover the grid or spectrum;
+   keeping it on top means the rest of the block never reflows under it. */
+function renderNow() {
+  const s = S.byId[S.live.sid];
+  if (!s) return;
   const laser = S.hoverLaser != null ? S.hoverLaser : S.live.laser;
   const fi = S.hoverFi != null ? S.hoverFi : S.fi;
-  return identity({ ...S.live, laser, meta: m, hzv: hz(fi) });
-}
-
-function renderNow() {
-  const i = liveIdentity();
-  if (!i) return;
-  $('#now').classList.toggle('muted', S.muted);
   const prev = S.hoverLaser != null || S.hoverFi != null;
-  $('#now').innerHTML =
-    `<span class="sw" style="background:${css('--ink')}"></span>
-     <span class="id"><b>${i.sid}${prev ? ' <u>preview</u>' : ''}</b>${i.line1}<br>${i.line2}<br>${i.line3}</span>`;
+  const lcf = `L${laser} · ${S.live.ch} · ${fmt(hz(fi))} Hz`;
+  const ds = S.info.dataset ?? S.info.box ?? '—';
+
+  const dl = $('#curmeta');
+  if (dl) {
+    dl.classList.toggle('muted', S.muted);
+    dl.innerHTML =
+      `<div class="top">${lcf}${prev ? ' <u>preview</u>' : ''}</div>` +
+      `<dt>dataset</dt><dd>${ds}</dd>` +
+      `<dt>position</dt><dd>${s.pos}</dd>` +
+      `<dt>speaker</dt><dd>${s.spk}</dd>` +
+      `<dt>sample id</dt><dd>${shortId(s.id)}</dd>` +
+      `<dt>layout</dt><dd>${s.layout}</dd>` +
+      `<dt>n_objects</dt><dd>${s.n}</dd>`;
+  }
+
+  const row = $('#nowrow');
+  if (row) {
+    row.classList.toggle('muted', S.muted);
+    row.innerHTML =
+      `<span class="sw" style="background:${css('--ink')}"></span>` +
+      `<span class="id"><b>${shortId(s.id)}${prev ? ' <u>preview</u>' : ''}</b>` +
+      `${s.box}  pos ${s.pos}  spk ${s.spk}<br>${s.layout}<br>${lcf}</span>`;
+  }
 }
 
 // Open eye / eye with a slash. The slash is always in the markup; CSS shows it only on
@@ -1661,7 +1897,7 @@ function allMasks() {
    x solid, y dashed -- so the key states which line is which instead of leaving it to be
    inferred from the plot. */
 const swatch = (c, dash) =>
-  `<b style="color:${c};${dash?.length ? 'border-top-style:dashed' : ''}"></b>`;
+  `<b class="sw" style="color:${c};${dash?.length ? 'border-top-style:dashed' : ''}"></b>`;
 
 /* The phase control belongs to mag+phi; in re+im there is no phase plot to reshape. */
 function phVis() {
@@ -1683,9 +1919,11 @@ function legends() {
         `current — L${S.live.laser}  ${S.live.ch}</span>`);
   const rows = shownProbes().map((p) => {
     const c = col(p), tail = `${fmt(p.hzv)} Hz  ${shortId(p.sid)}  L${p.laser}`;
+    // The row text carries the probe's own colour, so the key reads without cross-checking
+    // the swatch.
     return p.dataY
-      ? `<span data-id="${p.id}">${swatch(c, DASH.x)}x ${swatch(c, DASH.y)}y  ${tail}</span>`
-      : `<span data-id="${p.id}">${swatch(c, p.dash)}${tail}  ${p.ch}</span>`;
+      ? `<span data-id="${p.id}" style="color:${c}">${swatch(c, DASH.x)}x ${swatch(c, DASH.y)}y  ${tail}</span>`
+      : `<span data-id="${p.id}" style="color:${c}">${swatch(c, p.dash)}${tail}  ${p.ch}</span>`;
   }).join('');
   const prev = S.preview
     ? `<span><b style="color:${css('--accent')}"></b>preview — L${S.hoverLaser}</span>` : '';
@@ -1741,32 +1979,25 @@ function wire() {
   document.querySelectorAll('#p1, #p2').forEach((el) => freqAxis(el.parentElement));
   ['p1', 'p2', 'p3'].forEach((id) => zoomable($('#' + id).parentElement, id));
   $('#sigreset').onclick = () => resetZoom();
+  $('#summary').onclick = () => $('.s1frow')?.classList.toggle('hid');
 
-  const exp = $('#exp'), elist = $('#explist');
-  exp.oninput = () => { renderExpList(exp.value.trim()); elist.hidden = false; };
-  exp.onfocus = () => { renderExpList(exp.value.trim()); elist.hidden = false; };
-  exp.onblur = () => setTimeout(() => (elist.hidden = true), 120);
-
-  const sid = $('#sid'), slist = $('#sidlist');
-  sid.oninput = () => { renderSidList(sid.value.trim()); slist.hidden = false; };
-  sid.onfocus = () => { renderSidList(sid.value.trim()); slist.hidden = false; };
-  sid.onblur = () => setTimeout(() => (slist.hidden = true), 120);
-  sid.onkeydown = (e) => {
-    if (e.key === 'Enter') {
-      const q = sid.value.trim();
-      const hit = S.byId[q] ? q : S.all.find((s) => shortId(s.id) === q)?.id;
-      if (hit) { pickSample(hit); slist.hidden = true; sid.blur(); }
-    } else if (e.key === 'Escape') { slist.hidden = true; sid.blur(); }
+  // The scatter is the primary position picker (it is spatial); this is just a jump box
+  // for when you already know the number. It searches, it does not filter, so a position
+  // with no sample in the current filter flashes red rather than widening the set.
+  const pj = $('#posjump');
+  pj.onchange = () => {
+    const n = +pj.value;
+    if (POS().includes(n)) { goPos(n); pj.value = ''; }
+    else { pj.classList.add('miss'); setTimeout(() => pj.classList.remove('miss'), 600); }
   };
-  $('#summary').onclick = () => $('#pickers').classList.toggle('hid');
 
-  seg('#ch', (v) => { S.live.ch = v; refresh(); });
+  seg('#ch', (v) => { S.live.ch = v; reviewChannel(); });
   seg('#specmode', (v) => { S.specMode = v; phVis(); drawSpec(); buildPeaks(); peakList(); cursors(); axes(); });
   seg('#phmode', (v) => { S.phmode = v; drawSpec(); axes(); });
   // axes() too: lin/log swaps the y label between |FFT| and log |FFT|, and without it
   // the label kept whatever text the previous mode left behind.
   seg('#speclog', (v) => { S.log.spec = +v; drawSpec(); buildPeaks(); peakList(); cursors(); axes(); });
-  seg('#kind', (v) => { S.kind = v; refresh(); });
+  seg('#kind', (v) => { S.kind = v; reviewChannel(); });
   wheel($('#fkey2d'));                    // the square 2-D key, drawn once
   seg('#modeview', (v) => { S.modeview = v; viewCtls(); drawMode(); });
   $('#fieldbg').onchange = (e) => {
@@ -1779,7 +2010,7 @@ function wire() {
   $('#empty').onclick = () => {
     S.empty = !S.empty;
     $('#empty').classList.toggle('on', S.empty);
-    $('#scatter').hidden = S.empty; $('#repeats').hidden = !S.empty;
+    $('#scatter').hidden = S.empty; $('#posjump').hidden = S.empty; $('#repeats').hidden = !S.empty;
     if (S.empty) { renderRepeats(); select(S.all.find((s) => s.empty && s.spk === S.byId[S.live.sid].spk).id); }
   };
 

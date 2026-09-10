@@ -84,6 +84,15 @@ def masks_overlay(masks, colors, w=300):
     return b.getvalue()
 
 
+def thumb(path, box=(160, 120)):
+    """A tiny JPEG of a cropped-overhead photo, for the row icons in the step-1 pickers."""
+    im = Image.open(path).convert("RGB")
+    im.thumbnail(box)
+    b = io.BytesIO()
+    im.save(b, "JPEG", quality=78)
+    return b.getvalue()
+
+
 def scene(photo, mask, w=900):
     """Photo with the segmentation mask as a green tint."""
     im = photo.convert("RGB")
