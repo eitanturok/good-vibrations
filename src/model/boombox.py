@@ -12,8 +12,6 @@ What changes here:
 * No depth head: this dataset has no depth target.
 """
 
-import warnings
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -213,24 +211,30 @@ class ResBlock(nn.Module):
 
 class Decoder(nn.Module):
     """(B,D) -> (B,out_h,out_w), or (B,out_h,out_w,out_c) when out_c > 1. Seeds a 4x4
-    grid and doubles it three times to 32x32 -- the standardized output grid (run.py
-    --out-h/--out-w default to 32, so the conv head below is a no-op 1x1 in the common case).
+    grid and triples it (stride-2 transposed convs) to a 32x32 feature map, then a 3x3
+    conv head cleans up the transposed-conv checkerboard and emits the mask.
 
-    An out_h x out_w that is smaller than 32x32 (a box run at 21x30, say) needs the 32x32
-    feature map reconciled with it. `resize` picks how. 'conv' (default) makes the head's
-    first conv valid-mode with a kernel sized to eat exactly the 32 - out margin: no
-    interpolation, and the head convs then run on real feature-map pixels rather than
-    resampled ones. It is not the asymmetric *crop* the old comment warned about -- a conv
-    sees every input position, so no edge is discarded. 'conv' needs 32x32 >= out_h x out_w;
-    for an output over 32 in some axis it can't, so the decoder falls back to 'bilinear' with
-    a warning. 'bilinear' is the original behaviour, kept because checkpoints trained with it
-    need it to load.
+    An out_h x out_w below 32 in either axis (a box run at 21x30, say) is reconciled by a
+    bilinear resample of the 32x32 feature map BEFORE the head, so the head always runs at
+    the target resolution with its full 3x3 receptive field.
+
+    `resize` is kept for backwards compatibility but is now INERT. The old 'conv' mode
+    sized the head's first conv to a valid-mode kernel that ate the 32 - out margin; at the
+    standardized 32x32 grid that margin is 0, so the kernel degenerated to 1x1 -- a pure
+    channel projection with no spatial mixing -- which cost ~15-25% held-out IoU and much
+    slower convergence (grid ablation, 2026-09-10: 32x32+conv 0.242 vs 32x32+bilinear 0.300
+    vs hyb-h2 0.285, peak 1-cube/2-cubes soft-IoU). Both modes now do the same thing.
+
+    The head is 3 stacked size-preserving 3x3 convs (padding 1): two hidden 3x3 layers of
+    spatial mixing over the transposed-conv output before the projection to out_c. Changing
+    the head shape breaks loading pre-32x32 boombox checkpoints -- accepted.
     """
     SEED = (4, 4)
 
-    def __init__(self, d_model, out_h, out_w, out_c=1, resize='conv', mult:float=1.0, num_res_blocks:int|None=None):
+    def __init__(self, d_model, out_h, out_w, out_c=1, resize='bilinear', mult:float=1.0, num_res_blocks:int|None=None):
         super().__init__()
-        self.out_hw, self.out_c, self.resize = (out_h, out_w), out_c, resize
+        self.out_hw, self.out_c = (out_h, out_w), out_c
+        self.resize = resize  # accepted for backwards compat, no longer used (see docstring)
         base = int(512 * mult)
         self.base = base  # store for use in forward()
         self.project = nn.Linear(d_model, base * self.SEED[0] * self.SEED[1])
@@ -246,24 +250,16 @@ class Decoder(nn.Module):
                 for _ in range(num_res_blocks):
                     up_layers.append(ResBlock(widths[i + 1]))
         self.up = nn.Sequential(*up_layers)
-        up_h, up_w = self.SEED[0] * 8, self.SEED[1] * 8
         head_in = widths[-1]  # final upsampling layer outputs this many channels
-        if resize == 'conv' and (up_h - out_h + 1 < 1 or up_w - out_w + 1 < 1):
-            warnings.warn(f"resize='conv' needs {up_h}x{up_w} >= {out_h}x{out_w}; falling back to 'bilinear'")
-            resize = 'bilinear'
-        self.resize = resize  # may have been downgraded to 'bilinear' just above
-        if resize == 'conv':
-            # valid-mode kernel k = margin + 1 collapses up_hw down to out_hw exactly
-            # (k = (1, 1), i.e. a plain channel projection, at the standardized 32x32)
-            k = (up_h - out_h + 1, up_w - out_w + 1)
-            first = nn.Conv2d(head_in, 32, k)
-        else:
-            first = nn.Conv2d(head_in, 32, 3, padding=1)
-        self.head = nn.Sequential(first, nn.ReLU(inplace=True), nn.Conv2d(32, out_c, 3, padding=1))
+        self.head = nn.Sequential(
+            nn.Conv2d(head_in, 32, 3, padding=1), nn.ReLU(inplace=True),
+            nn.Conv2d(32, 32, 3, padding=1), nn.ReLU(inplace=True),
+            nn.Conv2d(32, out_c, 3, padding=1),
+            )
 
     def forward(self, emb):
-        x = self.up(self.project(emb).view(-1, self.base, *self.SEED))
-        if self.resize == 'bilinear':
+        x = self.up(self.project(emb).view(-1, self.base, *self.SEED))   # (B, head_in, 32, 32)
+        if tuple(x.shape[-2:]) != self.out_hw:
             x = F.interpolate(x, size=self.out_hw, mode='bilinear', align_corners=False)
         x = self.head(x)                                     # (B,out_c,H,W)
         # .contiguous(): permute leaves a non-contiguous view, and torchmetrics' MSE does

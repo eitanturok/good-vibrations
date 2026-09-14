@@ -26,7 +26,7 @@ from composer.core import Evaluator
 from composer.profiler import JSONTraceHandler, cyclic_schedule
 from composer.profiler.profiler import Profiler
 from composer.loggers import WandBLogger, FileLogger
-from composer.callbacks import RuntimeEstimator, SpeedMonitor, OOMObserver, NaNMonitor, SystemMetricsMonitor, OptimizerMonitor, LRMonitor
+from composer.callbacks import RuntimeEstimator, SpeedMonitor, OOMObserver, NaNMonitor, OptimizerMonitor, LRMonitor #, SystemMetricsMonitor
 from composer.optim import ConstantScheduler, CosineAnnealingScheduler, CosineAnnealingWithWarmupScheduler, LinearWithWarmupScheduler
 from composer.callbacks.speed_monitor import GPU_AVAILABLE_FLOPS
 
@@ -87,7 +87,7 @@ def get_parser():
     parser.add_argument("--learned-collapse",           action="store_true", help="boombox only. Replace the frequency stack's AdaptiveAvgPool with a learned (1,width) conv, so WHERE in the spectrum a filter fired survives the collapse instead of being averaged out. +328K params.")
     parser.add_argument("--freq-mult",                  type=int,   default=1, help="boombox only. Scale every frequency-stack width (32/64/128/256 -> x mult). NOTE this also scales the grid stack's input, so params grow well beyond the frequency stack itself.")
     parser.add_argument("--freq-depth",                 type=int,   default=1, help="boombox only. Stride-1 (1,3) blocks per stage, adding depth at each frequency scale. Unlike --freq-mult the output width is unchanged, so the grid stack costs nothing extra.")
-    parser.add_argument("--resize",                     type=str,   default="conv", choices=["conv", "bilinear"], help="boombox decoder. 'conv' absorbs the 24x32 -> out_h x out_w margin in a valid-mode head conv (no interpolation); 'bilinear' is the original resize, needed to load older checkpoints.")
+    parser.add_argument("--resize",                     type=str,   default="bilinear", choices=["conv", "bilinear"], help="DEPRECATED / inert. boombox decoder always bilinear-resamples the 32x32 feature map to out_h x out_w (when they differ) before a fixed 3x3 conv head. The old 'conv' mode degenerated to a 1x1 head conv at 32x32 and lost ~15-25%% held-out IoU.")
     parser.add_argument("--signal-mode",                type=str,   default="magnitude", choices=["magnitude", "log_magnitude", "complex", "mag_phase", "mag_trig_phase"])
     parser.add_argument("--normalize-mode",             type=str,   default="std", help="Per-sample: std, z, per_laser_z. Train-split statistics: per_bin_z. Append '+token-mean' for token-level normalization.")
     parser.add_argument("--augment-mask",               type=float, default=0.5, help="Probability a sample gets mask augmentation (blur+noise). 0 disables.")
@@ -110,7 +110,7 @@ def get_parser():
     # arch
     parser.add_argument("--model",                      type=str,   default="transformer", choices=("transformer", "boombox"), help="transformer = VibrationTransformer; boombox = the conv encoder/decoder from arXiv 2105.08052.")
     parser.add_argument("--d-model",                    type=int,   default=128)
-    parser.add_argument("--decoder",                    type=str,   default='mlp', choices=('mlp', 'mlp-mid', 'attn', 'attn-no-rope', 'conv'), help="--model transformer only. 'conv' is boombox's transposed-conv decoder on the transformer's cls token, i.e. the freq+laser transformer encoder with the boombox decoder.")
+    parser.add_argument("--decoder",                    type=str,   default='mlp', choices=('mlp', 'mlp-mid', 'attn', 'attn-no-rope', 'masked-attn', 'conv'), help="--model transformer only. 'conv' is boombox's transposed-conv decoder on the transformer's cls token, i.e. the freq+laser transformer encoder with the boombox decoder. 'masked-attn' is AttnDecoder + Mask2Former-style masked attention: each layer predicts an intermediate mask, whose per-query confidence gates that query's cross-attention sharpness in the next layer (see model/arch.py MaskedAttnDecoder docstring for why it's a confidence gate rather than a literal per-token mask).")
     parser.add_argument("--decoder-num-heads",          type=int,   default=2)
     parser.add_argument("--decoder-num-layers",         type=int,   default=2)
     parser.add_argument("--ffn-dim",                    type=int,   default=None, help="Width of every transformer FFN (freq encoder, laser encoder, attn decoder). Default None = 4*d_model. Torch's own default is a fixed 2048, so pre-2026-08 runs had a 2048-wide FFN regardless of d_model; pass 2048 to reproduce them. No effect on --model boombox.")
@@ -120,6 +120,8 @@ def get_parser():
     parser.add_argument("--mlp-dec-hidden",             type=int,   default=None, help="Hidden width of MLPDecoder (default: 256).")
     parser.add_argument("--conv-dec-mult",              type=float, default=None, help="Base-channel multiplier for boombox Decoder (base channels = 512*mult).")
     parser.add_argument("--conv-dec-res-blocks",        type=int,   default=None, help="Residual blocks per TwoBranchUp scale in boombox Decoder.")
+    parser.add_argument("--mask-temp",                  type=float, default=4.0, help="--decoder masked-attn only. Scales per-query mask confidence into the next layer's cross-attn logit bias; higher = sharper gating.")
+    parser.add_argument("--memory-grid",                type=int,   default=0, choices=(0, 1), help="--decoder attn/attn-no-rope/masked-attn only. Project the L+1 laser-token memory onto a new learned out_h x out_w grid (2D RoPE'd over that same grid) before decoder cross-attention, so Q and K/V share sequence length and spatial index. Off by default (memory stays the raw laser token sequence).")
     parser.add_argument("--pnt-num-heads",              type=int,   default=2)
     parser.add_argument("--seq-num-heads",              type=int,   default=2)
     parser.add_argument("--pnt-num-layers",             type=int,   default=2)
@@ -267,7 +269,7 @@ def run(**kwargs):
     else:
         enc_ffn_dim = args.enc_ffn_dim if args.enc_ffn_dim is not None else args.ffn_dim
         dec_ffn_dim = args.dec_ffn_dim if args.dec_ffn_dim is not None else args.ffn_dim
-        model = VibrationTransformer(args.d_model, args.pnt_num_heads, args.pnt_num_layers, args.seq_num_heads, args.seq_num_layers, data_info, args.decoder, args.decoder_num_heads, args.decoder_num_layers, freq_dropout=args.freq_dropout, laser_dropout=args.laser_dropout, loss_fn=args.loss_fn, loss_alpha=args.loss_alpha, count_loss_weight=args.count_loss_weight, enc_ffn_dim=enc_ffn_dim, dec_ffn_dim=dec_ffn_dim, mlp_dec_depth=args.mlp_dec_depth, mlp_dec_hidden=args.mlp_dec_hidden, conv_dec_mult=args.conv_dec_mult, conv_dec_res_blocks=args.conv_dec_res_blocks)
+        model = VibrationTransformer(args.d_model, args.pnt_num_heads, args.pnt_num_layers, args.seq_num_heads, args.seq_num_layers, data_info, args.decoder, args.decoder_num_heads, args.decoder_num_layers, freq_dropout=args.freq_dropout, laser_dropout=args.laser_dropout, loss_fn=args.loss_fn, loss_alpha=args.loss_alpha, count_loss_weight=args.count_loss_weight, enc_ffn_dim=enc_ffn_dim, dec_ffn_dim=dec_ffn_dim, mlp_dec_depth=args.mlp_dec_depth, mlp_dec_hidden=args.mlp_dec_hidden, conv_dec_mult=args.conv_dec_mult, conv_dec_res_blocks=args.conv_dec_res_blocks, mask_temp=args.mask_temp, memory_grid=bool(args.memory_grid))
     load_path = str(args.checkpoint_path) if args.checkpoint_path else None
 
     # logger
@@ -289,7 +291,10 @@ def run(**kwargs):
             )
 
     # callbacks
-    callbacks = [VisualizeSMask(args.viz_interval), NaNMonitor(), LRMonitor(), SystemMetricsMonitor(), SpeedMonitor(1),
+    # SystemMetricsMonitor() commented out: it calls pynvml.nvmlInit(), which raises NVMLError_LibRmVersionMismatch
+    # on hosts where the loaded NVIDIA kernel driver and the userspace NVML lib have drifted apart
+    # (a host-level mismatch, not a pip package problem -- nvidia-ml-py's own bundled shim hits it too).
+    callbacks = [VisualizeSMask(args.viz_interval), NaNMonitor(), LRMonitor(), SpeedMonitor(1), # SystemMetricsMonitor(),
                  OOMObserver(folder=f"runs/{{run_name}}/torch_traces", remote_file_name=None, overwrite=True), RuntimeEstimator(skip_batches=64, time_unit="minutes"),
                 OptimizerMonitor(log_optimizer_metrics=True, batch_log_interval=10)]
     if args.output_keys: callbacks.append(OutputSaver(args.eval_interval, f"runs/{{run_name}}/outputs_history", overwrite=True, output_keys=args.output_keys))
