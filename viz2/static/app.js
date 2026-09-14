@@ -207,6 +207,7 @@ async function refresh(paint = true) {
   const laser = S.live.laser === 'all' ? 'avg' : S.live.laser;
   $('#scene').src = `/api/scene/${sid}.jpg?v=${S.rv}`;
   $('#audio').src = `/api/audio/${sid}.wav?ch=${audioCh(ch)}&laser=${laser}`;
+  viewerMedia(sid);
   // "both" is x and y in one axes. The endpoint serves one channel, so ask twice and let
   // the dash pattern -- the channel's own visual channel already -- tell them apart.
   const q = (c) => api(`/api/probe/${sid}?ch=${c}&laser=${laser}&kind=${S.kind}`);
@@ -252,7 +253,7 @@ function paintAll() {
     `${shortId(s.id)}  pos ${s.pos}  spk ${s.spk}  ${s.layout}  L${S.live.laser}  ${S.live.ch}`;
   buildPeaks(); peakList(); allMasks(); drawSpec(); drawShifts(); drawMode(); cursors(); axes(); legends();
   readout();
-  renderScatter(); renderSpk(); renderSpkRing(); renderGrid(); renderProbes();
+  renderScatter(); renderSpk(); renderSpkRing(); renderGrid(); renderProbes(); renderRepeats();
 }
 
 /* ***** curves: live probe + pinned probes in one axes ***** */
@@ -1185,8 +1186,8 @@ function axes() {
     return f[l] + (f[r] - f[l]) * (c - l);
   };
   const HZ = 'frequency (Hz)';
-  xAxis($('#p1ov'), fAt(z.x0), fAt(z.x1), HZ, false);   // top of the pair: grid only
-  xAxis($('#p2ov'), fAt(z.x0), fAt(z.x1), HZ, true);    // bottom carries the numbers
+  xAxis($('#p1ov'), fAt(z.x0), fAt(z.x1), HZ, true);    // each spectrum plot labels its own axis
+  xAxis($('#p2ov'), fAt(z.x0), fAt(z.x1), HZ, true);
   // Shifts sits above them on a time axis of its own, so it labels itself.
   if (S.probe) {
     const zp = S.zoom.p3, dur = S.probe.dur;
@@ -1466,7 +1467,7 @@ function renderFilterChips() {
     `<span class="fnone">${blocked
       ? 'a “none” filter is set — 0 samples'
       : `${n} filter value${n === 1 ? '' : 's'} applied`}</span>` +
-    '<button class="fchip clr" id="fclear">clear all filters</button>';
+    '<button class="fchip clr" id="fclear" title="clear all filters">clear filters</button>';
   $('#fclear').onclick = () => {
     FILTER_KEYS.forEach((k) => S.f[k].clear());
     applyFilter();
@@ -1478,12 +1479,12 @@ function applyFilter() {
   drawPickers();
   renderFilterChips();
   $('#nmatch').textContent = m.length;
-  $('#nmatchsub').textContent = `of ${S.all.length}`;
+  $('#nmatchsub').textContent = `/${S.all.length}`;
   $('#nmatch').title = `${m.length} of ${S.all.length} samples in this dataset pass the filter`;
   buildScatter();
   // Keep the current sample if it still passes; otherwise jump to the first that does.
   if (m.length && !pass(S.byId[S.live.sid] || {})) select(m[0].id);
-  else { renderScatter(); renderSpk(); }
+  else { renderScatter(); renderSpk(); renderRepeats(); }
 }
 
 /* ***** pickers ***** */
@@ -1649,6 +1650,14 @@ function renderSpkRing() {
 function renderSpk() {
   const cur = S.byId[S.live.sid], at = S.byPos[cur?.pos] || {};
   const noFilter = !S.f.spk.size;
+  // selected speakers as removable chips, in the same lane the other filters use
+  const chips = $('#spkchips');
+  if (chips) {
+    chips.innerHTML = [...S.f.spk].filter((v) => typeof v !== 'symbol').sort((a, b) => a - b)
+      .map((s) => `<button class="pbchip" data-s="${s}" title="remove">spk ${s}<b>×</b></button>`).join('');
+    chips.querySelectorAll('.pbchip').forEach((b) =>
+      (b.onclick = () => toggleSpk(+b.dataset.s)));
+  }
   const present = new Set(S.all.map((s) => s.spk));       // speakers the dataset has at all
   $('#spk').querySelectorAll('.s').forEach((g) => {
     const s = +g.dataset.s;
@@ -1743,13 +1752,20 @@ function renderGrid() {
   $('#lasernow').textContent = i;
 }
 
-/* ***** empty box: 7 repeats per speaker, a drift measurement ***** */
+/* ***** empty box: the drift repeats for the current speaker, always shown *****
+   Empty-box samples have no object and no spatial COM, so they can't sit on the position
+   scatter; they live in their own strip beneath it, clearly labelled, and clicking one
+   selects it just like a scatter point. */
 function renderRepeats() {
-  const spk = S.byId[S.live.sid].spk;
+  const el = $('#repeats');
+  if (!el) return;
+  const spk = S.byId[S.live.sid]?.spk;
   const reps = matches().filter((s) => s.empty && s.spk === spk).sort((a, b) => a.pos - b.pos);
-  $('#repeats').innerHTML = reps.map((s) =>
-    `<button class="rep${s.id === S.live.sid ? ' on' : ''}" data-id="${s.id}">pos ${s.pos}</button>`).join('');
-  $('#repeats').querySelectorAll('.rep').forEach((b) => (b.onclick = () => select(b.dataset.id)));
+  el.innerHTML = reps.length
+    ? reps.map((s) =>
+        `<button class="rep${s.id === S.live.sid ? ' on' : ''}" data-id="${s.id}">pos ${s.pos}</button>`).join('')
+    : '<span class="repnone">none for this speaker</span>';
+  el.querySelectorAll('.rep').forEach((b) => (b.onclick = () => select(b.dataset.id)));
 }
 
 /* ***** probes ***** */
@@ -1819,6 +1835,97 @@ function renderNow() {
       `<span class="id"><b>${shortId(s.id)}${prev ? ' <u>preview</u>' : ''}</b>` +
       `${s.box}  pos ${s.pos}  spk ${s.spk}<br>${s.layout}<br>${lcf}</span>`;
   }
+
+  renderViewer();
+}
+
+/* The step-1 sample viewer: the current sample shown large, next to the filter/search
+   controls. Deliberately duplicates the pinned column's metadata -- here it is the
+   headline, there it is a reference beside the workbench. The images and media are only
+   re-pointed on a sample/channel change (viewerMedia, from refresh()); this just keeps
+   the metadata line current as the laser/frequency hover moves. */
+function renderViewer() {
+  const s = S.byId[S.live.sid];
+  if (!s) return;
+  const laser = S.hoverLaser != null ? S.hoverLaser : S.live.laser;
+  const ds = S.info.dataset ?? S.info.box ?? '—';
+  // one header block: pos/spk/id loud, then laser/layout/n_objects/xy, then the dataset
+  const [cy, cx] = s.com || [-1, -1];
+  const xy = cx >= 0 && cy >= 0 ? `${cx | 0}, ${cy | 0}` : '—';
+  const top = $('#svtop');
+  if (top) top.innerHTML =
+    `<div class="svk">pos <b>${s.pos}</b><s>·</s>spk <b>${s.spk}</b><s>·</s>id <b>${shortId(s.id)}</b></div>` +
+    `<div class="svk2">L${laser}·${S.live.ch}<s>·</s>${s.layout || '—'}<s>·</s>${s.n} obj<s>·</s>xy ${xy}</div>` +
+    `<div class="svds">${ds}</div>`;
+  comMarks(s);
+}
+
+/* Per-object centre-of-mass, drawn as a crosshair tick over the overhead and segmentation
+   images. coms are [row, col] in the overhead-pixel space (same as the smask), so the
+   overlay uses that as its viewBox with preserveAspectRatio="none" -- the box has the same
+   aspect as the images, so the mapping stays uniform (no stretch). */
+function comMarks(s) {
+  const [ow, oh] = S.info.overhead || [1, 1];
+  const pts = s.coms || [];
+  const arm = Math.max(ow, oh) * 0.055;           // crosshair half-length, image px
+  const gap = arm * 0.3;                          // centre gap, so the exact point stays open
+  const g = pts.map(([r, c], i) =>
+    `<line x1="${c - arm}" y1="${r}" x2="${c - gap}" y2="${r}"/>` +
+    `<line x1="${c + gap}" y1="${r}" x2="${c + arm}" y2="${r}"/>` +
+    `<line x1="${c}" y1="${r - arm}" x2="${c}" y2="${r - gap}"/>` +
+    `<line x1="${c}" y1="${r + gap}" x2="${c}" y2="${r + arm}"/>` +
+    (pts.length > 1
+      ? `<text x="${c + arm * 1.25}" y="${r}" dy="${arm * 0.4}" font-size="${arm}">${i + 1}</text>`
+      : '')).join('');
+  for (const sel of ['#svphotocom', '#svmaskcom']) {
+    const el = $(sel);
+    if (!el) continue;
+    el.setAttribute('viewBox', `0 0 ${ow} ${oh}`);
+    el.setAttribute('preserveAspectRatio', 'none');
+    el.innerHTML = g;
+  }
+  const note = $('#comnote');
+  if (note) note.textContent = pts.length
+    ? `· ${pts.length} com${pts.length > 1 ? 's' : ''}` : '';
+}
+
+/* Point the viewer's images and players at the current sample. A missing artefact (some
+   datasets lack the stimulus copy or the pre-rendered recovered clip) hides just that
+   element, or the whole original/recovered block if nothing in it loaded. */
+function viewerMedia(sid) {
+  setMedia('#svphoto', `/api/scene/${sid}.jpg?mask=0&v=${S.rv}`);
+  // the real segmentation mask; empty-box samples have none, so fall back to the tinted
+  // overhead and, if even that is missing, hide the figure.
+  const mk = $('#svmask'), fig = $('#svmaskfig');
+  if (mk) {
+    fig?.classList.remove('missing');
+    delete mk.dataset.fb;
+    mk.onerror = () => {
+      if (!mk.dataset.fb) { mk.dataset.fb = '1'; mk.src = `/api/scene/${sid}.jpg?v=${S.rv}`; }
+      else fig?.classList.add('missing');
+    };
+    mk.src = `/api/mask/${sid}.png?v=${S.rv}`;
+  }
+  setMedia('#svvidsrc', `/api/source_video/${sid}.mp4`);
+  setMedia('#svaudsrc', `/api/source_audio/${sid}.wav`);
+  setMedia('#svvidrec', `/api/recovered_video/${sid}.mp4`);
+  setMedia('#svaudrec', `/api/recovered_audio/${sid}.wav`);
+}
+
+function setMedia(sel, url) {
+  const el = $(sel);
+  if (!el) return;
+  el.classList.remove('missing');
+  const block = el.closest('.svm');
+  block?.classList.remove('missing');
+  el.onerror = () => {
+    el.classList.add('missing');
+    // hide the original/recovered block only if BOTH its media failed
+    if (block && !block.querySelector('video:not(.missing), audio:not(.missing)'))
+      block.classList.add('missing');
+  };
+  el.src = url;
+  if (el.tagName === 'VIDEO' || el.tagName === 'AUDIO') el.load();
 }
 
 // Open eye / eye with a slash. The slash is always in the markup; CSS shows it only on
@@ -2007,12 +2114,6 @@ function wire() {
   };
 
   $('#clear').onclick = () => { S.probes = []; renderProbes(); paintAll(); multiples(); };
-  $('#empty').onclick = () => {
-    S.empty = !S.empty;
-    $('#empty').classList.toggle('on', S.empty);
-    $('#scatter').hidden = S.empty; $('#posjump').hidden = S.empty; $('#repeats').hidden = !S.empty;
-    if (S.empty) { renderRepeats(); select(S.all.find((s) => s.empty && s.spk === S.byId[S.live.sid].spk).id); }
-  };
 
   // Both sliders read out their value beside the label, in the same `.cl em` slot the
   // laser and peak counts already use, so the rail keeps one style of readout.

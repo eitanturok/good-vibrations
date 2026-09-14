@@ -4,6 +4,8 @@
   --line:#e0e0dc; --firm:#c9c9c3;
   --ink:#1a1a19; --ink2:#55554f; --ink3:#86867e;
   --accent:#256abf; --accent-sf:#e8f0fc;
+  /* step-1 part accents: filter / search / viewer, so the three read as distinct zones */
+  --k-filter:#256abf; --k-search:#2f8f5f; --k-view:#b06a2c;
   --r:6px;
   --mono: ui-monospace, SFMono-Regular, Menlo, monospace;
   --sans: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
@@ -14,6 +16,7 @@
     --line:#33332f; --firm:#4a4a45;
     --ink:#f0efec; --ink2:#b8b7b1; --ink3:#86867e;
     --accent:#3987e5; --accent-sf:#12233a;
+    --k-filter:#3987e5; --k-search:#43b17d; --k-view:#d98635;
   }
 }
 * { box-sizing:border-box; }
@@ -52,12 +55,30 @@ h2 em { font-style:normal; color:var(--accent); font-family:var(--mono);
 .brand { font-weight:600; letter-spacing:.02em; }
 .summary { font-family:var(--mono); color:var(--ink2); cursor:pointer; padding:2px 0; }
 .summary:hover { color:var(--accent); }
-/* ***** step 1: one long filter row, then the search area *****
-   Every filter -- one dataset, plus many object / n_objects / layout / speaker -- reads
-   left to right across a single wrapping row. The box scatter and the sample list sit in
-   a second row beneath it. Neither the scatter nor the list filters; they only select.
-   The current sample lives in the pinned right column, not here. */
-.s1v { display:flex; flex-direction:column; gap:16px; margin-top:8px; }
+/* ***** step 1: filter -> search on the left, the current sample shown big on the right *****
+   One continuous panel, not three boxes. The three areas -- FILTER (narrow the set),
+   SEARCH (pick one sample), and the SAMPLE VIEWER -- are told apart only by a small
+   colour-coded label and a hairline rule, so the step still reads as one thing.
+   The viewer takes 2/5 of the width and duplicates the pinned column; that is deliberate. */
+.s1grid { display:grid; grid-template-columns:3fr 2fr; gap:0;
+          margin-top:10px; align-items:stretch; }
+.s1left { display:flex; flex-direction:column; min-width:0; }
+
+/* areas share the card's surface -- no border, no inset background */
+.s1part { position:relative; min-width:0; padding:4px 0 16px; }
+.s1left .s1part + .s1part { border-top:1px solid var(--line); padding-top:15px; }
+.s1viewer { display:flex; flex-direction:column;
+            border-left:1px solid var(--line); margin-left:22px; padding-left:22px; }
+.s1phead { font:600 9px/1 var(--sans); letter-spacing:.16em; text-transform:uppercase;
+           color:var(--ink3); margin-bottom:12px; display:flex; gap:9px; align-items:baseline; }
+/* a short colour tab before each label -- the only zone cue that remains */
+.s1phead::before { content:''; width:14px; height:2px; border-radius:1px;
+                   background:var(--firm); align-self:center; }
+.s1filter .s1phead::before { background:var(--k-filter); }
+.s1search .s1phead::before { background:var(--k-search); }
+.s1viewer .s1phead::before { background:var(--k-view); }
+.s1psub { font-weight:400; letter-spacing:.03em; text-transform:none; color:var(--ink3);
+          font-size:9.5px; }
 
 .s1frow { display:flex; flex-wrap:wrap; gap:14px 18px; align-items:flex-start; }
 .s1frow.hid { display:none; }               /* click the header summary to collapse */
@@ -77,22 +98,21 @@ h2 em { font-style:normal; color:var(--accent); font-family:var(--mono);
 .s1frow #datasetbox .pblist { max-height:176px; }
 /* dataset and speaker have no chip lane -- reserve its height so every filter's search
    box / ring still lines up across the row */
-.s1frow #datasetbox::before,
-.s1frow .pk.sp::before { content:''; display:block; height:26px; flex:none; }
+.s1frow #datasetbox::before { content:''; display:block; height:26px; flex:none; }
 .s1frow .pk.sp { width:174px; }
+/* selected-speaker chips: same lane geometry as the other filters' .pbsel strip, so the
+   ring below it lines up with their lists and the all/none row sits at one height */
+.spkchips { display:flex; flex-wrap:nowrap; gap:4px; height:22px; margin-bottom:4px;
+            overflow-x:auto; scrollbar-width:none; }
+.spkchips::-webkit-scrollbar { display:none; }
+.spkchips:empty::before { content:'—'; font:9px var(--mono); color:var(--ink3); opacity:.45; }
 .s1frow #spk { width:174px; height:108px; }   /* bigger, keeping the ring's aspect */
-/* the running total sits at the row's end, right-aligned: big number + quiet caption */
-.s1frow .s1count { margin-left:auto; align-self:flex-start; text-align:right;
-                   font:8.5px/1.35 var(--mono); letter-spacing:.06em;
-                   text-transform:uppercase; color:var(--ink3); }
-.s1frow .s1count b { display:block; font:600 27px/1 var(--mono); color:var(--ink);
-                     margin-bottom:4px; }
+/* the filtered / total count sits at the right end of the FILTER label row: x/y samples */
+.s1phead .s1count { margin-left:auto; font:9px/1 var(--mono); letter-spacing:.06em;
+                    text-transform:uppercase; color:var(--ink3); }
+.s1phead .s1count b { font:600 15px/1 var(--mono); color:var(--ink); }
+.s1phead .s1count #nmatchsub { color:var(--ink3); font-weight:400; }
 
-.s1block { border-top:1px solid var(--line); padding-top:14px; }
-.s1lab { display:block; font:9px/1 var(--mono); letter-spacing:.12em; text-transform:uppercase;
-         color:var(--ink3); margin-bottom:10px; }
-.s1lab em { font-style:normal; text-transform:none; letter-spacing:.02em; color:var(--ink3);
-            opacity:.8; }
 .s1srow { display:flex; flex-wrap:wrap; gap:16px 22px; align-items:flex-start; }
 
 /* Per-value chips live in each filter's own lane now; this bar is just the running
@@ -102,10 +122,66 @@ h2 em { font-style:normal; color:var(--accent); font-family:var(--mono);
 .fchip.clr { border:1px solid var(--line); background:var(--s1); color:var(--accent);
              font:10px var(--mono); padding:2px 8px; border-radius:4px; cursor:pointer; }
 .fchip.clr:hover { border-color:var(--accent); }
+/* "clear filters" sits in the gutter right of the pickers, just under the count */
+.s1filter #fclear { position:absolute; top:34px; right:0; margin:0; z-index:1; }
 
 /* SEARCH: the sample list grows to fill the row beside the scatter. */
 .s1search .pk.samp { flex:1 1 320px; max-width:480px; }
 .s1search #samplebox .pblist { max-height:250px; }
+
+/* ***** step 1: the sample viewer *****
+   The overhead + segmentation images are the point of this panel -- stacked and large so
+   they fill the height of the filter+search column beside them. The spectrogram clips are
+   a small squarish reference at the foot. */
+.svbody { display:flex; flex-direction:column; gap:12px; flex:1; min-height:0;
+          justify-content:space-between; }   /* spread the slack, don't pool it at the foot */
+/* the viewer's whole info block: pos/spk/id loud, then laser/layout/objects/xy, then dataset */
+.svtop { display:flex; flex-direction:column; gap:5px; padding-bottom:10px;
+         border-bottom:1px solid var(--line); font-family:var(--mono); }
+.svtop .svk { font-size:16px; color:var(--ink3); letter-spacing:.01em; }
+.svtop .svk b { color:var(--ink); font-weight:700; }
+.svtop .svk2 { font-size:11px; color:var(--ink2); }
+.svtop .svds { font-size:10px; color:var(--ink3); }
+.svtop s { text-decoration:none; color:var(--firm); margin:0 7px; }
+.svtop .svk2 s { margin:0 5px; }
+
+/* overhead + segmentation sit SIDE BY SIDE so neither one eats the panel's height */
+.svimgs { display:grid; grid-template-columns:1fr 1fr; gap:10px; align-items:start; }
+.svimgs figure { margin:0; display:flex; flex-direction:column; gap:5px; }
+.svimgwrap { position:relative; }
+.svimgwrap img { width:100%; height:auto; display:block;
+                 border:1px solid var(--line); border-radius:5px; background:var(--s2); }
+.comov { position:absolute; inset:0; width:100%; height:100%; overflow:visible;
+         pointer-events:none; }
+.comov line { stroke:var(--k-view); stroke-width:2; vector-effect:non-scaling-stroke;
+              stroke-linecap:round; }
+.comov text { fill:var(--k-view); text-anchor:start; paint-order:stroke;
+              stroke:#fff; stroke-width:3px; font-family:var(--mono); font-weight:700; }
+.svimgs figure.missing { display:none; }
+.svimgs figcaption { text-align:center; font:9.5px var(--mono);
+                     letter-spacing:.08em; text-transform:uppercase; color:var(--ink3); }
+.comnote { font-style:normal; text-transform:none; letter-spacing:.02em; color:var(--k-view); }
+
+/* two compact media blocks pinned to the foot; the slack sits above them so the viewer
+   fills the height of filter+search without any element being blown up to do it */
+.svmedia { display:grid; grid-template-columns:1fr 1fr; gap:8px 14px; }
+.svm { min-width:0; }
+.svm.missing { display:none; }                 /* no artefact for this sample -- hide the block */
+.svmh { font:8px/1.3 var(--mono); letter-spacing:.06em; text-transform:uppercase;
+        color:var(--ink3); margin-bottom:4px; }
+.svmh em { display:block; font-style:normal; opacity:.7; }
+.svm video { width:100%; max-width:150px; aspect-ratio:1; object-fit:cover; display:block;
+             border-radius:3px; background:#000; }
+.svm video.missing { display:none; }
+.svm audio { width:100%; max-width:190px; height:26px; display:block; margin-top:5px; }
+.svm audio.missing { display:none; }
+
+/* the whole step-1 grid stacks once the content column gets tight */
+@media (max-width:1180px) {
+  .s1grid { grid-template-columns:1fr; }
+  .s1viewer { border-left:0; border-top:1px solid var(--line);
+              margin-left:0; padding-left:0; margin-top:14px; padding-top:15px; }
+}
 
 .pk { display:flex; flex-direction:column; gap:4px; align-items:flex-start;
       flex:none; }
@@ -190,12 +266,17 @@ h2 em { font-style:normal; color:var(--accent); font-family:var(--mono);
        background:var(--s1); padding:2px; overflow:visible; }
 #grid { width:126px; height:153px; display:block; overflow:visible;
         align-self:center; }
-/* Empty-box mode: the drift repeats as a plain wrap of position pills, nothing more. */
-#repeats { display:flex; flex-wrap:wrap; gap:4px; width:300px; align-content:start; }
+/* Empty-box drift repeats: always shown, in their own labelled strip under the scatter --
+   they have no spatial COM so they can't be scatter points. */
+.repeatslab { width:300px; margin-top:10px; font-size:9px; letter-spacing:.06em;
+              text-transform:uppercase; color:var(--ink3); }
+#repeats { display:flex; flex-wrap:wrap; gap:4px; width:300px; align-content:start;
+           margin-top:5px; }
 .rep { font:10px var(--mono); padding:3px 8px; border:1px solid var(--line); border-radius:4px;
        background:var(--s1); color:var(--ink2); cursor:pointer; line-height:1.2; }
 .rep:hover { border-color:var(--firm); color:var(--ink); }
 .rep.on { background:var(--accent); border-color:var(--accent); color:#fff; }
+.repnone { font:10px var(--mono); color:var(--ink3); opacity:.6; }
 
 /* ***** controls ***** */
 button { font:inherit; cursor:pointer; }

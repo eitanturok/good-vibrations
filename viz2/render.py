@@ -38,16 +38,23 @@ def heat(v, lo, hi, lut="seq"):
     return b.getvalue()
 
 
-def mask_png(mask, w=900):
-    """The mask at its native full-frame geometry, so it aligns with the overhead photo.
-    Not cropped: the framing itself is information."""
+def mask_png(mask, w=900, photo=None):
+    """The segmentation alone, at its native full-frame geometry so it aligns with the
+    overhead: a flat grey field (as in the workbench mask composite) with the segmented
+    region a solid green and a darker 1px outline. `photo` is accepted but unused."""
     m = np.asarray(mask) > 0.5
-    img = Image.fromarray(np.where(m[..., None], np.array([24, 160, 100], np.uint8),
-                                   np.array([238, 238, 235], np.uint8)))
-    if img.width > w:
-        img = img.resize((w, round(img.height * w / img.width)), Image.NEAREST)
+    h, wd = m.shape
+    img = np.full((h, wd, 3), (238, 238, 235), np.uint8)
+    img[m] = (24, 160, 100)
+    er = m.copy()
+    for ax, sh in ((0, 1), (0, -1), (1, 1), (1, -1)):
+        er &= np.roll(m, sh, axis=ax)
+    img[m & ~er] = (13, 92, 56)
+    out = Image.fromarray(img)
+    if out.width > w:
+        out = out.resize((w, round(out.height * w / out.width)), Image.NEAREST)
     b = io.BytesIO()
-    img.save(b, "PNG")
+    out.save(b, "PNG")
     return b.getvalue()
 
 

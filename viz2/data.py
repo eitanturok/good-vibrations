@@ -53,6 +53,20 @@ def com(v) -> list[float]:
         return [-1.0, -1.0]
 
 
+def coms(v) -> list[list[float]]:
+    """Per-object [row, col] centres, in the same overhead-pixel space as the smask.
+
+    metadata's `coms` is nested one level deep ([[ [r,c], ... ]]); an empty box is the
+    single sentinel [-1, -1], which is dropped."""
+    try:
+        flat = v[0] if (v and isinstance(v[0], list)
+                        and v[0] and isinstance(v[0][0], list)) else v
+        out = [[float(p[0]), float(p[1])] for p in flat]
+        return [p for p in out if p != [-1.0, -1.0]]
+    except Exception:
+        return []
+
+
 def _first(d: Path, names):
     return next((n for n in names if (d / n).exists()), None)
 
@@ -65,6 +79,58 @@ def _fft(d: Path) -> Path | None:
 def sample_photo(sid: str) -> Path | None:
     p = _first(d(sid), PHOTOS)
     return d(sid) / p if p else None
+
+
+def _glob1(base: Path | None, *globs: str) -> Path | None:
+    """First file under `base` matching any of the glob patterns, in order."""
+    if not base or not base.is_dir():
+        return None
+    for g in globs:
+        hit = sorted(base.glob(g))
+        if hit:
+            return hit[0]
+    return None
+
+
+def recovered_wav(sid: str) -> Path | None:
+    """The pre-rendered recovered-audio wav (fixed laser/channel, e.g. 55/x)."""
+    return _glob1(DIRS.get(sid), "recovered_audio.wav", "vibration/*recovered_audio*.wav")
+
+
+def recovered_video(sid: str) -> Path | None:
+    """Spectrogram video of the recovered signal -- a fixed laser/x pre-render, so it does
+    NOT track the laser/channel selector the way viz2's synthesised playback does."""
+    return _glob1(DIRS.get(sid), "vibration/*spectrogram*.mp4")
+
+
+def _stim_dir(sid: str) -> Path | None:
+    """Local data/audio/<name>/ for the stimulus this sample played. metadata records only
+    the capture machine's absolute path, so we match on its basename and walk up from a few
+    roots to find the copy that lives beside the repo."""
+    raw = (META.get(sid) or {}).get("audio_dir") or ""
+    name = raw.replace("\\", "/").rstrip("/").split("/")[-1]
+    if not name:
+        return None
+    seen: set[Path] = set()
+    for start in (Path.cwd(), DATASETS.get(CURRENT, Path.cwd())):
+        for up in (start, *start.parents):
+            cand = up / "data" / "audio" / name
+            if cand in seen:
+                continue
+            seen.add(cand)
+            if cand.is_dir():
+                return cand
+    return None
+
+
+def source_wav(sid: str) -> Path | None:
+    """The stimulus wav that was played (the 'original' audio)."""
+    return _glob1(_stim_dir(sid), "audio.wav", "*.wav")
+
+
+def source_video(sid: str) -> Path | None:
+    """Spectrogram video of the played stimulus."""
+    return _glob1(_stim_dir(sid), "spectrogram.mp4", "*.mp4")
 
 
 @lru_cache(maxsize=32)
@@ -164,7 +230,11 @@ def _load(name: str) -> None:
             "objects": sorted((m.get("objects") or {}).keys()),
             "empty": bool(m.get("is_empty_box")),
             "com": com(m.get("avg_com")),
+            "coms": coms(m.get("coms")),                  # per-object [row, col], overhead px
             "box": m.get("box") or name,                 # carried onto every pinned probe
+            # capture-machine path to the played stimulus; only the basename survives here,
+            # matched back to a local data/audio/<name>/ tree by _stim_dir().
+            "audio_dir": m.get("audio_dir") or "",
         }
 
     d0 = DIRS[next(iter(DIRS))]

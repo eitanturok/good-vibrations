@@ -12,43 +12,83 @@
 <main>
 <div id="flow">
 
-  <!-- 1 . which recording: filter -> search -> current -->
-  <section class="card step">
+  <!-- 1 . which recording: filter -> search, with the current sample shown big alongside -->
+  <section class="card step step1">
     <h2><b>1</b> sample</h2>
-    <div class="s1v">
+    <div class="s1grid">
 
-      <!-- one long row of filters: one dataset, many object / n_objects / layout / speaker -->
-      <div class="s1frow">
-        <div class="pk pb ds"><span>dataset</span>
-          <div class="pickbox" id="datasetbox"></div>
+      <div class="s1left">
+
+        <!-- FILTER: narrow the set. one dataset, many object / n_objects / layout / speaker -->
+        <div class="s1part s1filter">
+          <div class="s1phead">filter <span class="s1psub">narrow the set</span>
+            <span class="s1count"><b id="nmatch">0</b><span id="nmatchsub">/0</span> samples</span>
+          </div>
+          <div class="s1frow">
+            <div class="pk pb ds"><span>dataset</span>
+              <div class="pickbox" id="datasetbox"></div>
+            </div>
+            <div class="pk pb"><span>object <span class="an"><button class="link" data-all="objects">all</button><button class="link" data-none="objects">none</button></span></span>
+              <div class="pickbox" id="objectbox"></div>
+            </div>
+            <div class="pk pb nb"><span>n_objects <span class="an"><button class="link" data-all="nobj">all</button><button class="link" data-none="nobj">none</button></span></span>
+              <div class="pickbox" id="nobjbox"></div>
+            </div>
+            <div class="pk pb ly"><span>layout <span class="an"><button class="link" data-all="layouts">all</button><button class="link" data-none="layouts">none</button></span></span>
+              <div class="pickbox" id="layoutbox"></div>
+            </div>
+            <div class="pk sp"><span>speaker <span class="an"><button class="link" data-all="spk">all</button><button class="link" data-none="spk">none</button></span></span>
+              <div class="spkchips" id="spkchips"></div>
+              <svg id="spk" tabindex="0"></svg>
+            </div>
+          </div>
+          <div id="filterchips"></div>
         </div>
-        <div class="pk pb"><span>object <span class="an"><button class="link" data-all="objects">all</button><button class="link" data-none="objects">none</button></span></span>
-          <div class="pickbox" id="objectbox"></div>
+
+        <!-- SEARCH: pick one sample out of what the filter left -->
+        <div class="s1part s1search">
+          <div class="s1phead">search <span class="s1psub">pick one sample</span></div>
+          <div class="s1srow">
+            <div class="pk pos"><span>search by position <em id="poscount"></em></span>
+              <input id="posjump" class="pbq" type="number" min="1" placeholder="jump to position #">
+              <svg id="scatter" tabindex="0"></svg>
+              <div class="repeatslab">empty box</div>
+              <div id="repeats"></div>
+            </div>
+            <div class="pk pb samp"><span>search by sample id</span>
+              <div class="pickbox" id="samplebox"></div>
+            </div>
+          </div>
         </div>
-        <div class="pk pb nb"><span>n_objects <span class="an"><button class="link" data-all="nobj">all</button><button class="link" data-none="nobj">none</button></span></span>
-          <div class="pickbox" id="nobjbox"></div>
-        </div>
-        <div class="pk pb ly"><span>layout <span class="an"><button class="link" data-all="layouts">all</button><button class="link" data-none="layouts">none</button></span></span>
-          <div class="pickbox" id="layoutbox"></div>
-        </div>
-        <div class="pk sp"><span>speaker <span class="an"><button class="link" data-all="spk">all</button><button class="link" data-none="spk">none</button></span></span>
-          <svg id="spk" tabindex="0"></svg>
-        </div>
-        <div class="s1count"><b id="nmatch">0</b><span><span id="nmatchsub">of 0</span> samples<br>after filter</span></div>
+
       </div>
 
-      <div id="filterchips"></div>
-
-      <div class="s1block s1search">
-        <div class="s1srow">
-          <div class="pk pos"><span>position <button id="empty" class="tog">empty box</button>
-            <em id="poscount"></em></span>
-            <input id="posjump" class="pbq" type="number" min="1" placeholder="jump to position #">
-            <svg id="scatter" tabindex="0"></svg>
-            <div id="repeats" hidden></div>
+      <!-- SAMPLE VIEWER: the current sample, large -->
+      <div class="s1part s1viewer">
+        <div class="s1phead">sample viewer <span class="s1psub">the current sample</span></div>
+        <div class="svbody">
+          <div class="svtop" id="svtop"></div>
+          <div class="svimgs">
+            <figure>
+              <div class="svimgwrap"><img id="svphoto" alt=""><svg class="comov" id="svphotocom" aria-hidden="true"></svg></div>
+              <figcaption>overhead <em class="comnote" id="comnote"></em></figcaption>
+            </figure>
+            <figure id="svmaskfig">
+              <div class="svimgwrap"><img id="svmask" alt=""><svg class="comov" id="svmaskcom" aria-hidden="true"></svg></div>
+              <figcaption>segmentation</figcaption>
+            </figure>
           </div>
-          <div class="pk pb samp"><span>sample id</span>
-            <div class="pickbox" id="samplebox"></div>
+          <div class="svmedia">
+            <div class="svm" id="svm-src">
+              <div class="svmh">original <em>played stimulus</em></div>
+              <video id="svvidsrc" controls preload="metadata" playsinline muted></video>
+              <audio id="svaudsrc" controls preload="none"></audio>
+            </div>
+            <div class="svm" id="svm-rec">
+              <div class="svmh">recovered <em>laser 55 · x · fixed render</em></div>
+              <video id="svvidrec" controls preload="metadata" playsinline muted></video>
+              <audio id="svaudrec" controls preload="none"></audio>
+            </div>
           </div>
         </div>
       </div>
@@ -94,7 +134,7 @@
         <button id="sigreset" class="zreset" title="reset zoom (or double-click a plot)">⤢ reset zoom</button>
         <div class="plot h110 gut"><i class="yl" id="y3"></i><img class="hm" id="h3" alt="">
           <canvas id="p3"></canvas><svg class="ov" id="p3ov"></svg><i class="cb" id="cb3"></i></div>
-        <div class="plot h150"><i class="yl" id="y1"></i><img class="hm" id="h1" alt="">
+        <div class="plot h150 gut"><i class="yl" id="y1"></i><img class="hm" id="h1" alt="">
           <canvas id="p1"></canvas><svg class="ov" id="p1ov"></svg><i class="cb" id="cb1"></i></div>
         <div class="plot h110 gut"><i class="yl" id="y2"></i><img class="hm" id="h2" alt="">
           <canvas id="p2"></canvas><svg class="ov" id="p2ov"></svg><i class="cb" id="cb2"></i></div>
