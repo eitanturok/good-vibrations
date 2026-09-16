@@ -6,7 +6,7 @@ import torch
 import torch.nn.functional as F
 from PIL import Image
 from tqdm import tqdm
-from torch.utils.data import Subset, DataLoader
+from torch.utils.data import Subset, DataLoader, ConcatDataset
 from sklearn.model_selection import train_test_split
 from composer.core import Evaluator, DataSpec
 from streaming import StreamingDataset, MDSWriter
@@ -39,20 +39,26 @@ def should_augment(p: float) -> bool:
 
 #***** 0 collect samples *****
 
-def laser_indices(laser_cols, n_laser_rows: int, n_laser_cols: int) -> np.ndarray | None:
-    """Column ids -> flat row-major indices into the laser axis L. None means every laser.
+def laser_indices(laser_cols, n_laser_rows: int, n_laser_cols: int, laser_rows=None) -> np.ndarray | None:
+    """Row/column ids -> flat row-major indices into the laser axis L. None (for both) means every laser.
 
-    Selection is always whole columns across every row, so the kept set stays a rectangle
-    (n_laser_rows, len(laser_cols)) and the model's grid is still well defined. Validated here,
-    once, so a bad id fails before the ~10 min MDS build rather than inside a worker.
+    Selection is always whole rows crossed with whole columns, so the kept set stays a rectangle
+    (len(laser_rows) or n_laser_rows, len(laser_cols) or n_laser_cols) and the model's grid is
+    still well defined. Validated here, once, so a bad id fails before the ~10 min MDS build
+    rather than inside a worker.
     """
-    if laser_cols is None: return None
-    cols = sorted(laser_cols)
+    if laser_cols is None and laser_rows is None: return None
+    cols = sorted(laser_cols) if laser_cols is not None else list(range(n_laser_cols))
+    rows = sorted(laser_rows) if laser_rows is not None else list(range(n_laser_rows))
     if len(set(cols)) != len(cols): raise ValueError(f"duplicate laser columns in {laser_cols}")
+    if len(set(rows)) != len(rows): raise ValueError(f"duplicate laser rows in {laser_rows}")
     if not cols: raise ValueError("laser_cols is empty; pass None for all lasers")
+    if not rows: raise ValueError("laser_rows is empty; pass None for all lasers")
     if bad := [c for c in cols if not 0 <= c < n_laser_cols]:
         raise ValueError(f"laser columns {bad} outside [0, {n_laser_cols}), the recorded grid's width")
-    return np.array([r * n_laser_cols + c for r in range(n_laser_rows) for c in cols])
+    if bad := [r for r in rows if not 0 <= r < n_laser_rows]:
+        raise ValueError(f"laser rows {bad} outside [0, {n_laser_rows}), the recorded grid's height")
+    return np.array([r * n_laser_cols + c for r in rows for c in cols])
 
 LASER_GRID_FILE = "laser_grid.json"
 BOX_GEOM_FILE = "box_geometry.json"
@@ -83,9 +89,11 @@ def infer_laser_grid(samples: list[tuple[Path, dict]], n_lasers: int) -> tuple[i
         raise ValueError(f"rois describe a {rows}x{cols} grid but the fft holds {n_lasers} lasers")
     return rows, cols
 
-def laser_tag(laser_cols) -> str:
-    """Filename/hash fragment for a column selection. Sorted, so [2,0,1] and [0,1,2] agree."""
-    return "" if laser_cols is None else "_lasers" + "-".join(str(c) for c in sorted(laser_cols))
+def laser_tag(laser_cols, laser_rows=None) -> str:
+    """Filename/hash fragment for a row/column selection. Sorted, so [2,0,1] and [0,1,2] agree."""
+    tag = "" if laser_cols is None else "_lasercols" + "-".join(str(c) for c in sorted(laser_cols))
+    tag += "" if laser_rows is None else "_laserrows" + "-".join(str(r) for r in sorted(laser_rows))
+    return tag
 
 def load_fft(sample_dir: Path, laser_idx: np.ndarray | None = None) -> np.ndarray:
     """The one door to the raw fft: (L,F,C) complex64, already restricted to the kept lasers.
@@ -98,7 +106,7 @@ def load_fft(sample_dir: Path, laser_idx: np.ndarray | None = None) -> np.ndarra
     X = np.squeeze(X, axis=0) if X.ndim == 4 and X.shape[0] == 1 else X
     return X if laser_idx is None else X[laser_idx]
 
-def precomputed_fft_name(signal_mode: str, normalize_mode: str, patch_size: int, subtract_speaker_mean: bool, subtract_empty_box: bool = False, phase_arm: str | None = None, phase_weight: float = 1.0, laser_cols=None) -> str:
+def precomputed_fft_name(signal_mode: str, normalize_mode: str, patch_size: int, subtract_speaker_mean: bool, subtract_empty_box: bool = False, phase_arm: str | None = None, phase_weight: float = 1.0, laser_cols=None, laser_rows=None) -> str:
     # the speaker mean and empty-box reference are baked into the precomputed array, so they have to
     # be part of the filename. so does the laser selection: normalize_fft reduces over L, so the
     # same sample precomputed on a subset of lasers is a different array -- this file lives next to
@@ -106,7 +114,7 @@ def precomputed_fft_name(signal_mode: str, normalize_mode: str, patch_size: int,
     suffix = "_spkmean" if subtract_speaker_mean else ""
     suffix += "_emptybox" if subtract_empty_box else ""
     suffix += f"_{phase_arm}w{phase_weight:g}" if phase_arm else ""
-    suffix += laser_tag(laser_cols)
+    suffix += laser_tag(laser_cols, laser_rows)
     return f"vibration/05_precomputed_fft_{signal_mode}_{normalize_mode}_{patch_size}{suffix}.npy"
 
 def mds_columns(augment_fft: bool) -> dict[str, str]:
@@ -139,12 +147,12 @@ def hash_samples(samples: list[tuple[Path, dict]], out_h: int | None = None, out
                   augment_fft: bool = True, signal_mode: str = "magnitude", normalize_mode: str = "std", patch_size: int = 64,
                   subtract_speaker_mean: bool = False, subtract_empty_box: bool = False,
                   mag_recipe: str | None = None, rgb: bool = False,
-                  phase_arm: str | None = None, phase_weight: float = 1.0, laser_cols=None) -> str:
+                  phase_arm: str | None = None, phase_weight: float = 1.0, laser_cols=None, laser_rows=None) -> str:
     h = hashlib.sha256()
     if rgb: h.update(b"rgb")  # different target entirely, so it needs its own cache
     if mag_recipe is not None: h.update(f"recipe{mag_recipe}".encode())  # changes the stored tensor
     if phase_arm is not None: h.update(f"phase{phase_arm}{phase_weight}".encode())  # adds channels to X
-    if laser_cols is not None: h.update(laser_tag(laser_cols).encode())  # fewer lasers in X, and every statistic recomputed over them
+    if laser_cols is not None or laser_rows is not None: h.update(laser_tag(laser_cols, laser_rows).encode())  # fewer lasers in X, and every statistic recomputed over them
     if out_h is not None: h.update(f"{out_h}x{out_w}".encode())  # resolution is baked into y, so it must invalidate the cache too
     if not augment_fft: h.update(f"{augment_fft}{signal_mode}{normalize_mode}{patch_size}".encode())  # baked into X when not augmenting, so it must invalidate the cache too
     # the sidecars below are written on both paths and depend on signal_mode, so they're hashed unconditionally
@@ -162,15 +170,16 @@ def convert_to_mds(mds_dir: Path, samples: list[tuple[Path, dict]], out_h: int, 
                     augment_fft: bool = True, signal_mode: str = "magnitude", normalize_mode: str = "std", patch_size: int = 64,
                     subtract_speaker_mean: bool = False, subtract_empty_box: bool = False, rgb: bool = False,
                     phase_arm: str | None = None, phase_weight: float = 1.0,
-                    laser_idx: np.ndarray | None = None, laser_cols=None) -> Path:
+                    laser_idx: np.ndarray | None = None, laser_cols=None, laser_rows=None) -> Path:
 
     def load_X(sample_dir: Path) -> np.ndarray:
         # the precomputed array was already written from the selected lasers, so it is sliced
         # once (here or there), never twice
         if not augment_fft:
-            return np.load(sample_dir / precomputed_fft_name(signal_mode, normalize_mode, patch_size, subtract_speaker_mean, subtract_empty_box, phase_arm, phase_weight))
+            return np.load(sample_dir / precomputed_fft_name(signal_mode, normalize_mode, patch_size, subtract_speaker_mean, subtract_empty_box, phase_arm, phase_weight, laser_cols, laser_rows))
         X = np.load(fft_path(sample_dir))["fft"]  # (1, L, F, C) complex64
-        return np.squeeze(X, axis=0) if X.ndim == 4 and X.shape[0] == 1 else X
+        X = np.squeeze(X, axis=0) if X.ndim == 4 and X.shape[0] == 1 else X
+        return X if laser_idx is None else X[laser_idx]
 
     x_shape = load_X(samples[0][0]).shape
     y_shape = (out_h, out_w, 3) if rgb else (out_h, out_w)  # y: the downsampled mask, or the downsampled rgb photo
@@ -573,17 +582,18 @@ def load_dataset_stats(path: Path) -> dict[str, torch.Tensor]:
     d = np.load(path)
     return {k: torch.from_numpy(d[k]).unsqueeze(0) for k in d.files}
 
-def precompute_vibration_samples(samples: list[tuple[Path, dict]], signal_mode: str, normalize_mode: str, patch_size: int, verbose: int = 1, speaker_means: dict[int, torch.Tensor] | None = None, stats: dict[str, torch.Tensor] | None = None, empty_box_ref: dict[int, torch.Tensor] | None = None, mag_recipe: str | None = None, phase_arm: str | None = None, phase_weight: float = 1.0) -> None:
+def precompute_vibration_samples(samples: list[tuple[Path, dict]], signal_mode: str, normalize_mode: str, patch_size: int, verbose: int = 1, speaker_means: dict[int, torch.Tensor] | None = None, stats: dict[str, torch.Tensor] | None = None, empty_box_ref: dict[int, torch.Tensor] | None = None, mag_recipe: str | None = None, phase_arm: str | None = None, phase_weight: float = 1.0, laser_idx: np.ndarray | None = None, laser_cols=None, laser_rows=None) -> None:
     freqs = torch.from_numpy(np.load(fft_path(samples[0][0]))["freqs"])
     for sample_dir, meta in tqdm(samples, desc="precomputing fft", disable=not verbose):
         X = np.load(fft_path(sample_dir))["fft"]  # (1, L, F, C) complex64
         X = np.squeeze(X, axis=0) if X.ndim == 4 and X.shape[0] == 1 else X
+        if laser_idx is not None: X = X[laser_idx]
         X = torch.from_numpy(X).unsqueeze(0)
         speaker = int(meta.get("speaker", -1))
         speaker_mean = speaker_means[speaker] if speaker_means is not None else None
         ref = empty_box_ref[speaker] if empty_box_ref is not None else None
         X = process_vibration(X, freqs, signal_mode, normalize_mode, patch_size, augment=0.0, speaker_mean=speaker_mean, stats=stats, empty_box_ref=ref, mag_recipe=mag_recipe, phase_arm=phase_arm, phase_weight=phase_weight).squeeze(0).numpy()
-        np.save(sample_dir / precomputed_fft_name(signal_mode, normalize_mode, patch_size, speaker_means is not None, empty_box_ref is not None, phase_arm, phase_weight, laser_cols), X)
+        np.save(sample_dir / precomputed_fft_name(signal_mode, normalize_mode, patch_size, speaker_means is not None, empty_box_ref is not None, phase_arm, phase_weight, laser_cols, laser_rows), X)
 
 #***** 5 define dataset *****
 
@@ -790,7 +800,10 @@ def gastronorm(mds_path, test_size=0.2, seed=42, speakers=None, n_objects=None, 
     return splits
 
 def gastronorm_one_cube(mds_path, test_size=0.2, seed=42, speakers=None, n_objects=None, box=None, n_samples: int | None = None, verbose: int = 1, index: list[dict] | None = None):
-
+    """Train on 1-cube scenes only (plus empty-box). Split by whole position_id -- every speaker at
+    a given position lands entirely in train or entirely in eval, never split across the two -- to
+    match gastronorm_two_cube.
+    """
     if index is None:
         lines = (Path(mds_path) / "metadata.jsonl").read_text().strip().splitlines()
         index = [json.loads(line) for line in lines if line]
@@ -798,8 +811,39 @@ def gastronorm_one_cube(mds_path, test_size=0.2, seed=42, speakers=None, n_objec
     keep = [i for i, row in enumerate(index) if _matches(row, speakers, n_objects, box)]
     if n_samples is not None: keep = keep[:n_samples]
 
-    one_cube_train, one_cube_eval = train_test_split([i for i, row in enumerate(index) if row['layout'] in ['purple-cube', 'empty-box']], test_size=0.2, random_state=seed, shuffle=True)
-    return {'train': one_cube_train, 'eval/1-cube': one_cube_eval}
+    empty_box = [i for i in keep if index[i]['layout'] == 'empty-box']
+    one_cube_pool = [i for i in keep if index[i]['layout'] in ['purple-cube', 'red-cube']]
+
+    one_cube_unseen_speaker, one_cube_unseen_position, one_cube_train = split_by_position(index, one_cube_pool, percent=test_size, seed=seed)
+
+    # fold split_by_position's held-out-speaker samples back into train: at a seen position every
+    # speaker must land in train, none held out, per the "no partial-position mixing" requirement.
+    splits = {'train': sorted(empty_box + one_cube_train + one_cube_unseen_speaker), 'eval/1-cube': one_cube_unseen_position}
+    if verbose:
+        for label, idxs in splits.items(): print(f"{label}: {len(idxs)} samples")
+    return splits
+
+def gastronorm_two_cube(mds_path, test_size=0.2, seed=42, speakers=None, n_objects=None, box=None, n_samples: int | None = None, verbose: int = 1, index: list[dict] | None = None):
+    """Train on 2-cube scenes only (plus empty-box), mirroring gastronorm_one_cube. Uses the same
+    grid4-held-out-by-position eval as the full gastronorm split, so eval/2-cubes numbers are
+    comparable across gastronorm splits.
+    """
+    if index is None:
+        lines = (Path(mds_path) / "metadata.jsonl").read_text().strip().splitlines()
+        index = [json.loads(line) for line in lines if line]
+
+    keep = [i for i, row in enumerate(index) if _matches(row, speakers, n_objects, box)]
+    if n_samples is not None: keep = keep[:n_samples]
+
+    two_cubes_unseen_speaker, two_cubes_unseen_position, two_cubes_train = split_by_position(index, [i for i in keep if index[i]['layout'] == 'purple--green-cube-grid4'], percent=test_size, seed=seed)
+
+    train = [i for i in keep if index[i]['layout'] in ['empty-box', 'purple--green-cube-grid1', 'purple--green-cube-grid2', 'purple--green-cube-grid3']]
+    train += two_cubes_train
+
+    splits = {'train': train, 'eval/2-cubes': two_cubes_unseen_position, 'eval/2-cubes-speaker': two_cubes_unseen_speaker}
+    if verbose:
+        for label, idxs in splits.items(): print(f"{label}: {len(idxs)} samples")
+    return splits
 
 # The object-count experiment excludes red-cube: it is a distinct object, so keeping it would
 # confound "how many objects" with "which object".
@@ -1016,6 +1060,16 @@ def plastic(mds_path, test_size=0.15, seed=42, speakers=None, n_objects=None, bo
     groups = [("1-cube", 1, ["red-cube"]), ("2-cubes", 2, TWO_CUBES)]
     return _grid_box_split(mds_path, groups, (), test_size, seed, speakers, n_objects, box, n_samples, verbose, index)
 
+def plastic_one_cube(mds_path, test_size=0.15, seed=42, speakers=None, n_objects=None, box=None, n_samples=None, verbose=1, index=None):
+    """Train on 1-cube scenes only (plus empty-box); subset of the full `plastic` split."""
+    groups = [("1-cube", 1, ["red-cube"])]
+    return _grid_box_split(mds_path, groups, (), test_size, seed, speakers, n_objects, box, n_samples, verbose, index)
+
+def plastic_two_cubes(mds_path, test_size=0.15, seed=42, speakers=None, n_objects=None, box=None, n_samples=None, verbose=1, index=None):
+    """Train on 2-cube scenes only (plus empty-box); subset of the full `plastic` split."""
+    groups = [("2-cubes", 2, TWO_CUBES)]
+    return _grid_box_split(mds_path, groups, (), test_size, seed, speakers, n_objects, box, n_samples, verbose, index)
+
 def wood(mds_path, test_size=0.15, seed=42, speakers=None, n_objects=None, box=None, n_samples=None, verbose=1, index=None):
     groups = [("1-cube", 1, ["one-cube-grid1"]), ("2-cubes", 2, TWO_CUBES)]
     return _grid_box_split(mds_path, groups, (), test_size, seed, speakers, n_objects, box, n_samples, verbose, index)
@@ -1083,11 +1137,13 @@ def shoebox_ring(mds_path, test_size=0.15, seed=42, speakers=None, n_objects=Non
 #***** 8 build dataloaders *****
 
 SPLIT_METHODS = {"exp25": exp25_split, "gastronorm": gastronorm, "gastronorm_one_cube": gastronorm_one_cube,
+                 "gastronorm_two_cube": gastronorm_two_cube,
                  "gastronorm_train1_eval2": gastronorm_train1_eval2, "gastronorm_train2_eval1": gastronorm_train2_eval1,
                  "gastronorm_train12_eval12": gastronorm_train12_eval12,
                  "gastronorm_train12_eval12_full": gastronorm_train12_eval12_full,
                  "green_plastic": green_plastic,
-                 "plastic": plastic, "wood": wood, "cardboard": cardboard, "shoebox": shoebox,
+                 "plastic": plastic, "plastic_one_cube": plastic_one_cube, "plastic_two_cubes": plastic_two_cubes,
+                 "wood": wood, "cardboard": cardboard, "shoebox": shoebox,
                  "shoebox_cube": shoebox_cube, "shoebox_cylinder": shoebox_cylinder,
                  "shoebox_mug": shoebox_mug, "shoebox_ring": shoebox_ring}
 
@@ -1121,6 +1177,18 @@ def loader(dataset, idxs, bs, num_workers, generator, shuffle=False, drop_last=F
                     persistent_workers=num_workers > 0, prefetch_factor=4 if num_workers > 0 else None, drop_last=drop_last)
     return DataSpec(dataloader=dl, get_num_samples_in_batch=num_samples)
 
+def combine_train_loaders(loaders: list, bs, num_workers, generator) -> DataSpec:
+    """Concatenate several boxes' train DataSpecs (as returned by build_dataset's train_loader) into
+    one shuffled DataLoader, so a single model trains on all of them together. Each loader's
+    underlying dataset must already agree on tensor shapes (same laser grid, out_h/out_w, patch_size,
+    n_channels) -- build_dataset raises on a mismatched laser grid within one data_dir, but nothing
+    catches a mismatch across data_dirs, so that's on the caller to arrange (e.g. via --laser-rows).
+    """
+    dl = DataLoader(ConcatDataset([l.dataloader.dataset for l in loaders]), batch_size=bs, shuffle=True,
+                    num_workers=num_workers, generator=generator, pin_memory=True,
+                    persistent_workers=num_workers > 0, prefetch_factor=4 if num_workers > 0 else None, drop_last=True)
+    return DataSpec(dataloader=dl, get_num_samples_in_batch=num_samples)
+
 def build_dataset(data_dir: str | Path, split: str = "exp25", batch_size: int = 64, eval_batch_size: int = 64,
                    num_workers: int = 8, out_h: int = 20, out_w: int = 40, signal_mode: str = "magnitude",
                    normalize_mode: str = "std", patch_size: int = 64, seed: int = 42,
@@ -1128,7 +1196,7 @@ def build_dataset(data_dir: str | Path, split: str = "exp25", batch_size: int = 
                    subtract_speaker_mean: bool = False, subtract_empty_box: bool = False, n_classes: int = 4, verbose: int = 1,
                    mag_recipe: str | None = None, pair_speakers_mode: bool = False, rgb: bool = False,
                    phase_arm: str | None = None, phase_weight: float = 1.0,
-                   laser_cols=None, device_eval_microbatch_size: str | int = "auto", **split_kwargs):
+                   laser_cols=None, laser_rows=None, device_eval_microbatch_size: str | int = "auto", **split_kwargs):
 
     # A recipe owns the domain and the operation, so it OVERRIDES signal_mode and both
     # subtract_* flags. Deriving signal_mode here is what guarantees the references are
@@ -1171,17 +1239,18 @@ def build_dataset(data_dir: str | Path, split: str = "exp25", batch_size: int = 
     # the laser grid is the data's own geometry, so it is read from the data, never configured
     n_lasers = np.load(fft_path(samples[0][0]))["fft"].shape[-3]
     n_laser_rows, n_laser_cols = infer_laser_grid(samples, n_lasers)
-    grid = (n_laser_rows, n_laser_cols if laser_cols is None else len(set(laser_cols)))
+    grid = (n_laser_rows if laser_rows is None else len(set(laser_rows)), n_laser_cols if laser_cols is None else len(set(laser_cols)))
     if verbose:
-        sel = f"columns {sorted(laser_cols)} of {n_laser_cols}" if laser_cols is not None else "all columns"
-        print(f"lasers: {n_laser_rows}x{n_laser_cols} recorded, {sel} -> {grid[0]}x{grid[1]} = {grid[0] * grid[1]} of {n_lasers}")
+        row_sel = f"rows {sorted(laser_rows)} of {n_laser_rows}" if laser_rows is not None else "all rows"
+        col_sel = f"columns {sorted(laser_cols)} of {n_laser_cols}" if laser_cols is not None else "all columns"
+        print(f"lasers: {n_laser_rows}x{n_laser_cols} recorded, {row_sel}, {col_sel} -> {grid[0]}x{grid[1]} = {grid[0] * grid[1]} of {n_lasers}")
 
     # Resolved once and applied at the single point where the fft is read off disk, so every
     # statistic (speaker means, empty-box ref, per-bin stats) and every normalization -- which
     # reduce over L -- see only the kept lasers. Slicing any later would normalize against
     # lasers the model never gets.
-    laser_idx = laser_indices(laser_cols, n_laser_rows, n_laser_cols)
-    mds_dir = data_dir / "mds" / hash_samples(samples, out_h, out_w, raw_fft, signal_mode, normalize_mode, patch_size, subtract_speaker_mean, subtract_empty_box, mag_recipe, rgb, phase_arm, phase_weight, laser_cols)[:16]
+    laser_idx = laser_indices(laser_cols, n_laser_rows, n_laser_cols, laser_rows)
+    mds_dir = data_dir / "mds" / hash_samples(samples, out_h, out_w, raw_fft, signal_mode, normalize_mode, patch_size, subtract_speaker_mean, subtract_empty_box, mag_recipe, rgb, phase_arm, phase_weight, laser_cols, laser_rows)[:16]
     done = mds_dir / "metadata.jsonl"  # last file convert_to_mds writes -- its presence means the build completed
 
     if force_rebuild_data and mds_dir.exists():
@@ -1201,8 +1270,8 @@ def build_dataset(data_dir: str | Path, split: str = "exp25", batch_size: int = 
 
         # downsample image, precompute fft, and convert to mds
         downsample_samples(samples, out_h, out_w, verbose=verbose, rgb=rgb)
-        if not raw_fft: precompute_vibration_samples(samples, signal_mode, normalize_mode, patch_size, verbose=verbose, speaker_means=speaker_means, stats=stats, empty_box_ref=empty_box_ref, mag_recipe=mag_recipe, phase_arm=phase_arm, phase_weight=phase_weight, laser_idx=laser_idx, laser_cols=laser_cols)
-        convert_to_mds(mds_dir, samples, out_h, out_w, verbose=verbose, augment_fft=raw_fft, signal_mode=signal_mode, normalize_mode=normalize_mode, patch_size=patch_size, subtract_speaker_mean=subtract_speaker_mean, subtract_empty_box=subtract_empty_box, rgb=rgb, phase_arm=phase_arm, phase_weight=phase_weight, laser_idx=laser_idx, laser_cols=laser_cols)
+        if not raw_fft: precompute_vibration_samples(samples, signal_mode, normalize_mode, patch_size, verbose=verbose, speaker_means=speaker_means, stats=stats, empty_box_ref=empty_box_ref, mag_recipe=mag_recipe, phase_arm=phase_arm, phase_weight=phase_weight, laser_idx=laser_idx, laser_cols=laser_cols, laser_rows=laser_rows)
+        convert_to_mds(mds_dir, samples, out_h, out_w, verbose=verbose, augment_fft=raw_fft, signal_mode=signal_mode, normalize_mode=normalize_mode, patch_size=patch_size, subtract_speaker_mean=subtract_speaker_mean, subtract_empty_box=subtract_empty_box, rgb=rgb, phase_arm=phase_arm, phase_weight=phase_weight, laser_idx=laser_idx, laser_cols=laser_cols, laser_rows=laser_rows)
         if speaker_means is not None: save_speaker_means(speaker_means, mds_dir / SPEAKER_MEANS_FILE)
         if stats is not None: save_dataset_stats(stats, mds_dir / DATASET_STATS_FILE)
         if empty_box_ref is not None: save_empty_box_ref(empty_box_ref, mds_dir / EMPTY_BOX_REF_FILE)

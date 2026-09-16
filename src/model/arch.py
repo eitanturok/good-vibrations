@@ -1,6 +1,20 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn.attention.flex_attention import flex_attention
+
+# Isolated behind torch._dynamo.disable so the whole-model torch.compile can't fuse flex_attention
+# into the same Triton kernel as neighboring pointwise ops (MaskedAttnDecoder's per-layer
+# tanh/mean/mul mask-confidence chain) -- that over-fusion is what crashes Triton codegen at
+# --memory-grid 1's Q_LEN=KV_LEN=out_h*out_w=1024 (confirmed: flex_attention compiles fine in
+# isolation at this exact shape, only fails when swept into the larger fused kernel). This forces
+# a graph break at the attention call instead, with flex_attention compiled as its own separate
+# unit -- still gets the O(N) memory benefit over the old dense-mask fallback, just not fused with
+# its neighbors.
+_compiled_flex_attention = torch.compile(flex_attention, dynamic=False)
+@torch._dynamo.disable()
+def _flex_attention_isolated(q, k, v, score_mod):
+    return _compiled_flex_attention(q, k, v, score_mod=score_mod)
 from composer import ComposerModel
 from torchmetrics import Metric
 
@@ -22,6 +36,23 @@ def precompute_freqs_cis_2d(dim: int, h: int, w: int, theta: float = 10000.0) ->
     angles = torch.cat([angles_h[:, None, :].repeat(1, w, 1),
                         angles_w[None, :, :].repeat(h, 1, 1)], dim=-1).reshape(h * w, dim // 2)
     return torch.cat([angles.cos(), angles.sin()], dim=-1)                          # (h*w,dim)
+
+def precompute_freqs_cis_shared_axis(dim: int, primary_pos: torch.Tensor, secondary_pos: torch.Tensor, theta: float = 10000.0) -> torch.Tensor:
+    """Like precompute_freqs_cis_2d, but takes explicit per-token (primary, secondary) coordinates
+    instead of assuming a dense h x w grid -- so two DIFFERENT grids (e.g. the wall's (x,z) and the
+    floor's (x,y)) can each get their own table while sharing the exact same freqs_x values on the
+    primary axis (same dim/theta => same freqs[::2] regardless of what secondary_pos holds). RoPE's
+    relative-position equivariance then falls out directly: a query and a key whose primary_pos
+    (x) match get a zero relative rotation on those channels, i.e. "same x" attention is a free,
+    unlearned inductive bias. primary_pos/secondary_pos are in the SAME physical units as each
+    other's counterpart grid (the caller is responsible for that alignment/calibration)."""
+    assert primary_pos.shape == secondary_pos.shape
+    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2).float() / dim))            # (dim//2,)
+    freqs_x, freqs_s = freqs[::2], freqs[1::2]                                  # same split as precompute_freqs_cis_2d
+    angles_x = primary_pos[:, None] * freqs_x[None, :]                         # (N,dim//4)
+    angles_s = secondary_pos[:, None] * freqs_s[None, :]                       # (N,dim//4)
+    angles = torch.cat([angles_x, angles_s], dim=-1)                           # (N,dim//2)
+    return torch.cat([angles.cos(), angles.sin()], dim=-1)                     # (N,dim)
 
 def apply_rope(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
     assert x.shape[-1] % 2 == 0
@@ -103,7 +134,20 @@ def mse_asym_loss(mask_logits, mask_pred, mask_true, alpha=0.5):
     fn = 2 * (1 - alpha) * err.clamp_min(0).square()
     return (fn + fp).mean()
 # pos_weight scales only the y*log(p) term, i.e. the false-negative half
-def ce_pixel_asym_loss(mask_logits, mask_pred, mask_true, alpha=0.5):
+def ce_pixel_asym_loss(mask_logits, mask_pred, mask_true, alpha=0.5, balanced=False):
+    if balanced:
+        # pos_weight above only reweights each POSITIVE pixel's own term -- reduction='mean' still
+        # divides by ALL pixels, so at sparse occupancy (gastronorm_one_cube: ~0.65% positive) that
+        # dilutes even a large pos_weight back down near the unweighted mean (need pos_weight
+        # ~(1-p)/p, ~150 here, just to BALANCE the two terms -- alpha=0.85 only gives ~5.7). Instead
+        # take the mean over positive pixels and the mean over negative pixels SEPARATELY (each
+        # independent of how many pixels of that class exist in the batch), then combine with
+        # alpha -- the false-negative/false-positive tradeoff no longer depends on the class prior.
+        per_pixel = F.binary_cross_entropy_with_logits(mask_logits, mask_true, reduction='none')
+        pos_n, neg_n = mask_true.sum().clamp_min(1), (1 - mask_true).sum().clamp_min(1)
+        pos_mean = (per_pixel * mask_true).sum() / pos_n
+        neg_mean = (per_pixel * (1 - mask_true)).sum() / neg_n
+        return 2 * alpha * pos_mean + 2 * (1 - alpha) * neg_mean
     return F.binary_cross_entropy_with_logits(mask_logits, mask_true, pos_weight=mask_logits.new_tensor(alpha / (1 - alpha)))
 def iou_loss(mask_logits, mask_pred, mask_true): return 1 - soft_iou(mask_pred, mask_true).mean()
 def dice_loss(mask_logits, mask_pred, mask_true): return 1 - soft_dice(mask_pred, mask_true).mean()
@@ -196,8 +240,54 @@ class MemoryReshaper(nn.Module):
         out, _ = self.attn(grid, memory, memory, key_padding_mask=memory_key_padding_mask, need_weights=False)
         return self.norm(grid + out)  # (B,out_h*out_w,D), indexed by the SAME out_h x out_w grid as the decoder queries
 
+class LearnedKeyPos(nn.Module):
+    """Learned per-laser 2D positional embedding, added to decoder memory (the keys/values the
+    queries cross-attend into) right before cross-attention -- so each of the 100 lasers (+ the
+    cls token) carries an explicit, LEARNED identity, symmetric with the query side's learned
+    query_seed + RoPE, instead of relying on whatever positional structure survived the encoder's
+    own (fixed sinusoidal) RoPE. Only meaningful when memory IS the raw laser token sequence;
+    once --memory-grid reshapes memory onto the output grid, "key i = laser row r col c" is no
+    longer true, so build_decoder asserts the two are mutually exclusive."""
+    def __init__(self, d_model, n_laser_rows, n_laser_cols):
+        super().__init__()
+        self.cls_pos = nn.Parameter(torch.zeros(1, 1, d_model))
+        self.grid_pos = nn.Parameter(torch.zeros(1, n_laser_rows * n_laser_cols, d_model))
+        nn.init.trunc_normal_(self.cls_pos, std=0.02)
+        nn.init.trunc_normal_(self.grid_pos, std=0.02)
+
+    def forward(self, memory):
+        B = memory.shape[0]
+        return memory + torch.cat([self.cls_pos, self.grid_pos], dim=1).expand(B, -1, -1)  # (B,1+L,D)
+
+def build_shared_x_freqs(dim: int, out_h: int, out_w: int, n_laser_rows: int, n_laser_cols: int, x_span: float, x_offset: float, theta: float = 10000.0):
+    """Query (wall, x-z plane) and key (floor, x-y plane) RoPE tables that share the SAME freqs_x
+    channels, so a query and laser with matching x get a zero relative rotation on those channels
+    (see precompute_freqs_cis_shared_axis). Wall: rows=z (out_h, vertical), cols=x (out_w,
+    horizontal) -- matches run.py's own out_h="height"/out_w="width" docstring. Floor: cols=x
+    (n_laser_cols, shared with the wall's out_w), rows=y (n_laser_rows, floor depth) -- assumed
+    convention (rows/cols come from camera ROI detection, not labeled by world axis in the data;
+    flip x_span's axis here if that assumption turns out backwards).
+
+    The floor's laser grid physically covers only PART of the wall's x-range (the laser doesn't
+    span the box's full width) -- x_span/x_offset are a simple, approximate calibration for that
+    (fractions of the wall's x-width the laser grid's x-axis covers / starts at), not derived from
+    real box geometry yet. Meant as a baseline to later replace with an exact calibration (e.g.
+    from box_geometry.json) once that's available."""
+    # wall (query): row-major flatten matching precompute_freqs_cis_2d / the decoder's own .view(out_h,out_w,...)
+    wall_z, wall_x = torch.meshgrid(torch.arange(out_h).float(), torch.arange(out_w).float(), indexing='ij')
+    freqs_query = precompute_freqs_cis_shared_axis(dim, wall_x.reshape(-1), wall_z.reshape(-1), theta)  # (out_h*out_w,dim)
+
+    # floor (key): row-major flatten matching laser_indices' r*n_laser_cols+c ordering
+    laser_y, laser_col = torch.meshgrid(torch.arange(n_laser_rows).float(), torch.arange(n_laser_cols).float(), indexing='ij')
+    x_scale = x_span * (out_w - 1)
+    laser_x = x_offset * (out_w - 1) + laser_col.reshape(-1) / max(n_laser_cols - 1, 1) * x_scale  # laser col -> wall x units
+    freqs_laser = precompute_freqs_cis_shared_axis(dim, laser_x, laser_y.reshape(-1), theta)  # (n_lasers,dim)
+    cls_freqs = torch.cat([torch.ones(1, dim // 2), torch.zeros(1, dim // 2)], dim=-1)  # angle=0 identity rotation for cls
+    freqs_key = torch.cat([cls_freqs, freqs_laser], dim=0)  # (1+n_lasers,dim)
+    return freqs_query, freqs_key
+
 class AttnDecoder(nn.Module):
-    def __init__(self, d_model, out_h, out_w, num_heads:int=2, num_layers:int=2, do_rope:bool=True, out_c:int=1, ffn_dim:int|None=None, memory_grid:bool=False):
+    def __init__(self, d_model, out_h, out_w, num_heads:int=2, num_layers:int=2, do_rope:bool=True, out_c:int=1, ffn_dim:int|None=None, memory_grid:bool=False, key_pos:str='none', n_laser_rows:int|None=None, n_laser_cols:int|None=None, x_span:float=1/3, x_offset:float=0.0):
         super().__init__()
         self.out_h, self.out_w, self.out_c = out_h, out_w, out_c
         # v1: one seed shared by every position, so RoPE alone distinguished the queries
@@ -205,9 +295,21 @@ class AttnDecoder(nn.Module):
         # v2: one learned query per output position (DETR-style); ties the ckpt to this resolution
         self.query_seed = nn.Parameter(torch.zeros(1, out_h * out_w, d_model))
         nn.init.trunc_normal_(self.query_seed, std=0.02)
-        self.register_buffer("freqs_query", precompute_freqs_cis_2d(d_model, out_h, out_w))  # 2D RoPE over the output grid
+        assert key_pos == 'none' or not memory_grid, "--key-pos is incompatible with --memory-grid 1: reshaped memory is indexed by output grid cell, not laser position"
+        self.shared_rope = key_pos == 'shared-rope'
+        if self.shared_rope:
+            freqs_query, freqs_key = build_shared_x_freqs(d_model, out_h, out_w, n_laser_rows, n_laser_cols, x_span, x_offset)
+            self.register_buffer("freqs_query", freqs_query)  # (x,z) RoPE, sharing freqs_x with freqs_key
+            self.register_buffer("freqs_key", freqs_key)      # (x,y) RoPE for memory (cls + lasers)
+        else:
+            self.register_buffer("freqs_query", precompute_freqs_cis_2d(d_model, out_h, out_w))  # 2D RoPE over the output grid
         self.memory_reshaper = MemoryReshaper(d_model, out_h, out_w, num_heads) if memory_grid else None
-        layer = nn.TransformerDecoderLayer(d_model=d_model, nhead=num_heads, dim_feedforward=ffn_dim or 4 * d_model, batch_first=True)
+        self.key_pos = LearnedKeyPos(d_model, n_laser_rows, n_laser_cols) if key_pos == 'learned' else None
+        # dropout=0.0: nn.TransformerDecoderLayer's own default is 0.1, silently active regardless
+        # of this script's --freq-dropout/--laser-dropout (a different mechanism -- whole-patch/
+        # whole-laser masking, not this). Explicit 0 matches --*-dropout 0's stated intent and
+        # measured ~25% less activation memory (see perf/TODO.md).
+        layer = nn.TransformerDecoderLayer(d_model=d_model, nhead=num_heads, dim_feedforward=ffn_dim or 4 * d_model, dropout=0.0, batch_first=True)
         self.layers = nn.TransformerDecoder(layer, num_layers=num_layers)
         self.head = nn.Linear(d_model, out_c)
         self.do_rope = do_rope
@@ -218,10 +320,44 @@ class AttnDecoder(nn.Module):
         if self.memory_reshaper is not None:
             memory = self.memory_reshaper(memory, memory_key_padding_mask)  # (B,S,D) -> (B,out_h*out_w,D)
             memory_key_padding_mask = None  # reshaped memory is dense (one token per grid cell, none padded)
+        elif self.key_pos is not None:
+            memory = self.key_pos(memory)  # (B,S,D) -> (B,S,D), each laser + cls gets its learned identity
+        elif self.shared_rope:
+            memory = apply_rope(memory, self.freqs_key)  # (B,S,D) -> (B,S,D), (x,y) RoPE sharing freqs_x with queries
         queries = self.query_seed.expand(B, -1, -1)  # (1,out_h*out_w,D) -> (B,out_h*out_w,D)
-        if self.do_rope: queries = apply_rope(queries, self.freqs_query)                    # give each query its 2D grid position
+        if self.do_rope or self.shared_rope: queries = apply_rope(queries, self.freqs_query)  # give each query its 2D grid position
         out = self.layers(queries, memory, memory_key_padding_mask=memory_key_padding_mask)  # (B,out_h*out_w,D)
         return self.head(out).view(B, self.out_h, self.out_w, self.out_c).squeeze(-1)
+
+def flex_cross_attn(mha: nn.MultiheadAttention, query, key, value, bias=None, key_padding_mask=None):
+    """Cross-attention using an nn.MultiheadAttention's own projection weights, but running the
+    actual attention op through FlexAttention instead of mha.forward. Needed for MaskedAttnDecoder:
+    its per-query confidence bias is a DENSE additive mask, and flash attention refuses ANY dense
+    additive attn_mask outright (verified directly: "Flash Attention does not support non-null
+    attn_mask") -- so mha.forward(..., attn_mask=mask) was silently falling back to PyTorch's
+    O(N^2)-memory 'math' backend, materializing the full (B*H,num_queries,S) attention matrix.
+    FlexAttention expresses the same bias as a fused score_mod instead, at flash-level O(N) memory
+    -- numerically verified identical to the old dense-mask path (see perf/TODO.md). Requires
+    torch.compile to actually fuse (flex_attention warns and materializes the same O(N^2) matrix
+    uncompiled) -- fine here since --compile defaults to on."""
+    B, Lq, D = query.shape
+    Lk = key.shape[1]
+    H = mha.num_heads
+    Dh = D // H
+    w_q, w_k, w_v = mha.in_proj_weight.chunk(3, dim=0)
+    b_q, b_k, b_v = mha.in_proj_bias.chunk(3, dim=0) if mha.in_proj_bias is not None else (None, None, None)
+    q = F.linear(query, w_q, b_q).view(B, Lq, H, Dh).transpose(1, 2)  # (B,H,Lq,Dh)
+    k = F.linear(key, w_k, b_k).view(B, Lk, H, Dh).transpose(1, 2)    # (B,H,Lk,Dh)
+    v = F.linear(value, w_v, b_v).view(B, Lk, H, Dh).transpose(1, 2)  # (B,H,Lk,Dh)
+
+    def score_mod(score, b, h, q_idx, kv_idx):
+        if bias is not None: score = score + bias[b, q_idx]
+        if key_padding_mask is not None: score = torch.where(key_padding_mask[b, kv_idx], torch.finfo(score.dtype).min, score)
+        return score
+
+    out = _flex_attention_isolated(q, k, v, score_mod)  # (B,H,Lq,Dh)
+    out = out.transpose(1, 2).reshape(B, Lq, D)
+    return mha.out_proj(out)
 
 class MaskedAttnDecoderLayer(nn.Module):
     """One Mask2Former-style decoder layer: cross-attn (gated by the running mask-confidence
@@ -238,17 +374,11 @@ class MaskedAttnDecoderLayer(nn.Module):
         self.norm3 = nn.LayerNorm(d_model)
 
     def forward(self, queries, memory, attn_bias=None, memory_key_padding_mask=None):
-        # attn_bias: (B,num_queries,S) additive bias on cross-attn logits -- the masked-attn gate.
-        # nn.MultiheadAttention wants a per-head mask (B*num_heads,L,S); the bias is head-uniform
-        # (it comes from a scalar-per-query confidence), so repeat rather than learn per-head gates.
-        # Fold the bool key_padding_mask into the same float additive mask -- passing both a bool
-        # key_padding_mask and a float attn_mask is deprecated (torch warns and merges them anyway).
-        mask = attn_bias.repeat_interleave(self.num_heads, dim=0) if attn_bias is not None else None
-        if memory_key_padding_mask is not None:
-            pad_bias = torch.zeros_like(memory_key_padding_mask, dtype=queries.dtype).masked_fill(memory_key_padding_mask, float('-inf'))
-            pad_bias = pad_bias[:, None, :].expand(-1, queries.shape[1], -1).repeat_interleave(self.num_heads, dim=0)
-            mask = pad_bias if mask is None else mask + pad_bias
-        x = self.norm1(queries + self.cross_attn(queries, memory, memory, attn_mask=mask, need_weights=False)[0])
+        # attn_bias: (B,num_queries,S) additive bias on cross-attn logits -- the masked-attn gate,
+        # uniform across S (broadcast from a per-query confidence), so only column 0 carries info.
+        bias = attn_bias[:, :, 0] if attn_bias is not None else None  # (B,num_queries)
+        cross_out = flex_cross_attn(self.cross_attn, queries, memory, memory, bias=bias, key_padding_mask=memory_key_padding_mask)
+        x = self.norm1(queries + cross_out)
         x = self.norm2(x + self.self_attn(x, x, x, need_weights=False)[0])
         return self.norm3(x + self.ffn(x))
 
@@ -262,13 +392,21 @@ class MaskedAttnDecoder(nn.Module):
     they already peaked), unconfident queries stay diffuse. This is a self-mask / confidence-gate
     rather than the literal per-memory-token include/exclude mask2former uses on same-domain
     pixel features, since there is no natural per-laser-token "inside this query's mask" test here."""
-    def __init__(self, d_model, out_h, out_w, num_heads:int=2, num_layers:int=2, do_rope:bool=True, out_c:int=1, ffn_dim:int|None=None, mask_temp:float=4.0, memory_grid:bool=False):
+    def __init__(self, d_model, out_h, out_w, num_heads:int=2, num_layers:int=2, do_rope:bool=True, out_c:int=1, ffn_dim:int|None=None, mask_temp:float=4.0, memory_grid:bool=False, key_pos:str='none', n_laser_rows:int|None=None, n_laser_cols:int|None=None, x_span:float=1/3, x_offset:float=0.0):
         super().__init__()
         self.out_h, self.out_w, self.out_c = out_h, out_w, out_c
         self.query_seed = nn.Parameter(torch.zeros(1, out_h * out_w, d_model))
         nn.init.trunc_normal_(self.query_seed, std=0.02)
-        self.register_buffer("freqs_query", precompute_freqs_cis_2d(d_model, out_h, out_w))
+        assert key_pos == 'none' or not memory_grid, "--key-pos is incompatible with --memory-grid 1: reshaped memory is indexed by output grid cell, not laser position"
+        self.shared_rope = key_pos == 'shared-rope'
+        if self.shared_rope:
+            freqs_query, freqs_key = build_shared_x_freqs(d_model, out_h, out_w, n_laser_rows, n_laser_cols, x_span, x_offset)
+            self.register_buffer("freqs_query", freqs_query)  # (x,z) RoPE, sharing freqs_x with freqs_key
+            self.register_buffer("freqs_key", freqs_key)      # (x,y) RoPE for memory (cls + lasers)
+        else:
+            self.register_buffer("freqs_query", precompute_freqs_cis_2d(d_model, out_h, out_w))
         self.memory_reshaper = MemoryReshaper(d_model, out_h, out_w, num_heads) if memory_grid else None
+        self.key_pos = LearnedKeyPos(d_model, n_laser_rows, n_laser_cols) if key_pos == 'learned' else None
         self.layers = nn.ModuleList([MaskedAttnDecoderLayer(d_model, num_heads, ffn_dim or 4 * d_model) for _ in range(num_layers)])
         self.mask_heads = nn.ModuleList([nn.Linear(d_model, out_c) for _ in range(num_layers)])  # per-layer intermediate mask head, final one IS the output head
         self.do_rope = do_rope
@@ -279,9 +417,13 @@ class MaskedAttnDecoder(nn.Module):
         if self.memory_reshaper is not None:
             memory = self.memory_reshaper(memory, memory_key_padding_mask)  # (B,S,D) -> (B,out_h*out_w,D)
             memory_key_padding_mask = None  # reshaped memory is dense (one token per grid cell, none padded)
+        elif self.key_pos is not None:
+            memory = self.key_pos(memory)  # (B,S,D) -> (B,S,D), each laser + cls gets its learned identity
+        elif self.shared_rope:
+            memory = apply_rope(memory, self.freqs_key)  # (B,S,D) -> (B,S,D), (x,y) RoPE sharing freqs_x with queries
         B, S, _ = memory.shape
         queries = self.query_seed.expand(B, -1, -1)
-        if self.do_rope: queries = apply_rope(queries, self.freqs_query)
+        if self.do_rope or self.shared_rope: queries = apply_rope(queries, self.freqs_query)
         attn_bias = None
         for layer, mask_head in zip(self.layers, self.mask_heads):
             queries = layer(queries, memory, attn_bias=attn_bias, memory_key_padding_mask=memory_key_padding_mask)
@@ -292,7 +434,7 @@ class MaskedAttnDecoder(nn.Module):
             attn_bias = (self.mask_temp * conf).expand(-1, -1, S)                # (B,out_h*out_w,S)
         return self.mask_heads[-1](queries).view(B, self.out_h, self.out_w, self.out_c).squeeze(-1)
 
-def build_decoder(decoder, d_model, out_h, out_w, decoder_num_heads:int=2, decoder_num_layers:int=2, out_c:int=1, ffn_dim:int|None=None, mlp_dec_depth:int|None=None, mlp_dec_hidden:int|None=None, conv_dec_mult:float|None=None, conv_dec_res_blocks:int|None=None, mask_temp:float=4.0, memory_grid:bool=False):
+def build_decoder(decoder, d_model, out_h, out_w, decoder_num_heads:int=2, decoder_num_layers:int=2, out_c:int=1, ffn_dim:int|None=None, mlp_dec_depth:int|None=None, mlp_dec_hidden:int|None=None, conv_dec_mult:float|None=None, conv_dec_res_blocks:int|None=None, mask_temp:float=4.0, memory_grid:bool=False, key_pos:str='none', n_laser_rows:int|None=None, n_laser_cols:int|None=None, x_span:float=1/3, x_offset:float=0.0):
     if decoder == 'mlp': return MLPDecoder(d_model, out_h, out_w, out_c, depth=mlp_dec_depth, hidden=mlp_dec_hidden)
     # boombox's transposed-conv stack on the transformer's cls token. Imported here, not at module
     # scope: boombox.py imports from this file, so a top-level import would be circular. Its
@@ -304,9 +446,9 @@ def build_decoder(decoder, d_model, out_h, out_w, decoder_num_heads:int=2, decod
         if conv_dec_res_blocks is not None: kwargs['num_res_blocks'] = conv_dec_res_blocks
         return ConvDecoder(**kwargs)
     if decoder == 'mlp-mid': return MLPMidDecoder(d_model, out_h, out_w, out_c)
-    if decoder == 'attn': return AttnDecoder(d_model, out_h, out_w, num_heads=decoder_num_heads, num_layers=decoder_num_layers, out_c=out_c, ffn_dim=ffn_dim, memory_grid=memory_grid)
-    if decoder == 'attn-no-rope': return AttnDecoder(d_model, out_h, out_w, num_heads=decoder_num_heads, num_layers=decoder_num_layers, do_rope=False, out_c=out_c, ffn_dim=ffn_dim, memory_grid=memory_grid)
-    if decoder == 'masked-attn': return MaskedAttnDecoder(d_model, out_h, out_w, num_heads=decoder_num_heads, num_layers=decoder_num_layers, out_c=out_c, ffn_dim=ffn_dim, mask_temp=mask_temp, memory_grid=memory_grid)
+    if decoder == 'attn': return AttnDecoder(d_model, out_h, out_w, num_heads=decoder_num_heads, num_layers=decoder_num_layers, out_c=out_c, ffn_dim=ffn_dim, memory_grid=memory_grid, key_pos=key_pos, n_laser_rows=n_laser_rows, n_laser_cols=n_laser_cols, x_span=x_span, x_offset=x_offset)
+    if decoder == 'attn-no-rope': return AttnDecoder(d_model, out_h, out_w, num_heads=decoder_num_heads, num_layers=decoder_num_layers, do_rope=False, out_c=out_c, ffn_dim=ffn_dim, memory_grid=memory_grid, key_pos=key_pos, n_laser_rows=n_laser_rows, n_laser_cols=n_laser_cols, x_span=x_span, x_offset=x_offset)
+    if decoder == 'masked-attn': return MaskedAttnDecoder(d_model, out_h, out_w, num_heads=decoder_num_heads, num_layers=decoder_num_layers, out_c=out_c, ffn_dim=ffn_dim, mask_temp=mask_temp, memory_grid=memory_grid, key_pos=key_pos, n_laser_rows=n_laser_rows, n_laser_cols=n_laser_cols, x_span=x_span, x_offset=x_offset)
     raise ValueError(f"Unknown decoder: {decoder}")
 
 #***** 4 encoder *****
@@ -329,7 +471,8 @@ class FreqEncoder(nn.Module):
         # no self.speakers_embed: dataset.py never produces a 'speakers_encoded' batch key, so
         # `speaker` below is always None -- a real speaker-conditioning embedding would need that
         # wired up in dataset.py first.
-        self.layers = nn.TransformerEncoder(nn.TransformerEncoderLayer(d_model=d_model, nhead=num_heads, dim_feedforward=ffn_dim or 4 * d_model, batch_first=True), num_layers=num_layers)
+        # dropout=0.0: see AttnDecoder's nn.TransformerDecoderLayer construction for why.
+        self.layers = nn.TransformerEncoder(nn.TransformerEncoderLayer(d_model=d_model, nhead=num_heads, dim_feedforward=ffn_dim or 4 * d_model, dropout=0.0, batch_first=True), num_layers=num_layers)
         self.cls_token = nn.Parameter(torch.zeros(1, 1, d_model))
         self.register_buffer("freqs_cis", precompute_freqs_cis(d_model, signal_length // patch_size))
         self.freq_dropout = freq_dropout
@@ -350,7 +493,7 @@ class FreqEncoder(nn.Module):
 #***** 5 model *****
 
 class VibrationTransformer(ComposerModel):
-    def __init__(self, d_model:int=128, pnt_num_heads:int=2, pnt_num_layers:int=2, seq_num_heads:int=2, seq_num_layers:int=2, data_info=None, decoder:str='mlp', decoder_num_heads:int=2, decoder_num_layers:int=2, freq_dropout:float=0.3, laser_dropout:float=0.3, loss_fn:str='mse', loss_alpha:float=0.5, count_loss_weight:float=0.0, ffn_dim:int|None=None, enc_ffn_dim:int|None=None, dec_ffn_dim:int|None=None, mlp_dec_depth:int|None=None, mlp_dec_hidden:int|None=None, conv_dec_mult:float|None=None, conv_dec_res_blocks:int|None=None, mask_temp:float=4.0, memory_grid:bool=False):
+    def __init__(self, d_model:int=128, pnt_num_heads:int=2, pnt_num_layers:int=2, seq_num_heads:int=2, seq_num_layers:int=2, data_info=None, decoder:str='mlp', decoder_num_heads:int=2, decoder_num_layers:int=2, freq_dropout:float=0.3, laser_dropout:float=0.3, loss_fn:str='mse', loss_alpha:float=0.5, loss_balanced:bool=False, count_loss_weight:float=0.0, ffn_dim:int|None=None, enc_ffn_dim:int|None=None, dec_ffn_dim:int|None=None, mlp_dec_depth:int|None=None, mlp_dec_hidden:int|None=None, conv_dec_mult:float|None=None, conv_dec_res_blocks:int|None=None, mask_temp:float=4.0, memory_grid:bool=False, key_pos:str='none', x_span:float=1/3, x_offset:float=0.0):
         super().__init__()
 
         # ffn_dim=None keeps the 4*d_model default. It is worth setting explicitly: torch's own
@@ -361,7 +504,8 @@ class VibrationTransformer(ComposerModel):
         _dec_ffn_dim = dec_ffn_dim if dec_ffn_dim is not None else ffn_dim
         # encoder
         self.freq_encoder = FreqEncoder(data_info['patch_size'], d_model, pnt_num_heads, pnt_num_layers, data_info['n_freqs'], freq_dropout, n_channels=data_info.get('n_channels', 2), ffn_dim=_enc_ffn_dim)
-        self.laser_encoder = nn.TransformerEncoder(nn.TransformerEncoderLayer(d_model=d_model, nhead=seq_num_heads, dim_feedforward=_enc_ffn_dim or 4 * d_model, batch_first=True), num_layers=seq_num_layers)
+        # dropout=0.0: see AttnDecoder's nn.TransformerDecoderLayer construction for why.
+        self.laser_encoder = nn.TransformerEncoder(nn.TransformerEncoderLayer(d_model=d_model, nhead=seq_num_heads, dim_feedforward=_enc_ffn_dim or 4 * d_model, dropout=0.0, batch_first=True), num_layers=seq_num_layers)
         self.laser_dropout = laser_dropout
 
         self.cls_token = nn.Parameter(torch.zeros(1, 1, d_model))
@@ -371,7 +515,7 @@ class VibrationTransformer(ComposerModel):
         # decoder
         out_c = data_info.get('out_c', 1)
         assert out_c == 1 or loss_fn in ('mse', 'ce-pixel'), f"{loss_fn} is mask-only; use mse or ce-pixel with an rgb target"
-        self.decoder = build_decoder(decoder, d_model, data_info['out_h'], data_info['out_w'], decoder_num_heads, decoder_num_layers, out_c, ffn_dim=_dec_ffn_dim, mlp_dec_depth=mlp_dec_depth, mlp_dec_hidden=mlp_dec_hidden, conv_dec_mult=conv_dec_mult, conv_dec_res_blocks=conv_dec_res_blocks, mask_temp=mask_temp, memory_grid=memory_grid)
+        self.decoder = build_decoder(decoder, d_model, data_info['out_h'], data_info['out_w'], decoder_num_heads, decoder_num_layers, out_c, ffn_dim=_dec_ffn_dim, mlp_dec_depth=mlp_dec_depth, mlp_dec_hidden=mlp_dec_hidden, conv_dec_mult=conv_dec_mult, conv_dec_res_blocks=conv_dec_res_blocks, mask_temp=mask_temp, memory_grid=memory_grid, key_pos=key_pos, n_laser_rows=data_info['n_laser_rows'], n_laser_cols=data_info['n_laser_cols'], x_span=x_span, x_offset=x_offset)
 
         # loss and metrics
         self.empty_head = nn.Linear(d_model, 1)  # extra "empty box" class for the spatial losses
@@ -382,6 +526,9 @@ class VibrationTransformer(ComposerModel):
         self.is_spatial_loss = loss_fn.startswith('ce-spatial')
         self.is_asym_loss = loss_fn.endswith('-asym')
         self.loss_alpha = loss_alpha
+        # 'balanced' is only implemented for ce-pixel-asym (see its comment) -- other -asym losses
+        # ignore it, so only pass it through for that one to keep their call signature untouched.
+        self.loss_balanced = loss_balanced and loss_fn == 'ce-pixel-asym'
         self.train_metrics = create_metrics(data_info, CHEAP_SEG_KEYS)  # cheap subset per step
         self.val_metrics = create_metrics(data_info)                   # full suite on eval loaders
 
@@ -415,7 +562,7 @@ class VibrationTransformer(ComposerModel):
 
     def loss(self, outputs, batch):
         kw = dict(empty_logit=outputs['empty_logit']) if self.is_spatial_loss else {}
-        if self.is_asym_loss: kw = dict(alpha=self.loss_alpha)
+        if self.is_asym_loss: kw = dict(alpha=self.loss_alpha, balanced=self.loss_balanced) if self.loss_balanced else dict(alpha=self.loss_alpha)
         total = self.loss_fn(outputs['mask_logits'], outputs['mask_pred'], batch['mask_true'], **kw)
         # count_head and empty_head stay always-on free probes (count-acc metrics, viz dashboard,
         # OutputSaver all read them regardless of loss_fn/count_loss_weight -- see their __init__

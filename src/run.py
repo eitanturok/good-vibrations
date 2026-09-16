@@ -33,7 +33,7 @@ from composer.callbacks.speed_monitor import GPU_AVAILABLE_FLOPS
 from icecream import install; install()
 
 from model.callbacks import VisualizeSMask, OutputSaver, AttributionSaver, OUTPUT_EXTRACTORS, DEFAULT_OUTPUT_KEYS
-from model.dataset import build_dataset
+from model.dataset import build_dataset, combine_train_loaders
 from model.arch import VibrationTransformer, LOSSES, N_COUNT_CLASSES
 from model.boombox import BoomboxModel
 from utils.helpers import cleanup
@@ -75,9 +75,12 @@ def get_parser():
     # build data
     parser.add_argument("--data-dir",                    type=str,  default=BASE_DATA_DIR / "31_07_2026_gastronorm_exp1")
     parser.add_argument("--split",                      type=str,   default="gastronorm", help="Which split method from SPLIT_METHODS to use (e.g. 'exp22', 'exp23').")
+    parser.add_argument("--data-dir-2",                  type=str,   default=None, help="A second box's data-dir to train on jointly with --data-dir (e.g. training gastronorm + plastic together). Only the train split is merged (via ConcatDataset); eval stays per-box, one Evaluator per split from each dir. The two dirs must produce the same tensor shape -- same laser grid (see --laser-cols/--laser-rows), out_h/out_w, patch_size, signal_mode. Default None = single box.")
+    parser.add_argument("--split-2",                    type=str,   default=None, help="--data-dir-2 only. Which split method to use for the second box; required if --data-dir-2 is set.")
     parser.add_argument("--num-workers",                type=int,   default=4)
     parser.add_argument("--test-size",                  type=float, default=0.2)
     parser.add_argument("--laser-cols",                 type=str,   default=None, help="Comma-separated laser column ids to train on, e.g. '0,1,2,3,4'. Whole columns across every row, so the kept lasers stay a rectangle. Default None = all. The selection is applied where the fft is read off disk, so every normalization and reference statistic is computed over exactly these lasers -- which means each selection gets its own MDS build.")
+    parser.add_argument("--laser-rows",                 type=str,   default=None, help="Comma-separated laser row ids to train on, e.g. '0,1,2,3,4,5,6,7'. Whole rows across every kept column, so the kept lasers stay a rectangle. Default None = all. Same single-point selection as --laser-cols (composes with it), each combination gets its own MDS build.")
     parser.add_argument("--patch-size",                 type=int,   default=32)
 
     # data normalization
@@ -122,6 +125,9 @@ def get_parser():
     parser.add_argument("--conv-dec-res-blocks",        type=int,   default=None, help="Residual blocks per TwoBranchUp scale in boombox Decoder.")
     parser.add_argument("--mask-temp",                  type=float, default=4.0, help="--decoder masked-attn only. Scales per-query mask confidence into the next layer's cross-attn logit bias; higher = sharper gating.")
     parser.add_argument("--memory-grid",                type=int,   default=0, choices=(0, 1), help="--decoder attn/attn-no-rope/masked-attn only. Project the L+1 laser-token memory onto a new learned out_h x out_w grid (2D RoPE'd over that same grid) before decoder cross-attention, so Q and K/V share sequence length and spatial index. Off by default (memory stays the raw laser token sequence).")
+    parser.add_argument("--key-pos",                    type=str,   default="none", choices=("none", "learned", "shared-rope"), help="--decoder attn/attn-no-rope/masked-attn only. 'learned' adds a learned per-laser 2D positional embedding (10x10 grid + 1 cls slot) to decoder memory right before cross-attention, so each key has an explicit learned identity, symmetric with the query side's learned query_seed + RoPE. 'shared-rope' instead gives queries (wall x-z plane) and keys (floor x-y plane) 2D RoPE that shares the SAME frequencies on the x channels, so query/key pairs with matching x get a zero relative rotation there (a free, unlearned 'same x -> related' bias) -- see --laser-x-span/--laser-x-offset for the (approximate) x-axis calibration between the two grids. Both modes incompatible with --memory-grid 1 (reshaped memory isn't laser-indexed).")
+    parser.add_argument("--laser-x-span",               type=float, default=1/3, help="--key-pos shared-rope only. Fraction of the wall's x-width the 10x10 laser grid's x-axis (assumed = laser grid cols) covers -- the laser doesn't shine across the box's full width. Approximate baseline calibration, not derived from real box geometry yet.")
+    parser.add_argument("--laser-x-offset",             type=float, default=0.0, help="--key-pos shared-rope only. Fraction of the wall's x-width where the laser grid's x-span starts (left edge). Approximate baseline calibration, not derived from real box geometry yet.")
     parser.add_argument("--pnt-num-heads",              type=int,   default=2)
     parser.add_argument("--seq-num-heads",              type=int,   default=2)
     parser.add_argument("--pnt-num-layers",             type=int,   default=2)
@@ -139,6 +145,7 @@ def get_parser():
     # loss
     parser.add_argument("--loss-fn",                    type=str,   default='mse', choices=list(LOSSES))
     parser.add_argument("--loss-alpha",                 type=float, default=0.5, help="for the -asym losses: weight on false negatives; >0.5 paints more, <0.5 holds back")
+    parser.add_argument("--loss-balanced",              type=int,   default=0, choices=(0, 1), help="ce-pixel-asym only: instead of pos_weight inside a reduction='mean' over ALL pixels (still diluted by the background:foreground pixel-count ratio -- a fixed pos_weight can't fully counteract sparse targets like gastronorm_one_cube's ~0.65%% occupancy), take the mean loss over positive pixels and negative pixels SEPARATELY and combine with alpha, so the false-negative/false-positive tradeoff no longer depends on the class prior.")
     parser.add_argument("--count-loss-weight",          type=float, default=0.0, help="weight on the auxiliary n_objects classification loss; 0 disables it (the head still runs, so count-acc stays readable as a free probe).")
 
     # train
@@ -240,13 +247,14 @@ def run(**kwargs):
 
     # dataset
     laser_cols = [int(c) for c in args.laser_cols.split(",") if c.strip()] if args.laser_cols else None
+    laser_rows = [int(r) for r in args.laser_rows.split(",") if r.strip()] if args.laser_rows else None
     train_loader, eval_loaders, train_eval_loader = build_dataset(
         args.data_dir, batch_size=args.batch_size, eval_batch_size=args.eval_batch_size, num_workers=args.num_workers,
         split=args.split, test_size=args.test_size, speakers=args.speakers, n_objects=args.n_objects, box=args.box, n_samples=args.n_samples,
         out_h=args.out_h, out_w=args.out_w, rgb=bool(args.rgb), signal_mode=args.signal_mode, normalize_mode=args.normalize_mode, patch_size=args.patch_size, seed=args.seed,
         augment_fft=args.augment_fft, augment_mask=args.augment_mask, subtract_speaker_mean=bool(args.subtract_speaker_mean), subtract_empty_box=bool(args.subtract_empty_box), mag_recipe=args.mag_recipe, phase_arm=args.phase_arm, phase_weight=args.phase_weight,
         force_rebuild_data=bool(args.force_rebuild_data), n_classes=N_COUNT_CLASSES, pair_speakers_mode=bool(args.pair_speakers),
-        laser_cols=laser_cols, device_eval_microbatch_size=microbatch(args.device_eval_microbatch_size))
+        laser_cols=laser_cols, laser_rows=laser_rows, device_eval_microbatch_size=microbatch(args.device_eval_microbatch_size))
     boundary_loaders = eval_loaders + [Evaluator(label='train', dataloader=train_eval_loader,
                                                  device_eval_microbatch_size=microbatch(args.device_eval_microbatch_size))]
     ensure_viz(args.data_dir, port=args.viz_port, enabled=not args.no_viz)
@@ -269,8 +277,29 @@ def run(**kwargs):
     else:
         enc_ffn_dim = args.enc_ffn_dim if args.enc_ffn_dim is not None else args.ffn_dim
         dec_ffn_dim = args.dec_ffn_dim if args.dec_ffn_dim is not None else args.ffn_dim
-        model = VibrationTransformer(args.d_model, args.pnt_num_heads, args.pnt_num_layers, args.seq_num_heads, args.seq_num_layers, data_info, args.decoder, args.decoder_num_heads, args.decoder_num_layers, freq_dropout=args.freq_dropout, laser_dropout=args.laser_dropout, loss_fn=args.loss_fn, loss_alpha=args.loss_alpha, count_loss_weight=args.count_loss_weight, enc_ffn_dim=enc_ffn_dim, dec_ffn_dim=dec_ffn_dim, mlp_dec_depth=args.mlp_dec_depth, mlp_dec_hidden=args.mlp_dec_hidden, conv_dec_mult=args.conv_dec_mult, conv_dec_res_blocks=args.conv_dec_res_blocks, mask_temp=args.mask_temp, memory_grid=bool(args.memory_grid))
+        model = VibrationTransformer(args.d_model, args.pnt_num_heads, args.pnt_num_layers, args.seq_num_heads, args.seq_num_layers, data_info, args.decoder, args.decoder_num_heads, args.decoder_num_layers, freq_dropout=args.freq_dropout, laser_dropout=args.laser_dropout, loss_fn=args.loss_fn, loss_alpha=args.loss_alpha, loss_balanced=bool(args.loss_balanced), count_loss_weight=args.count_loss_weight, enc_ffn_dim=enc_ffn_dim, dec_ffn_dim=dec_ffn_dim, mlp_dec_depth=args.mlp_dec_depth, mlp_dec_hidden=args.mlp_dec_hidden, conv_dec_mult=args.conv_dec_mult, conv_dec_res_blocks=args.conv_dec_res_blocks, mask_temp=args.mask_temp, memory_grid=bool(args.memory_grid), key_pos=args.key_pos, x_span=args.laser_x_span, x_offset=args.laser_x_offset)
     load_path = str(args.checkpoint_path) if args.checkpoint_path else None
+
+    # second box: train on the union of both, eval on each box's own splits separately (prefixed
+    # so e.g. gastronorm's eval/1-cube and plastic's eval/1-cube don't collide). data_info/model
+    # above are built from box 1 alone -- correct as long as both boxes share the same laser grid
+    # (arrange via --laser-rows/--laser-cols), out_h/out_w, patch_size, and signal_mode.
+    if args.data_dir_2:
+        if not args.split_2: raise ValueError("--data-dir-2 requires --split-2")
+        train_loader_2, eval_loaders_2, _ = build_dataset(
+            args.data_dir_2, batch_size=args.batch_size, eval_batch_size=args.eval_batch_size, num_workers=args.num_workers,
+            split=args.split_2, test_size=args.test_size, speakers=args.speakers, n_objects=args.n_objects, box=args.box, n_samples=args.n_samples,
+            out_h=args.out_h, out_w=args.out_w, rgb=bool(args.rgb), signal_mode=args.signal_mode, normalize_mode=args.normalize_mode, patch_size=args.patch_size, seed=args.seed,
+            augment_fft=args.augment_fft, augment_mask=args.augment_mask, subtract_speaker_mean=bool(args.subtract_speaker_mean), subtract_empty_box=bool(args.subtract_empty_box), mag_recipe=args.mag_recipe, phase_arm=args.phase_arm, phase_weight=args.phase_weight,
+            force_rebuild_data=bool(args.force_rebuild_data), n_classes=N_COUNT_CLASSES, pair_speakers_mode=bool(args.pair_speakers),
+            device_eval_microbatch_size=microbatch(args.device_eval_microbatch_size))
+        n_lasers_2 = train_loader_2.dataloader.dataset[0]['fft'].shape[0]
+        assert n_lasers_2 == n_lasers, f"--data-dir-2 has a {n_lasers_2}-laser grid, --data-dir has {n_lasers}; crop one to match (--laser-rows/--laser-cols) before combining"
+        generator = torch.Generator().manual_seed(args.seed)
+        train_loader = combine_train_loaders([train_loader, train_loader_2], args.batch_size, args.num_workers, generator)
+        for ev in eval_loaders_2: ev.label = f"box2-{ev.label}"
+        eval_loaders = eval_loaders + eval_loaders_2
+        boundary_loaders = boundary_loaders + eval_loaders_2
 
     # logger
     loggers = []
