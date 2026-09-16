@@ -14,28 +14,23 @@ if str(REPO_ROOT) not in sys.path:
 
 # ***** inputs (hardcoded defaults, overridable from __main__) *****
 
-EXPERIMENT_DIR = REPO_ROOT / "experiments" / "experiment-25"
+# The parent dir holding every experiment. Registry auto-detects whether this (or
+# whatever --experiment overrides it to) is one experiment (has samples/ directly) or a
+# parent of several -- see data.load_experiments.
+EXPERIMENT_DIR = REPO_ROOT / "experiments"
 RUNS_DIR = REPO_ROOT / "runs"
 PORT = 8503  # 8502 is taken by the other explorer
 
 # ***** dataset shape *****
 
-# The target grid. A dataset may ship masks at several downsample sizes side by side
-# (the gastronorm captures write both 20x40 and 30x30), and a run is only comparable
-# against the size it was trained on -- so this is overridable from the command line
-# (--mask 30x30) rather than a fixed property of the code. set_mask_shape rebinds it.
-MASK_H, MASK_W = 20, 40
+# A dataset may ship masks at several downsample sizes side by side (the gastronorm
+# captures write both 20x40 and 30x30), and a run is only comparable against the size it
+# was trained on. The grid is therefore resolved PER EXPERIMENT (data.load_experiments)
+# and passed explicitly to Layout/load_gt -- never a shared global, since experiments
+# loaded together can have no size in common. This is only the fallback used to produce a
+# descriptive error when an experiment ships no usable size and none was requested.
+DEFAULT_MASK_SHAPE = (20, 40)
 N_SAMPLES = 1024
-
-
-def set_mask_shape(h: int, w: int) -> None:
-    """Point viz at a different target grid, before anything reads the constants.
-
-    Layout paths embed {h}/{w}, and Layout instances are built after this runs, so the
-    ground-truth filename follows automatically.
-    """
-    global MASK_H, MASK_W
-    MASK_H, MASK_W = int(h), int(w)
 
 
 # How a downsampled target is named, with the numeric prefix left OPEN. The size is the
@@ -112,8 +107,8 @@ def usable_mask_shapes(samples_dir) -> list[tuple[int, int]]:
 # in the files themselves declares which era they belong to, so `Layout.detect` probes a
 # real sample directory rather than making viz depend on one hardcoded set of names.
 #
-# Every entry is a path RELATIVE TO A SAMPLE DIR. `{h}`/`{w}` are filled with MASK_H and
-# MASK_W so the mask name follows the configured target shape.
+# Every entry is a path RELATIVE TO A SAMPLE DIR. `{h}`/`{w}` are filled with the target
+# shape each Layout was constructed with, so the mask name follows it.
 #
 # A layout entry names a FILENAME SCHEME, not a dataset -- `dataset` carries the data
 # identity separately, and it is what a run's `family` is reported as. Two layouts sharing
@@ -192,8 +187,8 @@ class Layout:
     with a user-supplied id.
     """
 
-    def __init__(self, name: str, spec: dict):
-        fmt = {"h": MASK_H, "w": MASK_W}
+    def __init__(self, name: str, spec: dict, mask_h: int, mask_w: int):
+        fmt = {"h": mask_h, "w": mask_w}
         self.name = name
         self._gt_mask_spec = spec["gt_mask"]
         # Which data this is, independent of the filename scheme `name` identifies. Two
@@ -238,7 +233,7 @@ class Layout:
         return hits[0] if hits else None
 
     @classmethod
-    def detect(cls, samples_dir) -> "Layout":
+    def detect(cls, samples_dir, mask_h: int, mask_w: int) -> "Layout":
         """Pick the layout whose ground-truth mask actually exists on disk.
 
         Probes several sample dirs, not one: a partially-written capture can be missing
@@ -264,11 +259,11 @@ class Layout:
             probes = sorted(p for p in samples_dir.iterdir() if p.is_dir())[:25]
         except OSError:
             probes = []
-        layouts = [cls(name, LAYOUTS[name]) for name in LAYOUT_ORDER]
+        layouts = [cls(name, LAYOUTS[name], mask_h, mask_w) for name in LAYOUT_ORDER]
         for strict in (True, False):
             for layout in layouts:
                 for d in probes:
-                    if layout.resolve_gt_mask(d, MASK_H, MASK_W) is None:
+                    if layout.resolve_gt_mask(d, mask_h, mask_w) is None:
                         continue
                     if not (d / layout.backdrop).exists():
                         continue
@@ -283,7 +278,7 @@ class Layout:
         raise SystemExit(
             f"[viz] no known sample layout under {samples_dir}.\n"
             f"       tried: {known}. Expected a mask matching "
-            + GT_MASK_GLOB.format(h=MASK_H, w=MASK_W)
+            + GT_MASK_GLOB.format(h=mask_h, w=mask_w)
             + " plus that layout's backdrop.\n"
               "       Add a new entry to LAYOUTS in viz/config.py if this is a new "
               "dataset format."
@@ -303,7 +298,11 @@ OUTPUTS_SUBDIR = "outputs_history"
 # rather than 1-cube/2-cubes -- same capture, same grid, same ids, different slicing.
 # Runs that slice one dataset differently are meant to sit in the same table.
 
-N_DEFAULT_RUNS = 3  # auto-loaded on first open, most recently modified first
+# Auto-loaded on first open, most recently modified first -- PER EXPERIMENT (see
+# Registry.defaults), not a single global total, so switching the Box filter to any
+# loaded box always shows at least one real column. Lower than the single-experiment
+# default (3) was, since it now multiplies by however many experiments are loaded.
+N_DEFAULT_RUNS = 1
 
 # The runs directory is re-scanned at most this often, so runs that appear or keep
 # training while viz is open show up without a restart. A scan is ~0.15s.

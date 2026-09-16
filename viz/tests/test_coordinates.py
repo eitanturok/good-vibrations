@@ -30,9 +30,9 @@ def fingerprint(row: int) -> np.ndarray:
 
 
 @pytest.fixture
-def experiment(tmp_path, monkeypatch):
-    monkeypatch.setattr(config, "MASK_H", H)
-    monkeypatch.setattr(config, "MASK_W", W)
+def experiment(tmp_path):
+    # The mask grid is resolved from the data itself (data.load_experiments), not a
+    # global -- (H, W) is whatever size the fixture actually writes below.
     exp = tmp_path / "exp"
     row = 0
     for sid in IDS:
@@ -72,7 +72,7 @@ def registry(experiment, runs):
 
 def test_gt_rows_are_not_ids(registry):
     """The premise: without this, the rest of the suite proves nothing."""
-    assert registry.gt.row_of == ROW_OF
+    assert registry.gts[0].row_of == ROW_OF
 
 
 def test_run_row_of_is_keyed_by_row(registry):
@@ -99,5 +99,5 @@ def test_backdrop_cache_not_poisoned(registry):
     """scene_aspect must probe rows, not ids, or it caches wrong photos under real rows."""
     from viz import render
     render.scene_aspect()
-    for row in range(len(registry.gt)):
+    for row in range(registry.n_samples):
         assert render._backdrop(row).size == (100 + row, 80)
