@@ -766,8 +766,29 @@ def split_by_position(index: list[dict], idxs: list[int], percent: float = 0.2, 
     return sorted(unseen_speaker), sorted(unseen_position), sorted(train)
 
 
-def gastronorm(mds_path, test_size=0.2, seed=42, speakers=None, n_objects=None, box=None, n_samples: int | None = None, verbose: int = 1, index: list[dict] | None = None):
+def split_by_position_only(index: list[dict], idxs: list[int], percent: float = 0.2, seed: int = 42) -> tuple[list[int], list[int]]:
+    """Split `idxs` (indices into `index`) into (eval, train) by WHOLE position_id only: `percent`
+    of the positions go entirely to eval, the rest entirely to train. Unlike split_by_position,
+    there is no per-speaker holdout leg -- every speaker at a given position lands the same way,
+    so a position is never seen by some speakers in train and others in eval."""
+    position_ids = sorted({index[i]["position_id"] for i in idxs})
+    if not position_ids: return [], []
+    n_eval = round(percent * len(position_ids))
+    if n_eval <= 0: return [], sorted(idxs)
+    if n_eval >= len(position_ids): return sorted(idxs), []
+    _, eval_position_ids = train_test_split(position_ids, test_size=n_eval, random_state=seed, shuffle=True)
+    eval_position_ids = set(eval_position_ids)
+    eval_idx = [i for i in idxs if index[i]["position_id"] in eval_position_ids]
+    train_idx = [i for i in idxs if index[i]["position_id"] not in eval_position_ids]
+    return sorted(eval_idx), sorted(train_idx)
 
+
+def gastronorm(mds_path, test_size=0.2, seed=42, speakers=None, n_objects=None, box=None, n_samples: int | None = None, verbose: int = 1, index: list[dict] | None = None):
+    """train + eval/1-cube + eval/2-cubes + eval/3-cubes, nothing else. Every eval split is a
+    WHOLE-position holdout via split_by_position_only -- a position is never split across
+    speakers -- and red-cube (a single held-out-color sanity check, not another 1-cube data
+    source) always stays in train, never eval, so the model has always seen that color.
+    """
     if index is None:
         lines = (Path(mds_path) / "metadata.jsonl").read_text().strip().splitlines()
         index = [json.loads(line) for line in lines if line]
@@ -775,25 +796,22 @@ def gastronorm(mds_path, test_size=0.2, seed=42, speakers=None, n_objects=None, 
     keep = [i for i, row in enumerate(index) if _matches(row, speakers, n_objects, box)]
     if n_samples is not None: keep = keep[:n_samples]
 
-    # One cube
-    one_cube_unseen_speaker, one_cube_unseen_position, one_cube_train = split_by_position(index, [i for i, row in enumerate(index) if row['layout'] == 'purple-cube'], percent=test_size, seed=seed)
+    # One cube: purple-cube is the only layout actually split; red-cube is forced into train below.
+    one_cube_eval, one_cube_train = split_by_position_only(index, [i for i in keep if index[i]['layout'] == 'purple-cube'], percent=test_size, seed=seed)
 
     # Two cubes: eval comes from grid4 only, so grid1/2/3 stay wholly in train and every spot in the
     # raster is seen at least three times.
-    two_cubes_unseen_speaker, two_cubes_unseen_position, two_cubes_train = split_by_position(index, [i for i, row in enumerate(index) if row['layout'] == 'purple--green-cube-grid4'], percent=test_size, seed=seed)
+    two_cubes_eval, two_cubes_train = split_by_position_only(index, [i for i in keep if index[i]['layout'] == 'purple--green-cube-grid4'], percent=test_size, seed=seed)
 
-    # make train
-    splits = {}
-    splits['train'] = [i for i, row in enumerate(index) if row['layout'] in ['empty-box', 'purple--green-cube-grid1', 'purple--green-cube-grid2', 'purple--green-cube-grid3', 'x-shift', 'y-shift']]
-    splits['train'] += one_cube_train + two_cubes_train
+    # Three cubes: same whole-position holdout, out of its one layout.
+    three_cubes_eval, three_cubes_train = split_by_position_only(index, [i for i in keep if index[i]['layout'] == 'purple--green-red-cube'], percent=test_size, seed=seed)
 
-    # eval
-    splits |= {'eval/1-cube': one_cube_unseen_position, 'eval/1-cube-speaker': one_cube_unseen_speaker,
-               'eval/2-cubes': two_cubes_unseen_position, 'eval/2-cubes-speaker': two_cubes_unseen_speaker}
+    train = [i for i in keep if index[i]['layout'] in
+             ('empty-box', 'purple--green-cube-grid1', 'purple--green-cube-grid2', 'purple--green-cube-grid3',
+              'x-shift', 'y-shift', 'red-cube')]
+    train += one_cube_train + two_cubes_train + three_cubes_train
 
-    # ood eval
-    splits['eval/3-cubes'] = [i for i, row in enumerate(index) if row['layout'] == 'purple--green-red-cube']
-    splits['eval/red-cube'] = [i for i, row in enumerate(index) if row['layout'] == 'red-cube']
+    splits = {'train': sorted(train), 'eval/1-cube': one_cube_eval, 'eval/2-cubes': two_cubes_eval, 'eval/3-cubes': three_cubes_eval}
 
     if verbose:
         for label, idxs in splits.items(): print(f"{label}: {len(idxs)} samples")
