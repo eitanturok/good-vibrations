@@ -176,7 +176,16 @@ VIBRATION_GLOB = {
 # Stale Windows paths (D:\... , C:\...) recorded at capture time. Dropped when metadata
 # is parsed so they can never leak into a route; all paths are rebuilt from
 # EXPERIMENT_DIR. `experiment_dir` is the gastronorm-era spelling of `output_dir`.
-STALE_METADATA_KEYS = {"output_dir", "sample_dir", "audio_dir", "experiment_dir"}
+#
+# `rois`/`run_opt_multiROIs`/`run_opt` are the capture rig's laser-grid geometry -- read
+# by the TRAINING pipeline (src/data/vibrate.py, src/model/dataset.py), never by viz. They
+# are also, by a wide margin, the biggest thing in metadata.jsonl: ~4.3KB of the ~4.7KB a
+# typical sample's file carries, almost entirely nested lists of floats that parse into
+# thousands of individual Python objects. Kept in every GtIndex.meta[i] forever across
+# every loaded experiment, this was ~95MB retained for one 3000-sample experiment alone
+# (measured with tracemalloc -- see PERF_NOTES.md) for data nothing here ever reads.
+STALE_METADATA_KEYS = {"output_dir", "sample_dir", "audio_dir", "experiment_dir",
+                       "rois", "run_opt_multiROIs", "run_opt"}
 
 
 class Layout:
@@ -298,11 +307,10 @@ OUTPUTS_SUBDIR = "outputs_history"
 # rather than 1-cube/2-cubes -- same capture, same grid, same ids, different slicing.
 # Runs that slice one dataset differently are meant to sit in the same table.
 
-# Auto-loaded on first open, most recently modified first -- PER EXPERIMENT (see
-# Registry.defaults), not a single global total, so switching the Box filter to any
-# loaded box always shows at least one real column. Lower than the single-experiment
-# default (3) was, since it now multiplies by however many experiments are loaded.
-N_DEFAULT_RUNS = 1
+# Auto-loaded on first open: the N most recently modified compatible runs, globally
+# (see Registry.defaults). A box whose newest runs don't make this cut shows nothing
+# until a run is added manually -- accepted tradeoff for a simple "last N runs" default.
+N_DEFAULT_RUNS = 3
 
 # The runs directory is re-scanned at most this often, so runs that appear or keep
 # training while viz is open show up without a restart. A scan is ~0.15s.
@@ -311,6 +319,14 @@ RESCAN_SECONDS = 10.0
 # How many scrubbed-epoch RunData objects to keep. Each is ~5MB, so this bounds the
 # epoch slider's memory; the latest-epoch entry per run is never evicted.
 MAX_EPOCH_CACHE = 24
+
+# How many RunData objects (any epoch, including the "latest" entries that used to be
+# kept forever) Registry.run() keeps decoded in memory at once, LRU. Loading N runs over
+# the course of a session used to pin all N forever even after they were removed from the
+# table -- the single largest source of the process's memory growing unbounded over a long
+# session. 24 comfortably covers any table anyone actually keeps open at once (a handful
+# of columns) while still bounding a session that explores hundreds of runs over time.
+MAX_RUN_CACHE = 24
 
 # Run status is inferred from logs-rank0.txt: a clean shutdown prints the memory line,
 # a crash leaves a traceback, and anything else still being written is training.

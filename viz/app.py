@@ -10,6 +10,7 @@ conversion between them -- see SPEC.md.
 """
 
 import json
+import time
 from pathlib import Path
 
 import numpy as np
@@ -84,6 +85,9 @@ def api_runs():
     runs = [{"name": e.name, "compatible": e.compatible, "reason": e.reason,
              "mtime": e.mtime, "epoch": e.epoch, "eval_splits": e.eval_splits,
              "family": e.family, "status": e.status,
+             # Sorted so the client can deterministically pick the alphabetically-first
+             # dataset as a combined run's "by dataset" group in row-grouping mode.
+             "datasets": sorted(e.datasets),
              "shape": list(e.shape) if e.shape else None} for e in registry.entries]
     return {"runs": runs, "default_selected": registry.defaults(),
             "n_samples": registry.n_samples, "render_version": config.RENDER_VERSION}
@@ -123,6 +127,15 @@ def api_samples():
                 # The enclosure the scene sits in. Each experiment dir is one box today, so
                 # this filter populates itself with one chip per loaded experiment.
                 "box": m.get("box"),
+                # Which capture this sample belongs to -- same value as `experiment`
+                # above (one experiment dir = one capture), NOT `gt.layout.dataset`, which
+                # names a filename SCHEME and is shared by several distinct captures (every
+                # gastronorm-family box -- wood/cardboard/shoebox/gastronorm/green-plastic
+                # -- uses the one "gastronorm" layout entry, which would collapse them all
+                # into a single bucket). Drives the "by dataset" row-grouping mode and the
+                # dataset filter/chip, and is shown in the sample identity label -- both
+                # need "which real capture is this", not "which schema does it parse as".
+                "dataset": gt.experiment_dir.name,
                 "speaker": m.get("speaker"),
                 "is_empty_box": bool(m.get("is_empty_box")),
                 # full-resolution image coords, for the position scatter; [-1,-1] sentinel
@@ -134,6 +147,10 @@ def api_samples():
                 # drawn at is the only thing that says which box it came from. /api/lut's
                 # `aspect` is a fallback and is wrong the moment two boxes are loaded.
                 "aspect": render.aspect_for_box(m.get("box")),
+                # True pixel (width, height) of that same frame -- the table cell draws
+                # every box at one uniform size now, so this is what the corner label
+                # shows to say what shape got stretched to fit it.
+                "dims": render.dims_for_box(m.get("box")),
                 # Target object centroids, normalized [0,1] cell centres, for the ground-truth
                 # column's crosshairs. The run columns carry their own (see /api/run "coms"),
                 # matched against the target at THEIR grid rather than this one.
@@ -148,6 +165,7 @@ def api_samples():
 def api_run(name: str, reload: int = 0, epoch: int | None = None):
     """Per-sample metrics for one run. `epoch` scores that saved epoch instead of the
     latest, so the numbers and sorting match the masks on screen while scrubbing."""
+    _t0 = time.perf_counter()
     # reload=1 re-reads the run's prediction files, picking up epochs written since it
     # was first loaded (a run still training keeps producing them).
     if reload:
@@ -156,6 +174,7 @@ def api_run(name: str, reload: int = 0, epoch: int | None = None):
         rd = registry.run(name, reload=bool(reload), epoch=epoch)
     except KeyError:
         raise HTTPException(404, "unknown or incompatible run")
+    _t_loaded = time.perf_counter()
     # rd.global_ids is the GLOBAL id per row (load_run already routed each row to its own
     # experiment, since a combined run can predict more than one box). The client matches
     # this dict against s.i (app.js: `r.samples[s.i]`), which is that same global id.
@@ -170,6 +189,11 @@ def api_run(name: str, reload: int = 0, epoch: int | None = None):
             "coms": rd.com_pairs[i] if i < len(rd.com_pairs) else None,
             **{k: _clean(rd.metrics[k][i]) for k in rd.metrics},
         }
+    # See PERF_NOTES.md: separates "registry.run() (cache hit, or the load_run print
+    # above)" from "building this endpoint's own JSON dict", the two phases inside the
+    # /api/run request itself.
+    print(f"[viz] /api/run/{name}: registry.run()={_t_loaded - _t0:.2f}s, "
+          f"json-build={time.perf_counter() - _t_loaded:.2f}s", flush=True)
     return {"name": rd.name, "epoch": rd.epoch, "family": rd.family,
             # The grid this run predicts at. The client sizes the column's canvas from it,
             # so a 16x16 run and a 30x30 run render correctly in the same table.

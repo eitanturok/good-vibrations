@@ -10,6 +10,8 @@ every field, argument and map is keyed by.
 
 import json
 import os
+import re
+import resource
 import time
 from dataclasses import dataclass, field
 from functools import lru_cache
@@ -19,10 +21,17 @@ import numpy as np
 import torch
 
 from viz import config
-import torch.nn.functional as _F
-from utils.metrics import center_of_mass, object_centroids, soft_iou, mass_error, contour_f, localization, LOC_KEYS
+from utils.metrics import center_of_mass, object_centroids, soft_iou, contour_f, localization
 
-METRIC_KEYS = ('bce', 'iou', *LOC_KEYS, 'contour', 'mass')
+METRIC_KEYS = ('localization_rel', 'localization_raw', 'iou', 'contour')
+
+
+def _rss_mb() -> float:
+    """This process's resident memory, in MB -- for the `[viz]` timing/memory prints
+    scattered through the heavier load paths (see PERF_NOTES.md). ru_maxrss is KB on
+    Linux, bytes on macOS; this codebase only runs on Linux (see environment), so no
+    platform branch."""
+    return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
 
 # ***** ground truth *****
 
@@ -210,6 +219,12 @@ class RunEntry:
     # actual row (routing happens per-row in load_run/Registry.route via that row's own
     # `box`, against the FULL run, not this probe-derived set).
     experiments: frozenset = field(default_factory=frozenset)
+    # Every gt.layout.dataset this run was observed to touch during classification (same
+    # probe-derived caveat as `experiments`, above) -- `family` collapses this to a single
+    # string ("combined" when there's more than one), this keeps the actual set so the
+    # "by dataset" row-grouping mode can place a combined run's column in each of its
+    # groups instead of losing that information.
+    datasets: frozenset = field(default_factory=frozenset)
 
 
 def _epoch_of(p: Path) -> int:
@@ -265,9 +280,10 @@ def run_status(run_dir: Path) -> str:
 
 
 def _pred_files(outputs: Path) -> list[Path]:
-    """Every ep*.pt under train/ and eval/<split>/, via scandir (see _classify)."""
+    """Every ep*.pt under train/ and eval/<split>/ (or boxN-eval/<split>/), via scandir
+    (see _classify)."""
     out = []
-    for split_dir in (outputs / "train", *_eval_dirs(outputs)):
+    for _, split_dir in [("train", outputs / "train")] + _eval_dirs(outputs):
         try:
             with os.scandir(split_dir) as it:
                 out += [Path(e.path) for e in it
@@ -277,12 +293,32 @@ def _pred_files(outputs: Path) -> list[Path]:
     return out
 
 
-def _eval_dirs(outputs: Path) -> list[Path]:
+_BOXN_EVAL = re.compile(r"box\d+-eval")
+
+
+def _eval_dirs(outputs: Path) -> list[tuple[str, Path]]:
+    """Every split dir under `eval/`, plus every split dir under a `box2-eval/`,
+    `box3-eval/`, ... sibling -- a combined run (--data-dir-2) evaluates its second box's
+    splits under that prefix (see run.py: `ev.label = f"box2-{ev.label}"`) so they don't
+    collide with box 1's splits of the same name (both can have a "2-cubes"). Returns
+    (label, path) pairs, prefixing the second box's split names the same way run.py
+    prefixed its labels, so the two groups stay distinct in viz's split set."""
     try:
-        with os.scandir(outputs / "eval") as it:
-            return sorted((Path(e.path) for e in it if e.is_dir()), key=lambda p: p.name)
+        with os.scandir(outputs) as it:
+            groups = sorted((e.name for e in it if e.is_dir()
+                              and (e.name == "eval" or _BOXN_EVAL.fullmatch(e.name))))
     except OSError:
         return []
+    out: list[tuple[str, Path]] = []
+    for group in groups:
+        prefix = "" if group == "eval" else f"{group.removesuffix('-eval')}-"
+        try:
+            with os.scandir(outputs / group) as it:
+                out += sorted(((f"{prefix}{e.name}", Path(e.path)) for e in it if e.is_dir()),
+                              key=lambda t: t[0])
+        except OSError:
+            continue
+    return out
 
 
 # A run's schema (mask shape, info fields) is fixed by the code that trained it, so a
@@ -373,7 +409,7 @@ def _classify(name: str, outputs: Path, files: list[Path], obj: dict | None,
     if not {"sample_id", "x_com"} <= obj["info_keys"]:
         return RunEntry(name, False, "legacy info schema")
 
-    splits = [p.name for p in _eval_dirs(outputs)]
+    splits = [label for label, _ in _eval_dirs(outputs)]
 
     # A run's samples can come from more than one experiment (a "combined" training run
     # predicting several boxes at once) -- so identity is checked PER PROBED SAMPLE, routed
@@ -419,8 +455,13 @@ def _classify(name: str, outputs: Path, files: list[Path], obj: dict | None,
     # Recency comes from the highest-epoch file rather than a stat() of every .pt: epochs
     # are written in order, so it ranks runs identically at a fraction of the cost.
     newest = files[0]
+    # Per-CAPTURE, not `families` (layout.dataset, a filename SCHEME several distinct
+    # captures can share -- see RunEntry.datasets' own docstring); reuses `experiments`
+    # (already-collected gi's) rather than tracking a second parallel set in the loop above.
+    datasets = frozenset(registry.gts[gi].experiment_dir.name for gi in experiments)
     return RunEntry(name, True, None, newest.stat().st_mtime, _epoch_of(newest), splits,
-                    family, shape=shape, experiments=frozenset(experiments))
+                    family, shape=shape, experiments=frozenset(experiments),
+                    datasets=datasets)
 
 
 def _run_shape_counts(runs_dir: Path, sample: int = 40):
@@ -640,7 +681,7 @@ class RunData:
 
 def _split_dirs(outputs: Path) -> list[tuple[str, Path]]:
     out = [("train", outputs / "train")] if (outputs / "train").is_dir() else []
-    return out + [(p.name, p) for p in _eval_dirs(outputs)]
+    return out + _eval_dirs(outputs)
 
 
 def load_epoch_masks(name: str, runs_dir: Path, epoch: int,
@@ -753,13 +794,15 @@ def load_run(name: str, runs_dir: Path, registry: "Registry", family: str = "unk
     `registry.route`, using that row's own `box` field where available. This is why `gt`
     became `registry`: no single GtIndex is enough once a run can span more than one.
 
-    Metrics mirror the training loop exactly (see src/model/arch.py mses/com_distances
-    and utils/metrics.soft_iou), which is what lets the column headers be cross-checked
+    Metrics mirror the training loop exactly (see src/model/arch.py com_distances and
+    utils/metrics.localization), which is what lets the column headers be cross-checked
     against the numbers in the run's own logs-rank0.txt.
     """
     outputs = runs_dir / name / config.OUTPUTS_SUBDIR
     ids, masks, splits, boxes, skipped = [], [], [], [], []
     want, epoch = epoch, 0
+    _t0 = time.perf_counter()
+    _n_files = 0   # see the [viz] load_run print at the end of this function
 
     for split, d in _split_dirs(outputs):
         files = sorted(d.glob("ep*.pt"), key=_epoch_of)
@@ -787,6 +830,7 @@ def load_run(name: str, runs_dir: Path, registry: "Registry", family: str = "unk
                 splits += [split] * len(sid)
                 boxes += _as_box_list(obj["info"], len(sid))
                 got = True
+                _n_files += 1
             if got:
                 epoch = max(epoch, last)
                 break
@@ -892,18 +936,15 @@ def load_run(name: str, runs_dir: Path, registry: "Registry", family: str = "unk
     pred = torch.from_numpy(preds)
     truth_t = torch.from_numpy(truth)
 
-    # pred is already sigmoid probabilities; viz never sees the logits, so bce is scored
-    # from clamped probs (negligibly different from logit-space).
     # One call, not two: geometry=True returns the crosshair geometry from the SAME
     # labelling/matching pass that produces the numbers, which halves the scoring cost of a
     # run and makes it impossible for a drawn line to disagree with its metric.
     loc, geom = localization(pred, truth_t, geometry=True)
     metrics = {
-        'bce': _F.binary_cross_entropy(pred.clamp(1e-6, 1 - 1e-6), truth_t, reduction='none').mean(dim=(-2, -1)).numpy(),
+        'localization_rel': loc['localization_rel'].numpy(),
+        'localization_raw': loc['localization_raw'].numpy(),
         'iou': soft_iou(pred, truth_t).numpy(),
         'contour': contour_f(pred, truth_t).numpy(),
-        'mass': mass_error(pred, truth_t).numpy(),
-        **{k: v.numpy() for k, v in loc.items()},
     }
     com_pred = center_of_mass(pred, epsilon=config.EPSILON).numpy()
 
@@ -913,6 +954,11 @@ def load_run(name: str, runs_dir: Path, registry: "Registry", family: str = "unk
     # global_rows[i] is the ground-truth row of sample_ids[i]. See SPEC.md 2 and 5.
     row_of = {int(r): i for i, r in enumerate(global_rows)}
     global_ids = registry.global_id(gi_arr, sample_ids)
+    # See PERF_NOTES.md. `_n_files` .pt reads (each a disk read + torch.load deserialize)
+    # is usually the dominant cost here -- this is what tells you whether a slow add is
+    # "many small files" (fix: fewer/larger saves upstream) or something in scoring.
+    print(f"[viz] load_run {name!r}: {_n_files} .pt files, {len(sample_ids)} samples, "
+          f"{time.perf_counter() - _t0:.2f}s", flush=True)
     return RunData(name, epoch, sample_ids, pred.numpy(), splits,
                    metrics, com_pred, row_of, skipped, family, shape,
                    com_pairs=geom, global_ids=global_ids)
@@ -946,6 +992,13 @@ class Registry:
         t0 = time.perf_counter()
         self.experiment_dir, self.runs_dir = experiment_dir, runs_dir
         self.gts = load_experiments(experiment_dir, runs_dir, mask_override)
+        # See PERF_NOTES.md: separates ground-truth mask decoding (every experiment's
+        # full mask array, loaded eagerly and kept resident for the process lifetime --
+        # this is the process's memory FLOOR, before a single run is ever added) from run
+        # directory scanning, below.
+        t_gt = time.perf_counter()
+        print(f"[viz] loaded {len(self.gts)} experiments' ground truth in {t_gt - t0:.2f}s "
+              f"| rss={_rss_mb():.0f}MB", flush=True)
         self._index_experiments()
         self._scanned_at = 0.0
         self.rescan()
@@ -956,7 +1009,8 @@ class Registry:
             print(f"[viz] {gt.experiment_dir.name} | layout '{gt.layout.name}' | "
                   f"{len(gt)} samples")
         print(f"[viz] {n_ok} compatible / {len(self.entries) - n_ok} incompatible runs | "
-              f"{self.startup_s:.2f}s")
+              f"{time.perf_counter() - t_gt:.2f}s scan | {self.startup_s:.2f}s total "
+              f"| rss={_rss_mb():.0f}MB", flush=True)
 
     def _index_experiments(self) -> None:
         """Build the flat row space: `_row_base[gi]` is where experiment gi's rows start,
@@ -1044,30 +1098,10 @@ class Registry:
             self.rescan()
 
     def defaults(self) -> list[str]:
-        """Auto-loaded on first open: up to N_DEFAULT_RUNS per loaded experiment, not
-        N_DEFAULT_RUNS total.
-
-        A single global top-N (by recency, across every box) can leave whole experiments
-        with nothing loaded -- filtering the Box chip to one of them then shows every
-        column as "not in run" even though real predictions exist, because the runs that
-        happen to be newest all belong to OTHER boxes. Picking per experiment means
-        switching the Box filter to any loaded box always has at least one real column.
-        `entries` is already sorted compatible-first, newest-first, so the first
-        `N_DEFAULT_RUNS` un-picked matches per experiment are also the most recent ones.
-        """
-        chosen: list[str] = []
-        seen: set[str] = set()
-        for gi in range(len(self.gts)):
-            n = 0
-            for e in self.entries:
-                if not e.compatible or e.name in seen or gi not in e.experiments:
-                    continue
-                chosen.append(e.name)
-                seen.add(e.name)
-                n += 1
-                if n >= config.N_DEFAULT_RUNS:
-                    break
-        return chosen
+        """Auto-loaded on first open: the N_DEFAULT_RUNS most recently modified compatible
+        runs, globally -- `entries` is already sorted compatible-first, newest-first, so
+        this is just its first slice."""
+        return [e.name for e in self.entries if e.compatible][:config.N_DEFAULT_RUNS]
 
     def run(self, name: str, reload: bool = False, epoch: int | None = None) -> RunData:
         entry = self.by_name.get(name)
@@ -1080,16 +1114,38 @@ class Registry:
         key = (name, epoch)
         if reload:
             self._runs.pop(key, None)
-        if key not in self._runs:
-            rd = load_run(name, self.runs_dir, self, entry.family, epoch, entry.shape)
-            rd.n_params = param_count(name, self.runs_dir)
-            self._runs[key] = rd
-            # Each RunData is ~5MB, and scrubbing a 200-epoch run would otherwise pin a
-            # gigabyte. Latest-epoch entries (epoch=None) are what the table always needs,
-            # so evict scrubbed ones first, oldest first.
-            scrubbed = [k for k in self._runs if k[1] is not None]
-            for old in scrubbed[:-config.MAX_EPOCH_CACHE]:
-                self._runs.pop(old, None)
+        if key in self._runs:
+            # Move to the end: dicts keep insertion order, so re-inserting is how this
+            # tracks "least recently used" for the MAX_RUN_CACHE eviction below, without a
+            # separate structure. A cache hit is the common case (the table re-requests
+            # every loaded run on each poll), so this stays O(1) amortized.
+            self._runs[key] = self._runs.pop(key)
+            return self._runs[key]
+        t0 = time.perf_counter()
+        rd = load_run(name, self.runs_dir, self, entry.family, epoch, entry.shape)
+        rd.n_params = param_count(name, self.runs_dir)
+        self._runs[key] = rd
+        # See PERF_NOTES.md: this print is how "10s to add a run" gets diagnosed -- it
+        # separates decode time (this call) from whatever the browser spends afterward.
+        print(f"[viz] loaded run {name!r} epoch={epoch} in {time.perf_counter() - t0:.2f}s "
+              f"| {len(rd.sample_ids)} samples | rss={_rss_mb():.0f}MB "
+              f"| cache={len(self._runs) + 1} runs", flush=True)
+        # Each RunData is ~5MB, and scrubbing a 200-epoch run would otherwise pin a
+        # gigabyte. Latest-epoch entries (epoch=None) are what the table always needs
+        # AT THE TIME they're loaded, so keep scrubbed ones tighter-capped than the
+        # general LRU below.
+        scrubbed = [k for k in self._runs if k[1] is not None]
+        for old in scrubbed[:-config.MAX_EPOCH_CACHE]:
+            self._runs.pop(old, None)
+        # MAX_RUN_CACHE, not "keep every epoch=None entry forever": a run removed from the
+        # table client-side leaves no trace server-side, so without this every run anyone
+        # ever added over a session stayed fully decoded in memory for the rest of the
+        # process -- the single largest source of unbounded RSS growth (see PERF_NOTES.md).
+        while len(self._runs) > config.MAX_RUN_CACHE:
+            oldest = next(iter(self._runs))
+            if oldest == key:
+                break   # never evict the entry this call just built
+            self._runs.pop(oldest, None)
         return self._runs[key]
 
     def epochs(self, name: str) -> list[int]:

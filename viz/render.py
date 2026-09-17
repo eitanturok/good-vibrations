@@ -164,11 +164,11 @@ OVERLAY_GAIN = 0.85
 
 
 @lru_cache(maxsize=1)
-def aspect_by_box() -> dict:
-    """{box_name: width/height} of the cropped frame each box's masks tile.
+def dims_by_box() -> dict:
+    """{box_name: (width, height)} of the cropped frame each box's masks tile, in pixels.
 
     Keyed on the BOX, not the sample: downsample_mask squashes every box into the same
-    (out_h,out_w), so the aspect a grid must be drawn at is a property of the enclosure and
+    (out_h,out_w), so the true frame a grid represents is a property of the enclosure and
     is identical for every sample inside it. That also makes this one PNG header read per
     box rather than per sample -- `Image.open().size` parses the header without decoding,
     unlike _backdrop, which keeps whole frames in memory.
@@ -189,9 +189,13 @@ def aspect_by_box() -> dict:
         p = gt.experiment_dir / "samples" / gt.sample_ids[r] / gt.layout.backdrop
         if not p.exists(): continue
         with Image.open(p) as im:
-            w, h = im.size
-        out[box] = w / h
+            out[box] = im.size
     return out
+
+
+def aspect_by_box() -> dict:
+    """{box_name: width/height}, derived from dims_by_box -- see its docstring."""
+    return {box: w / h for box, (w, h) in dims_by_box().items()}
 
 
 def aspect_for_box(box) -> float:
@@ -203,6 +207,12 @@ def aspect_for_box(box) -> float:
     """
     a = aspect_by_box().get(box)
     return a if a is not None else scene_aspect()
+
+
+def dims_for_box(box) -> tuple | None:
+    """(width, height) in pixels of the frame a given box's masks tile, or None for a box
+    whose backdrop could not be read (see dims_by_box)."""
+    return dims_by_box().get(box)
 
 
 def row_aspect(row: int) -> float:
