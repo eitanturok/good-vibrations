@@ -140,13 +140,45 @@ GLOBAL_STATS = {
 BEATS_TARGET_STD = 0.32  # measured std of real BEATs fbank input after its own fixed-constant normalize
 
 
-def to_beats_fbank(cond_map: np.ndarray, condition_mode: str, target_freq_bins: int = BEATS_MEL_BINS) -> torch.Tensor:
-    """(F, L_or_T) -> (L_or_T, target_freq_bins) tensor shaped like BEATs' own fbank:
-    freq axis resized (bilinear) into the [MEL_BAND_LO,MEL_BAND_HI) sub-range of the
-    pretrained patch-embedding's fixed 128 mel bins (see above), padded with a per-sample
-    floor value elsewhere, then transposed so time/laser is the row axis and freq is the
-    column axis (BEATs.preprocess's own convention). Normalized by GLOBAL_STATS[condition_mode]
-    (fixed, dataset-level -- not per-sample), rescaled to BEATS_TARGET_STD."""
+def _log_freq_resample(band: torch.Tensor, target_h: int) -> torch.Tensor:
+    """(F, L) -> (target_h, L): resample rows onto a log-Hz axis, assuming band's rows are
+    linearly spaced across MIN_FREQ..MAX_FREQ. Gives low frequencies within our 50-1000Hz
+    band proportionally more output rows than a plain linear resize would -- see
+    notebooks/83_spectrogram_stretch_strategies.ipynb (strategy 2) for the derivation and a
+    visual comparison against linear resize (strategy 1) and tiling (strategy 3)."""
+    f_bins = band.shape[0]
+    log_f = torch.linspace(np.log(MIN_FREQ), np.log(MAX_FREQ), f_bins)
+    target_log = torch.linspace(log_f[0], log_f[-1], target_h)
+    idx = torch.searchsorted(log_f, target_log).clamp(1, f_bins - 1)
+    lo, hi = idx - 1, idx
+    w = ((target_log - log_f[lo]) / (log_f[hi] - log_f[lo]).clamp_min(1e-8))[:, None]
+    return band[lo] * (1 - w) + band[hi] * w
+
+
+def to_beats_fbank(cond_map: np.ndarray, condition_mode: str, target_freq_bins: int = BEATS_MEL_BINS,
+                    log_stretch: bool = False) -> torch.Tensor:
+    """(F, L_or_T) -> (L_or_T, target_freq_bins) tensor shaped like BEATs' own fbank, freq
+    axis resized then transposed so time/laser is the row axis and freq is the column axis
+    (BEATs.preprocess's own convention).
+
+    log_stretch=False (default): bilinear-resize into the [MEL_BAND_LO,MEL_BAND_HI) sub-range
+    of the pretrained patch-embedding's fixed 128 mel bins (see above), padded with a
+    per-sample floor value elsewhere. Normalized by GLOBAL_STATS[condition_mode] (fixed,
+    dataset-level -- not per-sample), rescaled to BEATS_TARGET_STD.
+
+    log_stretch=True: log-Hz warp the band (see _log_freq_resample) across the FULL
+    target_freq_bins instead of a narrow sub-range -- trades the (already-approximate)
+    alignment to BEATs' real mel-bin positions for full use of its frequency resolution.
+    This changes the value distribution entirely (no floor padding, full-range warped data),
+    and no global stats have been computed for it yet (unlike GLOBAL_STATS above, which
+    scripts/compute_beats_global_stats.py measured for the log_stretch=False scheme) --
+    normalized per-sample instead."""
+    if log_stretch:
+        t = torch.from_numpy(cond_map).float()  # (F, L)
+        full = _log_freq_resample(t, target_freq_bins).T  # (L, target_freq_bins)
+        mean, std = full.mean(), full.std().clamp_min(1e-8)
+        return (full - mean) / std * BEATS_TARGET_STD
+
     band_bins = MEL_BAND_HI - MEL_BAND_LO
     t = torch.from_numpy(cond_map).float()[None, None]  # (1,1,F,L)
     t = tf.interpolate(t, size=(band_bins, cond_map.shape[1]), mode="bilinear", align_corners=False)

@@ -79,12 +79,13 @@ def load_image(path: Path, resolution: int) -> torch.Tensor:
 class AudioTokenDataset(torch.utils.data.Dataset):
     def __init__(self, box: str, split: str, condition_mode: str, target: str,
                  resolution: int = 512, eval_frac: float = 0.2, seed: int = 42, limit: int | None = None,
-                 prompt: str | None = None, target_n_objects: int = 1):
+                 prompt: str | None = None, target_n_objects: int = 1, log_stretch: bool = False):
         assert box in BOX_DIRS
         assert split in ("train", "eval")
         assert condition_mode in ("laser-freq", "spectrogram")
         assert target in ("mask", "photo")
         self.box, self.condition_mode, self.target, self.resolution = box, condition_mode, target, resolution
+        self.log_stretch = log_stretch
         self.target_name = MASK_NAME if target == "mask" else PHOTO_NAME
         if prompt is None:
             self.prompt = PROMPTS[target]
@@ -116,6 +117,6 @@ class AudioTokenDataset(torch.utils.data.Dataset):
     def __getitem__(self, i: int) -> dict:
         sample_dir, meta = self.samples[i]
         pixel_values = load_image(sample_dir / self.target_name, self.resolution)
-        fbank = to_beats_fbank(self.condition_map(sample_dir, meta), self.condition_mode)
+        fbank = to_beats_fbank(self.condition_map(sample_dir, meta), self.condition_mode, log_stretch=self.log_stretch)
         return {"pixel_values": pixel_values, "fbank": fbank, "prompt": self.prompt,
                 "sample_id": meta.get("sample_id", sample_dir.name)}
