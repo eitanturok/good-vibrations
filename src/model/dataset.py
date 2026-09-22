@@ -642,6 +642,23 @@ def _matches(row: dict, speakers, n_objects, box) -> bool:
     if box is not None and row["box"] not in (box if isinstance(box, list) else [box]): return False
     return True
 
+def _sample_speakers_per_position(index: list[dict], keep: list[int], n_speakers: int, seed: int) -> list[int]:
+    """For each distinct position_id among `keep`, independently draw `n_speakers` of that
+    position's own available speakers (uniformly, without replacement, seeded per-position so a
+    given `seed` always draws the same subset for that position) and keep only samples whose
+    speaker is in that draw. This is a *per-position random* speaker subset -- different from
+    `speakers=[...]` (a single fixed global subset applied everywhere via `_matches`) -- for
+    ablating "same number of speakers, but not the same ones at every position" data diversity."""
+    by_pos: dict[int, list[int]] = {}
+    for i in keep:
+        by_pos.setdefault(index[i]["position_id"], []).append(i)
+    out = []
+    for pos, idxs in by_pos.items():
+        speakers = sorted({index[i]["speaker"] for i in idxs})
+        chosen = set(random.Random(seed + pos).sample(speakers, min(n_speakers, len(speakers))))
+        out += [i for i in idxs if index[i]["speaker"] in chosen]
+    return sorted(out)
+
 EXP25_GROUPS = {
     "purple_cube":         {"train_range": (3, 29),   "eval_ranges": [(30, 59)]},
     "green_cube":          {"train_range": (110, 124), "eval_ranges": [(125, 127)]},
@@ -783,17 +800,24 @@ def split_by_position_only(index: list[dict], idxs: list[int], percent: float = 
     return sorted(eval_idx), sorted(train_idx)
 
 
-def gastronorm(mds_path, test_size=0.2, seed=42, speakers=None, n_objects=None, box=None, n_samples: int | None = None, verbose: int = 1, index: list[dict] | None = None):
+def gastronorm(mds_path, test_size=0.2, seed=42, speakers=None, n_objects=None, box=None, n_samples: int | None = None,
+               speaker_sample_per_position: int | None = None, verbose: int = 1, index: list[dict] | None = None):
     """train + eval/1-cube + eval/2-cubes + eval/3-cubes, nothing else. Every eval split is a
     WHOLE-position holdout via split_by_position_only -- a position is never split across
     speakers -- and red-cube (a single held-out-color sanity check, not another 1-cube data
     source) always stays in train, never eval, so the model has always seen that color.
+
+    `speaker_sample_per_position`, if set, additionally restricts to a random `n`-of-available
+    speakers drawn independently per position (see _sample_speakers_per_position) -- applied
+    before the eval split, so it shrinks both train and eval consistently, the same as `speakers`.
     """
     if index is None:
         lines = (Path(mds_path) / "metadata.jsonl").read_text().strip().splitlines()
         index = [json.loads(line) for line in lines if line]
 
     keep = [i for i, row in enumerate(index) if _matches(row, speakers, n_objects, box)]
+    if speaker_sample_per_position is not None:
+        keep = _sample_speakers_per_position(index, keep, speaker_sample_per_position, seed)
     if n_samples is not None: keep = keep[:n_samples]
 
     # One cube: purple-cube is the only layout actually split; red-cube is forced into train below.
@@ -812,6 +836,54 @@ def gastronorm(mds_path, test_size=0.2, seed=42, speakers=None, n_objects=None, 
     train += one_cube_train + two_cubes_train + three_cubes_train
 
     splits = {'train': sorted(train), 'eval/1-cube': one_cube_eval, 'eval/2-cubes': two_cubes_eval, 'eval/3-cubes': three_cubes_eval}
+
+    if verbose:
+        for label, idxs in splits.items(): print(f"{label}: {len(idxs)} samples")
+    return splits
+
+def gastronorm_speaker_gen(mds_path, test_size=0.2, seed=42, speakers=None, train_speakers=None, eval_speakers=None,
+                            n_objects=None, box=None, n_samples: int | None = None, verbose: int = 1,
+                            index: list[dict] | None = None):
+    """gastronorm (see its docstring) with train and eval speaker sets controlled independently,
+    for unseen-speaker generalization ablations: train_speakers is the only thing the model is
+    ever trained on; eval_speakers is normally a superset that also includes speakers absent from
+    train_speakers, to measure whether the model generalizes to a speaker it never saw in training.
+
+    Reuses gastronorm's own per-layout position holdout (eval/1-cube, eval/2-cubes, eval/3-cubes)
+    for train_speakers -- identical numbers to a plain --speakers=train_speakers gastronorm run.
+    Any speaker in eval_speakers but not train_speakers was never trained on at all, so EVERY one
+    of its samples is eval-only (no position holdout needed, since none of it was ever seen); those
+    land in per-speaker eval/{n}obj-unseen-spk{s} buckets (n = row['n_objects'], s = that speaker's
+    id), one bucket per (object count, unseen speaker) pair rather than lumped across every unseen
+    speaker -- so wandb gets a distinct metric per speaker, and multiple runs with different unseen
+    speakers stay directly comparable per-speaker instead of only as one blended average.
+
+    `speakers` is accepted only so this split can be dropped into the standard speakers= plumbing
+    unchanged; pass train_speakers instead (or leave both unset for "all speakers, no unseen leg").
+    eval_speakers=None defaults to train_speakers (no unseen-speaker leg at all).
+    """
+    if speakers is not None and train_speakers is not None:
+        raise ValueError("gastronorm_speaker_gen: pass train_speakers, not speakers (speakers is a plumbing alias for it)")
+    train_speakers = train_speakers if train_speakers is not None else speakers
+    if index is None:
+        lines = (Path(mds_path) / "metadata.jsonl").read_text().strip().splitlines()
+        index = [json.loads(line) for line in lines if line]
+
+    splits = dict(gastronorm(mds_path, test_size=test_size, seed=seed, speakers=train_speakers,
+                              n_objects=n_objects, box=box, n_samples=n_samples, verbose=0, index=index))
+
+    train_speakers_list = train_speakers if isinstance(train_speakers, list) else ([train_speakers] if train_speakers is not None else None)
+    if eval_speakers is not None:
+        eval_speakers_list = eval_speakers if isinstance(eval_speakers, list) else [eval_speakers]
+        unseen_speakers = [s for s in eval_speakers_list if train_speakers_list is None or s not in train_speakers_list]
+        if unseen_speakers:
+            unseen_pool = [i for i, row in enumerate(index) if _matches(row, unseen_speakers, n_objects, box)]
+            if n_samples is not None: unseen_pool = unseen_pool[:n_samples]
+            by_speaker_n_objects: dict[tuple[int, int], list[int]] = {}
+            for i in unseen_pool:
+                by_speaker_n_objects.setdefault((index[i]["speaker"], index[i]["n_objects"]), []).append(i)
+            for (s, n), idxs in sorted(by_speaker_n_objects.items()):
+                splits[f"eval/{n}obj-unseen-spk{s}"] = sorted(idxs)
 
     if verbose:
         for label, idxs in splits.items(): print(f"{label}: {len(idxs)} samples")
@@ -1154,7 +1226,8 @@ def shoebox_ring(mds_path, test_size=0.15, seed=42, speakers=None, n_objects=Non
 
 #***** 8 build dataloaders *****
 
-SPLIT_METHODS = {"exp25": exp25_split, "gastronorm": gastronorm, "gastronorm_one_cube": gastronorm_one_cube,
+SPLIT_METHODS = {"exp25": exp25_split, "gastronorm": gastronorm, "gastronorm_speaker_gen": gastronorm_speaker_gen,
+                 "gastronorm_one_cube": gastronorm_one_cube,
                  "gastronorm_two_cube": gastronorm_two_cube,
                  "gastronorm_train1_eval2": gastronorm_train1_eval2, "gastronorm_train2_eval1": gastronorm_train2_eval1,
                  "gastronorm_train12_eval12": gastronorm_train12_eval12,

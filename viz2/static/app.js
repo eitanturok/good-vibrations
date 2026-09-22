@@ -404,11 +404,15 @@ async function drawHeat() {
   });
 }
 
+// Which quantity each spectrum plot draws -- shared with the hover tooltip, so a value it
+// reads is always the value the curve is actually showing.
+function specKey(id) {
+  if (S.specMode !== 'magphase') return id === 'p1' ? 're' : 'im';
+  return id === 'p1' ? (S.log.spec ? 'logmag' : 'mag') : (S.phmode === 'cos' ? 'cosphase' : 'phase');
+}
+
 function drawSpec() {
-  const a = S.specMode === 'magphase' ? (S.log.spec ? 'logmag' : 'mag') : 're';
-  const b = S.specMode === 'magphase'
-    ? (S.phmode === 'cos' ? 'cosphase' : 'phase') : 'im';
-  multi($('#p1'), a); multi($('#p2'), b);
+  multi($('#p1'), specKey('p1')); multi($('#p2'), specKey('p2'));
   yAxis('#p1ov', 'p1'); yAxis('#p2ov', 'p2');
   drawHeat();
 }
@@ -938,6 +942,7 @@ function zoomable(plot, id) {
   plot.addEventListener('pointerdown', (e) => {
     if (e.button || S.live.laser === 'all' || e.target.closest('.pk')) return;
     start = frac(e); S.dragging = true;
+    hideTip(plot);
     plot.setPointerCapture(e.pointerId);
   });
   plot.addEventListener('pointermove', (e) => {
@@ -1203,8 +1208,52 @@ function axes() {
   $('#sigreset')?.classList.toggle('show', zoomed());
 }
 
+/* ***** hover tooltip: every visible series' value at the hovered frequency *****
+   Wandb-style: a dark box near the cursor, one row per shown probe (color + label + value)
+   plus the live probe when it is actually drawn. Piggybacks on freqAxis's own hoverFi, so
+   it can never disagree with the crosshair line about which bin is hovered. */
+function ttRow(c, lab, v) {
+  return { c, lab, v };
+}
+function seriesAt(key, fi) {
+  const rows = shownProbes().flatMap((p) => {
+    const c = probeHex(p), lab = `${shortId(p.sid)} L${p.laser}`;
+    return p.dataY
+      ? [ttRow(c, `${lab} x`, vals(p.data, key)?.[fi]), ttRow(c, `${lab} y`, vals(p.dataY, key)?.[fi])]
+      : [ttRow(c, lab, vals(p.data, key)?.[fi])];
+  });
+  if (!S.muted && S.probe) {
+    const c = css('--ink');
+    rows.push(...(S.probeY
+      ? [ttRow(c, 'current x', vals(S.probe, key)?.[fi]), ttRow(c, 'current y', vals(S.probeY, key)?.[fi])]
+      : [ttRow(c, 'current', vals(S.probe, key)?.[fi])]));
+  }
+  return rows.filter((r) => r.v != null).sort((a, b) => b.v - a.v);
+}
+function ttEl(el) {
+  let tt = el.querySelector('.ptt');
+  if (!tt) { tt = document.createElement('div'); tt.className = 'ptt'; el.appendChild(tt); }
+  return tt;
+}
+function hideTip(el) { const tt = el.querySelector('.ptt'); if (tt) tt.style.display = 'none'; }
+function showTip(el, cvid, e) {
+  if (S.live.laser === 'all' || S.hoverFi == null) return hideTip(el);
+  const rows = seriesAt(specKey(cvid), S.hoverFi);
+  const tt = ttEl(el);
+  if (!rows.length) { tt.style.display = 'none'; return; }
+  tt.innerHTML = `<b>${fmt(hz(S.hoverFi))} Hz</b>` + rows.map((r) =>
+    `<span><i style="background:${r.c}"></i>${r.lab}<em>${fmtTick(r.v)}</em></span>`).join('');
+  tt.style.display = 'block';
+  const r = el.getBoundingClientRect();
+  let x = e.clientX - r.left + 14, y = e.clientY - r.top + 14;
+  if (x + tt.offsetWidth > r.width) x = e.clientX - r.left - tt.offsetWidth - 14;
+  if (y + tt.offsetHeight > r.height) y = e.clientY - r.top - tt.offsetHeight - 14;
+  tt.style.left = `${Math.max(0, x)}px`; tt.style.top = `${Math.max(0, y)}px`;
+}
+
 function freqAxis(el) {
   el.style.cursor = 'crosshair';
+  const cvid = el.querySelector('canvas').id;
   el.addEventListener('pointermove', (e) => {
     if (S.dragging) return;                   // a box-zoom drag is in progress -- not a hover
     const b = el.getBoundingClientRect();
@@ -1215,11 +1264,13 @@ function freqAxis(el) {
     cursors();
     readout();
     previewMode(S.hoverFi);
+    showTip(el, cvid, e);
   });
   el.addEventListener('pointerleave', () => {
     S.hoverFi = null;
     if (S.modePreview) previewMode(null);
     cursors(); readout();
+    hideTip(el);
   });
   el.addEventListener('click', () => {
     if (S.hoverFi == null) return;
@@ -1391,7 +1442,7 @@ function buildFilters() {
     pick: (v) => pickSample(v),
     // The field rests empty (the current sample shows in the pinned right column, and as
     // the divided top row of this list) -- so it reads as a search box, not a label.
-    restBlank: true, cap: 200, placeholder: 'jump to sample id',
+    restBlank: true, cap: 200, placeholder: 'search by sample id',
   });
   pickbox($('#objectbox'), {
     // Object TYPE, regardless of count. Multi-select: a sample passes if it holds ANY of
@@ -1482,8 +1533,14 @@ function applyFilter() {
   $('#nmatchsub').textContent = `/${S.all.length}`;
   $('#nmatch').title = `${m.length} of ${S.all.length} samples in this dataset pass the filter`;
   buildScatter();
-  // Keep the current sample if it still passes; otherwise jump to the first that does.
-  if (m.length && !pass(S.byId[S.live.sid] || {})) select(m[0].id);
+  // Keep the current sample if it still passes; otherwise stay at the same position under
+  // the new filter (e.g. a speaker toggle shouldn't also bounce you to a different spot in
+  // the box), falling back to the first match only if that position has none.
+  if (m.length && !pass(S.byId[S.live.sid] || {})) {
+    const pos = S.byId[S.live.sid]?.pos;
+    const atPos = m.filter((s) => s.pos === pos && !s.empty);
+    select((atPos[0] || m[0]).id);
+  }
   else { renderScatter(); renderSpk(); renderRepeats(); }
 }
 
@@ -1628,6 +1685,31 @@ function toggleSpk(spk) {
   applyFilter();
 }
 
+// With 2+ speakers selected, flip which of them is shown at the CURRENT position -- the
+// scatter/grid already own "same speaker, different position"; this is the other axis.
+function selectedSpks() {
+  return [...S.f.spk].filter((v) => typeof v !== 'symbol').sort((a, b) => a - b);
+}
+
+function cycleSpk(dir) {
+  const s = S.byId[S.live.sid];
+  const at = S.byPos[s?.pos] || {};
+  const avail = selectedSpks().filter((sp) => at[sp]);
+  if (avail.length < 2) return;
+  const i = avail.indexOf(s.spk);
+  select(at[avail[(i + dir + avail.length) % avail.length]]);
+}
+
+function renderSpkCycle() {
+  const el = $('#spkcycle');
+  if (!el) return;
+  const s = S.byId[S.live.sid], at = S.byPos[s?.pos] || {};
+  const avail = selectedSpks().filter((sp) => at[sp]);
+  el.hidden = avail.length < 2;
+  if (avail.length < 2) return;
+  $('#spkcyclelbl').textContent = `spk ${s.spk} (${avail.indexOf(s.spk) + 1}/${avail.length})`;
+}
+
 /* The 8-speaker ring drawn AROUND the overhead in the "current" panel -- a static readout
    of where this sample's active speaker sat, in the same layout as the filter ring
    (1,2 right / 3-6 top / 7,8 left). */
@@ -1668,6 +1750,7 @@ function renderSpk() {
     // dimmed when the speaker filter excludes it, or this position has no such sample
     g.classList.toggle('off', !absent && ((S.f.spk.size && !S.f.spk.has(s)) || !at[s]));
   });
+  renderSpkCycle();
 }
 
 function buildGrid() {
@@ -1716,9 +1799,14 @@ function buildGrid() {
   };
 }
 
-function setLaser(i) {
+async function setLaser(i) {
   S.live.laser = i;
-  refresh();
+  // reprobePinned() refetches each pinned probe at its OWN p.laser, so pinned
+  // probes must be retargeted to the new laser first or they'd refetch stale data.
+  S.probes.forEach((p) => { p.laser = i; });
+  await refresh(false);
+  await reprobePinned();
+  paintAll();
 }
 
 function renderGrid() {
@@ -2094,9 +2182,14 @@ function wire() {
   const pj = $('#posjump');
   pj.onchange = () => {
     const n = +pj.value;
-    if (POS().includes(n)) { goPos(n); pj.value = ''; }
+    // Land back on the scatter, not the text field -- Enter picked the position, arrow
+    // keys now belong to it (same as clicking a dot: see buildScatter's onkeydown).
+    if (POS().includes(n)) { goPos(n); pj.value = ''; $('#scatter').focus(); }
     else { pj.classList.add('miss'); setTimeout(() => pj.classList.remove('miss'), 600); }
   };
+
+  $('#spkprev').onclick = () => cycleSpk(-1);
+  $('#spknext').onclick = () => cycleSpk(1);
 
   seg('#ch', (v) => { S.live.ch = v; reviewChannel(); });
   seg('#specmode', (v) => { S.specMode = v; phVis(); drawSpec(); buildPeaks(); peakList(); cursors(); axes(); });

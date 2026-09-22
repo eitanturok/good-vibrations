@@ -40,6 +40,11 @@
             <div class="pk sp"><span>speaker <span class="an"><button class="link" data-all="spk">all</button><button class="link" data-none="spk">none</button></span></span>
               <div class="spkchips" id="spkchips"></div>
               <svg id="spk" tabindex="0"></svg>
+              <div class="spkcycle" id="spkcycle" hidden>
+                <button id="spkprev" title="previous selected speaker, same position">‹</button>
+                <span id="spkcyclelbl"></span>
+                <button id="spknext" title="next selected speaker, same position">›</button>
+              </div>
             </div>
           </div>
           <div id="filterchips"></div>
@@ -50,7 +55,7 @@
           <div class="s1phead">search <span class="s1psub">pick one sample</span></div>
           <div class="s1srow">
             <div class="pk pos"><span>search by position <em id="poscount"></em></span>
-              <input id="posjump" class="pbq" type="number" min="1" placeholder="jump to position #">
+              <input id="posjump" class="pbq" type="number" min="1" placeholder="search by position #">
               <svg id="scatter" tabindex="0"></svg>
               <div class="repeatslab">empty box</div>
               <div id="repeats"></div>

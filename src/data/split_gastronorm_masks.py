@@ -57,7 +57,7 @@ def named_coms(meta: dict) -> list[tuple[str, int, tuple[float, float]]]:
     out = []
     for (obj, _), com_list in zip(meta["objects"].items(), meta["coms"]):
         for i, com in enumerate(com_list):
-            out.append((obj, i, tuple(com[0]) if len(com) == 1 else tuple(com)))
+            out.append((obj, i, tuple(com)))  # com is always a (row, col) pair
     return out
 
 
@@ -110,12 +110,14 @@ def write_masks(rep_dir: Path, sibling_dirs: list[Path], masks: dict[str, np.nda
 
 
 def run_split(data_dir: Path, n_samples: int | None, execute: bool) -> None:
-    ok_jobs, bad_jobs = [], []
+    ok_jobs, bad_jobs, n_empty, n_already_done = [], [], 0, 0
     for position_id, group in collect_positions(data_dir).items():
         rep_dir, meta = group[0]
         if not meta.get("objects"):
+            n_empty += 1
             continue  # empty box, nothing to split
         if (rep_dir / "image/smasks").exists():
+            n_already_done += 1
             continue  # already has per-object masks
         r = split_position(rep_dir, meta)
         r["rep_dir"], r["sibling_dirs"] = rep_dir, [d for d, _ in group[1:]]
@@ -124,7 +126,9 @@ def run_split(data_dir: Path, n_samples: int | None, execute: bool) -> None:
     if n_samples is not None:
         ok_jobs = ok_jobs[:n_samples]
 
-    print(f"{len(ok_jobs) + len(bad_jobs)} positions need splitting")
+    print(f"{n_empty} empty-box positions skipped, {n_already_done} already have image/smasks/")
+    print(f"{len(ok_jobs) + len(bad_jobs)} positions still need splitting"
+          + (f" ({len(ok_jobs)} selected by --n-samples)" if n_samples is not None else ""))
     print(f"  {len(ok_jobs)} matched cleanly (n_components == n_expected_objects)")
     print(f"  {len(bad_jobs)} MISMATCHED (component count != expected object count -- likely "
           f"touching/overlapping objects or segmentation noise; these need the SAM3 fallback "
@@ -179,21 +183,33 @@ def verify(data_dir: Path, n_verify: int) -> None:
 
         image_bytes = (rep_dir / "image/02_cropped_overhead.png").read_bytes()
         seg_results = unpack_masks(segmenter.run.remote(image_bytes, meta["prompts"], top_k=list(meta["objects"].values())))
-        real_masks = {}
-        for (obj, _), r in zip(meta["objects"].items(), seg_results):
-            for i, m in enumerate(r["masks"]):
-                real_masks[f"{obj}{i}"] = m
+        # Match fresh SAM3 masks to derived masks by nearest centroid, NOT by positional index --
+        # a second SAM3 call can return same-name instances in a different order than the
+        # original capture-time call did (only matters when some object has >1 instance; every
+        # gastronorm object today has exactly 1, so this never actually swaps here, but matching
+        # by index instead of geometry would silently mismatch names if that ever changes).
+        real_masks_flat = [(f"{obj}{i}", m) for (obj, _), r in zip(meta["objects"].items(), seg_results)
+                            for i, m in enumerate(r["masks"])]
+        real_coms = [center_of_mass(m) for _, m in real_masks_flat]
+        derived_items = list(derived["masks"].items())
+        derived_coms = [center_of_mass(m) for _, m in derived_items]
 
         print(f"position {position_id}:")
-        for name, derived_mask in derived["masks"].items():
-            real_mask = real_masks.get(name)
-            if real_mask is None:
-                print(f"  {name}: NO MATCHING REAL MASK (name mismatch?)")
-                continue
+        if len(real_coms) != len(derived_coms):
+            print(f"  MISMATCH: derived {len(derived_coms)} instances, real SAM3 call returned "
+                  f"{len(real_coms)} -- skipping IoU comparison")
+            continue
+        cost = np.linalg.norm(np.array(derived_coms)[:, None, :] - np.array(real_coms)[None, :, :], axis=2)
+        derived_idx, real_idx = linear_sum_assignment(cost)
+        for di, ri in zip(derived_idx, real_idx):
+            derived_name, derived_mask = derived_items[di]
+            real_name, real_mask = real_masks_flat[ri]
             intersection = np.logical_and(derived_mask, real_mask).sum()
             union = np.logical_or(derived_mask, real_mask).sum()
             iou = intersection / union if union else float("nan")
-            print(f"  {name}: IoU = {iou:.4f} (derived {derived_mask.sum()}px, real {real_mask.sum()}px)")
+            match_note = "" if derived_name == real_name else f" (matched to real {real_name!r})"
+            print(f"  {derived_name}{match_note}: IoU = {iou:.4f} "
+                  f"(derived {derived_mask.sum()}px, real {real_mask.sum()}px)")
         checked += 1
 
 

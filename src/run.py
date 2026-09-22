@@ -111,7 +111,10 @@ def get_parser():
 
     # filter data
     parser.add_argument("--n-samples",                  type=int,   default=None)
-    parser.add_argument("--speakers",                   type=int,   default=None)
+    parser.add_argument("--speakers",                   type=str,   default=None, help="Comma-separated speaker ids to restrict train+eval to, e.g. '1,3,5,7' (a single id also works, e.g. '1'). Default None = all speakers. Forwarded to the split fn (model.dataset._matches).")
+    parser.add_argument("--speaker-sample-per-position", type=int,  default=None, help="--split gastronorm only. Instead of a fixed --speakers set, draw this many speakers at random PER POSITION (independently, seeded by --seed) -- see model.dataset._sample_speakers_per_position. Mutually exclusive with --speakers.")
+    parser.add_argument("--train-speakers",             type=str,   default=None, help="--split gastronorm_speaker_gen only. Comma-separated speaker ids the model is ever trained on (replaces --speakers for this split).")
+    parser.add_argument("--eval-speakers",               type=str,   default=None, help="--split gastronorm_speaker_gen only. Comma-separated speaker ids to eval on; any id here not in --train-speakers is an unseen-speaker generalization leg (see model.dataset.gastronorm_speaker_gen). Default None = --train-speakers (no unseen leg).")
     parser.add_argument("--n-objects",                  type=int,   default=None)
     parser.add_argument("--box",                        type=str,   default=None)
 
@@ -253,13 +256,22 @@ def run(**kwargs):
     # dataset
     laser_cols = [int(c) for c in args.laser_cols.split(",") if c.strip()] if args.laser_cols else None
     laser_rows = [int(r) for r in args.laser_rows.split(",") if r.strip()] if args.laser_rows else None
+    if args.speakers and args.speaker_sample_per_position:
+        raise ValueError("--speakers and --speaker-sample-per-position are mutually exclusive")
+    speakers = [int(s) for s in args.speakers.split(",")] if args.speakers else None
+    # only forwarded when set: not every split fn accepts speaker_sample_per_position/train_speakers/
+    # eval_speakers (only gastronorm()/gastronorm_speaker_gen() do), so passing them unconditionally
+    # (even as None) would break the others
+    speaker_kwargs = {"speaker_sample_per_position": args.speaker_sample_per_position} if args.speaker_sample_per_position else {}
+    if args.train_speakers: speaker_kwargs["train_speakers"] = [int(s) for s in args.train_speakers.split(",")]
+    if args.eval_speakers: speaker_kwargs["eval_speakers"] = [int(s) for s in args.eval_speakers.split(",")]
     train_loader, eval_loaders, train_eval_loader = build_dataset(
         args.data_dir, batch_size=args.batch_size, eval_batch_size=args.eval_batch_size, num_workers=args.num_workers,
-        split=args.split, test_size=args.test_size, speakers=args.speakers, n_objects=args.n_objects, box=args.box, n_samples=args.n_samples,
+        split=args.split, test_size=args.test_size, speakers=speakers, n_objects=args.n_objects, box=args.box, n_samples=args.n_samples,
         out_h=args.out_h, out_w=args.out_w, rgb=bool(args.rgb), signal_mode=args.signal_mode, normalize_mode=args.normalize_mode, patch_size=args.patch_size, seed=args.seed,
         augment_fft=args.augment_fft, augment_mask=args.augment_mask, subtract_speaker_mean=bool(args.subtract_speaker_mean), subtract_empty_box=bool(args.subtract_empty_box), mag_recipe=args.mag_recipe, phase_arm=args.phase_arm, phase_weight=args.phase_weight,
         force_rebuild_data=bool(args.force_rebuild_data), n_classes=N_COUNT_CLASSES, pair_speakers_mode=bool(args.pair_speakers),
-        laser_cols=laser_cols, laser_rows=laser_rows, device_eval_microbatch_size=microbatch(args.device_eval_microbatch_size))
+        laser_cols=laser_cols, laser_rows=laser_rows, device_eval_microbatch_size=microbatch(args.device_eval_microbatch_size), **speaker_kwargs)
     boundary_loaders = eval_loaders + [Evaluator(label='train', dataloader=train_eval_loader,
                                                  device_eval_microbatch_size=microbatch(args.device_eval_microbatch_size))]
     ensure_viz(args.data_dir, port=args.viz_port, enabled=not args.no_viz)
@@ -293,7 +305,7 @@ def run(**kwargs):
         if not args.split_2: raise ValueError("--data-dir-2 requires --split-2")
         train_loader_2, eval_loaders_2, _ = build_dataset(
             args.data_dir_2, batch_size=args.batch_size, eval_batch_size=args.eval_batch_size, num_workers=args.num_workers,
-            split=args.split_2, test_size=args.test_size, speakers=args.speakers, n_objects=args.n_objects, box=args.box, n_samples=args.n_samples,
+            split=args.split_2, test_size=args.test_size, speakers=speakers, n_objects=args.n_objects, box=args.box, n_samples=args.n_samples,
             out_h=args.out_h, out_w=args.out_w, rgb=bool(args.rgb), signal_mode=args.signal_mode, normalize_mode=args.normalize_mode, patch_size=args.patch_size, seed=args.seed,
             augment_fft=args.augment_fft, augment_mask=args.augment_mask, subtract_speaker_mean=bool(args.subtract_speaker_mean), subtract_empty_box=bool(args.subtract_empty_box), mag_recipe=args.mag_recipe, phase_arm=args.phase_arm, phase_weight=args.phase_weight,
             force_rebuild_data=bool(args.force_rebuild_data), n_classes=N_COUNT_CLASSES, pair_speakers_mode=bool(args.pair_speakers),

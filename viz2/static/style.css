@@ -107,6 +107,14 @@ h2 em { font-style:normal; color:var(--accent); font-family:var(--mono);
 .spkchips::-webkit-scrollbar { display:none; }
 .spkchips:empty::before { content:'—'; font:9px var(--mono); color:var(--ink3); opacity:.45; }
 .s1frow #spk { width:174px; height:108px; }   /* bigger, keeping the ring's aspect */
+/* prev/next between the currently-selected speakers, AT this position -- only meaningful
+   once 2+ speakers are picked (hidden otherwise, see renderSpkCycle) */
+.spkcycle { display:flex; align-items:center; justify-content:center; gap:8px;
+            margin-top:4px; font:10px var(--mono); color:var(--ink2); }
+.spkcycle button { font:12px var(--mono); line-height:1; padding:2px 8px;
+                   border:1px solid var(--firm); border-radius:4px; background:var(--s1);
+                   color:var(--ink); cursor:pointer; }
+.spkcycle button:hover { border-color:var(--accent); color:var(--accent); }
 /* the filtered / total count sits at the right end of the FILTER label row: x/y samples */
 .s1phead .s1count { margin-left:auto; font:9px/1 var(--mono); letter-spacing:.06em;
                     text-transform:uppercase; color:var(--ink3); }
@@ -311,6 +319,16 @@ main { flex:1; display:grid; grid-template-columns:minmax(0,1fr) 244px; gap:12px
 .chsel { width:150px; }
 .chsel button { flex:1; padding:4px 0; font-size:12px; }
 .lf { flex:1; min-width:0; position:relative; }
+
+/* Hover tooltip on the signal plots: wandb-style dark box, one row per visible series. */
+.ptt { position:absolute; z-index:4; display:none; pointer-events:none;
+       background:var(--ink); color:var(--s1); border-radius:5px; padding:6px 8px;
+       font:10px var(--mono); line-height:1.6; white-space:nowrap; box-shadow:0 2px 8px rgba(0,0,0,.25); }
+.ptt b { display:block; font-weight:600; margin-bottom:2px; color:var(--s1); }
+.ptt span { display:flex; align-items:center; gap:6px; }
+.ptt span i { width:8px; height:8px; border-radius:50%; flex:none; display:inline-block; }
+.ptt span em { font-style:normal; margin-left:auto; padding-left:10px;
+               font-variant-numeric:tabular-nums; opacity:.9; }
 
 /* Box zoom: the rubber-band rectangle, and the reset affordance that only appears
    once a plot is actually zoomed. */

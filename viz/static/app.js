@@ -2159,6 +2159,13 @@ async function poll() {
     S.frameData = {};   // new epochs exist; refetch mask values
     // Mask URLs are cached immutable, so a new epoch needs a new URL to be fetched.
     S.epochTag = (S.epochTag || 0) + 1;
+    // addRun(reload=true) just reset metricsEpoch to null and filled `samples` with the
+    // run's LATEST epoch, regardless of where the epoch scrubber is pinned -- so a run
+    // that is still training would silently jump its header stats (and every cell) back
+    // to "latest" the moment it advances, even while the user is looking at the past.
+    // Re-pin it to whatever epoch is currently shown before anything repaints.
+    invalidateEpochs();
+    fetchEpochMetrics();
     // New metrics can reorder a sorted table. Keep whichever sample is at the top of the
     // viewport in view, so rows don't slide out from under the user mid-read.
     const sc = $("#scroller");

@@ -386,6 +386,12 @@ main { flex: 1; min-width: 0; display: flex; flex-direction: column; height: 100
 .hrow {
   position: sticky; top: 0; z-index: 30; display: flex;
   background: var(--surface-1); border-bottom: 1px solid var(--line-firm);
+  /* Row cells repaint their canvases every scroll frame (paintCanvas), which gets Chrome
+     promoting them to their own compositor layers mid-scroll. A sticky element with no
+     layer of its own can lose the ordering race against a layer that just appeared,
+     which is what showed as a sample cell painting in front of the header. Giving the
+     header its own layer up front makes the stacking order explicit instead of guessed. */
+  will-change: transform;
 }
 .row {
   position: absolute; left: 0; display: flex; height: var(--row-h);
