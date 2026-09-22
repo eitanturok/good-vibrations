@@ -237,3 +237,4 @@ src3/vendor
 src4/cache
 .venv-ldmseg
 src4/ckpts
+src2/data
