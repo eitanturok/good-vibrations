@@ -104,12 +104,14 @@ def sample(sid: str):
 
 
 @app.get("/api/scene/{sid}.jpg")
-def scene(sid: str):
+def scene(sid: str, mask: int = 1):
+    """The cropped overhead. mask=1 (default) tints the segmentation green; mask=0 is the
+    bare photo, for showing the box and its segmentation side by side."""
     d = _d(sid)
-    mask = None
-    if data.INFO["mask"] and (d / data.INFO["mask"]).exists():
-        mask = np.load(d / data.INFO["mask"])
-    return Response(render.scene(Image.open(d / data.INFO["photo"]), mask),
+    m = None
+    if mask and data.INFO["mask"] and (d / data.INFO["mask"]).exists():
+        m = np.load(d / data.INFO["mask"])
+    return Response(render.scene(Image.open(d / data.INFO["photo"]), m),
                     media_type="image/jpeg", headers=CACHE)
 
 
@@ -209,3 +211,37 @@ def audio(sid: str, ch: str = "x", laser: str = "55"):
     _d(sid)
     pcm, sr = data.audio(sid, ch, laser)
     return Response(_wav(pcm, sr), media_type="audio/wav", headers=CACHE)
+
+
+def _media(path, media_type):
+    if not path or not path.is_file():
+        raise HTTPException(404, "no media")
+    return FileResponse(path, media_type=media_type, headers=CACHE)
+
+
+@app.get("/api/source_audio/{sid}.wav")
+def source_audio(sid: str):
+    """The played stimulus, as recorded beside the repo (data/audio/<name>/)."""
+    _d(sid)
+    return _media(data.source_wav(sid), "audio/wav")
+
+
+@app.get("/api/source_video/{sid}.mp4")
+def source_video(sid: str):
+    """Spectrogram video of the played stimulus."""
+    _d(sid)
+    return _media(data.source_video(sid), "video/mp4")
+
+
+@app.get("/api/recovered_audio/{sid}.wav")
+def recovered_audio(sid: str):
+    """The pre-rendered recovered audio (fixed laser/channel -- see recovered_video)."""
+    _d(sid)
+    return _media(data.recovered_wav(sid), "audio/wav")
+
+
+@app.get("/api/recovered_video/{sid}.mp4")
+def recovered_video(sid: str):
+    """Spectrogram video of the recovered signal -- a fixed laser/x pre-render."""
+    _d(sid)
+    return _media(data.recovered_video(sid), "video/mp4")

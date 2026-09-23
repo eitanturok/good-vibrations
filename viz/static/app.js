@@ -19,29 +19,31 @@ const cssPx = (name, fallback) => {
   const v = parseFloat(getComputedStyle(document.documentElement).getPropertyValue(name));
   return Number.isFinite(v) ? v : fallback;
 };
-let ROW_H_BASE = 226, MASK_BOX = 114;
+let ROW_H_BASE = 239, MASK_BOX = 172;
 function readRowMetrics() {
   ROW_H_BASE = cssPx("--row-h", ROW_H_BASE);
-  MASK_BOX = cssPx("--mask-h", 110) + 4;   // mask box plus the gap above it
+  MASK_BOX = cssPx("--mask-h", 168) + 4;   // mask box plus the gap above it
 }
 const rowH = () => (S.view.mode === "stacked" ? ROW_H_BASE + MASK_BOX : ROW_H_BASE);
-// Overlap / shape metrics first, then the six localization (centre-of-mass error) ones as
-// a block at the end -- they share a prefix and a scale, so they read as one group and
-// belong together after the metrics that judge the mask itself.
+// --mask-w/--mask-h (see style.css) are the MAX a mask cell is ever allowed to take, not
+// the size it renders at: stretching every box to fill that box regardless of its own
+// real aspect distorts the ones that don't match it. Instead each row scales its own
+// sample up (or down) by the LARGER of the two limits -- the classic "contain" fit -- so
+// the image touches one edge of the box and is never squeezed off its real shape. Returns
+// [w, h] in px, always <= the max on both axes.
+function containedSize(asp) {
+  const maxW = cssPx("--mask-w", 160), maxH = cssPx("--mask-h", 168);
+  if (!(asp > 0)) return [maxW, maxH];
+  const wAtMaxH = maxH * asp;
+  return wAtMaxH <= maxW ? [wAtMaxH, maxH] : [maxW, maxW / asp];
+}
+// rel = fraction of the box (grid-independent, so 21x30 and 32x32 runs compare directly),
+// raw = grid cells (kept so older runs stay readable).
 const METRICS = [
-  { key: "bce",            label: "BCE",     short: "bce",  worst: "high" },
-  { key: "iou",            label: "IoU",     short: "iou",  worst: "low"  },
-  { key: "contour",        label: "Contour", short: "cnt",  worst: "low"  },
-  { key: "mass",           label: "Mass",    short: "mass", worst: "abs"  },
-  // rel = fraction of the box (grid-independent, so 21x30 and 32x32 runs compare directly);
-  // raw = grid cells, kept so older runs stay readable. h is the vertical (row) error, w the
-  // horizontal (column) one -- these were _x/_y and read backwards.
   { key: "localization_rel",   label: "Loc %",    short: "loc",   worst: "high" },
-  { key: "localization_rel_h", label: "Loc % h",  short: "loch",  worst: "high" },
-  { key: "localization_rel_w", label: "Loc % w",  short: "locw",  worst: "high" },
   { key: "localization_raw",   label: "Loc px",   short: "locr",  worst: "high" },
-  { key: "localization_raw_h", label: "Loc px h", short: "locrh", worst: "high" },
-  { key: "localization_raw_w", label: "Loc px w", short: "locrw", worst: "high" },
+  { key: "iou",                label: "IoU",      short: "iou",   worst: "low"  },
+  { key: "contour",            label: "Contour",  short: "cnt",   worst: "low"  },
 ];
 
 const S = {
@@ -50,6 +52,7 @@ const S = {
     splits: new Set(), speakers: new Set(), layouts: new Set(), nObjects: new Set(),
     objects: new Set(),          // object TYPES present, independent of layout
     boxes: new Set(),            // enclosure the scene sits in
+    datasets: new Set(),         // true data-identity field, distinct from box
     positions: null, ranges: {},
     // Explicit lookups. Empty means "no restriction"; any entry narrows the table to
     // exactly those samples/positions, unioned so both searches can be used at once.
@@ -62,7 +65,12 @@ const S = {
   // returns to when switched back on, so the two are stored separately. maskOp scales
   // the mask -- the cube -- alone, which is why it is applied as a canvas alpha and an
   // <img> opacity rather than to the cell, whose backdrop must not move with it.
-  view: { mode: "pred", background: true, relative: false, coms: true, bgOp: 1, maskOp: 1 },
+  // rowMode "dataset" (default): each loaded run's column is grouped by which dataset(s)
+  // it was trained on and independently resolves its own row content -- see computeGroups
+  // and S.groups, below. "single": today's original behaviour, one shared sample per row
+  // across every column, via the flat S.order.
+  view: { mode: "pred", rowMode: "dataset", background: true, relative: false, coms: true, bgOp: 1, maskOp: 1 },
+  groups: null,   // computed in applyFilters() when rowMode is "dataset" -- see computeGroups
   domain: {}, positions: [], activePos: -1, modalRow: -1,
   hidden: new Map(),  // filter key -> samples that ONLY that filter is holding back
   renderVersion: 0,   // from /api/runs; part of image URLs to defeat immutable caching
@@ -108,13 +116,21 @@ function statusChip(status) {
    played, and the sample it belongs to. Shared so the two titles cannot drift apart. */
 function identity(s) {
   const pos = s.output_id == null ? "–" : +s.output_id;
-  return `Pos ${pos}, Spk ${s.speaker} (${+s.sample_id})`;
+  return `Pos ${pos}, Spk ${s.speaker} (${+s.sample_id}${s.dataset ? `, ${s.dataset}` : ""})`;
 }
 
 function shortLayout(s) {
   if (!s) return "–";
   if (s === "empty-box") return "empty";
   return s.split("-").filter((w) => w !== "cube" && w !== "cubes").join("+") || s;
+}
+
+/* The true pixel shape (height x width, matching the h x w convention every grid size
+   elsewhere in this file uses) of the frame this sample's box tiles -- stamped in the
+   corner of every mask cell because they all now render at one fixed size regardless of
+   this, so a stretched cell never gets mistaken for the box's real proportions. */
+function shapeLabel(s) {
+  return s && s.dims ? `${s.dims[1]}×${s.dims[0]}` : "";
 }
 
 /* The split chip. Two runs can put the same sample in different splits, so this is the
@@ -143,25 +159,10 @@ async function boot() {
   S.meta = runs;
   S.renderVersion = runs.render_version ?? 0;
   S.samples = samples.samples;
-  // The cell box follows the SCENE's aspect, not the mask grid's. --mask-h is the fixed
-  // dimension; width derives from it so a 20x40 and a 30x30 grid over the same room draw
-  // the same shape and land on the same features. Set before readRowMetrics re-runs, and
-  // before any row is measured, since --mask-h/--mask-w drive the virtualizer's geometry.
-  //
-  // The COLUMN is sized by the WIDEST box loaded, and each row letterboxes its own mask
-  // inside it (see paintRow's --row-mask-w). Sizing per row instead would give every box a
-  // different column width and break the alignment the table exists for; sizing everything
-  // at one aspect -- what lut.aspect alone did -- draws the narrower box stretched, sliding
-  // its prediction off the features it refers to. lut.aspect stays the fallback for a
-  // sample whose backdrop is missing.
-  {
-    const mh = cssPx("--mask-h", 110);
-    const asp = Math.max(...S.samples.map((x) => x.aspect || 0), lut.aspect || 0);
-    if (asp > 0) {
-      document.documentElement.style.setProperty("--mask-w", `${Math.round(mh * asp)}px`);
-      readRowMetrics();
-    }
-  }
+  // --mask-w/--mask-h are a fixed MAX cell footprint (literals in style.css); each row
+  // scales its own box up to fit inside it without distortion -- see containedSize() and
+  // paintRow, which sets --row-mask-w/--row-mask-h per row. Nothing to compute at boot
+  // now that the cell footprint no longer tracks any sample's own aspect.
   buildPositions();
   initFilters();
   bindFind();
@@ -230,8 +231,25 @@ function indexMembership(d) {
   d.splitOf = Object.fromEntries(Object.entries(d.samples).map(([k, v]) => [k, v.split]));
 }
 
+// Names with a fetch in flight -- checked and set BEFORE the first await, so a second
+// click on the same run while its /api/run request is still pending (the picker no longer
+// closes after one pick, so nothing else stops a fast double-click or repeated Enter)
+// can't slip past the `S.runs[name]` guard below, which isn't set until the fetch resolves.
+const addInFlight = new Set();
 async function addRun(name, reload = false) {
   if (S.runs[name] && !reload) return;
+  if (!reload) {
+    if (addInFlight.has(name)) return;
+    addInFlight.add(name);
+  }
+  try {
+    await addRunNow(name, reload);
+  } finally {
+    addInFlight.delete(name);
+  }
+}
+
+async function addRunNow(name, reload) {
   const d = await api(`/api/run/${encodeURIComponent(name)}${reload ? "?reload=1" : ""}`);
   d.entry = S.meta.runs.find((r) => r.name === name);
   d.metricsEpoch = null;        // /api/run without ?epoch scores the latest
@@ -308,6 +326,7 @@ function initFilters() {
     if (s.layout) f.layouts.add(s.layout);
     if (s.n_objects != null) f.nObjects.add(s.n_objects);
     if (s.box) f.boxes.add(s.box);
+    if (s.dataset) f.datasets.add(s.dataset);
     (s.objects && s.objects.length ? s.objects : ["(none)"]).forEach((o) => f.objects.add(o));
   });
   // Speaker 1 only. The 8 speakers at a position capture the same scene, so showing all
@@ -337,9 +356,9 @@ function uniq(get) {
    epoch has not left the run -- its ground truth certainly has not changed. Keying the
    filter on the swapped table made those rows fail `failures` and vanish from the table
    entirely, taking the ground-truth column with them. */
-function splitsOf(sampleIdx) {
+function splitsOf(sampleIdx, runs = S.runOrder) {
   const out = new Set();
-  for (const n of S.runOrder) {
+  for (const n of runs) {
     const sp = S.runs[n].splitOf && S.runs[n].splitOf[sampleIdx];
     if (sp) out.add(sp);
   }
@@ -364,6 +383,7 @@ function failures(s) {
   if (!f.layouts.has(s.layout)) out.push("layouts");
   if (!f.nObjects.has(s.n_objects)) out.push("nObjects");
   if (!f.boxes.has(s.box)) out.push("boxes");
+  if (!f.datasets.has(s.dataset)) out.push("datasets");
   // Contains-any: a scene passes if any object in it is selected. Empty boxes have no
   // objects, so they ride on the "empty" pseudo-entry rather than never matching.
   const objs = s.objects && s.objects.length ? s.objects : ["(none)"];
@@ -372,10 +392,21 @@ function failures(s) {
 
   // With no runs loaded the table is a ground-truth browser, so every sample qualifies;
   // the split filter only applies once some run has assigned splits.
+  //
+  // "By dataset" mode: whether a run is relevant to THIS check is scoped to runs that
+  // actually train on this sample's own dataset. Checking against every loaded run
+  // (S.runOrder) unscoped -- as "single sample" mode correctly does, since there every
+  // run shares one row space -- meant loading a run for a totally different box (with no
+  // overlapping datasets at all) marked EVERY sample of every other loaded box's dataset
+  // "nopred", because that new run obviously never predicted them either. A cardboard
+  // sample's coverage should only ever be judged against cardboard-trained runs.
+  const relevantRuns = S.view.rowMode === "dataset"
+    ? S.runOrder.filter((n) => ((S.runs[n].entry && S.runs[n].entry.datasets) || []).includes(s.dataset))
+    : S.runOrder;
   if (S.runOrder.length) {
-    const sps = splitsOf(s.i);
-    // No loaded run predicted this sample. Reported separately from the split chips
-    // because no chip can bring it back -- the fix is loading a run that covers it.
+    const sps = splitsOf(s.i, relevantRuns);
+    // No RELEVANT loaded run predicted this sample. Reported separately from the split
+    // chips because no chip can bring it back -- the fix is loading a run that covers it.
     if (!sps.size) out.push("nopred");
     else {
       // Contains-any, like the object filter. A sample that is `2-obj` to one run and
@@ -387,9 +418,10 @@ function failures(s) {
     }
   }
 
-  // Metric ranges read the sorted run when one is chosen, else any loaded run may
-  // satisfy them (union) — the intuitive reading of "show me samples where MSE is high".
-  const names = S.sort.run && S.runs[S.sort.run] ? [S.sort.run] : S.runOrder;
+  // Metric ranges read the sorted run when one is chosen, else any RELEVANT loaded run
+  // may satisfy them (union) — the intuitive reading of "show me samples where MSE is
+  // high", scoped the same way as the split check just above and for the same reason.
+  const names = S.sort.run && S.runs[S.sort.run] ? [S.sort.run] : relevantRuns;
   if (!names.length) return out;
   let any = false;
   for (const n of names) {
@@ -423,6 +455,7 @@ const FILTERS = {
   objects:   { label: "contains", clear: (f) => S.samples.forEach((s) => (s.objects && s.objects.length ? s.objects : ["(none)"]).forEach((o) => f.objects.add(o))) },
   layouts:   { label: "layout",   clear: (f) => S.samples.forEach((s) => s.layout && f.layouts.add(s.layout)) },
   boxes:     { label: "box",      clear: (f) => S.samples.forEach((s) => s.box && f.boxes.add(s.box)) },
+  datasets:  { label: "dataset",  clear: (f) => S.samples.forEach((s) => s.dataset && f.datasets.add(s.dataset)) },
   positions: { label: "position", clear: (f) => { f.positions = null; S.activePos = -1; } },
   ranges:    { label: "metrics",  clear: (f) => { for (const m of METRICS) f.ranges[m.key] = [...S.domain[m.key]]; syncSliders(); } },
   find:      { label: "id search", clear: (f) => { f.findSamples.clear(); f.findPositions.clear(); renderFindChips(); } },
@@ -464,14 +497,14 @@ function applyFilters() {
     const at = (s) => (rank.has(s.i) ? rank.get(s.i) : Number.MAX_SAFE_INTEGER);
     rows.sort((a, b) => at(a) - at(b) || a.i - b.i);
     S.order = rows;
+    S.groups = S.view.rowMode === "dataset" ? computeGroups(rows) : null;
     return;
   }
 
   if (run && S.runs[run]) {
     const m = METRICS.find((x) => x.key === metric);
-    // "worst" means high for BCE/localization, LOW for IoU/contour, and largest |value|
-    // for mass (over- and under-paint are both bad); the direction button is labelled
-    // semantically so this inversion never lands on the user.
+    // "worst" means high for localization, LOW for IoU/contour; the direction button is
+    // labelled semantically so this inversion never lands on the user.
     const isAbs = m.worst === "abs";
     const desc = isAbs ? dir === "worst" : (m.worst === "high") === (dir === "worst");
     const key = (v) => (isAbs ? Math.abs(v) : v);
@@ -490,6 +523,62 @@ function applyFilters() {
     });
   }
   S.order = rows;
+  // Sort runs first every group's own row list, so "sort by this run's metric" is
+  // preserved WITHIN each dataset group too, at no extra cost -- filtering into groups
+  // below is a stable partition of the already-sorted `rows`.
+  S.groups = S.view.rowMode === "dataset" ? computeGroups(rows) : null;
+}
+
+/* Partitions the filtered/sorted `rows` into one entry per dataset among the currently
+   loaded runs, for "by dataset" row mode (see paintRow's `sampleForGroup`).
+
+   A run belongs to the group for the alphabetically-first of its own dataset(s) (plain
+   single-dataset runs only have the one). A COMBINED run (trained on two datasets at
+   once, see run.py's --data-dir-2) is a member of that same first-dataset group like any
+   other column -- its second dataset has no group to align with, so those samples are
+   appended as extra, unaligned rows at the END of the table instead: a synthetic trailing
+   group, padded with `undefined` for every rank before its samples start, so every column
+   outside that trailing run is simply blank there (see paintRow's `!cs` branch) rather
+   than claiming a correspondence that doesn't exist. */
+function computeGroups(rows) {
+  if (!S.runOrder.length) return null;
+  const byDataset = new Map();
+  for (const s of rows) {
+    if (!s.dataset) continue;
+    if (!byDataset.has(s.dataset)) byDataset.set(s.dataset, []);
+    byDataset.get(s.dataset).push(s);
+  }
+  const primaryOf = new Map(), secondaryOf = new Map();
+  for (const name of S.runOrder) {
+    const ds = (S.runs[name].entry && S.runs[name].entry.datasets) || [];
+    if (!ds.length) continue;
+    primaryOf.set(name, ds[0]);
+    if (ds.length > 1) secondaryOf.set(name, ds[1]);
+  }
+  const mainDatasets = [...new Set(primaryOf.values())].sort();
+  const groups = mainDatasets.map((d) => ({
+    dataset: d, tail: false,
+    runs: S.runOrder.filter((n) => primaryOf.get(n) === d),
+    order: byDataset.get(d) || [],
+  }));
+  const mainRowCount = groups.reduce((n, g) => Math.max(n, g.order.length), 0);
+
+  const tailDatasets = [...new Set(secondaryOf.values())].sort();
+  for (const d of tailDatasets) {
+    const runs = S.runOrder.filter((n) => secondaryOf.get(n) === d);
+    const items = byDataset.get(d) || [];
+    groups.push({ dataset: d, tail: true, runs, order: new Array(mainRowCount).fill(undefined).concat(items) });
+  }
+  return groups;
+}
+
+/* Total row count the virtualizer must cover: the flat filtered list in "single sample"
+   mode, or the longest active dataset group (including any trailing tail rows) in "by
+   dataset" mode -- shorter groups just paint blank past their own end (see paintRow). */
+function rowCount() {
+  if (S.view.rowMode === "dataset" && S.groups && S.groups.length)
+    return S.groups.reduce((n, g) => Math.max(n, g.order.length), 0);
+  return S.order.length;
 }
 
 /* ***** table ***** */
@@ -634,8 +723,28 @@ function makeDraggable(cell, name) {
    than in the column itself. Width lives in a CSS var, so the header, every pooled row, and the
    sticky offsets all follow from one class -- no re-render, and no row heights change. */
 function setGtCol(open) {
+  // There is no single shared ground truth to show outside "single sample" mode -- see
+  // paintRow -- so opening it is a no-op there rather than fighting setRowMode over the
+  // nogt class every time either one runs.
+  if (open && S.view.rowMode !== "single") return;
   document.body.classList.toggle("nogt", !open);
   try { localStorage.setItem("viz.gtcol", open ? "1" : "0"); } catch (_) {}
+}
+
+/* "By dataset" (default) vs "single sample" -- see S.view.rowMode's doc comment and
+   paintRow. Switching away from "single" force-collapses the ground-truth column;
+   switching back restores whatever the user last had it set to. */
+function setRowMode(mode) {
+  S.view.rowMode = mode;
+  $("#rowmode-seg").querySelectorAll("button").forEach((b) => b.classList.toggle("on", b.dataset.rowmode === mode));
+  if (mode === "single") {
+    let stored = "1";
+    try { stored = localStorage.getItem("viz.gtcol") ?? "1"; } catch (_) {}
+    setGtCol(stored !== "0");
+  } else {
+    setGtCol(false);
+  }
+  refresh(true);
 }
 
 function renderHeader() {
@@ -770,7 +879,7 @@ function buildRow() {
   el.innerHTML = `<div class="cell idx sticky-1"><span class="idxn"></span></div>
     <div class="cell gt sticky-2 gtcell">
       <div class="ctitle gt-head"></div>
-      <div class="mask gtwrap"><img class="gtimg" loading="lazy" decoding="async" alt=""><canvas class="gtcoms"></canvas></div>
+      <div class="mask gtwrap"><img class="gtimg" loading="lazy" decoding="async" alt=""><canvas class="gtcoms"></canvas><span class="shapelabel"></span></div>
       <div class="tags gt-foot"></div>
     </div>`;
   el._runCells = [];
@@ -793,86 +902,142 @@ function syncRowCells(el) {
     // are just starting dimensions for a canvas that has not been painted yet.
     const { h: mh, w: mw } = S.lut;
     c.innerHTML = `<div class="ctitle run-head"></div>` +
-      `<canvas class="mask predmask" width="${mw}" height="${mh}"></canvas>` +
-      `<canvas class="mask truthmask" width="${mw}" height="${mh}" hidden></canvas>` +
+      `<div class="maskbox predbox"><canvas class="mask predmask" width="${mw}" height="${mh}"></canvas><span class="shapelabel"></span></div>` +
+      `<div class="maskbox truthbox" hidden><canvas class="mask truthmask" width="${mw}" height="${mh}"></canvas><span class="shapelabel"></span></div>` +
       `<div class="tags subtags"></div>`;
     el.appendChild(c);
     el._runCells.push(c);
   }
 }
 
+// In "by dataset" row mode a row is no longer one shared sample -- each run column
+// resolves ITS OWN dataset group's Nth (filtered/sorted) sample independently, so two
+// columns only show the same scene when their runs actually share a dataset. Returns
+// undefined past the end of that group's own row list (a shorter group than others, or
+// the padding before a combined run's trailing second-dataset rows -- see computeGroups).
+function sampleForGroup(name, rank) {
+  const g = S.groups && S.groups.find((g) => g.runs.includes(name));
+  return g ? g.order[rank] : undefined;
+}
+
 function paintRow(el, rank) {
+  // "Single sample" mode is exactly today's behaviour: one shared sample across the whole
+  // row, via the flat S.order. "By dataset" mode has no single shared sample -- each
+  // column below resolves its own via sampleForGroup -- so the dedicated ground-truth
+  // column (which can only ever show ONE thing) is force-collapsed in that mode (see
+  // setRowMode) and left unpainted here.
+  const grouped = S.view.rowMode === "dataset";
   const s = S.order[rank];
   el.style.transform = `translateY(${rank * rowH()}px)`;
   el.querySelector(".idxn").textContent = rank + 1;
-  // Identity line: which sample, where it was captured, which speaker played. The 8
-  // samples sharing a position differ only by speaker, so all three belong together.
-  // The run columns no longer repeat this: the sample is the same across the whole row,
-  // so saying it once in the sticky column leaves the run cells free to spend their
-  // title on what actually differs between them (name, split, epoch).
-  el.querySelector(".gt-head").innerHTML =
-    `<span class="t1">Ground truth</span><span class="t2">${identity(s)}</span>`;
 
-  // The ground-truth cell shows the same 20x40 target the runs predict, over the same
-  // backdrop, so it is directly comparable with every prediction column. The speaker
-  // view lives in the detail modal instead.
-  // The wrapper carries the backdrop and the hover/tooltip identity; the <img> inside is
-  // the bare mask, so `opacity` fades the cube without touching the photo behind it.
-  // Target object marks over the server-rendered GT image. The image is a PNG, not a
-  // canvas, so the marks need their own layer; it carries X's only, since there is no
-  // prediction in this column to pair them with.
-  {
-    const gcv = el.querySelector(".gtcoms");
-    const [gh, gw] = gtShape();
-    sizeMaskCanvas(gcv, gw, gh);
-    const g2 = gcv.getContext("2d");
-    g2.clearRect(0, 0, gcv.width, gcv.height);
-    if (S.view.coms && s.obj_com && s.obj_com.length)
-      drawComs(g2, gcv.width, gcv.height, { missed: s.obj_com }, true);
+  if (!grouped) {
+    // The true pixel shape stamped in every mask cell's corner (see .shapelabel) -- every
+    // cell in the row needs it, ground truth included, so it is computed once up front
+    // rather than separately per cell.
+    const shape = shapeLabel(s);
+    // Every .mask in this row -- ground truth and each run column -- draws at THIS
+    // sample's own aspect, scaled up to fit inside --mask-w x --mask-h without distortion
+    // (see containedSize). One row-level pair of variables rather than a per-element style
+    // so the GT and the predictions beside it can never disagree about the frame they sit
+    // in, and .mask can fall back to the fixed max for anything outside a row (e.g. the
+    // "no prediction" placeholder).
+    const [rmw, rmh] = containedSize(s.aspect);
+    el.style.setProperty("--row-mask-w", `${Math.round(rmw)}px`);
+    el.style.setProperty("--row-mask-h", `${Math.round(rmh)}px`);
+    // Identity line: which sample, where it was captured, which speaker played. The 8
+    // samples sharing a position differ only by speaker, so all three belong together.
+    // The run columns no longer repeat this: the sample is the same across the whole row,
+    // so saying it once in the sticky column leaves the run cells free to spend their
+    // title on what actually differs between them (name, split, epoch).
+    el.querySelector(".gt-head").innerHTML =
+      `<span class="t1"><span class="txt">Ground truth</span></span>` +
+      `<span class="t2"><span class="txt">${identity(s)}</span></span>`;
+
+    // The ground-truth cell shows the same 20x40 target the runs predict, over the same
+    // backdrop, so it is directly comparable with every prediction column. The speaker
+    // view lives in the detail modal instead.
+    // The wrapper carries the backdrop and the hover/tooltip identity; the <img> inside is
+    // the bare mask, so `opacity` fades the cube without touching the photo behind it.
+    // Target object marks over the server-rendered GT image. The image is a PNG, not a
+    // canvas, so the marks need their own layer; it carries X's only, since there is no
+    // prediction in this column to pair them with.
+    {
+      const gcv = el.querySelector(".gtcoms");
+      const [gh, gw] = gtShape();
+      sizeMaskCanvas(gcv, gw, gh);
+      const g2 = gcv.getContext("2d");
+      g2.clearRect(0, 0, gcv.width, gcv.height);
+      if (S.view.coms && s.obj_com && s.obj_com.length)
+        drawComs(g2, gcv.width, gcv.height, { missed: s.obj_com }, true);
+    }
+    const wrap = el.querySelector(".gtwrap");
+    const img = wrap.querySelector(".gtimg");
+    wrap.className = "mask gtwrap" + (S.view.background ? " bg" : " nobg");
+    setBackdrop(wrap, s.i);
+    const src = gtMaskURL(s.i);
+    if (img.getAttribute("src") !== src) img.setAttribute("src", src);
+    wrap.dataset.run = ""; wrap.dataset.sid = s.i;
+    wrap.querySelector(".shapelabel").textContent = shape;
+
+    // Split is a property of each run's dataloader, not of the sample, so it is shown per
+    // run column rather than here.
+    el.querySelector(".gt-foot").innerHTML =
+      `<span class="tag" title="${s.layout}">${shortLayout(s.layout)}</span>` +
+      `<span class="tag">${s.n_objects} obj</span>` +
+      (s.box ? `<span class="tag" title="box: ${s.box}">${s.box}</span>` : "");
+    // Collapsed, the cell is a bare rail -- clicking it must not open the sample modal.
+    el.querySelector(".gtcell").onclick = () => {
+      if (!document.body.classList.contains("nogt")) openModal(rank);
+    };
   }
-  const wrap = el.querySelector(".gtwrap");
-  const img = wrap.querySelector(".gtimg");
-  wrap.className = "mask gtwrap" + (S.view.background ? " bg" : " nobg");
-  setBackdrop(wrap, s.i);
-  const src = gtMaskURL(s.i);
-  if (img.getAttribute("src") !== src) img.setAttribute("src", src);
-  wrap.dataset.run = ""; wrap.dataset.sid = s.i;
 
-  // Split is a property of each run's dataloader, not of the sample, so it is shown per
-  // run column rather than here.
-  const com = s.com_gt && s.com_gt[0] != null && s.com_gt[0] >= 0
-    ? `${fmt(s.com_gt[0], 1)}, ${fmt(s.com_gt[1], 1)}` : "–";
-  // Four chips have to share 224px without wrapping -- a second line would overflow the
-  // fixed row height the virtualizer depends on. "com" is dropped from the label (the
-  // value reads as a coordinate pair, and the modal spells it out) to buy that room.
-  el.querySelector(".gt-foot").innerHTML =
-    `<span class="tag" title="center of mass (row, col) in grid coords">${com}</span>` +
-    `<span class="tag" title="${s.layout}">${shortLayout(s.layout)}</span>` +
-    `<span class="tag">${s.n_objects} obj</span>` +
-    (s.box ? `<span class="tag" title="box: ${s.box}">${s.box}</span>` : "");
-  // Collapsed, the cell is a bare rail -- clicking it must not open the sample modal.
-  el.querySelector(".gtcell").onclick = () => {
-    if (!document.body.classList.contains("nogt")) openModal(rank);
-  };
-
-  // Every .mask in this row -- ground truth and each run column -- is drawn at THIS
-  // sample's box aspect and centred in the --mask-w column box. One row-level variable
-  // rather than a per-element style so the GT and the predictions beside it can never
-  // disagree about the frame they are drawn in.
-  el.style.setProperty("--row-mask-w",
-    s.aspect > 0 ? `${Math.round(cssPx("--mask-h", 110) * s.aspect)}px` : "var(--mask-w)");
-
+  // Every .mask in this row -- ground truth and each run column -- is drawn at the SAME
+  // fixed --mask-w x --mask-h box regardless of this sample's own box shape, so cells
+  // compare directly at a glance instead of varying width row to row. A box whose real
+  // frame is a different shape gets stretched to fit; the shape label stamps the true
+  // pixel size in the corner so that stretch is never mistaken for the real proportions.
   syncRowCells(el);
   // Hoisted: depends only on S.runOrder, so computing it per cell rebuilt a Set ~140
   // times per repaint (28 pooled rows x 5 columns) at scroll frame rate.
   const mixed = mixedShapes();
   S.runOrder.forEach((name, k) => {
     const c = el._runCells[k];
-    const e = S.runs[name].samples[s.i];
+    // The sample THIS column paints against -- shared with every other column in "single
+    // sample" mode, resolved independently per dataset group in "by dataset" mode.
+    const cs = grouped ? sampleForGroup(name, rank) : s;
     const head = c.querySelector(".run-head");
-    const m = c.querySelector(".mask");
+    const predBox = c.querySelector(".predbox");
+    const m = predBox.querySelector(".mask");
     const chips = c.querySelector(".subtags");
     const [rh, rw] = runShape(name);
+
+    if (grouped) {
+      // Per-cell rather than per-row: different columns can be showing different
+      // datasets' boxes at once, each with its own real aspect to preserve.
+      const [rmw, rmh] = containedSize(cs ? cs.aspect : 0);
+      c.style.setProperty("--row-mask-w", `${Math.round(rmw)}px`);
+      c.style.setProperty("--row-mask-h", `${Math.round(rmh)}px`);
+    }
+
+    if (!cs) {
+      // This rank is past the end of THIS column's own dataset group -- another group (or
+      // a combined run's trailing second-dataset tail) is longer. Nothing to show here at
+      // all, not even "not in run": there is no sample, not just no prediction.
+      chips.innerHTML = "";
+      head.innerHTML = `<span class="t1 run"><span class="txt" title="${name}">${name}</span></span>`;
+      predBox.hidden = true;
+      m.style.backgroundImage = ""; m.dataset.bd = "";
+      if (!c._np) { c._np = document.createElement("div"); c._np.className = "nopred"; c.appendChild(c._np); }
+      c._np.className = "nopred nosample";
+      c._np.textContent = "—";
+      c._np.title = "no sample at this row for this run's dataset";
+      c._np.hidden = false;
+      return;
+    }
+
+    const shape = grouped ? shapeLabel(cs) : shapeLabel(s);
+    const e = S.runs[name].samples[cs.i];
 
     // Split and epoch are both PER-CELL facts, which is why neither can be left to the
     // column header: dataloaders assign splits independently, so one sample can be train
@@ -881,23 +1046,31 @@ function paintRow(el, rank) {
     const cellEp = epochFor(name);
     const shownEp = cellEp == null ? (S.runs[name].epochs || []).slice(-1)[0] : cellEp;
     const latest = cellEp == null;
-    const split = e ? e.split : (S.runs[name].splitOf || {})[s.i];
+    const split = e ? e.split : (S.runs[name].splitOf || {})[cs.i];
     // The grid is shown only when columns disagree on it. Both metrics are
     // grid-normalized so the numbers share a scale, but a coarser grid is systematically
     // easier -- a small cross-size gap is not evidence of a better model, so the reader
     // needs to see which size they are looking at.
     const gs = mixed ? `<span class="tag gsz" title="mask grid">${rh}x${rw}</span>` : "";
-    // The title is identity only: the run name (wrapped over two lines, never cut) and
-    // the sample. Split and epoch describe THIS PREDICTION rather than the sample or the
-    // run, so they go below the image with the metrics -- see `chips` further down.
+    const epchip = `<span class="epchip${latest ? "" : " scrub"}" title="epoch ${shownEp ?? "?"}${
+      latest ? " (latest saved)" : " (scrubbed)"}"><b>${shownEp ?? "–"}</b><span class="k">ep</span></span>`;
+    // Epoch sits on the RUN's own line -- it is a fact about the run, not the sample --
+    // right-aligned against the name so the two never run together. Split sits on the
+    // SAMPLE's line instead, since it is a fact about how this run's dataloader filed
+    // THIS sample, also right-aligned. Both describe the prediction, which is why neither
+    // lived below the image before: they are closer in kind to a title than to a metric.
+    // identity(cs) is also where a grouped cell's OWN dataset becomes visible -- see
+    // identity()'s "(sample_id, dataset)" suffix -- since neighbouring columns in
+    // different groups can be showing entirely different datasets at this same rank.
     head.innerHTML =
-      `<span class="t1 run" title="${name}">${name}</span>` +
-      `<span class="t2">${identity(s)}</span>`;
+      `<span class="t1 run"><span class="txt" title="${name}">${name}</span>${epchip}</span>` +
+      `<span class="t2"><span class="txt">${identity(cs)}</span>${splitChip(split)}</span>`;
 
     if (!e) {
       chips.innerHTML = "";
-      m.hidden = true;
+      predBox.hidden = true;
       m.style.backgroundImage = ""; m.dataset.bd = "";   // keep the cache flag honest
+      predBox.querySelector(".shapelabel").textContent = "";
       if (!c._np) { c._np = document.createElement("div"); c._np.className = "nopred"; c.appendChild(c._np); }
       // Three different situations used to read "no prediction" alike, which made a
       // 250ms debounce look identical to data that was never written:
@@ -906,7 +1079,7 @@ function paintRow(el, rank) {
       //               train loader uses drop_last + shuffle, so each epoch discards a
       //               different remainder (see src/model/dataset.py build_dataset).
       //   not in run -- the sample is outside this run's split entirely.
-      const covered = (S.runs[name].splitOf || {})[s.i];
+      const covered = (S.runs[name].splitOf || {})[cs.i];
       const st = S.runs[name].metricsPending !== undefined ? ["loading", "loading…", "fetching metrics for this epoch"]
         : covered ? ["unsaved", "not saved", `this run covers this sample, but epoch ${shownEp ?? "?"} saved no prediction for it`]
         : ["nopred", "not in run", "this sample is not in this run's split"];
@@ -917,48 +1090,41 @@ function paintRow(el, rank) {
       return;
     }
     if (c._np) c._np.hidden = true;
-    // Below the image, in reading order: one line saying WHICH FRAME this is -- the split
-    // this run filed the sample under, the epoch shown, and the predicted centre of mass --
-    // then the metrics wrapped below it. The frame line comes first because it qualifies
-    // everything after it: a good score means something different on a train sample than on
-    // a held-out one. Everything sits at the natural left edge; nothing is right-aligned,
-    // so the column reads as one left-hand stack. The metrics move to their own lines
-    // because all of them plus the frame line do not fit one row at a readable size.
+    // Split and epoch moved up to the title (see head.innerHTML above); this is just the
+    // grid-size tag, when shown, followed by the metrics.
     chips.innerHTML =
-      `${splitChip(split)}` +
-      `<span class="epchip${latest ? "" : " scrub"}" title="epoch ${shownEp ?? "?"}${
-        latest ? " (latest saved)" : " (scrubbed)"}"><b>${shownEp ?? "–"}</b>` +
-      `<span class="k">ep</span></span>${gs}` +
-      `<span class="tag com" title="predicted center of mass (row, col) in grid coords">${
-        fmt(e.com[0], 1)}, ${fmt(e.com[1], 1)}</span><i class="brk"></i>` +
+      gs +
       METRICS.map((mm) => {
         const v = e[mm.key];
         return `<span class="tag"><span class="k">${mm.short}</span> <b>${
           v == null ? "–" : fmt(v, 3)}</b></span>`;
       }).join("");
-    m.hidden = false;
+    predBox.hidden = false;
+    predBox.querySelector(".shapelabel").textContent = shape;
     // Match the canvas buffer to THIS run's grid. Rows are recycled across runs, so a
     // pooled cell can arrive still sized for a column of a different resolution.
     sizeMaskCanvas(m, rw, rh);
-    m.dataset.run = name; m.dataset.sid = s.i;
-    m.onclick = () => openNeighbors(name, s.i);
+    m.dataset.run = name; m.dataset.sid = cs.i;
+    m.onclick = () => openNeighbors(name, cs.i);
     m.className = "mask predmask" + (S.view.background ? " bg" : " nobg");
-    setBackdrop(m, s.i);
-    paintCanvas(m, name, s.i, epochFor(name));
+    setBackdrop(m, cs.i);
+    paintCanvas(m, name, cs.i, epochFor(name));
 
     // Stacked: the target gets its own box directly below the prediction, so the two are
     // adjacent instead of the ground truth being columns away in the leftmost cell.
-    const tm = c.querySelector(".truthmask");
-    tm.hidden = S.view.mode !== "stacked";
-    if (!tm.hidden) {
+    const tmBox = c.querySelector(".truthbox");
+    const tm = tmBox.querySelector(".mask");
+    tmBox.hidden = S.view.mode !== "stacked";
+    if (!tmBox.hidden) {
       tm.className = "mask truthmask" + (S.view.background ? " bg" : " nobg");
-      setBackdrop(tm, s.i);
+      setBackdrop(tm, cs.i);
       sizeMaskCanvas(tm, rw, rh);
-      const truth = S.truthCache[truthKey(s.i, rh, rw)];
+      tmBox.querySelector(".shapelabel").textContent = shape;
+      const truth = S.truthCache[truthKey(cs.i, rh, rw)];
       // The stacked target half shows the target's own objects and nothing else: the
       // prediction marks and the connecting lines belong on the prediction above it.
-      if (truth) drawMask(tm, truth, "truth", null, [rh, rw], comsFor(name, s.i), true);
-      else ensureTruth(s.i, rh, rw);
+      if (truth) drawMask(tm, truth, "truth", null, [rh, rw], comsFor(name, cs.i), true);
+      else ensureTruth(cs.i, rh, rw);
     }
   });
 }
@@ -972,7 +1138,7 @@ function visibleRange(pad = 3) {
   const top = Math.max(0, sc.scrollTop - (hdr ? hdr.offsetHeight : 0));
   return {
     first: Math.max(0, Math.floor(top / rowH()) - pad),
-    last: Math.min(S.order.length, Math.ceil((top + sc.clientHeight) / rowH()) + pad),
+    last: Math.min(rowCount(), Math.ceil((top + sc.clientHeight) / rowH()) + pad),
   };
 }
 
@@ -1013,7 +1179,7 @@ function refresh(toTop = false) {
   // grows with the number of run columns, so measure it rather than assume a height.
   const hh = hdr.offsetHeight;
   $("#rows").style.top = `${hh}px`;
-  $("#spacer").style.height = `${hh + S.order.length * rowH()}px`;
+  $("#spacer").style.height = `${hh + rowCount() * rowH()}px`;
   const nRuns = S.runOrder.length;
   // "3 of 3007" on its own reads as a broken tool. Naming the filter that is holding the
   // other 3004 back -- and making the name the button that switches it off -- turns
@@ -1135,6 +1301,7 @@ function renderChips() {
   chipRow($("#layout-chips"), uniq((s) => s.layout), f.layouts, (v) => v);
   chipRow($("#nobj-chips"), uniq((s) => s.n_objects), f.nObjects, (v) => `${v}`);
   chipRow($("#box-chips"), uniq((s) => s.box), f.boxes, (v) => v);
+  chipRow($("#dataset-chips"), uniq((s) => s.dataset), f.datasets, (v) => v);
   // Contains-object: one chip per object TYPE, counted across every layout it appears
   // in, so "purple-cube" covers both the solo and the two-object scenes.
   const objCounts = new Map();
@@ -1149,6 +1316,7 @@ function renderChips() {
   $("#layout-count").textContent = `${f.layouts.size}/${uniq((s) => s.layout).length}`;
   $("#nobj-count").textContent = `${f.nObjects.size}/${uniq((s) => s.n_objects).length}`;
   $("#box-count").textContent = `${f.boxes.size}/${uniq((s) => s.box).length}`;
+  $("#dataset-count").textContent = `${f.datasets.size}/${uniq((s) => s.dataset).length}`;
   $("#spk-count").textContent = `${f.speakers.size}/8`;
   $("#metric-scope").textContent = S.sort.run ? `range applies to ${S.sort.run}` : "any loaded run in range";
 }
@@ -1711,7 +1879,13 @@ async function ensureFrames(run) {
     do {
       framesStale.delete(run);
       const first = Math.max(0, Math.floor(Math.max(0, $("#scroller").scrollTop) / rowH()) - 4);
-      const sids = S.order.slice(first, first + 24).map((s) => s.i);
+      // In "by dataset" row mode this run's cells are painted against ITS OWN group's row
+      // list (see paintRow's sampleForGroup), not the flat S.order -- fetching S.order's
+      // window here would almost never contain the sample actually on screen for this
+      // column, so paintCanvas kept finding a miss and re-triggering this fetch forever.
+      const grouped = S.view.rowMode === "dataset" && S.groups;
+      const src = grouped ? (S.groups.find((g) => g.runs.includes(run)) || { order: [] }).order : S.order;
+      const sids = src.slice(first, first + 24).filter(Boolean).map((s) => s.i);
       if (!sids.length) return;
       const d = await fetchFrames(run, sids);
       // Replace rather than merge: a store holds one contiguous window, and its raw blob
@@ -1985,6 +2159,13 @@ async function poll() {
     S.frameData = {};   // new epochs exist; refetch mask values
     // Mask URLs are cached immutable, so a new epoch needs a new URL to be fetched.
     S.epochTag = (S.epochTag || 0) + 1;
+    // addRun(reload=true) just reset metricsEpoch to null and filled `samples` with the
+    // run's LATEST epoch, regardless of where the epoch scrubber is pinned -- so a run
+    // that is still training would silently jump its header stats (and every cell) back
+    // to "latest" the moment it advances, even while the user is looking at the past.
+    // Re-pin it to whatever epoch is currently shown before anything repaints.
+    invalidateEpochs();
+    fetchEpochMetrics();
     // New metrics can reorder a sorted table. Keep whichever sample is at the top of the
     // viewport in view, so rows don't slide out from under the user mid-read.
     const sc = $("#scroller");
@@ -2037,13 +2218,17 @@ function openPicker() {
   if (!hits.length) list.innerHTML = `<div class="none">no run matches "${term}"</div>`;
   hits.forEach((r) => {
     const added = !!S.runs[r.name];
-    const ok = r.compatible && !added;
+    // Fetch in flight (see addInFlight): shown as its own state right away, rather than
+    // leaving the row looking clickable -- and still unresponsive -- for however long
+    // /api/run/{name} takes, which is what made a slow load look like a dead click.
+    const adding = addInFlight.has(r.name);
+    const ok = r.compatible && !added && !adding;
     const d = document.createElement("div");
-    d.className = "ritem" + (r.compatible ? (added ? " added" : "") : " bad") + (ok ? " ok" : "");
+    d.className = "ritem" + (r.compatible ? (added ? " added" : adding ? " adding" : "") : " bad") + (ok ? " ok" : "");
     d.innerHTML = `<div><div class="nm">${r.name}</div>
       <div class="sub">${statusChip(r.status)} ${r.compatible
         ? `ep ${r.epoch ?? "?"} · ${r.eval_splits.length} eval splits` : r.reason}</div></div>
-      <span class="badge">${added ? "added" : r.compatible ? "add" : "unavailable"}</span>`;
+      <span class="badge">${added ? "added" : adding ? "adding…" : r.compatible ? "add" : "unavailable"}</span>`;
     if (ok) d.onclick = () => pick(r.name);
     list.appendChild(d);
   });
@@ -2052,10 +2237,19 @@ function openPicker() {
   q.setAttribute("aria-expanded", "true");
 }
 
+// Deliberately does NOT close the picker: arrow-key-and-Enter is the fast path for adding
+// several runs in one pass (e.g. every eval run across all boxes for a comparison), and
+// closing after each pick would force reopening + re-searching between every one. The
+// search term is kept too, so repeated picks under one query stay filtered. Escape (see
+// #run-search's keydown handler) still closes it explicitly when the user is done.
 async function pick(name) {
-  $("#run-search").value = "";
-  closePicker();
-  await addRun(name);
+  // addInFlight is set synchronously before addRun's first await, so by the time this
+  // call returns control here the picker can already re-render the row as "adding…"
+  // instead of sitting there looking like the click did nothing until the fetch resolves.
+  const p = addRun(name);
+  if (pickerOpen()) openPicker();
+  await p;
+  if (pickerOpen()) openPicker();   // re-render again so it now shows as "added"
 }
 
 /* ***** hover tooltip *****
@@ -2342,7 +2536,7 @@ async function openNeighbors(run, sid) {
   {
     const nb = $(".nbviews"), smp = S.samples.find((x) => x.i === +sid);
     if (nb && smp && smp.aspect > 0)
-      nb.style.setProperty("--row-mask-w", `${Math.round(cssPx("--mask-h", 110) * smp.aspect)}px`);
+      nb.style.setProperty("--row-mask-w", `${Math.round(cssPx("--mask-h", 168) * smp.aspect)}px`);
   }
   // After layout, so each overlay canvas can size itself from its rendered panel.
   requestAnimationFrame(syncModalComs);
@@ -2392,7 +2586,13 @@ function bindUI() {
   $("#sidebar-hide").onclick = () => setSidebar(false);
   $("#sidebar-show").onclick = () => setSidebar(true);
   try { if (localStorage.getItem("viz.sidebar") === "0") setSidebar(false); } catch (_) {}
-  try { if (localStorage.getItem("viz.gtcol") === "0") setGtCol(false); } catch (_) {}
+
+  $("#rowmode-seg").querySelectorAll("button").forEach((b) => {
+    b.onclick = () => setRowMode(b.dataset.rowmode);
+  });
+  let storedRowMode = "dataset";
+  try { storedRowMode = localStorage.getItem("viz.rowmode") || "dataset"; } catch (_) {}
+  setRowMode(storedRowMode === "single" ? "single" : "dataset");
 
   $("#mode-seg").querySelectorAll("button").forEach((b) => {
     b.onclick = () => {
@@ -2459,6 +2659,7 @@ function bindUI() {
       if (k === "layouts") S.filters.layouts = new Set(uniq((s) => s.layout).map((x) => x[0]));
       if (k === "nObjects") S.filters.nObjects = new Set(uniq((s) => s.n_objects).map((x) => x[0]));
       if (k === "boxes") S.filters.boxes = new Set(uniq((s) => s.box).map((x) => x[0]));
+      if (k === "datasets") S.filters.datasets = new Set(uniq((s) => s.dataset).map((x) => x[0]));
       if (k === "objects") {
         const all = new Set();
         S.samples.forEach((s) => (s.objects && s.objects.length ? s.objects : ["(none)"]).forEach((o) => all.add(o)));

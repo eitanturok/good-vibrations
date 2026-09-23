@@ -25,6 +25,14 @@
   </section>
 
   <section class="panel">
+    <h2>Rows</h2>
+    <div class="seg" id="rowmode-seg">
+      <button data-rowmode="dataset" class="on" title="Each run's column is grouped by which dataset(s) it was trained on. Columns sharing a dataset stay row-aligned to the same sample, like today; columns from different datasets are just juxtaposed at the same row position, not claimed to be the same scene. No shared ground-truth column, since there is no longer one shared sample per row.">By dataset</button>
+      <button data-rowmode="single" title="One shared sample per row across every column, exactly as before -- a column whose run doesn't cover that sample shows 'not in run'. The only mode with a ground-truth column.">Single sample</button>
+    </div>
+  </section>
+
+  <section class="panel">
     <h2>Display</h2>
     <div class="seg" id="mode-seg">
       <button data-mode="pred" class="on" title="Prediction only">Pred</button>
@@ -125,6 +133,14 @@
       <span class="links"><button class="link" data-all="boxes">all</button><button class="link" data-none="boxes">none</button></span>
     </div>
     <div class="chips" id="box-chips"></div>
+  </section>
+
+  <section class="panel browse">
+    <div class="phead"><h2>Dataset</h2>
+      <span class="count" id="dataset-count"></span>
+      <span class="links"><button class="link" data-all="datasets">all</button><button class="link" data-none="datasets">none</button></span>
+    </div>
+    <div class="chips" id="dataset-chips"></div>
   </section>
 
   <section class="panel browse">

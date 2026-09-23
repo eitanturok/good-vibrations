@@ -3,14 +3,19 @@
 Compare predicted segmentation masks across training runs, sample by sample.
 
 ```bash
-python -m viz                 # http://127.0.0.1:8503
+python -m viz                 # http://127.0.0.1:8503 -- every experiment under experiments/, at once
 python -m viz --port 9000 --experiment experiments/experiment-25 --runs runs
 python -m viz --experiment experiments/31_07_2026_gastronorm_exp1 --mask 30x30
 ```
 
-Startup is ~0.5 s. No inference runs: ground-truth masks are read from the per-sample
-`.npy` on disk and predictions from the `.pt` files the `OutputSaver` callback already
-wrote during training.
+`--experiment` takes either a single experiment dir (has `samples/` directly) or a
+**parent** dir holding several -- every child with `samples/` loads and shows up in one
+table, filterable by its `box` metadata. This is what the bare `python -m viz` default
+(`experiments/`) does. Startup with all of them is a few seconds; a single experiment dir
+stays ~0.5 s.
+
+No inference runs: ground-truth masks are read from the per-sample `.npy` on disk and
+predictions from the `.pt` files the `OutputSaver` callback already wrote during training.
 
 ## Watching a remote training run
 
@@ -61,13 +66,18 @@ Add a new format by appending an entry to `LAYOUTS` in `config.py`.
 
 **Sample ids are not row indices.** The gastronorm dataset starts at `000009`, and any
 dataset can be missing a sample whose mask was never written, so every id → row lookup
-goes through `GtIndex.row_of`.
+goes through `GtIndex.row_of`. With several experiments loaded at once, the id the client
+sees is further offset per experiment (`Registry.global_id`) so ids never collide across
+them — `Registry.locate(row)` is the one place a row resolves back to which experiment it
+came from.
 
-**`--mask HxW`** picks the target grid. A dataset may ship several sizes side by side
-(gastronorm has both `20x40` and `30x30`); viz uses the only size on disk when there is
-one, otherwise defaults to `20x40` and says so. Runs trained on a different size are
-listed as incompatible, with the shape mismatch as the reason — so if a run you expect is
-missing, check the mask size first.
+**`--mask HxW`** picks the target grid, applied to every loaded experiment. Each
+experiment defaults independently to its own best size (the usable size most of its own
+runs were trained at); pass `--mask` to force one size everywhere. An experiment that
+doesn't ship the requested size is skipped (or, with a single `--experiment` dir, a hard
+error, same as before). Runs trained on a size their experiment doesn't ship are listed as
+incompatible, with the shape mismatch as the reason — so if a run you expect is missing,
+check the mask size first.
 
 ## Layout
 
@@ -124,10 +134,14 @@ through the current sort order.
 
 ## Which runs appear
 
-Only runs that can be validly compared against this experiment. A run is rejected if it
-has no `outputs_history/`, has a different mask shape, uses the legacy `info` schema, or
-was trained on a **different dataset** — sample ids collide across experiments, so a
-cylinder/bullet run would otherwise join cleanly and report silently wrong numbers.
+Only runs that can be validly compared against one of the loaded experiments. A run is
+tried against every loaded experiment and matched to the first it's compatible with, by
+sample-id overlap — not by directory or run name, since a run's samples came from exactly
+one real experiment regardless of how it happened to be named. A run is rejected if it has
+no `outputs_history/`, has a mask shape none of the loaded experiments ship, uses the
+legacy `info` schema, or was trained on a dataset none of them contain — sample ids can
+collide across experiments (the id spaces are small, per-experiment), so a run from an
+unrelated dataset would otherwise join cleanly and report silently wrong numbers.
 Rejected runs stay visible in the picker with the reason. Truncated `.pt` files are
 skipped per-file and reported in the column header rather than failing the run.
 

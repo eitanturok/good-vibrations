@@ -164,11 +164,11 @@ OVERLAY_GAIN = 0.85
 
 
 @lru_cache(maxsize=1)
-def aspect_by_box() -> dict:
-    """{box_name: width/height} of the cropped frame each box's masks tile.
+def dims_by_box() -> dict:
+    """{box_name: (width, height)} of the cropped frame each box's masks tile, in pixels.
 
     Keyed on the BOX, not the sample: downsample_mask squashes every box into the same
-    (out_h,out_w), so the aspect a grid must be drawn at is a property of the enclosure and
+    (out_h,out_w), so the true frame a grid represents is a property of the enclosure and
     is identical for every sample inside it. That also makes this one PNG header read per
     box rather than per sample -- `Image.open().size` parses the header without decoding,
     unlike _backdrop, which keeps whole frames in memory.
@@ -178,30 +178,48 @@ def aspect_by_box() -> dict:
     """
     from viz.app import registry
     out: dict = {}
-    for row in range(len(registry.gt)):
-        # Rows, not sample ids: sample_dir takes a row. Passing ids read the wrong photos
+    for row in range(registry.n_samples):
+        # Rows, not sample ids: locate() takes a row. Passing ids read the wrong photos
         # on any dataset whose ids do not start at zero.
-        box = registry.gt.meta[row].get("box")
+        _, gt, r = registry.locate(row)
+        box = gt.meta[r].get("box")
         if box in out: continue
-        p = registry.sample_dir(row) / registry.gt.layout.backdrop
+        # gt/r are already known, so build the path directly rather than going through
+        # registry.sample_dir(row) -- that re-derives the same (gt, r) via another locate().
+        p = gt.experiment_dir / "samples" / gt.sample_ids[r] / gt.layout.backdrop
         if not p.exists(): continue
         with Image.open(p) as im:
-            w, h = im.size
-        out[box] = w / h
+            out[box] = im.size
     return out
 
 
-def row_aspect(row: int) -> float:
-    """Width/height of the frame THIS row's masks tile.
+def aspect_by_box() -> dict:
+    """{box_name: width/height}, derived from dims_by_box -- see its docstring."""
+    return {box: w / h for box, (w, h) in dims_by_box().items()}
 
-    Per row rather than one global number, because a dataset holding two boxes has no
+
+def aspect_for_box(box) -> float:
+    """Width/height of the frame a given box's masks tile, or the dataset-wide fallback.
+
+    Per box rather than one global number, because a dataset holding two boxes has no
     single answer: gastronorm is 1.204 and green-plastic 1.120, and drawing both at one
     aspect slides every prediction off the features it refers to in at least one of them.
-    Falls back to the dataset-wide aspect when the row's box has no backdrop on disk.
     """
-    from viz.app import registry
-    a = aspect_by_box().get(registry.gt.meta[row].get("box"))
+    a = aspect_by_box().get(box)
     return a if a is not None else scene_aspect()
+
+
+def dims_for_box(box) -> tuple | None:
+    """(width, height) in pixels of the frame a given box's masks tile, or None for a box
+    whose backdrop could not be read (see dims_by_box)."""
+    return dims_by_box().get(box)
+
+
+def row_aspect(row: int) -> float:
+    """aspect_for_box, resolved from a row rather than a box already in hand."""
+    from viz.app import registry
+    _, gt, r = registry.locate(row)
+    return aspect_for_box(gt.meta[r].get("box"))
 
 
 @lru_cache(maxsize=1)
@@ -213,11 +231,12 @@ def scene_aspect() -> float:
     and /api/lut needs a value to seed the client before any sample has loaded.
     """
     from viz.app import registry
-    for row in range(min(25, len(registry.gt))):
+    for row in range(min(25, registry.n_samples)):
         im = _backdrop(row)
         if im is not None:
             return im.size[0] / im.size[1]
-    return config.MASK_W / config.MASK_H
+    shape = registry.gts[0].masks.shape
+    return shape[2] / shape[1]
 
 
 def canvas_size(h: int, w: int, backdrop: Image.Image | None = None,
@@ -338,7 +357,8 @@ def _backdrop(sid: int) -> Image.Image | None:
     """The cropped overhead frame the masks are aligned to, kept decoded so repeated
     composites for the same sample don't re-read the file."""
     from viz.app import registry
-    p = registry.sample_dir(sid) / registry.gt.layout.backdrop
+    _, gt, r = registry.locate(sid)
+    p = registry.sample_dir(sid) / gt.layout.backdrop
     if not p.exists():
         return None
     im = Image.open(p)
@@ -351,29 +371,32 @@ def _cached(kind: str, run: str, sid: int, mode: str, background: bool, epoch: i
             relative: bool = False, shape: tuple[int, int] | None = None) -> bytes:
     from viz.app import registry  # set at startup
     bd = _backdrop(sid) if background else None
+    _, gt, r = registry.locate(sid)
     if kind == "gt":
         # The ground-truth column follows the columns beside it, so it can be asked for a
         # grid other than the primary one. `sid` is a ROW here (callers resolve the id
         # first) and masks_at is row-aligned with gt.sample_ids, so this needs no
-        # re-indexing. A missing size raises rather than quietly serving the primary
-        # shape -- a silent fallback would put an unrelated resolution beside the runs.
-        m = registry.gt.masks if shape is None else registry.gt.masks_at(shape)
+        # re-indexing beyond resolving which experiment's gt owns this row. A missing
+        # size raises rather than quietly serving the primary shape -- a silent fallback
+        # would put an unrelated resolution beside the runs.
+        m = gt.masks if shape is None else gt.masks_at(shape)
         if m is None:
             raise KeyError(shape)
-        return render_mask(m[sid], "truth", background, bd, relative)
+        return render_mask(m[r], "truth", background, bd, relative)
     rd = registry.run(run)
     row = rd.row_of[sid]
     values = rd.masks[row]
-    # Diff and overlay are elementwise, so the target must be at THIS run's grid -- the
-    # table mixes resolutions and gt.masks holds only the primary one.
-    truth = registry.gt.masks_at(rd.shape)
+    # Diff and overlay are elementwise, so the target must be at THIS run's grid, from
+    # the SAME experiment this row belongs to -- the table mixes resolutions (and now
+    # experiments) and gt.masks holds only the primary one.
+    truth = gt.masks_at(rd.shape)
     if truth is None:
         return render_mask(values, mode if mode != "diff" else "pred", background, bd,
                            relative)
     if mode in ("overlay", "stacked"):
-        return render_both(values, truth[sid], background, bd, relative)
+        return render_both(values, truth[r], background, bd, relative)
     if mode == "diff":
-        values = values - truth[sid]
+        values = values - truth[r]
     return render_mask(values, mode, background, bd, relative)
 
 

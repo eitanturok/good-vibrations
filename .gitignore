@@ -231,3 +231,10 @@ __marimo__/
 
 # viz dashboard generated caches
 viz/cache/
+
+# other
+src3/vendor
+src4/cache
+.venv-ldmseg
+src4/ckpts
+src2/data

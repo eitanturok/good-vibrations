@@ -14,28 +14,23 @@ if str(REPO_ROOT) not in sys.path:
 
 # ***** inputs (hardcoded defaults, overridable from __main__) *****
 
-EXPERIMENT_DIR = REPO_ROOT / "experiments" / "experiment-25"
+# The parent dir holding every experiment. Registry auto-detects whether this (or
+# whatever --experiment overrides it to) is one experiment (has samples/ directly) or a
+# parent of several -- see data.load_experiments.
+EXPERIMENT_DIR = REPO_ROOT / "experiments"
 RUNS_DIR = REPO_ROOT / "runs"
 PORT = 8503  # 8502 is taken by the other explorer
 
 # ***** dataset shape *****
 
-# The target grid. A dataset may ship masks at several downsample sizes side by side
-# (the gastronorm captures write both 20x40 and 30x30), and a run is only comparable
-# against the size it was trained on -- so this is overridable from the command line
-# (--mask 30x30) rather than a fixed property of the code. set_mask_shape rebinds it.
-MASK_H, MASK_W = 20, 40
+# A dataset may ship masks at several downsample sizes side by side (the gastronorm
+# captures write both 20x40 and 30x30), and a run is only comparable against the size it
+# was trained on. The grid is therefore resolved PER EXPERIMENT (data.load_experiments)
+# and passed explicitly to Layout/load_gt -- never a shared global, since experiments
+# loaded together can have no size in common. This is only the fallback used to produce a
+# descriptive error when an experiment ships no usable size and none was requested.
+DEFAULT_MASK_SHAPE = (20, 40)
 N_SAMPLES = 1024
-
-
-def set_mask_shape(h: int, w: int) -> None:
-    """Point viz at a different target grid, before anything reads the constants.
-
-    Layout paths embed {h}/{w}, and Layout instances are built after this runs, so the
-    ground-truth filename follows automatically.
-    """
-    global MASK_H, MASK_W
-    MASK_H, MASK_W = int(h), int(w)
 
 
 # How a downsampled target is named, with the numeric prefix left OPEN. The size is the
@@ -112,8 +107,8 @@ def usable_mask_shapes(samples_dir) -> list[tuple[int, int]]:
 # in the files themselves declares which era they belong to, so `Layout.detect` probes a
 # real sample directory rather than making viz depend on one hardcoded set of names.
 #
-# Every entry is a path RELATIVE TO A SAMPLE DIR. `{h}`/`{w}` are filled with MASK_H and
-# MASK_W so the mask name follows the configured target shape.
+# Every entry is a path RELATIVE TO A SAMPLE DIR. `{h}`/`{w}` are filled with the target
+# shape each Layout was constructed with, so the mask name follows it.
 #
 # A layout entry names a FILENAME SCHEME, not a dataset -- `dataset` carries the data
 # identity separately, and it is what a run's `family` is reported as. Two layouts sharing
@@ -181,7 +176,16 @@ VIBRATION_GLOB = {
 # Stale Windows paths (D:\... , C:\...) recorded at capture time. Dropped when metadata
 # is parsed so they can never leak into a route; all paths are rebuilt from
 # EXPERIMENT_DIR. `experiment_dir` is the gastronorm-era spelling of `output_dir`.
-STALE_METADATA_KEYS = {"output_dir", "sample_dir", "audio_dir", "experiment_dir"}
+#
+# `rois`/`run_opt_multiROIs`/`run_opt` are the capture rig's laser-grid geometry -- read
+# by the TRAINING pipeline (src/data/vibrate.py, src/model/dataset.py), never by viz. They
+# are also, by a wide margin, the biggest thing in metadata.jsonl: ~4.3KB of the ~4.7KB a
+# typical sample's file carries, almost entirely nested lists of floats that parse into
+# thousands of individual Python objects. Kept in every GtIndex.meta[i] forever across
+# every loaded experiment, this was ~95MB retained for one 3000-sample experiment alone
+# (measured with tracemalloc -- see PERF_NOTES.md) for data nothing here ever reads.
+STALE_METADATA_KEYS = {"output_dir", "sample_dir", "audio_dir", "experiment_dir",
+                       "rois", "run_opt_multiROIs", "run_opt"}
 
 
 class Layout:
@@ -192,8 +196,8 @@ class Layout:
     with a user-supplied id.
     """
 
-    def __init__(self, name: str, spec: dict):
-        fmt = {"h": MASK_H, "w": MASK_W}
+    def __init__(self, name: str, spec: dict, mask_h: int, mask_w: int):
+        fmt = {"h": mask_h, "w": mask_w}
         self.name = name
         self._gt_mask_spec = spec["gt_mask"]
         # Which data this is, independent of the filename scheme `name` identifies. Two
@@ -238,7 +242,7 @@ class Layout:
         return hits[0] if hits else None
 
     @classmethod
-    def detect(cls, samples_dir) -> "Layout":
+    def detect(cls, samples_dir, mask_h: int, mask_w: int) -> "Layout":
         """Pick the layout whose ground-truth mask actually exists on disk.
 
         Probes several sample dirs, not one: a partially-written capture can be missing
@@ -264,11 +268,11 @@ class Layout:
             probes = sorted(p for p in samples_dir.iterdir() if p.is_dir())[:25]
         except OSError:
             probes = []
-        layouts = [cls(name, LAYOUTS[name]) for name in LAYOUT_ORDER]
+        layouts = [cls(name, LAYOUTS[name], mask_h, mask_w) for name in LAYOUT_ORDER]
         for strict in (True, False):
             for layout in layouts:
                 for d in probes:
-                    if layout.resolve_gt_mask(d, MASK_H, MASK_W) is None:
+                    if layout.resolve_gt_mask(d, mask_h, mask_w) is None:
                         continue
                     if not (d / layout.backdrop).exists():
                         continue
@@ -283,7 +287,7 @@ class Layout:
         raise SystemExit(
             f"[viz] no known sample layout under {samples_dir}.\n"
             f"       tried: {known}. Expected a mask matching "
-            + GT_MASK_GLOB.format(h=MASK_H, w=MASK_W)
+            + GT_MASK_GLOB.format(h=mask_h, w=mask_w)
             + " plus that layout's backdrop.\n"
               "       Add a new entry to LAYOUTS in viz/config.py if this is a new "
               "dataset format."
@@ -303,7 +307,10 @@ OUTPUTS_SUBDIR = "outputs_history"
 # rather than 1-cube/2-cubes -- same capture, same grid, same ids, different slicing.
 # Runs that slice one dataset differently are meant to sit in the same table.
 
-N_DEFAULT_RUNS = 3  # auto-loaded on first open, most recently modified first
+# Auto-loaded on first open: the N most recently modified compatible runs, globally
+# (see Registry.defaults). A box whose newest runs don't make this cut shows nothing
+# until a run is added manually -- accepted tradeoff for a simple "last N runs" default.
+N_DEFAULT_RUNS = 3
 
 # The runs directory is re-scanned at most this often, so runs that appear or keep
 # training while viz is open show up without a restart. A scan is ~0.15s.
@@ -312,6 +319,14 @@ RESCAN_SECONDS = 10.0
 # How many scrubbed-epoch RunData objects to keep. Each is ~5MB, so this bounds the
 # epoch slider's memory; the latest-epoch entry per run is never evicted.
 MAX_EPOCH_CACHE = 24
+
+# How many RunData objects (any epoch, including the "latest" entries that used to be
+# kept forever) Registry.run() keeps decoded in memory at once, LRU. Loading N runs over
+# the course of a session used to pin all N forever even after they were removed from the
+# table -- the single largest source of the process's memory growing unbounded over a long
+# session. 24 comfortably covers any table anyone actually keeps open at once (a handful
+# of columns) while still bounding a session that explores hundreds of runs over time.
+MAX_RUN_CACHE = 24
 
 # Run status is inferred from logs-rank0.txt: a clean shutdown prints the memory line,
 # a crash leaves a traceback, and anything else still being written is training.

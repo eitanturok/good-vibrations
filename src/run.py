@@ -26,14 +26,14 @@ from composer.core import Evaluator
 from composer.profiler import JSONTraceHandler, cyclic_schedule
 from composer.profiler.profiler import Profiler
 from composer.loggers import WandBLogger, FileLogger
-from composer.callbacks import RuntimeEstimator, SpeedMonitor, OOMObserver, NaNMonitor, SystemMetricsMonitor, OptimizerMonitor, LRMonitor
+from composer.callbacks import RuntimeEstimator, SpeedMonitor, OOMObserver, NaNMonitor, OptimizerMonitor, LRMonitor #, SystemMetricsMonitor
 from composer.optim import ConstantScheduler, CosineAnnealingScheduler, CosineAnnealingWithWarmupScheduler, LinearWithWarmupScheduler
 from composer.callbacks.speed_monitor import GPU_AVAILABLE_FLOPS
 
 from icecream import install; install()
 
 from model.callbacks import VisualizeSMask, OutputSaver, AttributionSaver, OUTPUT_EXTRACTORS, DEFAULT_OUTPUT_KEYS
-from model.dataset import build_dataset
+from model.dataset import build_dataset, combine_train_loaders
 from model.arch import VibrationTransformer, LOSSES, N_COUNT_CLASSES
 from model.boombox import BoomboxModel
 from utils.helpers import cleanup
@@ -75,9 +75,12 @@ def get_parser():
     # build data
     parser.add_argument("--data-dir",                    type=str,  default=BASE_DATA_DIR / "31_07_2026_gastronorm_exp1")
     parser.add_argument("--split",                      type=str,   default="gastronorm", help="Which split method from SPLIT_METHODS to use (e.g. 'exp22', 'exp23').")
+    parser.add_argument("--data-dir-2",                  type=str,   default=None, help="A second box's data-dir to train on jointly with --data-dir (e.g. training gastronorm + plastic together). Only the train split is merged (via ConcatDataset); eval stays per-box, one Evaluator per split from each dir. The two dirs must produce the same tensor shape -- same laser grid (see --laser-cols/--laser-rows), out_h/out_w, patch_size, signal_mode. Default None = single box.")
+    parser.add_argument("--split-2",                    type=str,   default=None, help="--data-dir-2 only. Which split method to use for the second box; required if --data-dir-2 is set.")
     parser.add_argument("--num-workers",                type=int,   default=4)
     parser.add_argument("--test-size",                  type=float, default=0.2)
     parser.add_argument("--laser-cols",                 type=str,   default=None, help="Comma-separated laser column ids to train on, e.g. '0,1,2,3,4'. Whole columns across every row, so the kept lasers stay a rectangle. Default None = all. The selection is applied where the fft is read off disk, so every normalization and reference statistic is computed over exactly these lasers -- which means each selection gets its own MDS build.")
+    parser.add_argument("--laser-rows",                 type=str,   default=None, help="Comma-separated laser row ids to train on, e.g. '0,1,2,3,4,5,6,7'. Whole rows across every kept column, so the kept lasers stay a rectangle. Default None = all. Same single-point selection as --laser-cols (composes with it), each combination gets its own MDS build.")
     parser.add_argument("--patch-size",                 type=int,   default=32)
 
     # data normalization
@@ -87,7 +90,12 @@ def get_parser():
     parser.add_argument("--learned-collapse",           action="store_true", help="boombox only. Replace the frequency stack's AdaptiveAvgPool with a learned (1,width) conv, so WHERE in the spectrum a filter fired survives the collapse instead of being averaged out. +328K params.")
     parser.add_argument("--freq-mult",                  type=int,   default=1, help="boombox only. Scale every frequency-stack width (32/64/128/256 -> x mult). NOTE this also scales the grid stack's input, so params grow well beyond the frequency stack itself.")
     parser.add_argument("--freq-depth",                 type=int,   default=1, help="boombox only. Stride-1 (1,3) blocks per stage, adding depth at each frequency scale. Unlike --freq-mult the output width is unchanged, so the grid stack costs nothing extra.")
-    parser.add_argument("--resize",                     type=str,   default="conv", choices=["conv", "bilinear"], help="boombox decoder. 'conv' absorbs the 24x32 -> out_h x out_w margin in a valid-mode head conv (no interpolation); 'bilinear' is the original resize, needed to load older checkpoints.")
+    parser.add_argument("--resize",                     type=str,   default="bilinear", choices=["conv", "bilinear"], help="DEPRECATED / inert. boombox decoder always bilinear-resamples the 32x32 feature map to out_h x out_w (when they differ) before a fixed 3x3 conv head. The old 'conv' mode degenerated to a 1x1 head conv at 32x32 and lost ~15-25%% held-out IoU.")
+    parser.add_argument("--coordconv",                  action="store_true", help="boombox only. Every conv in the decoder's upsampling stages + head becomes a CoordConv2d (Liu et al. 2018, arXiv:1807.03247): concatenates normalized (x,y) channels before each conv, so the decoder gets an explicit position input instead of having to infer 'where am I in the output grid' from context. See model/boombox.py CoordConv2d docstring.")
+    parser.add_argument("--decoder-arch",                type=str,   default="default", choices=["default", "masked-conv"], help="boombox only. 'masked-conv' is a conv analogue of Mask2Former's masked attention (Cheng et al. 2022, arXiv:2112.01527): after each upsampling stage (except the last), a 1x1 conv predicts a coarse mask, thresholded at 0.5, that gates (zeroes out) the background before the next stage runs. Trained with an auxiliary BCE loss on the intermediate masks (see --masked-conv-aux-weight). See model/boombox.py MaskedConvDecoder docstring.")
+    parser.add_argument("--masked-conv-aux-weight",     type=float, default=0.5, help="--decoder-arch masked-conv only. Weight on the auxiliary BCE loss over the intermediate gate masks (mean over stages), added to the main mask loss. Needed because an untrained (all-zero) gate kills gradient to every later decoder stage.")
+    parser.add_argument("--decoder-upsample",           type=str,   default="transposed", choices=["transposed", "pixelshuffle"], help="boombox only. 'pixelshuffle' swaps TwoBranchUp's ConvTranspose2d for sub-pixel (PixelShuffle) upsampling (Shi et al. 2016, arXiv:1609.05158), avoiding the periodic checkerboard artifact strided transposed convs are known to introduce (Odena et al., Distill 2016).")
+    parser.add_argument("--decoder-nonlocal-stage",     type=int,   default=None, help="boombox only. Insert a NonLocalBlock2d (Wang et al. 2018, arXiv:1711.07971 'Non-local Neural Networks', self-attention over the H*W feature map) after this many decoder upsampling stages have run, e.g. 1 = after the first TwoBranchUp at 8x8. Gives every spatial location a direct, one-layer path to every other location before later stages commit to fine pixel detail. None = disabled.")
     parser.add_argument("--signal-mode",                type=str,   default="magnitude", choices=["magnitude", "log_magnitude", "complex", "mag_phase", "mag_trig_phase"])
     parser.add_argument("--normalize-mode",             type=str,   default="std", help="Per-sample: std, z, per_laser_z. Train-split statistics: per_bin_z. Append '+token-mean' for token-level normalization.")
     parser.add_argument("--augment-mask",               type=float, default=0.5, help="Probability a sample gets mask augmentation (blur+noise). 0 disables.")
@@ -103,14 +111,17 @@ def get_parser():
 
     # filter data
     parser.add_argument("--n-samples",                  type=int,   default=None)
-    parser.add_argument("--speakers",                   type=int,   default=None)
+    parser.add_argument("--speakers",                   type=str,   default=None, help="Comma-separated speaker ids to restrict train+eval to, e.g. '1,3,5,7' (a single id also works, e.g. '1'). Default None = all speakers. Forwarded to the split fn (model.dataset._matches).")
+    parser.add_argument("--speaker-sample-per-position", type=int,  default=None, help="--split gastronorm only. Instead of a fixed --speakers set, draw this many speakers at random PER POSITION (independently, seeded by --seed) -- see model.dataset._sample_speakers_per_position. Mutually exclusive with --speakers.")
+    parser.add_argument("--train-speakers",             type=str,   default=None, help="--split gastronorm_speaker_gen only. Comma-separated speaker ids the model is ever trained on (replaces --speakers for this split).")
+    parser.add_argument("--eval-speakers",               type=str,   default=None, help="--split gastronorm_speaker_gen only. Comma-separated speaker ids to eval on; any id here not in --train-speakers is an unseen-speaker generalization leg (see model.dataset.gastronorm_speaker_gen). Default None = --train-speakers (no unseen leg).")
     parser.add_argument("--n-objects",                  type=int,   default=None)
     parser.add_argument("--box",                        type=str,   default=None)
 
     # arch
     parser.add_argument("--model",                      type=str,   default="transformer", choices=("transformer", "boombox"), help="transformer = VibrationTransformer; boombox = the conv encoder/decoder from arXiv 2105.08052.")
     parser.add_argument("--d-model",                    type=int,   default=128)
-    parser.add_argument("--decoder",                    type=str,   default='mlp', choices=('mlp', 'mlp-mid', 'attn', 'attn-no-rope', 'conv'), help="--model transformer only. 'conv' is boombox's transposed-conv decoder on the transformer's cls token, i.e. the freq+laser transformer encoder with the boombox decoder.")
+    parser.add_argument("--decoder",                    type=str,   default='mlp', choices=('mlp', 'mlp-mid', 'attn', 'attn-no-rope', 'masked-attn', 'conv'), help="--model transformer only. 'conv' is boombox's transposed-conv decoder on the transformer's cls token, i.e. the freq+laser transformer encoder with the boombox decoder. 'masked-attn' is AttnDecoder + Mask2Former-style masked attention: each layer predicts an intermediate mask, whose per-query confidence gates that query's cross-attention sharpness in the next layer (see model/arch.py MaskedAttnDecoder docstring for why it's a confidence gate rather than a literal per-token mask).")
     parser.add_argument("--decoder-num-heads",          type=int,   default=2)
     parser.add_argument("--decoder-num-layers",         type=int,   default=2)
     parser.add_argument("--ffn-dim",                    type=int,   default=None, help="Width of every transformer FFN (freq encoder, laser encoder, attn decoder). Default None = 4*d_model. Torch's own default is a fixed 2048, so pre-2026-08 runs had a 2048-wide FFN regardless of d_model; pass 2048 to reproduce them. No effect on --model boombox.")
@@ -120,6 +131,11 @@ def get_parser():
     parser.add_argument("--mlp-dec-hidden",             type=int,   default=None, help="Hidden width of MLPDecoder (default: 256).")
     parser.add_argument("--conv-dec-mult",              type=float, default=None, help="Base-channel multiplier for boombox Decoder (base channels = 512*mult).")
     parser.add_argument("--conv-dec-res-blocks",        type=int,   default=None, help="Residual blocks per TwoBranchUp scale in boombox Decoder.")
+    parser.add_argument("--mask-temp",                  type=float, default=4.0, help="--decoder masked-attn only. Scales per-query mask confidence into the next layer's cross-attn logit bias; higher = sharper gating.")
+    parser.add_argument("--memory-grid",                type=int,   default=0, choices=(0, 1), help="--decoder attn/attn-no-rope/masked-attn only. Project the L+1 laser-token memory onto a new learned out_h x out_w grid (2D RoPE'd over that same grid) before decoder cross-attention, so Q and K/V share sequence length and spatial index. Off by default (memory stays the raw laser token sequence).")
+    parser.add_argument("--key-pos",                    type=str,   default="none", choices=("none", "learned", "shared-rope"), help="--decoder attn/attn-no-rope/masked-attn only. 'learned' adds a learned per-laser 2D positional embedding (10x10 grid + 1 cls slot) to decoder memory right before cross-attention, so each key has an explicit learned identity, symmetric with the query side's learned query_seed + RoPE. 'shared-rope' instead gives queries (wall x-z plane) and keys (floor x-y plane) 2D RoPE that shares the SAME frequencies on the x channels, so query/key pairs with matching x get a zero relative rotation there (a free, unlearned 'same x -> related' bias) -- see --laser-x-span/--laser-x-offset for the (approximate) x-axis calibration between the two grids. Both modes incompatible with --memory-grid 1 (reshaped memory isn't laser-indexed).")
+    parser.add_argument("--laser-x-span",               type=float, default=1/3, help="--key-pos shared-rope only. Fraction of the wall's x-width the 10x10 laser grid's x-axis (assumed = laser grid cols) covers -- the laser doesn't shine across the box's full width. Approximate baseline calibration, not derived from real box geometry yet.")
+    parser.add_argument("--laser-x-offset",             type=float, default=0.0, help="--key-pos shared-rope only. Fraction of the wall's x-width where the laser grid's x-span starts (left edge). Approximate baseline calibration, not derived from real box geometry yet.")
     parser.add_argument("--pnt-num-heads",              type=int,   default=2)
     parser.add_argument("--seq-num-heads",              type=int,   default=2)
     parser.add_argument("--pnt-num-layers",             type=int,   default=2)
@@ -137,6 +153,7 @@ def get_parser():
     # loss
     parser.add_argument("--loss-fn",                    type=str,   default='mse', choices=list(LOSSES))
     parser.add_argument("--loss-alpha",                 type=float, default=0.5, help="for the -asym losses: weight on false negatives; >0.5 paints more, <0.5 holds back")
+    parser.add_argument("--loss-balanced",              type=int,   default=0, choices=(0, 1), help="ce-pixel-asym only: instead of pos_weight inside a reduction='mean' over ALL pixels (still diluted by the background:foreground pixel-count ratio -- a fixed pos_weight can't fully counteract sparse targets like gastronorm_one_cube's ~0.65%% occupancy), take the mean loss over positive pixels and negative pixels SEPARATELY and combine with alpha, so the false-negative/false-positive tradeoff no longer depends on the class prior.")
     parser.add_argument("--count-loss-weight",          type=float, default=0.0, help="weight on the auxiliary n_objects classification loss; 0 disables it (the head still runs, so count-acc stays readable as a free probe).")
 
     # train
@@ -238,13 +255,23 @@ def run(**kwargs):
 
     # dataset
     laser_cols = [int(c) for c in args.laser_cols.split(",") if c.strip()] if args.laser_cols else None
+    laser_rows = [int(r) for r in args.laser_rows.split(",") if r.strip()] if args.laser_rows else None
+    if args.speakers and args.speaker_sample_per_position:
+        raise ValueError("--speakers and --speaker-sample-per-position are mutually exclusive")
+    speakers = [int(s) for s in args.speakers.split(",")] if args.speakers else None
+    # only forwarded when set: not every split fn accepts speaker_sample_per_position/train_speakers/
+    # eval_speakers (only gastronorm()/gastronorm_speaker_gen() do), so passing them unconditionally
+    # (even as None) would break the others
+    speaker_kwargs = {"speaker_sample_per_position": args.speaker_sample_per_position} if args.speaker_sample_per_position else {}
+    if args.train_speakers: speaker_kwargs["train_speakers"] = [int(s) for s in args.train_speakers.split(",")]
+    if args.eval_speakers: speaker_kwargs["eval_speakers"] = [int(s) for s in args.eval_speakers.split(",")]
     train_loader, eval_loaders, train_eval_loader = build_dataset(
         args.data_dir, batch_size=args.batch_size, eval_batch_size=args.eval_batch_size, num_workers=args.num_workers,
-        split=args.split, test_size=args.test_size, speakers=args.speakers, n_objects=args.n_objects, box=args.box, n_samples=args.n_samples,
+        split=args.split, test_size=args.test_size, speakers=speakers, n_objects=args.n_objects, box=args.box, n_samples=args.n_samples,
         out_h=args.out_h, out_w=args.out_w, rgb=bool(args.rgb), signal_mode=args.signal_mode, normalize_mode=args.normalize_mode, patch_size=args.patch_size, seed=args.seed,
         augment_fft=args.augment_fft, augment_mask=args.augment_mask, subtract_speaker_mean=bool(args.subtract_speaker_mean), subtract_empty_box=bool(args.subtract_empty_box), mag_recipe=args.mag_recipe, phase_arm=args.phase_arm, phase_weight=args.phase_weight,
         force_rebuild_data=bool(args.force_rebuild_data), n_classes=N_COUNT_CLASSES, pair_speakers_mode=bool(args.pair_speakers),
-        laser_cols=laser_cols, device_eval_microbatch_size=microbatch(args.device_eval_microbatch_size))
+        laser_cols=laser_cols, laser_rows=laser_rows, device_eval_microbatch_size=microbatch(args.device_eval_microbatch_size), **speaker_kwargs)
     boundary_loaders = eval_loaders + [Evaluator(label='train', dataloader=train_eval_loader,
                                                  device_eval_microbatch_size=microbatch(args.device_eval_microbatch_size))]
     ensure_viz(args.data_dir, port=args.viz_port, enabled=not args.no_viz)
@@ -263,12 +290,33 @@ def run(**kwargs):
     print(f"laser grid: {n_laser_rows} rows x {n_laser_cols} cols = {n_lasers} lasers")
     print(f"{n_freqs_real} freq bins -> {n_patches} patches of {patch_size} = {n_patches * patch_size} ({n_patches * patch_size - n_freqs_real} padded)")
     if args.model == "boombox":
-        model = BoomboxModel(args.d_model, data_info, loss_fn=args.loss_fn, loss_alpha=args.loss_alpha, count_loss_weight=args.count_loss_weight, freq_dropout=args.freq_dropout, laser_dropout=args.laser_dropout, encoder=args.encoder, fuse=args.fuse, trim_pad=args.trim_pad, learned_collapse=args.learned_collapse, freq_mult=args.freq_mult, freq_depth=args.freq_depth, resize=args.resize)
+        model = BoomboxModel(args.d_model, data_info, loss_fn=args.loss_fn, loss_alpha=args.loss_alpha, count_loss_weight=args.count_loss_weight, freq_dropout=args.freq_dropout, laser_dropout=args.laser_dropout, encoder=args.encoder, fuse=args.fuse, trim_pad=args.trim_pad, learned_collapse=args.learned_collapse, freq_mult=args.freq_mult, freq_depth=args.freq_depth, resize=args.resize, decoder_arch=args.decoder_arch, coordconv=bool(args.coordconv), decoder_upsample=args.decoder_upsample, decoder_nonlocal_stage=args.decoder_nonlocal_stage, masked_conv_aux_weight=args.masked_conv_aux_weight)
     else:
         enc_ffn_dim = args.enc_ffn_dim if args.enc_ffn_dim is not None else args.ffn_dim
         dec_ffn_dim = args.dec_ffn_dim if args.dec_ffn_dim is not None else args.ffn_dim
-        model = VibrationTransformer(args.d_model, args.pnt_num_heads, args.pnt_num_layers, args.seq_num_heads, args.seq_num_layers, data_info, args.decoder, args.decoder_num_heads, args.decoder_num_layers, freq_dropout=args.freq_dropout, laser_dropout=args.laser_dropout, loss_fn=args.loss_fn, loss_alpha=args.loss_alpha, count_loss_weight=args.count_loss_weight, enc_ffn_dim=enc_ffn_dim, dec_ffn_dim=dec_ffn_dim, mlp_dec_depth=args.mlp_dec_depth, mlp_dec_hidden=args.mlp_dec_hidden, conv_dec_mult=args.conv_dec_mult, conv_dec_res_blocks=args.conv_dec_res_blocks)
+        model = VibrationTransformer(args.d_model, args.pnt_num_heads, args.pnt_num_layers, args.seq_num_heads, args.seq_num_layers, data_info, args.decoder, args.decoder_num_heads, args.decoder_num_layers, freq_dropout=args.freq_dropout, laser_dropout=args.laser_dropout, loss_fn=args.loss_fn, loss_alpha=args.loss_alpha, loss_balanced=bool(args.loss_balanced), count_loss_weight=args.count_loss_weight, enc_ffn_dim=enc_ffn_dim, dec_ffn_dim=dec_ffn_dim, mlp_dec_depth=args.mlp_dec_depth, mlp_dec_hidden=args.mlp_dec_hidden, conv_dec_mult=args.conv_dec_mult, conv_dec_res_blocks=args.conv_dec_res_blocks, mask_temp=args.mask_temp, memory_grid=bool(args.memory_grid), key_pos=args.key_pos, x_span=args.laser_x_span, x_offset=args.laser_x_offset)
     load_path = str(args.checkpoint_path) if args.checkpoint_path else None
+
+    # second box: train on the union of both, eval on each box's own splits separately (prefixed
+    # so e.g. gastronorm's eval/1-cube and plastic's eval/1-cube don't collide). data_info/model
+    # above are built from box 1 alone -- correct as long as both boxes share the same laser grid
+    # (arrange via --laser-rows/--laser-cols), out_h/out_w, patch_size, and signal_mode.
+    if args.data_dir_2:
+        if not args.split_2: raise ValueError("--data-dir-2 requires --split-2")
+        train_loader_2, eval_loaders_2, _ = build_dataset(
+            args.data_dir_2, batch_size=args.batch_size, eval_batch_size=args.eval_batch_size, num_workers=args.num_workers,
+            split=args.split_2, test_size=args.test_size, speakers=speakers, n_objects=args.n_objects, box=args.box, n_samples=args.n_samples,
+            out_h=args.out_h, out_w=args.out_w, rgb=bool(args.rgb), signal_mode=args.signal_mode, normalize_mode=args.normalize_mode, patch_size=args.patch_size, seed=args.seed,
+            augment_fft=args.augment_fft, augment_mask=args.augment_mask, subtract_speaker_mean=bool(args.subtract_speaker_mean), subtract_empty_box=bool(args.subtract_empty_box), mag_recipe=args.mag_recipe, phase_arm=args.phase_arm, phase_weight=args.phase_weight,
+            force_rebuild_data=bool(args.force_rebuild_data), n_classes=N_COUNT_CLASSES, pair_speakers_mode=bool(args.pair_speakers),
+            device_eval_microbatch_size=microbatch(args.device_eval_microbatch_size))
+        n_lasers_2 = train_loader_2.dataloader.dataset[0]['fft'].shape[0]
+        assert n_lasers_2 == n_lasers, f"--data-dir-2 has a {n_lasers_2}-laser grid, --data-dir has {n_lasers}; crop one to match (--laser-rows/--laser-cols) before combining"
+        generator = torch.Generator().manual_seed(args.seed)
+        train_loader = combine_train_loaders([train_loader, train_loader_2], args.batch_size, args.num_workers, generator)
+        for ev in eval_loaders_2: ev.label = f"box2-{ev.label}"
+        eval_loaders = eval_loaders + eval_loaders_2
+        boundary_loaders = boundary_loaders + eval_loaders_2
 
     # logger
     loggers = []
@@ -289,7 +337,10 @@ def run(**kwargs):
             )
 
     # callbacks
-    callbacks = [VisualizeSMask(args.viz_interval), NaNMonitor(), LRMonitor(), SystemMetricsMonitor(), SpeedMonitor(1),
+    # SystemMetricsMonitor() commented out: it calls pynvml.nvmlInit(), which raises NVMLError_LibRmVersionMismatch
+    # on hosts where the loaded NVIDIA kernel driver and the userspace NVML lib have drifted apart
+    # (a host-level mismatch, not a pip package problem -- nvidia-ml-py's own bundled shim hits it too).
+    callbacks = [VisualizeSMask(args.viz_interval), NaNMonitor(), LRMonitor(), SpeedMonitor(1), # SystemMetricsMonitor(),
                  OOMObserver(folder=f"runs/{{run_name}}/torch_traces", remote_file_name=None, overwrite=True), RuntimeEstimator(skip_batches=64, time_unit="minutes"),
                 OptimizerMonitor(log_optimizer_metrics=True, batch_log_interval=10)]
     if args.output_keys: callbacks.append(OutputSaver(args.eval_interval, f"runs/{{run_name}}/outputs_history", overwrite=True, output_keys=args.output_keys))

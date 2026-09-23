@@ -10,6 +10,7 @@ conversion between them -- see SPEC.md.
 """
 
 import json
+import time
 from pathlib import Path
 
 import numpy as np
@@ -27,9 +28,11 @@ STATIC = Path(__file__).parent / "static"
 IMMUTABLE = {"Cache-Control": "public, max-age=31536000, immutable"}
 
 
-def init(experiment_dir: Path = None, runs_dir: Path = None) -> Registry:
+def init(experiment_dir: Path = None, runs_dir: Path = None,
+        mask_override: tuple[int, int] | None = None) -> Registry:
     global registry
-    registry = Registry(experiment_dir or config.EXPERIMENT_DIR, runs_dir or config.RUNS_DIR)
+    registry = Registry(experiment_dir or config.EXPERIMENT_DIR,
+                        runs_dir or config.RUNS_DIR, mask_override)
     for name in registry.defaults():  # warm so the first paint has data
         registry.run(name)
     return registry
@@ -82,57 +85,79 @@ def api_runs():
     runs = [{"name": e.name, "compatible": e.compatible, "reason": e.reason,
              "mtime": e.mtime, "epoch": e.epoch, "eval_splits": e.eval_splits,
              "family": e.family, "status": e.status,
+             # Sorted so the client can deterministically pick the alphabetically-first
+             # dataset as a combined run's "by dataset" group in row-grouping mode.
+             "datasets": sorted(e.datasets),
              "shape": list(e.shape) if e.shape else None} for e in registry.entries]
     return {"runs": runs, "default_selected": registry.defaults(),
-            "n_samples": len(registry.gt), "render_version": config.RENDER_VERSION}
+            "n_samples": registry.n_samples, "render_version": config.RENDER_VERSION}
 
 
 @app.get("/api/samples")
 def api_samples():
-    gt = registry.gt
     out = []
-    for i, sid in enumerate(gt.sample_ids):
-        m = gt.meta[i]
-        com = gt.avg_com[i]
-        out.append({
-            # The SAMPLE ID, not the row. Every route the client calls with this value
-            # (`/api/backdrop/{sid}`, `/api/gt_mask.png?sid=`, `/api/frames?sids=`) resolves
-            # it through gt.row_of, and `/api/run/{name}` keys its per-sample metrics by
-            # sample id too. Emitting the row here made both of those lookups wrong on any
-            # dataset whose ids do not start at zero: gastronorm starts at 000009, so the
-            # ground-truth column resolved row->row-9 while the prediction column matched
-            # the row against a raw sample_id, putting two DIFFERENT scenes side by side.
-            "i": int(sid),
-            "sample_id": sid,
-            # position_id is the gastronorm spelling of output_id: the scene identity
-            # shared by the 8 samples that differ only in which speaker played.
-            "output_id": m.get("output_id") or m.get("position_id"),
-            "layout": m.get("layout"),
-            "n_objects": m.get("n_objects"),
-            # Object types present, independent of layout: lets the UI ask "contains a
-            # cylinder?" once the dataset holds more than cubes.
-            "objects": sorted(m.get("objects") or {}),
-            # The enclosure the scene sits in. Experiment-25 is entirely "metal", so the
-            # filter shows a single chip today; it populates itself if other boxes appear.
-            "box": m.get("box"),
-            "speaker": m.get("speaker"),
-            "is_empty_box": bool(m.get("is_empty_box")),
-            # full-resolution image coords, for the position scatter; [-1,-1] sentinel
-            # on empty-box samples means "no position"
-            "avg_com": [_clean(com[0]), _clean(com[1])],
-            "com_gt": [_clean(gt.com_gt[i][0]), _clean(gt.com_gt[i][1])],
-            # Width/height of the frame THIS sample's grid tiles. Per sample because the
-            # grid is a fixed (out_h,out_w) for every box, so the aspect it must be drawn
-            # at is the only thing that says which box it came from. /api/lut's `aspect`
-            # is a dataset-wide fallback and is wrong the moment two boxes are loaded.
-            "aspect": render.row_aspect(i),
-            # Target object centroids, normalized [0,1] cell centres, for the ground-truth
-            # column's crosshairs. The run columns carry their own (see /api/run "coms"),
-            # matched against the target at THEIR grid rather than this one.
-            "obj_com": [[round(float(r + 0.5) / gt.masks.shape[1], 4),
-                         round(float(c + 0.5) / gt.masks.shape[2], 4)]
-                        for r, c in (gt.obj_com[i] if i < len(gt.obj_com) else [])],
-        })
+    for gi, gt in enumerate(registry.gts):
+        for local, sid in enumerate(gt.sample_ids):
+            m = gt.meta[local]
+            com = gt.avg_com[local]
+            out.append({
+                # The GLOBAL sample id, not the row. Every route the client calls with
+                # this value (`/api/backdrop/{sid}`, `/api/gt_mask.png?sid=`,
+                # `/api/frames?sids=`) resolves it through registry.row_of, and
+                # `/api/run/{name}` keys its per-sample metrics by sample id too. Emitting
+                # the row here made both of those lookups wrong on any dataset whose ids
+                # do not start at zero: gastronorm starts at 000009, so the ground-truth
+                # column resolved row->row-9 while the prediction column matched the row
+                # against a raw sample_id, putting two DIFFERENT scenes side by side. With
+                # one experiment loaded this is just the raw sample id, unchanged.
+                "i": registry.global_id(gi, int(sid)),
+                "sample_id": sid,
+                # Which experiment dir this sample came from -- not needed by today's UI
+                # (box already disambiguates), but cheap to carry for whatever needs it
+                # next, e.g. two experiments someday sharing a box value.
+                "experiment": gt.experiment_dir.name,
+                # position_id is the gastronorm spelling of output_id: the scene identity
+                # shared by the 8 samples that differ only in which speaker played.
+                "output_id": m.get("output_id") or m.get("position_id"),
+                "layout": m.get("layout"),
+                "n_objects": m.get("n_objects"),
+                # Object types present, independent of layout: lets the UI ask "contains a
+                # cylinder?" once the dataset holds more than cubes.
+                "objects": sorted(m.get("objects") or {}),
+                # The enclosure the scene sits in. Each experiment dir is one box today, so
+                # this filter populates itself with one chip per loaded experiment.
+                "box": m.get("box"),
+                # Which capture this sample belongs to -- same value as `experiment`
+                # above (one experiment dir = one capture), NOT `gt.layout.dataset`, which
+                # names a filename SCHEME and is shared by several distinct captures (every
+                # gastronorm-family box -- wood/cardboard/shoebox/gastronorm/green-plastic
+                # -- uses the one "gastronorm" layout entry, which would collapse them all
+                # into a single bucket). Drives the "by dataset" row-grouping mode and the
+                # dataset filter/chip, and is shown in the sample identity label -- both
+                # need "which real capture is this", not "which schema does it parse as".
+                "dataset": gt.experiment_dir.name,
+                "speaker": m.get("speaker"),
+                "is_empty_box": bool(m.get("is_empty_box")),
+                # full-resolution image coords, for the position scatter; [-1,-1] sentinel
+                # on empty-box samples means "no position"
+                "avg_com": [_clean(com[0]), _clean(com[1])],
+                "com_gt": [_clean(gt.com_gt[local][0]), _clean(gt.com_gt[local][1])],
+                # Width/height of the frame THIS sample's grid tiles. Per sample because
+                # the grid is a fixed (out_h,out_w) for every box, so the aspect it must be
+                # drawn at is the only thing that says which box it came from. /api/lut's
+                # `aspect` is a fallback and is wrong the moment two boxes are loaded.
+                "aspect": render.aspect_for_box(m.get("box")),
+                # True pixel (width, height) of that same frame -- the table cell draws
+                # every box at one uniform size now, so this is what the corner label
+                # shows to say what shape got stretched to fit it.
+                "dims": render.dims_for_box(m.get("box")),
+                # Target object centroids, normalized [0,1] cell centres, for the ground-truth
+                # column's crosshairs. The run columns carry their own (see /api/run "coms"),
+                # matched against the target at THEIR grid rather than this one.
+                "obj_com": [[round(float(r_ + 0.5) / gt.masks.shape[1], 4),
+                             round(float(c_ + 0.5) / gt.masks.shape[2], 4)]
+                            for r_, c_ in (gt.obj_com[local] if local < len(gt.obj_com) else [])],
+            })
     return {"samples": out}
 
 
@@ -140,6 +165,7 @@ def api_samples():
 def api_run(name: str, reload: int = 0, epoch: int | None = None):
     """Per-sample metrics for one run. `epoch` scores that saved epoch instead of the
     latest, so the numbers and sorting match the masks on screen while scrubbing."""
+    _t0 = time.perf_counter()
     # reload=1 re-reads the run's prediction files, picking up epochs written since it
     # was first loaded (a run still training keeps producing them).
     if reload:
@@ -148,9 +174,13 @@ def api_run(name: str, reload: int = 0, epoch: int | None = None):
         rd = registry.run(name, reload=bool(reload), epoch=epoch)
     except KeyError:
         raise HTTPException(404, "unknown or incompatible run")
+    _t_loaded = time.perf_counter()
+    # rd.global_ids is the GLOBAL id per row (load_run already routed each row to its own
+    # experiment, since a combined run can predict more than one box). The client matches
+    # this dict against s.i (app.js: `r.samples[s.i]`), which is that same global id.
     samples = {}
-    for i, sid in enumerate(rd.sample_ids):
-        samples[int(sid)] = {
+    for i, gid in enumerate(rd.global_ids):
+        samples[int(gid)] = {
             "split": rd.splits[i],
             "com": [_clean(rd.com_pred[i][0]), _clean(rd.com_pred[i][1])],
             # Crosshair geometry: matched prediction/target object centroids, plus the
@@ -159,6 +189,11 @@ def api_run(name: str, reload: int = 0, epoch: int | None = None):
             "coms": rd.com_pairs[i] if i < len(rd.com_pairs) else None,
             **{k: _clean(rd.metrics[k][i]) for k in rd.metrics},
         }
+    # See PERF_NOTES.md: separates "registry.run() (cache hit, or the load_run print
+    # above)" from "building this endpoint's own JSON dict", the two phases inside the
+    # /api/run request itself.
+    print(f"[viz] /api/run/{name}: registry.run()={_t_loaded - _t0:.2f}s, "
+          f"json-build={time.perf_counter() - _t_loaded:.2f}s", flush=True)
     return {"name": rd.name, "epoch": rd.epoch, "family": rd.family,
             # The grid this run predicts at. The client sizes the column's canvas from it,
             # so a 16x16 run and a 30x30 run render correctly in the same table.
@@ -227,13 +262,14 @@ def api_values(sid: int, run: str = "", mode: str = "pred", shape: str = ""):
     truth/diff overlays of a run trained at a non-default grid.
     """
     i = _sid(sid)
+    _, gt, r = registry.locate(i)
     if not run:
-        values = registry.gt.masks[i]
+        values = gt.masks[r]
         if shape:
-            alt = registry.gt.masks_at(_parse_shape(shape))
+            alt = gt.masks_at(_parse_shape(shape))
             if alt is None:
                 raise HTTPException(404, f"no ground truth at {shape}")
-            values = alt[i]
+            values = alt[r]
     else:
         rd = _run(run)
         if i not in rd.row_of:
@@ -241,18 +277,18 @@ def api_values(sid: int, run: str = "", mode: str = "pred", shape: str = ""):
         values = rd.masks[rd.row_of[i]]
         # Ground truth at this run's grid, since diff/overlay are elementwise and the
         # table can hold runs at several resolutions at once.
-        gt_masks = registry.gt.masks_at(rd.shape)
+        gt_masks = gt.masks_at(rd.shape)
         if gt_masks is None:
             return JSONResponse({"v": np.round(values.astype(np.float64), 4).tolist()},
                                 headers=IMMUTABLE)
         if mode == "diff":
-            values = values - gt_masks[i]
+            values = values - gt_masks[r]
         elif mode in ("overlay", "stacked"):
             # Two masks are on screen, so report both rather than leaving the reader to
             # guess which one a single number belongs to.
             return JSONResponse(
                 {"v": np.round(values.astype(np.float64), 4).tolist(),
-                 "t": np.round(gt_masks[i].astype(np.float64), 4).tolist()},
+                 "t": np.round(gt_masks[r].astype(np.float64), 4).tolist()},
                 headers=IMMUTABLE)
     return JSONResponse({"v": np.round(values.astype(np.float64), 4).tolist()},
                         headers=IMMUTABLE)
@@ -263,7 +299,9 @@ def api_values(sid: int, run: str = "", mode: str = "pred", shape: str = ""):
 
 @app.get("/api/overhead/{sid}.png")
 def api_overhead(sid: int):
-    p = registry.sample_dir(_sid(sid)) / registry.gt.layout.overhead
+    i = _sid(sid)
+    _, gt, r = registry.locate(i)
+    p = registry.sample_dir(i) / gt.layout.overhead
     if not p.exists():
         raise HTTPException(404, "no overhead image")
     return FileResponse(p, media_type="image/png", headers=IMMUTABLE)
@@ -282,12 +320,14 @@ def api_vibration(sid: int, which: str):
 
 @app.get("/api/audio/{sid}/{which}")
 def api_audio(sid: int, which: str):
-    rel = registry.gt.layout.audio.get(which)
+    i = _sid(sid)
+    _, gt, r = registry.locate(i)
+    rel = gt.layout.audio.get(which)
     if rel is None:
         # Either an unknown name or a track this layout never produces (the gastronorm
         # captures ship no source audio, only the recovered waveform).
         raise HTTPException(404, "unknown audio")
-    p = registry.sample_dir(_sid(sid)) / rel
+    p = registry.sample_dir(i) / rel
     if not p.exists():
         raise HTTPException(404, "not generated for this sample")
     # FileResponse handles Range requests, which <audio> needs in order to seek.
@@ -304,7 +344,9 @@ def api_lut():
             # FALLBACK grid only, for a cell whose run has not reported its shape yet.
             # Not "the table's grid": columns each draw at their own resolution, and the
             # thing that actually drives layout is `aspect`, which is grid-independent.
-            "h": config.MASK_H, "w": config.MASK_W,
+            # Taken from the first loaded experiment -- there is no single grid shared by
+            # every experiment once more than one is loaded.
+            "h": registry.gts[0].masks.shape[1], "w": registry.gts[0].masks.shape[2],
             # Width/height of the cropped frame the masks were downsampled from. The mask
             # grid tiles that frame uniformly, so the CELL BOX must use this aspect, not
             # w/h -- a 30x30 grid over a 2.2-aspect scene is not square, and drawing it in
@@ -323,35 +365,37 @@ def api_frames(run: str, sids: str, epochs: str = ""):
     Layout: float16[n_epochs][n_sids][H*W], C-order. Samples the run never predicted are
     filled with NaN so the client can show its "no prediction" state.
     """
-    # load_epoch_masks matches against the raw sample_id stored in each .pt, so `want`
-    # must hold SAMPLE IDS, not rows. sample_index is still called for its side effect of
-    # rejecting an id this dataset does not have -- resolving to a row and then looking
-    # that row up as an id silently returned another sample's prediction.
-    ids = []
+    entry = registry.by_name.get(run)
+    if entry is None or not entry.compatible:
+        raise HTTPException(404, "unknown or incompatible run")
+
+    # load_epoch_masks matches against the raw LOCAL sample_id + box stored in each .pt,
+    # not the GLOBAL id the client sends -- decode each one via locate() rather than a
+    # single per-run offset, since a combined run can predict more than one experiment and
+    # each sid can belong to a different one.
+    pairs = []   # (local_id, box) -- box disambiguates ids that collide across experiments
     for s in sids.split(","):
         if s.strip():
-            registry.sample_index(s)
-            ids.append(int(s))
-    if not ids:
+            row = registry.sample_index(s)   # validates + rejects an id no experiment has
+            _, gt, local_row = registry.locate(row)
+            pairs.append((int(gt.sample_ids[local_row]), gt.meta[local_row].get("box")))
+    if not pairs:
         raise HTTPException(400, "no sids")
     eps = [int(e) for e in epochs.split(",") if e.strip()] or registry.epochs(run)
     if not eps:
         raise HTTPException(404, "run has no saved epochs")
 
-    if run not in registry.by_name or not registry.by_name[run].compatible:
-        raise HTTPException(404, "unknown or incompatible run")
-
     # Sized from THIS run's grid, not the global default: the table mixes resolutions, so
     # a fixed cell count would truncate a finer run's mask or pad a coarser one. A
     # compatible entry always carries a shape (_classify sets it), and the guard above
     # already rejected anything else.
-    h, w = registry.by_name[run].shape
-    want = set(ids)
-    out = np.full((len(eps), len(ids), h * w), np.nan, dtype=np.float16)
+    h, w = entry.shape
+    want = set(pairs)
+    out = np.full((len(eps), len(pairs), h * w), np.nan, dtype=np.float16)
     for ei, ep in enumerate(eps):
         masks = data.load_epoch_masks(run, registry.runs_dir, ep, want)
-        for si, i in enumerate(ids):
-            m = masks.get(i)
+        for si, pair in enumerate(pairs):
+            m = masks.get(pair)
             if m is not None:
                 out[ei, si] = m.reshape(-1)
     return Response(out.tobytes(), media_type="application/octet-stream", headers=IMMUTABLE)
@@ -371,7 +415,10 @@ def api_neighbors(run: str, sid: int, k: int = 5):
         raise HTTPException(404, "no prediction for this sample")
     pred = np.asarray(rd.com_pred[rd.row_of[i]], dtype=np.float64)
 
-    gt = registry.gt
+    # Neighbours are searched within the SAME experiment the queried sample came from --
+    # comparing "which real scene looks like this prediction" only makes sense against
+    # scenes captured in the same box.
+    gi, gt, r = registry.locate(i)
     # Grid cells are not square (20 rows x 40 cols over the same scene), so normalise to
     # [0,1] on each axis before measuring -- otherwise a column offset counts double.
     # Scale by THIS RUN's grid, and compare against targets measured on that same grid:
@@ -425,9 +472,10 @@ def api_neighbors(run: str, sid: int, k: int = 5):
 
     def pack(idx):
         m = gt.meta[idx]
-        # "i" is the sample id, matching /api/samples: the client both requests
+        # "i" is the GLOBAL sample id, matching /api/samples: the client both requests
         # /api/gt_mask.png?sid= with it and matches it against s.i to open the row.
-        return {"i": int(gt.sample_ids[idx]), "sample_id": gt.sample_ids[idx],
+        return {"i": registry.global_id(gi, int(gt.sample_ids[idx])),
+                "sample_id": gt.sample_ids[idx],
                 "output_id": m.get("output_id") or m.get("position_id"),
                 "speaker": m.get("speaker"),
                 "layout": m.get("layout"), "n_objects": m.get("n_objects"),
@@ -436,10 +484,10 @@ def api_neighbors(run: str, sid: int, k: int = 5):
 
     # Every coordinate in this payload is in the run's grid, so the modal can print
     # pred_com and gt_com side by side without them meaning different things.
-    return {"run": run, "sample_id": gt.sample_ids[i],
+    return {"run": run, "sample_id": gt.sample_ids[r],
             "shape": [rd.shape[0], rd.shape[1]],
             "pred_com": [_clean(pred[0]), _clean(pred[1])],
-            "gt_com": [_clean(com_gt[i][0]), _clean(com_gt[i][1])],
+            "gt_com": [_clean(com_gt[r][0]), _clean(com_gt[r][1])],
             "n_candidates": len(order),
             "most_similar": [pack(j) for j in distinct(order)],
             "least_similar": [pack(j) for j in distinct(order[::-1])]}
@@ -448,7 +496,8 @@ def api_neighbors(run: str, sid: int, k: int = 5):
 @app.get("/api/detail/{sid}")
 def api_detail(sid: int, shape: str = ""):
     i = _sid(sid)
-    m = registry.gt.meta[i]
+    _, gt, r = registry.locate(i)
+    m = gt.meta[r]
     d = registry.sample_dir(i)
     # Union of both eras' metadata: experiment-25 writes output_id/n_lasers, the
     # gastronorm captures write position_id/laser_idx/timestamp/n_rows/n_cols. Missing
@@ -464,17 +513,19 @@ def api_detail(sid: int, shape: str = ""):
     # COM and the grid it is measured in, kept together so the modal can never print one
     # against the other. `shape` follows the table's ground-truth column, so the modal
     # agrees with the row it was opened from rather than reporting a resolution nothing
-    # on screen uses. Falls back to the primary grid when the size has no targets.
-    grid = (config.MASK_H, config.MASK_W)
-    com = registry.gt.com_gt
+    # on screen uses. Falls back to THIS SAMPLE'S OWN experiment's primary grid (not a
+    # process-wide default, which is meaningless once experiments with different native
+    # grids are loaded together) when the requested size has no targets.
+    grid = (gt.masks.shape[1], gt.masks.shape[2])
+    com = gt.com_gt
     if shape:
         want = _parse_shape(shape)
-        alt = registry.gt.com_at(want)
+        alt = gt.com_at(want)
         if alt is not None:
             grid, com = want, alt
-    out["com_gt_grid"] = [_clean(com[i][0]), _clean(com[i][1])]
+    out["com_gt_grid"] = [_clean(com[r][0]), _clean(com[r][1])]
     out["grid"] = list(grid)
-    audio = registry.gt.layout.audio
+    audio = gt.layout.audio
     out["has"] = {
         # A track the layout does not define is simply absent, so the modal hides it
         # rather than offering a control that 404s.

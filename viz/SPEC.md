@@ -73,7 +73,47 @@ the mask is stretched onto it anisotropically — which exactly undoes the aniso
 binning that produced the mask, landing every cell back on the pixels it averaged. So a
 21x30 and a 20x40 mask of the same scene occupy the same box and align over the same photo.
 
-## 5. The rule
+## 5. Multiple experiments
+
+`Registry` can hold more than one `GtIndex` (one per experiment dir under a parent
+`experiments/`), each with its own local `SampleId`/`Row` spaces as described above. Two
+more ids sit on top:
+
+| | `GlobalId` | `Row` (as above) |
+|---|---|---|
+| is | `gi * ID_STRIDE + local SampleId` | a single index into a flat space spanning every loaded experiment |
+| domain | sparse, one disjoint 1,000,000-wide block per experiment | dense, `0 .. registry.n_samples-1` |
+| authoritative for | the wire, same as `SampleId` was (URLs, JSON `s.i`) | every numpy/torch array, same as `Row` was |
+| from | `registry.global_id(gi, local_id)` | `_sid()` / `registry.sample_index()`, same entry point as before |
+
+`Registry.locate(row) -> (gi, gt, local_row)` is the single place a flat row resolves back
+to which experiment's `GtIndex` it came from and that experiment's own local row — the
+multi-experiment analog of `_sid()`. With exactly one experiment loaded, `gi == 0`,
+`GlobalId == local SampleId` and `Row == local row`, so single-experiment behaviour
+(including `ensure_viz`'s per-training-job auto-launch) is bit-for-bit unchanged.
+
+A run's predictions are NOT assumed to belong to one experiment: `load_run` now takes the
+whole `Registry` and routes every predicted row to its own experiment via
+`Registry.route(local_id, box)`, using the `box` field each `.pt`'s `info` carries per
+sample (falling back to id-overlap against every loaded experiment for runs saved before
+`box` existed). This matters because a "combined" training run can predict samples from
+more than one box in the same eval, with per-box-local ids that are NOT unique across
+experiments -- two boxes can both have a `000010`. `RunData.row_of` still ends up keyed
+by `Row` exactly as section 2/5 describe, and `RunData.global_ids` (parallel to
+`sample_ids`) carries each row's own `GlobalId`, computed from ITS OWN routed `gi` rather
+than one shared run-level offset.
+
+`/api/frames` is still the one place that works in `SampleId`/`GlobalId` space end-to-end
+(see section 2), and it too has to be per-row now: it decodes each requested `GlobalId`
+via `registry.locate()` into `(local_id, box)` and matches `load_epoch_masks` on that pair
+(not the bare id), so two experiments' colliding local ids can never serve each other's
+mask. Do not "fix" this into row space either; both exceptions exist for the same reason
+(`load_epoch_masks` matches ids read straight out of the `.pt`, never rows).
+
+`/api/run/{name}`'s per-sample `samples` dict is keyed by `GlobalId`, read straight off
+`RunData.global_ids` (to match `/api/samples`' `s.i`, which `app.js` looks it up by).
+
+## 6. The rule
 
 **`_sid()` in `app.py` is the only `SampleId` → `Row` conversion, and it happens once per
 request, at the HTTP edge. Below `app.py`, everything is a `Row`.**

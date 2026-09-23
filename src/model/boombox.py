@@ -12,8 +12,6 @@ What changes here:
 * No depth head: this dataset has no depth target.
 """
 
-import warnings
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -184,18 +182,107 @@ class TwoStreamEncoder(nn.Module):
                 else torch.cat([m, p], dim=1)
         return self.grid(m.reshape(x.shape[0], -1, *self.grid_shape)).flatten(1)
 
+class CoordConv2d(nn.Module):
+    """Liu et al., "An Intriguing Failing of Convolutional Neural Networks and the
+    CoordConv Solution" (NeurIPS 2018, https://arxiv.org/abs/1807.03247). A plain conv
+    is translation-equivariant: the same kernel produces the same output no matter
+    WHERE in the feature map it fires, so the network has no direct way to represent
+    "this activation belongs at row 3, column 9" -- it has to infer position
+    indirectly from where a signal happens to land, which the paper shows can fail
+    outright even on trivial coordinate-regression tasks. CoordConv concatenates two
+    extra channels -- normalized (x,y) in [-1,1] -- onto the input before every conv,
+    making position an explicit, always-available input instead of something the
+    receptive field has to reconstruct. Used in the decoder (see --coordconv), which
+    is exactly where this model has to turn a bottleneck embedding into precise pixel
+    positions."""
+    def __init__(self, c_in, c_out, kernel, stride=1, padding=0):
+        super().__init__()
+        self.conv = nn.Conv2d(c_in + 2, c_out, kernel, stride=stride, padding=padding)
+
+    def forward(self, x):
+        B, _, H, W = x.shape
+        yy = torch.linspace(-1, 1, H, device=x.device, dtype=x.dtype).view(1, 1, H, 1).expand(B, 1, H, W)
+        xx = torch.linspace(-1, 1, W, device=x.device, dtype=x.dtype).view(1, 1, 1, W).expand(B, 1, H, W)
+        return self.conv(torch.cat([x, xx, yy], dim=1))
+
+def _conv2d(c_in, c_out, kernel, stride=1, padding=0, coordconv=False):
+    cls = CoordConv2d if coordconv else nn.Conv2d
+    return cls(c_in, c_out, kernel, stride=stride, padding=padding)
+
+class PixelShuffleUp(nn.Module):
+    """Shi et al., "Real-Time Single Image and Video Super-Resolution Using an
+    Efficient Sub-Pixel Convolutional Neural Network" (CVPR 2016,
+    https://arxiv.org/abs/1609.05158). A stride-2 ConvTranspose2d (this model's
+    default upsampler, in TwoBranchUp) computes each output pixel from overlapping,
+    unevenly-spaced input windows, which is the textbook cause of the checkerboard
+    grid artifact documented in Odena et al., "Deconvolution and Checkerboard
+    Artifacts" (Distill 2016, https://distill.pub/2016/deconv-checkerboard/) --
+    exactly the kind of periodic bias that corrupts precise pixel localization.
+    PixelShuffle instead computes all r^2 sub-pixel positions with one ordinary
+    (evenly-strided) conv, then rearranges channels into space, so there is no
+    overlap pattern to alias into a grid."""
+    def __init__(self, c_in, c_out, coordconv=False):
+        super().__init__()
+        self.conv = _conv2d(c_in, c_out * 4, 3, padding=1, coordconv=coordconv)
+        self.shuffle = nn.PixelShuffle(2)
+
+    def forward(self, x): return self.shuffle(self.conv(x))
+
 class TwoBranchUp(nn.Module):
     """The paper's decoder layer: a transposed conv, and a conv then a transposed
     conv, concatenated. Branch (b)'s extra conv is what stops the two branches
-    collapsing to the same function."""
-    def __init__(self, c_in, c_out):
+    collapsing to the same function.
+
+    `upsample='pixelshuffle'` swaps both branches' ConvTranspose2d for PixelShuffleUp
+    (see its docstring); `coordconv=True` makes every conv in this block a CoordConv2d
+    (see its docstring)."""
+    def __init__(self, c_in, c_out, upsample:str='transposed', coordconv:bool=False):
         super().__init__()
-        self.a = nn.ConvTranspose2d(c_in, c_out // 2, 4, stride=2, padding=1)
-        self.b = nn.Sequential(nn.Conv2d(c_in, c_in, 3, padding=1), nn.ReLU(inplace=True),
-                               nn.ConvTranspose2d(c_in, c_out // 2, 4, stride=2, padding=1))
+        if upsample == 'transposed':
+            self.a = nn.ConvTranspose2d(c_in, c_out // 2, 4, stride=2, padding=1)
+            up_b = nn.ConvTranspose2d(c_in, c_out // 2, 4, stride=2, padding=1)
+        elif upsample == 'pixelshuffle':
+            self.a = PixelShuffleUp(c_in, c_out // 2, coordconv=coordconv)
+            up_b = PixelShuffleUp(c_in, c_out // 2, coordconv=coordconv)
+        else:
+            raise ValueError(f"unknown upsample mode: {upsample}")
+        self.b = nn.Sequential(_conv2d(c_in, c_in, 3, padding=1, coordconv=coordconv), nn.ReLU(inplace=True), up_b)
         self.out = nn.Sequential(nn.BatchNorm2d(c_out), nn.ReLU(inplace=True))
 
     def forward(self, x): return self.out(torch.cat([self.a(x), self.b(x)], dim=1))
+
+class NonLocalBlock2d(nn.Module):
+    """Wang et al., "Non-local Neural Networks" (CVPR 2018,
+    https://arxiv.org/abs/1711.07971). Every conv in this decoder only mixes a local
+    kxk neighbourhood, so two spatial locations only start to influence each other
+    once enough stacked layers make their receptive fields overlap -- e.g. a cube's
+    near edge cannot directly inform the prediction at its far edge without real
+    depth. A non-local block computes one similarity-weighted average over ALL other
+    locations per query (plain self-attention over the H*W feature map, "embedded
+    Gaussian" instantiation), giving every location a direct path to every other
+    location in a single layer. Applied at the decoder's 8x8 stage (64 tokens) --
+    cheap enough there to run as O(HW^2), and coarse enough that long-range spatial
+    reasoning (how many objects, how far apart) is still cheap to learn before the
+    later stages commit to fine pixel detail. `out` is zero-initialized so the block
+    starts as an identity function (pure residual) and only earns a nonzero
+    contribution once training rewards using it."""
+    def __init__(self, c, c_inter:int|None=None):
+        super().__init__()
+        c_inter = c_inter or max(c // 2, 1)
+        self.theta = nn.Conv2d(c, c_inter, 1)
+        self.phi = nn.Conv2d(c, c_inter, 1)
+        self.g = nn.Conv2d(c, c_inter, 1)
+        self.out = nn.Conv2d(c_inter, c, 1)
+        nn.init.zeros_(self.out.weight); nn.init.zeros_(self.out.bias)
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+        theta = self.theta(x).flatten(2)                                    # (B,Ci,HW)
+        phi = self.phi(x).flatten(2)                                        # (B,Ci,HW)
+        g = self.g(x).flatten(2)                                            # (B,Ci,HW)
+        attn = torch.softmax(theta.transpose(1, 2) @ phi / (theta.shape[1] ** 0.5), dim=-1)  # (B,HW,HW)
+        y = (g @ attn.transpose(1, 2)).view(B, -1, H, W)
+        return x + self.out(y)
 
 class ResBlock(nn.Module):
     """Same-resolution refinement block: y = x + f(x), two 3x3 convs (stride 1, 'same'
@@ -213,63 +300,130 @@ class ResBlock(nn.Module):
 
 class Decoder(nn.Module):
     """(B,D) -> (B,out_h,out_w), or (B,out_h,out_w,out_c) when out_c > 1. Seeds a 4x4
-    grid and doubles it three times to 32x32 -- the standardized output grid (run.py
-    --out-h/--out-w default to 32, so the conv head below is a no-op 1x1 in the common case).
+    grid and triples it (stride-2 transposed convs) to a 32x32 feature map, then a 3x3
+    conv head cleans up the transposed-conv checkerboard and emits the mask.
 
-    An out_h x out_w that is smaller than 32x32 (a box run at 21x30, say) needs the 32x32
-    feature map reconciled with it. `resize` picks how. 'conv' (default) makes the head's
-    first conv valid-mode with a kernel sized to eat exactly the 32 - out margin: no
-    interpolation, and the head convs then run on real feature-map pixels rather than
-    resampled ones. It is not the asymmetric *crop* the old comment warned about -- a conv
-    sees every input position, so no edge is discarded. 'conv' needs 32x32 >= out_h x out_w;
-    for an output over 32 in some axis it can't, so the decoder falls back to 'bilinear' with
-    a warning. 'bilinear' is the original behaviour, kept because checkpoints trained with it
-    need it to load.
+    An out_h x out_w below 32 in either axis (a box run at 21x30, say) is reconciled by a
+    bilinear resample of the 32x32 feature map BEFORE the head, so the head always runs at
+    the target resolution with its full 3x3 receptive field.
+
+    `resize` is kept for backwards compatibility but is now INERT. The old 'conv' mode
+    sized the head's first conv to a valid-mode kernel that ate the 32 - out margin; at the
+    standardized 32x32 grid that margin is 0, so the kernel degenerated to 1x1 -- a pure
+    channel projection with no spatial mixing -- which cost ~15-25% held-out IoU and much
+    slower convergence (grid ablation, 2026-09-10: 32x32+conv 0.242 vs 32x32+bilinear 0.300
+    vs hyb-h2 0.285, peak 1-cube/2-cubes soft-IoU). Both modes now do the same thing.
+
+    The head is 3 stacked size-preserving 3x3 convs (padding 1): two hidden 3x3 layers of
+    spatial mixing over the transposed-conv output before the projection to out_c. Changing
+    the head shape breaks loading pre-32x32 boombox checkpoints -- accepted.
+
+    Three orthogonal modifiers, all off by default (identical to the original arch when all
+    are left at default):
+    * `coordconv`: every conv in the upsampling stages and the head becomes a CoordConv2d
+      (see its docstring) -- gives the decoder an explicit position input everywhere it turns
+      the bottleneck embedding into pixels.
+    * `upsample='pixelshuffle'`: swap TwoBranchUp's ConvTranspose2d for PixelShuffleUp (see
+      its docstring) -- avoids the transposed-conv checkerboard pattern.
+    * `nonlocal_stage`: insert a NonLocalBlock2d (see its docstring) after this many upsampling
+      stages have run (e.g. 1 = after the first TwoBranchUp, at 8x8) -- gives every spatial
+      location a direct, one-layer path to every other location before the later stages commit
+      to fine pixel detail. None disables it.
     """
     SEED = (4, 4)
 
-    def __init__(self, d_model, out_h, out_w, out_c=1, resize='conv', mult:float=1.0, num_res_blocks:int|None=None):
+    def __init__(self, d_model, out_h, out_w, out_c=1, resize='bilinear', mult:float=1.0, num_res_blocks:int|None=None,
+                 coordconv:bool=False, upsample:str='transposed', nonlocal_stage:int|None=None):
         super().__init__()
-        self.out_hw, self.out_c, self.resize = (out_h, out_w), out_c, resize
+        self.out_hw, self.out_c = (out_h, out_w), out_c
+        self.resize = resize  # accepted for backwards compat, no longer used (see docstring)
+        self.nonlocal_stage = nonlocal_stage
         base = int(512 * mult)
         self.base = base  # store for use in forward()
         self.project = nn.Linear(d_model, base * self.SEED[0] * self.SEED[1])
         # Default: 3 upsampling stages (512->256->128->64). num_res_blocks adds that many
         # same-resolution ResBlocks after each TwoBranchUp -- refinement depth, not more
         # upsampling (TwoBranchUp itself always doubles spatial size via stride-2 transposed
-        # convs, even at equal in/out channels, so it can't be reused for this).
+        # convs, even at equal in/out channels, so it can't be reused for this). Each stage is
+        # its own nn.Sequential (not one flat stack) so a subclass (MaskedConvDecoder) can hook
+        # in between stages; NonLocalBlock2d is inserted the same way via nonlocal_stage.
         widths = [base, base // 2, base // 4, base // 8]
-        up_layers = []
+        self.stages = nn.ModuleList()
         for i in range(len(widths) - 1):
-            up_layers.append(TwoBranchUp(widths[i], widths[i + 1]))
+            stage = [TwoBranchUp(widths[i], widths[i + 1], upsample=upsample, coordconv=coordconv)]
             if num_res_blocks:
-                for _ in range(num_res_blocks):
-                    up_layers.append(ResBlock(widths[i + 1]))
-        self.up = nn.Sequential(*up_layers)
-        up_h, up_w = self.SEED[0] * 8, self.SEED[1] * 8
+                stage += [ResBlock(widths[i + 1]) for _ in range(num_res_blocks)]
+            self.stages.append(nn.Sequential(*stage))
+        self.nonlocal_block = NonLocalBlock2d(widths[nonlocal_stage]) if nonlocal_stage is not None else None
         head_in = widths[-1]  # final upsampling layer outputs this many channels
-        if resize == 'conv' and (up_h - out_h + 1 < 1 or up_w - out_w + 1 < 1):
-            warnings.warn(f"resize='conv' needs {up_h}x{up_w} >= {out_h}x{out_w}; falling back to 'bilinear'")
-            resize = 'bilinear'
-        self.resize = resize  # may have been downgraded to 'bilinear' just above
-        if resize == 'conv':
-            # valid-mode kernel k = margin + 1 collapses up_hw down to out_hw exactly
-            # (k = (1, 1), i.e. a plain channel projection, at the standardized 32x32)
-            k = (up_h - out_h + 1, up_w - out_w + 1)
-            first = nn.Conv2d(head_in, 32, k)
-        else:
-            first = nn.Conv2d(head_in, 32, 3, padding=1)
-        self.head = nn.Sequential(first, nn.ReLU(inplace=True), nn.Conv2d(32, out_c, 3, padding=1))
+        self.head = nn.Sequential(
+            _conv2d(head_in, 32, 3, padding=1, coordconv=coordconv), nn.ReLU(inplace=True),
+            _conv2d(32, 32, 3, padding=1, coordconv=coordconv), nn.ReLU(inplace=True),
+            nn.Conv2d(32, out_c, 3, padding=1),
+            )
+
+    def run_stages(self, x):
+        """(B,base,4,4) -> (B,head_in,32,32). Split out of forward() so MaskedConvDecoder can
+        override it alone and reuse everything else (project, resize, head)."""
+        for i, stage in enumerate(self.stages):
+            x = stage(x)
+            if self.nonlocal_block is not None and i + 1 == self.nonlocal_stage:
+                x = self.nonlocal_block(x)
+        return x
 
     def forward(self, emb):
-        x = self.up(self.project(emb).view(-1, self.base, *self.SEED))
-        if self.resize == 'bilinear':
+        x = self.run_stages(self.project(emb).view(-1, self.base, *self.SEED))
+        if tuple(x.shape[-2:]) != self.out_hw:
             x = F.interpolate(x, size=self.out_hw, mode='bilinear', align_corners=False)
         x = self.head(x)                                     # (B,out_c,H,W)
         # .contiguous(): permute leaves a non-contiguous view, and torchmetrics' MSE does
         # preds.view(-1), which requires contiguity. Only bites on the rgb path -- out_c == 1
         # takes squeeze(1), which stays contiguous.
         return x.squeeze(1) if self.out_c == 1 else x.permute(0, 2, 3, 1).contiguous()
+
+class MaskedConvDecoder(Decoder):
+    """Conv analogue of Mask2Former's masked attention (Cheng et al., "Masked-attention Mask
+    Transformer for Universal Image Segmentation", CVPR 2022, https://arxiv.org/abs/2112.01527).
+    Mask2Former restricts each decoder layer's cross-attention to only the FOREGROUND predicted
+    by the previous layer's mask (hard-thresholded at 0.5), instead of attending everywhere --
+    every layer refines just the region the model already believes contains the object, rather
+    than splitting capacity over the whole (mostly empty) frame.
+
+    This decoder has no attention, so the conv equivalent is a spatial gate: after each
+    upsampling stage except the last, a 1x1 conv predicts a coarse mask from the current
+    feature map, which is thresholded at 0.5 (hard threshold, like the paper -- not a soft
+    sigmoid gate, which would just be an ordinary squeeze-excite) and multiplied into the
+    features before the NEXT stage runs. Background locations are zeroed and stop drawing
+    gradient into the next stage's convs, which then only have to spend capacity refining the
+    region already believed to be foreground. The gate is applied post-BatchNorm/ReLU (stage
+    output is already non-negative there), and multiplying by a boolean mask commutes with the
+    later stages' convs' receptive fields, so this doesn't change the head or run_stages
+    signature -- only what flows between stages.
+
+    A dead gate (all-zero coarse mask) would zero every later stage and stop all
+    gradient to them, so this is TRAINED WITH a small auxiliary BCE loss per intermediate mask
+    against the downsampled ground truth (see BoomboxModel.loss / MASKED_CONV_AUX_WEIGHT) --
+    exactly as Mask2Former supervises its intermediate masks, and for the same reason: the gate
+    only starts out useful once the mask predictions do.
+    """
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        widths = [self.base, self.base // 2, self.base // 4, self.base // 8]
+        self.mask_heads = nn.ModuleList([nn.Conv2d(widths[i + 1], 1, 1) for i in range(len(self.stages) - 1)])
+
+    def run_stages(self, x):
+        aux_logits = []
+        for i, stage in enumerate(self.stages):
+            x = stage(x)
+            if self.nonlocal_block is not None and i + 1 == self.nonlocal_stage:
+                x = self.nonlocal_block(x)
+            if i < len(self.stages) - 1:
+                coarse_logits = self.mask_heads[i](x)                  # (B,1,H_i,W_i)
+                aux_logits.append(coarse_logits)
+                gate = (coarse_logits.sigmoid() > 0.5).to(x.dtype)     # hard threshold, like the paper
+                x = x * gate
+        self.last_aux_logits = aux_logits  # stashed for the auxiliary loss (see class docstring)
+        return x
 
 class BoomboxModel(ComposerModel):
     """Same ComposerModel contract as VibrationTransformer, so callbacks, metrics
@@ -278,7 +432,9 @@ class BoomboxModel(ComposerModel):
                  loss_fn='mse', loss_alpha=0.5, count_loss_weight=0.0,
                  freq_dropout=0.0, laser_dropout=0.0, encoder='single', fuse='concat',
                  trim_pad=False, learned_collapse=False, freq_mult=1, freq_depth=1,
-                 resize='conv'):
+                 resize='conv', decoder_arch='default', coordconv=False,
+                 decoder_upsample='transposed', decoder_nonlocal_stage=None,
+                 masked_conv_aux_weight=0.5):
         super().__init__()
         # tokenize() zero-pads F up to a whole number of patches. That padding is justified for
         # the transformer (FreqEncoder.embed sees the zeros at FIXED positions and absorbs them),
@@ -299,8 +455,11 @@ class BoomboxModel(ComposerModel):
         kw.update(freq_mult=freq_mult, freq_depth=freq_depth)
         self.encoder = enc(data_info.get('n_channels', 2), d_model, data_info['n_laser_rows'],
                            data_info['n_laser_cols'], freq_dropout, laser_dropout, **kw)
-        self.decoder = Decoder(d_model, data_info['out_h'], data_info['out_w'],
-                               data_info.get('out_c', 1), resize=resize)
+        dec_cls = MaskedConvDecoder if decoder_arch == 'masked-conv' else Decoder
+        self.decoder = dec_cls(d_model, data_info['out_h'], data_info['out_w'],
+                               data_info.get('out_c', 1), resize=resize, coordconv=coordconv,
+                               upsample=decoder_upsample, nonlocal_stage=decoder_nonlocal_stage)
+        self.masked_conv_aux_weight = masked_conv_aux_weight if decoder_arch == 'masked-conv' else 0.0
         self.fuse_speakers = fuse_speakers
         self.empty_head = nn.Linear(d_model, 1)
         self.count_head = nn.Linear(d_model, N_COUNT_CLASSES)
@@ -322,8 +481,10 @@ class BoomboxModel(ComposerModel):
         else:
             emb = self.encoder(self._to_conv(x))
         mask_logits = self.decoder(emb)
-        return dict(mask_pred=mask_logits.sigmoid(), mask_logits=mask_logits,
-                    empty_logit=self.empty_head(emb), count_logits=self.count_head(emb))
+        out = dict(mask_pred=mask_logits.sigmoid(), mask_logits=mask_logits,
+                   empty_logit=self.empty_head(emb), count_logits=self.count_head(emb))
+        if self.masked_conv_aux_weight: out['aux_mask_logits'] = self.decoder.last_aux_logits
+        return out
 
     def _to_conv(self, x):
         """(B,L,P,PS,C) -> (B,C,L,P*PS), dropping tokenize()'s trailing zero-pad if enabled."""
@@ -338,6 +499,16 @@ class BoomboxModel(ComposerModel):
         total = self.loss_fn(outputs['mask_logits'], outputs['mask_pred'], batch['mask_true'], **kw)
         if self.count_loss_weight:
             total = total + self.count_loss_weight * count_loss(outputs['count_logits'], batch['info']['n_objects'])
+        if self.masked_conv_aux_weight and 'aux_mask_logits' in outputs:
+            # supervise MaskedConvDecoder's intermediate gates (see its docstring for why: an
+            # untrained gate is all-zero and kills gradient to every later stage) -- BCE against
+            # the ground-truth mask, downsampled to each stage's resolution.
+            gt = batch['mask_true'].unsqueeze(1).float()  # (B,1,out_h,out_w), binary segmentation target
+            aux = 0.0
+            for logits in outputs['aux_mask_logits']:
+                target = F.interpolate(gt, size=logits.shape[-2:], mode='bilinear', align_corners=False)
+                aux = aux + F.binary_cross_entropy_with_logits(logits, target)
+            total = total + self.masked_conv_aux_weight * (aux / len(outputs['aux_mask_logits']))
         return total
 
     def get_metrics(self, is_train=False): return self.train_metrics if is_train else self.val_metrics
