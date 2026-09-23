@@ -21,12 +21,12 @@ SHIFTS = {"clean": "vibration/03_clean_shifts.npy", "raw": "vibration/02_raw_shi
 PHOTOS = ["image/02_cropped_overhead.png", "image/01_cropped.png"]
 MASKS = ["image/03_smask.npy", "image/02_smask.npy"]
 
+ROOT: Path | None = None            # what init() was pointed at; rescan_datasets() rewalks it
 DATASETS: dict[str, Path] = {}      # dataset name -> its dir (the one holding samples/)
-COUNTS: dict[str, int] = {}         # dataset name -> its sample count (scanned once at init)
+COUNTS: dict[str, int] = {}         # dataset name -> its sample count
 CURRENT: str = ""                   # which dataset is loaded right now
 MAX_OVERHEAD = [1, 1]               # largest cropped-overhead [w, h] over ALL datasets,
                                     # so the client can size every box against the biggest
-DEFAULT = "gastro"                  # substring of the dataset to open first
 
 DIRS: dict[str, Path] = {}   # sample id -> dir; the only id->path map
 META: dict[str, dict] = {}
@@ -133,6 +133,16 @@ def source_video(sid: str) -> Path | None:
     return _glob1(_stim_dir(sid), "spectrogram.mp4", "*.mp4")
 
 
+def stim_params(sid: str) -> dict:
+    """The chirp's own frequency/time-padding params (src/data/audio.py), straight from
+    its metadata.jsonl -- distinct from the sample's own metadata.jsonl."""
+    sd = _stim_dir(sid)
+    if not sd or not (sd / "metadata.jsonl").exists():
+        return {}
+    m = _meta(sd)
+    return {k: m[k] for k in ("f_start", "f_end", "T_start", "T_end") if k in m}
+
+
 @lru_cache(maxsize=32)
 def box_photo(name: str) -> Path | None:
     """A cropped-overhead shot that stands for a whole dataset: an empty-box sample's if
@@ -156,6 +166,22 @@ def _sample_count(ds: Path) -> int:
     return sum(1 for d in sm.iterdir() if _fft(d)) if sm.is_dir() else 0
 
 
+def summarize(name: str) -> dict:
+    """Positions / speakers / object types in a dataset -- metadata.jsonl only, no FFT or
+    image loads, so this is cheap enough to run over every dataset at boot."""
+    positions, speakers, objects = set(), set(), set()
+    n = 0
+    for d in sorted((DATASETS[name] / "samples").iterdir()):
+        if not _fft(d):
+            continue
+        m = _meta(d)
+        positions.add(int(m.get("position_id") or 0))
+        speakers.add(int(m.get("speaker") or 0))
+        objects.update((m.get("objects") or {}).keys())
+        n += 1
+    return {"n": n, "positions": sorted(positions), "speakers": sorted(speakers), "objects": sorted(objects)}
+
+
 def _overhead_size(ds: Path):
     """[w, h] of the first sample's cropped-overhead photo -- the box's real pixel size,
     which is what makes one box render bigger than another. Falls back to [1, 1]."""
@@ -170,26 +196,15 @@ def _overhead_size(ds: Path):
 def init(root: Path) -> int:
     """Point viz2 at either one dataset dir (has samples/) or a parent dir of them.
 
-    Every dataset becomes a pickable box; DEFAULT (or the first) is loaded now, the rest
-    on demand via switch(). Returns the dataset count."""
-    root = Path(root)
-    cands = [root] if (root / "samples").is_dir() else sorted(root.iterdir())
-    for c in cands:
-        n = _sample_count(c)
-        if n:
-            DATASETS[c.name] = c
-            COUNTS[c.name] = n
+    Every dataset becomes a pickable box; the most recently modified one (i.e. whichever a
+    watcher is actively dropping samples into) is loaded now, the rest on demand via
+    switch(). Returns the dataset count."""
+    global ROOT
+    ROOT = Path(root)
+    rescan_datasets()
     if not DATASETS:
         raise SystemExit(f"no loadable datasets (a samples/ dir with an FFT) under {root}")
-
-    # The biggest box across everything, measured once, so the client scales them together.
-    w = h = 1
-    for ds in DATASETS.values():
-        ow, oh = _overhead_size(ds)
-        w, h = max(w, ow), max(h, oh)
-    MAX_OVERHEAD[:] = [w, h]
-
-    first = next((n for n in DATASETS if DEFAULT in n.lower()), next(iter(DATASETS)))
+    first = max(DATASETS, key=lambda n: (DATASETS[n] / "samples").stat().st_mtime)
     _load(first)
     return len(DATASETS)
 
@@ -200,6 +215,86 @@ def switch(name: str) -> int:
         raise KeyError(name)
     _load(name)
     return len(DIRS)
+
+
+def rescan_datasets() -> int:
+    """Reconcile DATASETS against what's under ROOT: pick up new experiment dirs, and drop
+    ones whose dir (or samples/) is just gone -- a whole box scrapped, not just one bad
+    sample. Removal is a directory-existence check, NOT a full _sample_count() walk -- that
+    would re-stat every sample in every dataset on every poll tick, which is the whole
+    dataset tree, every 0.5s. If CURRENT was the one that vanished, falls back to another
+    loaded dataset, or clears the view if none are left. Returns how many datasets changed."""
+    try:
+        cands = {ROOT.name: ROOT} if (ROOT / "samples").is_dir() else {c.name: c for c in ROOT.iterdir()}
+    except OSError:
+        cands = {}
+    changed = 0
+    for name in [n for n in DATASETS if not (cands.get(n) and (cands[n] / "samples").is_dir())]:
+        del DATASETS[name]; COUNTS.pop(name, None)
+        changed += 1
+    for name, c in cands.items():
+        if name in DATASETS:
+            continue
+        cnt = _sample_count(c)
+        if not cnt:
+            continue  # not loadable yet -- no sample has finished processing
+        DATASETS[name] = c
+        COUNTS[name] = cnt
+        ow, oh = _overhead_size(c)
+        MAX_OVERHEAD[:] = [max(MAX_OVERHEAD[0], ow), max(MAX_OVERHEAD[1], oh)]
+        changed += 1
+    if CURRENT and CURRENT not in DATASETS:           # the loaded dataset was the one dropped
+        if DATASETS:
+            _load(next(iter(DATASETS)))
+        else:
+            DIRS.clear(); META.clear(); INFO.clear()
+        changed += 1
+    return changed
+
+
+def rescan() -> int:
+    """Reconcile DIRS/META for the current dataset against what's on disk: pick up samples
+    the watcher finished writing, and drop ones whose directory (or FFT) is gone -- e.g. a
+    bad capture deleted mid-collection. Returns how many samples changed either way."""
+    if CURRENT not in DATASETS:
+        return 0
+    try:
+        on_disk = {d.name: d for d in (DATASETS[CURRENT] / "samples").iterdir()}
+    except OSError:
+        on_disk = {}
+    changed = 0
+    for sid in [s for s in DIRS if s not in on_disk]:
+        del DIRS[sid]; del META[sid]
+        changed += 1
+    for name, d in on_disk.items():
+        if name not in DIRS and _fft(d):
+            DIRS[name] = d
+            META[name] = _meta_row(name, d, CURRENT)
+            changed += 1
+    if changed:
+        COUNTS[CURRENT] = len(DIRS)   # keep the box picker's count for the live dataset honest
+    return changed
+
+
+def _meta_row(sid: str, d: Path, name: str) -> dict:
+    m = _meta(d)
+    return {
+        "id": sid,
+        "pos": int(m.get("position_id") or 0),      # int here, string on exp-25
+        "spk": int(m.get("speaker") or 0),
+        "layout": m.get("layout") or "",
+        "n": int(m.get("n_objects") or 0),
+        # distinct object TYPES in the box, regardless of how many of each
+        "objects": sorted((m.get("objects") or {}).keys()),
+        "objcounts": dict(sorted((m.get("objects") or {}).items())),  # type -> how many
+        "empty": bool(m.get("is_empty_box")),
+        "com": com(m.get("avg_com")),
+        "coms": coms(m.get("coms")),                  # per-object [row, col], overhead px
+        "box": m.get("box") or name,                 # carried onto every pinned probe
+        # capture-machine path to the played stimulus; only the basename survives here,
+        # matched back to a local data/audio/<name>/ tree by _stim_dir().
+        "audio_dir": m.get("audio_dir") or "",
+    }
 
 
 def _load(name: str) -> None:
@@ -219,23 +314,7 @@ def _load(name: str) -> None:
         raise SystemExit(f"no samples with an FFT under {ds}/samples")
 
     for sid, d in DIRS.items():
-        m = _meta(d)
-        META[sid] = {
-            "id": sid,
-            "pos": int(m.get("position_id") or 0),      # int here, string on exp-25
-            "spk": int(m.get("speaker") or 0),
-            "layout": m.get("layout") or "",
-            "n": int(m.get("n_objects") or 0),
-            # distinct object TYPES in the box, regardless of how many of each
-            "objects": sorted((m.get("objects") or {}).keys()),
-            "empty": bool(m.get("is_empty_box")),
-            "com": com(m.get("avg_com")),
-            "coms": coms(m.get("coms")),                  # per-object [row, col], overhead px
-            "box": m.get("box") or name,                 # carried onto every pinned probe
-            # capture-machine path to the played stimulus; only the basename survives here,
-            # matched back to a local data/audio/<name>/ tree by _stim_dir().
-            "audio_dir": m.get("audio_dir") or "",
-        }
+        META[sid] = _meta_row(sid, d, name)
 
     d0 = DIRS[next(iter(DIRS))]
     m0 = _meta(d0)
@@ -304,9 +383,11 @@ def _scales(n=SCALE_N):
         # Linear magnitude, unlike the log axis, is dominated by the single largest peak:
         # 10**lm_hi would leave the typical curve a flat line along the bottom. A high
         # percentile of the pooled values keeps the usual shape readable. Magnitude cannot
-        # go below zero, so the axis starts there -- nudged just under it so a curve
-        # sitting on the floor is not drawn flush along the frame edge.
-        "mag": [-0.02 * _mag_hi, _mag_hi],
+        # go below zero, so the axis starts flush at 0 -- a negative minimum here (like
+        # logmag's headroom) would be faking room below a true hard floor, not a soft one,
+        # and a line thicker than 1px would visibly dip into it for any near-zero bin
+        # (viz2/static/app.js:span() had the same bug for the live plot).
+        "mag": [0, _mag_hi],
         "phase": [-math.pi, math.pi],          # bounded already, so global by definition
         "cosphase": [-1.0, 1.0],
         "re": [-m, m], "im": [-m, m],

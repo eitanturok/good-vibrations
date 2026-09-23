@@ -127,15 +127,18 @@ h2 em { font-style:normal; color:var(--accent); font-family:var(--mono);
    summary + a single "clear all". One fixed line, so it never reflows step 2. */
 #filterchips { display:flex; align-items:center; gap:10px; min-height:22px; }
 .fnone { font:10px var(--mono); color:var(--ink3); }
+/* distinct dataset/object/n_obj/layout counts among the current matches -- hard right,
+   opposite the "clear filters" chip */
+.ffacets { margin-left:auto; font:9px var(--mono); letter-spacing:.04em; color:var(--ink3); }
 .fchip.clr { border:1px solid var(--line); background:var(--s1); color:var(--accent);
              font:10px var(--mono); padding:2px 8px; border-radius:4px; cursor:pointer; }
 .fchip.clr:hover { border-color:var(--accent); }
 /* "clear filters" sits in the gutter right of the pickers, just under the count */
 .s1filter #fclear { position:absolute; top:34px; right:0; margin:0; z-index:1; }
 
-/* SEARCH: the sample list grows to fill the row beside the scatter. */
-.s1search .pk.samp { flex:1 1 320px; max-width:480px; }
-.s1search #samplebox .pblist { max-height:250px; }
+/* SEARCH: the sample grid grows to fill the row beside the scatter -- 5 photos need more
+   room than the old single-column list did. */
+.s1search .pk.samp { flex:1 1 480px; max-width:none; }
 
 /* ***** step 1: the sample viewer *****
    The overhead + segmentation images are the point of this panel -- stacked and large so
@@ -178,11 +181,17 @@ h2 em { font-style:normal; color:var(--accent); font-family:var(--mono);
 .svmh { font:8px/1.3 var(--mono); letter-spacing:.06em; text-transform:uppercase;
         color:var(--ink3); margin-bottom:4px; }
 .svmh em { display:block; font-style:normal; opacity:.7; }
-.svm video { width:100%; max-width:150px; aspect-ratio:1; object-fit:cover; display:block;
+/* 2:1 to match make_spectrogram_video's figsize=(6,3); contain (not cover) so the whole
+   spectrogram shows -- this is the primary way you watch+listen now, not a muted thumbnail
+   beside a separate audio player, so it gets real width instead of a small cropped square. */
+.svm video { width:100%; max-width:280px; aspect-ratio:2/1; object-fit:contain; display:block;
              border-radius:3px; background:#000; }
 .svm video.missing { display:none; }
-.svm audio { width:100%; max-width:190px; height:26px; display:block; margin-top:5px; }
-.svm audio.missing { display:none; }
+/* Recovered small-multiples: same .fgrid-cur/.fgrid-rest skeleton as the mode grid, sized
+   for these 2:1 videos instead of square mode canvases. */
+#recgrid .fgrid-rest { grid-template-columns:repeat(auto-fill, 180px); }
+#recgrid video { width:100%; max-width:180px; aspect-ratio:2/1; object-fit:contain;
+                  display:block; border-radius:3px; background:#000; }
 
 /* the whole step-1 grid stacks once the content column gets tight */
 @media (max-width:1180px) {
@@ -197,6 +206,11 @@ h2 em { font-style:normal; color:var(--accent); font-family:var(--mono);
 
 .pk > span { font-size:9px; letter-spacing:.06em; text-transform:uppercase; color:var(--ink3);
              display:flex; gap:6px; align-items:center; }
+/* How many distinct values this facet has in total -- unfiltered, so it always reads as
+   "how big is this picker", not "how many currently pass" (that's .ffacets, down by the
+   filter chips). Normal case + mono, so it doesn't read as part of the uppercase label. */
+.pk-n { font:9px var(--mono); font-style:normal; text-transform:none; letter-spacing:0;
+        color:var(--ink3); opacity:.75; }
 /* Every step-1 picker: a search box over a scrollable list. Same control for the dataset,
    the sample id, and the multi-select layout / object-count filters -- so a long list
    scrolls in place instead of growing the panel. Typed text matches anywhere and is
@@ -251,12 +265,24 @@ h2 em { font-style:normal; color:var(--accent); font-family:var(--mono);
    enough to read at a glance. */
 .pbimg { width:58px; height:44px; object-fit:cover; border-radius:3px; flex:none;
          background:var(--s2); }
-#datasetbox .pbrow, #samplebox .pbrow { padding:5px 7px; gap:9px; }
+#datasetbox .pbrow { padding:5px 7px; gap:9px; }
 /* Dataset rows: a small thumbnail so the (often long) name has room to sit on one line. */
 #datasetbox .pbimg { width:44px; height:34px; }
 #datasetbox .pbrow i { min-width:2.5ch; padding-left:6px; }
 #datasetbox .pblist { max-height:200px; }
-#samplebox .pblist { max-height:260px; }
+/* The sample list: a scrollable photo grid, 5 per row -- caption above thumbnail so the
+   pos/spk/id reads before the picture. */
+.sgrid { display:grid; grid-template-columns:repeat(5, 1fr); gap:8px;
+         max-height:320px; overflow-y:auto; overscroll-behavior:contain;
+         border:1px solid var(--line); border-radius:var(--r); background:var(--s1); padding:6px; }
+.scard { display:flex; flex-direction:column; gap:3px; border:1px solid transparent;
+         background:none; border-radius:4px; padding:3px; cursor:pointer; text-align:center; }
+.scard:hover { background:var(--s2); }
+.scard.on { border-color:var(--accent); background:var(--accent-sf); }
+.sclab { font:9px var(--mono); color:var(--ink2); overflow:hidden; text-overflow:ellipsis;
+         white-space:nowrap; }
+.scard.on .sclab { color:var(--ink); font-weight:600; }
+.scimg { width:100%; aspect-ratio:4/3; object-fit:cover; border-radius:3px; background:var(--s2); }
 .pbdot { width:8px; height:8px; border-radius:50%; flex:none;
          background:hsl(var(--h) 58% 52%); }
 /* Dataset names are long -- let the row wrap to two lines instead of a very wide column. */
@@ -305,7 +331,7 @@ button { font:inherit; cursor:pointer; }
 /* ***** layout ***** */
 /* The left flow scrolls; the right column is pinned to the viewport so the current
    sample is always in view. main itself does not scroll -- each column owns its scroll. */
-main { flex:1; display:grid; grid-template-columns:minmax(0,1fr) 244px; gap:12px;
+main { flex:1; display:grid; grid-template-columns:minmax(0,1fr) 280px; gap:12px;
         padding:12px; overflow:hidden; align-items:stretch; }
 #flow { display:flex; flex-direction:column; gap:12px; min-width:0; min-height:0;
         overflow-y:auto; overscroll-behavior:contain; padding-right:2px; }
@@ -392,16 +418,21 @@ main { flex:1; display:grid; grid-template-columns:minmax(0,1fr) 244px; gap:12px
 .plot canvas, .plot img { width:100%; height:100%; display:block; }
 
 .plot img { image-rendering:pixelated; border-radius:2px; }
+/* svg is a REPLACED element (like img/canvas): with no explicit height, top/bottom are
+   ignored and it falls back to the browser's default intrinsic size (300x150) instead of
+   stretching to fill .plot -- so it silently rendered 150px tall regardless of the actual
+   plot height, off by exactly the difference. width happened to dodge this because it IS
+   given explicitly below; height needs the same treatment. */
 .ov { position:absolute; top:0; left:64px; right:0; bottom:0;
-       width:calc(100% - 64px); overflow:visible; pointer-events:none; }
+       width:calc(100% - 64px); height:100%; overflow:visible; pointer-events:none; }
 .ov circle.pk { pointer-events:auto; cursor:pointer; }
 .ov line.ptick { stroke-width:1.4; }
 .ov rect.lr { fill:none; stroke:var(--accent); stroke-width:1.2; }
 .ov rect.lr.hov { stroke:var(--ink); stroke-dasharray:3 2; opacity:.75; }
 .ov line.cur { stroke:var(--accent); stroke-width:1; }
-.ov .ax line.grid { stroke:var(--line); stroke-width:1; opacity:.55; }
-.ov .ax text { font:9px var(--mono); fill:var(--ink3); text-anchor:middle; }
-.ov .ax text.unit { fill:var(--ink2); font-size:10px; }
+.ov .ax line.grid { stroke:var(--firm); stroke-width:1; opacity:.85; }
+.ov .ax text { font:600 9.5px var(--mono); fill:var(--ink2); text-anchor:middle; }
+.ov .ax text.unit { fill:var(--ink); font-size:10px; }
 .ov .lax text.ly { font:9px var(--mono); fill:var(--ink3); text-anchor:end; }
 .ov text { font:9px var(--mono); fill:var(--ink3); }
 .ov circle.pk { fill:var(--s1); stroke:var(--ink2); stroke-width:1.2; }
@@ -564,18 +595,24 @@ h2 em.soft { color:var(--ink3); font-weight:400; margin-left:auto; }
          font-size:9px; }
 
 /* ***** mode: field small-multiples *****
-   One field per probe at a SHARED brightness scale, so panels are comparable. */
-.fgrid { display:grid; grid-template-columns:repeat(auto-fill, 164px); gap:10px 12px;
-         align-content:start; flex:1; min-width:0; }
+   One field per probe at a SHARED brightness scale, so panels are comparable. The current
+   sample gets its own fixed leftmost column (.fgrid-cur); every pinned probe wraps in its
+   own grid to the right (.fgrid-rest) -- a plain single grid would drop row 2 back under
+   the current-sample tile instead of continuing past it. */
+.fgrid { display:flex; gap:14px; align-items:flex-start; flex:1; min-width:0; }
+.fgrid-cur { flex:none; }
+.fgrid-rest { display:grid; grid-template-columns:repeat(auto-fill, 108px); gap:8px 10px;
+              align-content:start; flex:1; min-width:0; }
 .fghead { grid-column:1/-1; display:flex; align-items:center; gap:8px;
           font:11px var(--mono); color:var(--ink3); letter-spacing:.04em; }
 .fgrid figure { margin:0; transition:opacity .12s; }
-.fgrid canvas { width:164px; height:164px; display:block; border-radius:3px; }
-.fgrid figcaption { font:10px/1.4 var(--mono); margin-top:5px;
+.fgrid-cur canvas { width:108px; height:108px; display:block; border-radius:3px; }
+.fgrid-rest canvas { width:108px; height:108px; display:block; border-radius:3px; }
+.fgrid figcaption { font:9.5px/1.4 var(--mono); margin-top:5px;
                     padding-left:6px; border-left:2px solid var(--ink); }
 .fgrid figcaption b { color:var(--ink); font-weight:600; }
 .fgrid figcaption i { display:block; font-style:normal; color:var(--ink3); white-space:nowrap; }
-.fgrid:has(figure.hot) figure:not(.hot) { opacity:.28; }
+.fgrid-rest:has(figure.hot) figure:not(.hot) { opacity:.28; }
 /* The 2-D key: hue across x (direction), lightness down y (amplitude). */
 .fkey { margin:0; position:relative; padding:0 0 12px 42px; }
 .fkey canvas { width:132px; height:34px; display:block; border-radius:2px; }
@@ -584,9 +621,9 @@ h2 em.soft { color:var(--ink3); font-weight:400; margin-left:auto; }
 .fkey .kx { left:42px; bottom:0; }
 .fkey .ky { left:-2px; top:34px; transform:rotate(-90deg); transform-origin:left center; }
 /* y-axis ticks: numbers in the gutter beside the rotated label, grid lines behind data. */
-.ov .ynum { font:9px var(--mono); fill:var(--ink3); text-anchor:end;
+.ov .ynum { font:600 9.5px var(--mono); fill:var(--ink2); text-anchor:end;
             transform:translateX(-2px); }
-.ov .ygrid { stroke:var(--line); stroke-width:1; opacity:.55; }
+.ov .ygrid { stroke:var(--firm); stroke-width:1; opacity:.85; }
 /* The empty workbench states its one gesture, where the result will appear. */
 .addhint { font:9px var(--sans); font-style:normal; color:var(--ink3);
            text-transform:none; letter-spacing:0; }
@@ -603,7 +640,7 @@ h2 em.soft { color:var(--ink3); font-weight:400; margin-left:auto; }
                   border:1px solid var(--line); display:block; }
 #modekey em { display:block; font-style:normal; font:9px/1.4 var(--mono); color:var(--ink3);
               margin-top:3px; }
-.fgrid figure.hot canvas { outline:2px solid var(--accent); outline-offset:1px; }
+.fgrid figure.hot canvas, .fgrid figure.hot video { outline:2px solid var(--accent); outline-offset:1px; }
 /* The mode canvas is square, so it sizes to its height rather than stretching. The hint
    belongs under it, not beside the tiles. */
 /* The overlay plot on the left, the per-probe tiles on the right half.
@@ -632,8 +669,11 @@ h2 em.soft { color:var(--ink3); font-weight:400; margin-left:auto; }
                 flex:none; display:block; background:var(--s2); }
 .card2 .meta { min-width:0; flex:1; font-family:var(--mono); line-height:1.25; }
 .card2 .ln1 { display:flex; align-items:baseline; gap:4px; }
-.card2 .ln1 b { font-size:11px; color:var(--ink); font-weight:600; }
-.card2 .sub { font-size:9px; color:var(--ink3); }
+.card2 .ln1 b { font-size:11px; color:var(--ink); font-weight:600; flex:none; }
+/* Without min-width:0 a flex item won't shrink below its text's natural width -- it wraps
+   onto extra lines instead, which is what made these cards look cramped and uneven. */
+.card2 .sub { font-size:9px; color:var(--ink3); flex:1; min-width:0;
+              overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .card2 .sub.foreign { color:var(--accent); }   /* probe kept from another box */
 .card2 .ln3 { font-size:9.5px; color:var(--ink2); white-space:nowrap; }
 .card2 .x { border:0; background:none; color:var(--ink3); font-size:13px;

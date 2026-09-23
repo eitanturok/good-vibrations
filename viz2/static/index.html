@@ -25,16 +25,16 @@
             <span class="s1count"><b id="nmatch">0</b><span id="nmatchsub">/0</span> samples</span>
           </div>
           <div class="s1frow">
-            <div class="pk pb ds"><span>dataset</span>
+            <div class="pk pb ds"><span>dataset <i class="pk-n" id="dscount"></i></span>
               <div class="pickbox" id="datasetbox"></div>
             </div>
-            <div class="pk pb"><span>object <span class="an"><button class="link" data-all="objects">all</button><button class="link" data-none="objects">none</button></span></span>
+            <div class="pk pb"><span>object <i class="pk-n" id="objcount"></i> <span class="an"><button class="link" data-all="objects">all</button><button class="link" data-none="objects">none</button></span></span>
               <div class="pickbox" id="objectbox"></div>
             </div>
-            <div class="pk pb nb"><span>n_objects <span class="an"><button class="link" data-all="nobj">all</button><button class="link" data-none="nobj">none</button></span></span>
+            <div class="pk pb nb"><span>n_objects <i class="pk-n" id="nobjcount"></i> <span class="an"><button class="link" data-all="nobj">all</button><button class="link" data-none="nobj">none</button></span></span>
               <div class="pickbox" id="nobjbox"></div>
             </div>
-            <div class="pk pb ly"><span>layout <span class="an"><button class="link" data-all="layouts">all</button><button class="link" data-none="layouts">none</button></span></span>
+            <div class="pk pb ly"><span>layout <i class="pk-n" id="lycount"></i> <span class="an"><button class="link" data-all="layouts">all</button><button class="link" data-none="layouts">none</button></span></span>
               <div class="pickbox" id="layoutbox"></div>
             </div>
             <div class="pk sp"><span>speaker <span class="an"><button class="link" data-all="spk">all</button><button class="link" data-none="spk">none</button></span></span>
@@ -85,14 +85,12 @@
           </div>
           <div class="svmedia">
             <div class="svm" id="svm-src">
-              <div class="svmh">original <em>played stimulus</em></div>
-              <video id="svvidsrc" controls preload="metadata" playsinline muted></video>
-              <audio id="svaudsrc" controls preload="none"></audio>
+              <div class="svmh">original <em id="svstim">played stimulus</em></div>
+              <video id="svvidsrc" preload="metadata" playsinline></video>
             </div>
             <div class="svm" id="svm-rec">
               <div class="svmh">recovered <em>laser 55 · x · fixed render</em></div>
-              <video id="svvidrec" controls preload="metadata" playsinline muted></video>
-              <audio id="svaudrec" controls preload="none"></audio>
+              <video id="svvidrec" preload="metadata" playsinline></video>
             </div>
           </div>
         </div>
@@ -191,10 +189,8 @@
 
   <!-- 5 . recovered audio -->
   <section class="card step">
-    <h2><b>4</b> recovered audio</h2>
-    <p class="ptitle" id="audtitle"></p>
-    <div class="audio"><audio id="audio" controls preload="none"></audio></div>
-    <div id="heldaudio"></div>
+    <h2><b>4</b> recovered audio <em class="soft">laser 55 · x · fixed render, per pinned sample</em></h2>
+    <div class="fgrid" id="recgrid"></div>
   </section>
 
 </div>

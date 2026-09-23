@@ -24,7 +24,7 @@ def index():
     changes appear not to take effect -- which is a genuinely confusing failure, because
     the server is serving the new file and the page is running the old one.
     """
-    html = (STATIC / "index.html").read_text()
+    html = (STATIC / "index.html").read_text(encoding="utf-8")
     for name in ("app.js", "style.css"):
         v = int((STATIC / name).stat().st_mtime)
         html = html.replace(f'"/{name}"', f'"/{name}?v={v}"')
@@ -55,13 +55,21 @@ def _wav(pcm, sr):
 
 
 def _payload():
-    return {"samples": list(data.META.values()), "info": data.INFO, "rv": RENDER_V,
+    # rv is the cache-buster on every sid-keyed media URL (thumb/scene/mask/heat/...), and
+    # those endpoints are "immutable" cached forever -- sample ids are only unique WITHIN a
+    # dataset (both loaded datasets can have a "000009"), so rv must fold in the dataset
+    # name too, or switching datasets serves the old dataset's cached image back.
+    return {"samples": list(data.META.values()), "info": data.INFO, "rv": f"{RENDER_V}-{data.CURRENT}",
             "datasets": sorted(data.DATASETS), "dataset": data.CURRENT,
             "dataset_counts": data.COUNTS}
 
 
 @app.get("/api/samples")
 def samples():
+    """Also picks up samples (and new experiment dirs) the watcher finished writing since
+    the last call -- cheap (an iterdir), so the client just polls this to go live."""
+    data.rescan_datasets()
+    data.rescan()
     return _payload()
 
 
@@ -100,7 +108,7 @@ def sample_thumb(sid: str):
 def sample(sid: str):
     _d(sid)
     _, freqs = data.fft(sid)
-    return {**data.META[sid], "freqs": [round(f, 3) for f in freqs]}
+    return {**data.META[sid], "freqs": [round(f, 3) for f in freqs], "stim": data.stim_params(sid)}
 
 
 @app.get("/api/scene/{sid}.jpg")

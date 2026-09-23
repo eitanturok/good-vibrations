@@ -121,10 +121,7 @@ function reshade() {
 }
 
 const DASH = { avg: [], x: [], y: [7, 6], both: [] };
-// Audio inverts one real channel, so neither avg (a mean of complex spectra) nor both
-// can be played: fall back to x. The heatmap paints one plane, and avg IS a plane, so
-// only "both" needs replacing there.
-const audioCh = (c) => (c === 'x' || c === 'y' ? c : 'x');
+// The heatmap paints one plane, and avg IS a plane, so only "both" needs replacing there.
 const planeCh = (c) => (c === 'both' ? 'x' : c);
 const col = (p, a = 1) => `hsl(${p.hue} 66% ${p.lit ?? 46}% / ${a})`;
 
@@ -147,7 +144,16 @@ const css = (n) => getComputedStyle(document.body).getPropertyValue(n).trim();
   loadPayload(await api('/api/samples'));
   wire(); phVis();
   await firstSample();
+  setInterval(poll, 500);
 })();
+
+// Live: watch_and_process.py drops new samples (and new experiment dirs) under the watch
+// path while it's running. /api/samples rescans both each call; only rebuild the UI when
+// something actually moved.
+async function poll() {
+  const j = await api('/api/samples');
+  if (j.samples.length !== S.all.length || j.datasets.length !== S.datasets.length) loadPayload(j);
+}
 
 /* Swap in another dataset (box). The samples, positions, speaker ring, grid and scales
    are all per-box, so this is a full reload of everything except the workbench -- pinned
@@ -202,11 +208,10 @@ async function select(sid) {
 
 async function refresh(paint = true) {
   const { sid, ch } = S.live;
-  // "all" is a rendering of every laser, not a laser: the curves and the audio behind it
-  // stay the average, so the peak list and the readout still mean something.
+  // "all" is a rendering of every laser, not a laser: the curves behind it stay the
+  // average, so the peak list and the readout still mean something.
   const laser = S.live.laser === 'all' ? 'avg' : S.live.laser;
   $('#scene').src = `/api/scene/${sid}.jpg?v=${S.rv}`;
-  $('#audio').src = `/api/audio/${sid}.wav?ch=${audioCh(ch)}&laser=${laser}`;
   viewerMedia(sid);
   // "both" is x and y in one axes. The endpoint serves one channel, so ask twice and let
   // the dash pattern -- the channel's own visual channel already -- tell them apart.
@@ -325,9 +330,11 @@ function line(g, y, w, h, c, lw) {
    with the zero line kept in view since magnitude is a distance from zero. */
 function span(list, key) {
   if (key === 'mag') {
+    // |FFT| cannot be negative -- 0 is a hard floor, so the axis starts flush at it
+    // rather than faking a negative minimum for cosmetic headroom.
     let hi = 0;
     for (const s of list) for (const v of vals(s.d, key)) if (v > hi) hi = v;
-    return [-0.02 * hi, hi * 1.05 || 1];
+    return [0, hi * 1.05 || 1];
   }
   const g = S.info?.scale?.[key];
   if (g) return [g[0], g[1]];
@@ -344,6 +351,15 @@ function vals(d, key) {
   return (d._cos ??= d.phase.map(Math.cos));
 }
 
+// Shared top/bottom margin (px), so a value at the true lo/hi (e.g. linear mag's hard 0
+// floor) isn't drawn flush on the frame edge. The one place value -> pixel happens, for
+// the curve, the peak markers and the axis ticks alike, so all three always agree.
+const YPAD = 8;
+const yMap = (v, lo, hi, h) => {
+  const H = h - 2 * YPAD;
+  return YPAD + H - (v - lo) * (H / ((hi - lo) || 1));
+};
+
 function multi(cv, key) {
   const [g, w, h] = fit(cv), ss = series().filter((s) => s.d);
   if (!ss.length) return;
@@ -351,8 +367,8 @@ function multi(cv, key) {
   const N = Math.max(...ss.map((s) => vals(s.d, key).length));
   const a = z.x0 * (N - 1), b = z.x1 * (N - 1);          // visible index window
   const lo = flo + z.y0 * (fhi - flo), hi = flo + z.y1 * (fhi - flo);
-  const k = h / ((hi - lo) || 1), sx = w / ((b - a) || 1);
-  S.rng[cv.id] = { lo, hi };                  // so the y axis can label the same scale
+  const sx = w / ((b - a) || 1);
+  S.rng[cv.id] = { lo, hi, h };                // so the y axis can label the same scale
   if (cv.id === 'p1') S.p1 = { lo, hi, h };   // peak markers sit ON the curve
   g.save();
   g.beginPath(); g.rect(0, 0, w, h); g.clip();         // a zoomed y must not spill the frame
@@ -361,7 +377,10 @@ function multi(cv, key) {
     g.beginPath();
     let pen = false;
     for (let i = 0; i < y.length; i++) {
-      const X = (i - a) * sx, Y = h - (y[i] - lo) * k;
+      // Clamp to the currently visible [lo,hi] -- a y-zoom (which persists across sample
+      // switches, not just this one plot) can leave `lo` above this sample's true floor,
+      // and an unclamped value below it maps to a pixel below the axis's own floor line.
+      const X = (i - a) * sx, Y = yMap(Math.min(hi, Math.max(lo, y[i])), lo, hi, h);
       if (X < -sx || X > w + sx) { pen = false; continue; }   // skip offscreen, break the path
       pen ? g.lineTo(X, Y) : g.moveTo(X, Y);
       pen = true;
@@ -435,15 +454,16 @@ function yAxis(sel, id) {
   if (!g) { g = document.createElementNS('http://www.w3.org/2000/svg', 'g');
             g.setAttribute('class', 'yt'); svg.prepend(g); }
   g.dataset.mode = 'val';
-  const { lo, hi } = r;
+  const { lo, hi, h } = r;
   // Linear magnitude is a distance from zero, so the zero line is the reference the eye
   // reads everything against. The tick step only lands on it by luck, so force it in.
   const tv = ticks(lo, hi, 4);
   if (S.specMode === 'magphase' && !S.log.spec && id === 'p1'
       && lo <= 0 && hi >= 0 && !tv.some((v) => Math.abs(v) < 1e-9)) tv.push(0);
+  // Same yMap() the curve and its peak markers use, as a percent of the plot's own height
+  // -- so the gridline, its number, and the data itself always land on the same pixel.
   g.innerHTML = tv.map((v) => {
-    const y = (1 - (v - lo) / ((hi - lo) || 1)) * 100;
-    if (y < 1 || y > 99) return '';           // skip labels that would clip the frame
+    const y = yMap(v, lo, hi, h) / h * 100;
     return `<line class="ygrid" x1="0" x2="100%" y1="${y}%" y2="${y}%"/>` +
            `<text class="ynum" x="-5" y="${y}%" dy="3">${fmtTick(v)}</text>`;
   }).join('');
@@ -503,6 +523,7 @@ function viewCtls() {
 
 function drawMode() {
   fieldGrid();
+  recoveredGrid();
   modeAxes();
   const cv = $('#mode'), [g, w, h] = fit(cv);
   if (!S.mode) return;
@@ -840,11 +861,10 @@ function fieldGrid() {
   if (!box) return;
   const lm = S.byId[S.live.sid];
   const cap = (m, hzv) => `<b>${fmt(hzv)} Hz</b><i>${shortId(m.id)}  pos ${m.pos}  spk ${m.spk}</i>`;
-  const sets = [
-    ...(S.mode && lm ? [{ m: S.mode, c: css('--ink'), id: 0, t: cap(lm, hz(S.fi)) }] : []),
-    ...shownProbes().filter(fitsGrid)
-      .map((p) => ({ m: p.mode, c: col(p), id: p.id, t: cap(p.meta, p.hzv) })),
-  ];
+  const cur = S.mode && lm ? { m: S.mode, c: css('--ink'), id: 0, t: cap(lm, hz(S.fi)) } : null;
+  const rest = shownProbes().filter(fitsGrid)
+    .map((p) => ({ m: p.mode, c: col(p), id: p.id, t: cap(p.meta, p.hzv) }));
+  const sets = [...(cur ? [cur] : []), ...rest];
   // Draw even for a single set. The tiles are not only a comparison: the lone tile is the
   // current mode on its OWN scale, which the overlaid plot above cannot show, so it is
   // worth having before any probe is pinned.
@@ -853,9 +873,14 @@ function fieldGrid() {
   const sig = sets.map((s) => s.id).join(',') + '|' + sets.map((s) => s.t).join('|');
   if (box.dataset.sig !== sig) {          // rebuild only when the SET changes, not per frame
     box.dataset.sig = sig;
-    box.innerHTML = sets.map((s) => `<figure data-id="${s.id}">` +
+    // .fgrid-rest lists in DOM order right after .fgrid-cur, so `figure canvas` below still
+    // walks in the same order as `sets` (current first, then the rest) despite the nesting.
+    const tile = (s) => `<figure data-id="${s.id}">` +
       `<canvas width="124" height="124"></canvas>` +
-      `<figcaption style="border-left-color:${s.c}">${s.t}</figcaption></figure>`).join('');
+      `<figcaption style="border-left-color:${s.c}">${s.t}</figcaption></figure>`;
+    box.innerHTML =
+      (cur ? `<div class="fgrid-cur">${tile(cur)}</div>` : '') +
+      `<div class="fgrid-rest">${rest.map(tile).join('')}</div>`;
   }
   box.querySelectorAll('figure').forEach((f) =>
     f.classList.toggle('hot', !!S.hot && +f.dataset.id === S.hot.id));
@@ -877,6 +902,39 @@ function fieldGrid() {
     const k = (Math.min(cw, chh) * 0.42 * S.asize) / (max || 1);
     arrows(g, [{ m: sets[i].m, c: S.fieldbg ? '#fff' : sets[i].c }], w, h, R, C, cw, chh, k, 0);
   });
+}
+
+/* Recovered-video small-multiples: same current+rest layout as the mode grid above, but
+   each tile is that SAMPLE's own already-saved fixed-render video (see recovered_video())
+   -- no recomputation per probe, which would be ~1.2s each (matplotlib frames + ffmpeg
+   mux) for an interactive pin action. */
+function recoveredGrid() {
+  const box = $('#recgrid');
+  if (!box) return;
+  const lm = S.byId[S.live.sid];
+  const cap = (s) => `<i>${shortId(s.id)}  pos ${s.pos}  spk ${s.spk}</i>`;
+  const cur = lm ? { sid: lm.id, c: css('--ink'), id: 0, t: cap(lm) } : null;
+  const rest = shownProbes().map((p) => ({ sid: p.sid, c: col(p), id: p.id, t: cap(p.meta) }));
+  const sets = [...(cur ? [cur] : []), ...rest];
+  if (!sets.length) { box.innerHTML = ''; box.dataset.sig = ''; return; }
+
+  const sig = sets.map((s) => `${s.id}:${s.sid}`).join(',');
+  if (box.dataset.sig !== sig) {          // rebuild only on a SET change -- reloading a
+    box.dataset.sig = sig;                // <video>'s src mid-playback would restart it
+    const tile = (s) => `<figure data-id="${s.id}"><video preload="metadata" playsinline></video>` +
+      `<figcaption style="border-left-color:${s.c}">${s.t}</figcaption></figure>`;
+    box.innerHTML =
+      (cur ? `<div class="fgrid-cur">${tile(cur)}</div>` : '') +
+      `<div class="fgrid-rest">${rest.map(tile).join('')}</div>`;
+    box.querySelectorAll('figure').forEach((f, i) => {
+      const v = f.querySelector('video');
+      wireHoverControls(v);
+      v.onerror = () => { f.style.display = 'none'; };   // this sample has no rendered video
+      v.src = `/api/recovered_video/${sets[i].sid}.mp4?v=${S.rv}`;
+    });
+  }
+  box.querySelectorAll('figure').forEach((f) =>
+    f.classList.toggle('hot', !!S.hot && +f.dataset.id === S.hot.id));
 }
 
 /* The key is the color map itself, drawn as the 2-D plane it is: hue sweeps the full
@@ -930,13 +988,17 @@ function applyZoom(id, axis, lo, hi) {
   }
 }
 
+// Clamp to [0,1] and pull anything within tol of an edge flush to it -- landing on the
+// exact boundary pixel by hand is unreliable, so without this a drag or hover can never
+// quite reach axis min/max, only get close.
+const snapEdge = (v, tol = 0.015) => (v < tol ? 0 : v > 1 - tol ? 1 : Math.max(0, Math.min(1, v)));
+
 function zoomable(plot, id) {
   const ov = plot.querySelector('.ov');       // the overlay exactly covers the data area
   let start = null, band = null;
   const frac = (e) => {
     const r = ov.getBoundingClientRect();
-    const c = (v) => Math.max(0, Math.min(1, v));
-    return [c((e.clientX - r.left) / r.width), c((e.clientY - r.top) / r.height)];
+    return [snapEdge((e.clientX - r.left) / r.width), snapEdge((e.clientY - r.top) / r.height)];
   };
 
   plot.addEventListener('pointerdown', (e) => {
@@ -1031,14 +1093,15 @@ function peakY(i) {
   if (!m || !S.probe) return 10;
   const mag = S.specMode === 'magphase'
     ? (S.log.spec ? S.probe.logmag : S.probe.mag) : S.probe.re;
-  return m.h - ((mag[i] - m.lo) / ((m.hi - m.lo) || 1)) * m.h;
+  return yMap(mag[i], m.lo, m.hi, m.h);
 }
 
 /* The detected resonances, listed. Clicking one is the same as clicking its marker. */
 function peakList() {
   const el = $('#pklist');
   if (!el) return;
-  const pk = S.probe?.peaks || [];
+  // Muted (esc) hides the current curve -- its peak list shouldn't linger either.
+  const pk = S.muted ? [] : (S.probe?.peaks || []);
   $('#npk').textContent = pk.length || '';
   // Strongest first: when hunting resonances, rank is the useful order. dB is shown so
   // "how much stronger" is answerable, not just "which is stronger".
@@ -1069,8 +1132,9 @@ function peakList() {
 function buildPeaks() {
   const g = $('#p1ov').querySelector('.pks');
   if (!g) return;
-  // The markers ride the magnitude curve; with an image in its place they have no y.
-  const pk = S.live.laser === 'all' ? [] : (S.probe?.peaks || []);
+  // The markers ride the magnitude curve; with an image in its place they have no y, and
+  // muted (esc) hides that curve too -- riderless markers would just float there.
+  const pk = (S.live.laser === 'all' || S.muted) ? [] : (S.probe?.peaks || []);
   let lastX = -99, up = true;
   g.innerHTML = pk.map((i) => {
     const x = specX(i);
@@ -1251,23 +1315,36 @@ function showTip(el, cvid, e) {
   tt.style.left = `${Math.max(0, x)}px`; tt.style.top = `${Math.max(0, y)}px`;
 }
 
+// The most recent hover, so a log/linear or mag/phase toggle can refresh an already-open
+// tooltip in place instead of leaving it showing the previous mode's value until the mouse
+// next moves.
+let lastHover = null;
+function refreshTip() { if (lastHover) showTip(lastHover.el, lastHover.cvid, lastHover.e); }
+
 function freqAxis(el) {
   el.style.cursor = 'crosshair';
   const cvid = el.querySelector('canvas').id;
+  const ov = el.querySelector('.ov');   // the actual chart area -- el also carries the 64px
+                                         // left gutter for y-axis labels, which would skew
+                                         // every hover position toward the right if used here
   el.addEventListener('pointermove', (e) => {
     if (S.dragging) return;                   // a box-zoom drag is in progress -- not a hover
-    const b = el.getBoundingClientRect();
+    const b = ov.getBoundingClientRect();
     const n = S.d.freqs.length, z = S.zoom.p1;
-    const seen = (e.clientX - b.left) / b.width;         // 0..1 across the visible plot
+    // ov's right edge IS el's right edge (no gutter there like the 64px one on the left),
+    // so without snapping the last bin is only reachable by landing on one exact pixel.
+    const seen = snapEdge((e.clientX - b.left) / b.width);   // 0..1 across the visible plot
     const f = z.x0 + seen * (z.x1 - z.x0);               // -> fraction of the full axis
     S.hoverFi = Math.max(0, Math.min(n - 1, Math.round(f * (n - 1))));
     cursors();
     readout();
     previewMode(S.hoverFi);
     showTip(el, cvid, e);
+    lastHover = { el, cvid, e };
   });
   el.addEventListener('pointerleave', () => {
     S.hoverFi = null;
+    lastHover = null;
     if (S.modePreview) previewMode(null);
     cursors(); readout();
     hideTip(el);
@@ -1295,12 +1372,6 @@ function readout() {
   const title = (...parts) => `${scene}: ${parts.join(', ')}`;
 
   $('#sigtitle').innerHTML = title(laser, chan, freq);
-  // Audio reconstructs one laser's single channel -- an average of complex spectra does
-  // not invert -- and spans the whole band, so no frequency.
-  const ach = audioCh(S.live.ch);
-  $('#audtitle').innerHTML = title(
-    `Laser <b>${S.live.laser === 'avg' ? 'avg' : S.live.laser}</b>`,
-    `Chn <b>${ach}</b>`);
   // The mode is every laser at one frequency, using BOTH channels (a 2-D displacement
   // field), so neither laser nor channel is a field here -- only the frequency.
   $('#modetitle').innerHTML = title(freq);
@@ -1424,6 +1495,13 @@ const tally = (key) => {
 const hueOf = (n) => (28 + n * 47) % 360;
 
 function buildFilters() {
+  // Unfiltered totals -- how many distinct values this picker HAS, not how many currently
+  // pass (that's the .ffacets line by the filter chips). Always the whole dataset's count,
+  // so it doesn't shrink as you filter and start looking like the picker itself shrank.
+  $('#dscount').textContent = `(${S.datasets.length})`;
+  $('#objcount').textContent = `(${objectValues().length})`;
+  $('#nobjcount').textContent = `(${new Set(S.all.map((s) => s.n)).size})`;
+  $('#lycount').textContent = `(${new Set(S.all.map((s) => s.layout)).size})`;
   pickbox($('#datasetbox'), {
     // Each row carries a thumbnail of the bare box, so the datasets are told apart at a
     // glance rather than by reading long names.
@@ -1434,16 +1512,7 @@ function buildFilters() {
     current: () => ({ v: S.info.dataset, label: S.info.dataset }),
     placeholder: 'change dataset',
   });
-  pickbox($('#samplebox'), {
-    opts: () => matches().map((s) => ({
-      v: s.id, img: `/api/thumb/${s.id}.jpg?v=${S.rv}`,
-      label: `${shortId(s.id)}  pos ${s.pos}  spk ${s.spk}  ${s.layout}` })),
-    on: (v) => v === S.live.sid,
-    pick: (v) => pickSample(v),
-    // The field rests empty (the current sample shows in the pinned right column, and as
-    // the divided top row of this list) -- so it reads as a search box, not a label.
-    restBlank: true, cap: 200, placeholder: 'search by sample id',
-  });
+  buildSampleGrid();
   pickbox($('#objectbox'), {
     // Object TYPE, regardless of count. Multi-select: a sample passes if it holds ANY of
     // the picked types. Count is faceted against the other filters.
@@ -1494,6 +1563,39 @@ function pickSample(id) {
   select(id);
 }
 
+/* The sample list, as a scrollable photo grid (5/row): overhead thumbnail + "Pos x, Spk y
+   (id)" caption. select() redraws it on every pick -- from here, the scatter or a workbench
+   probe -- so the current sample is always highlighted and scrolled into view. */
+function buildSampleGrid() {
+  const host = $('#samplebox');
+  host.innerHTML = '<input class="pbq" spellcheck="false" autocomplete="off" placeholder="search by sample id">' +
+    '<div class="sgrid"></div>';
+  const q = host.querySelector('.pbq'), grid = host.querySelector('.sgrid');
+  host._draw = () => {
+    const s = q.value.trim().toLowerCase();
+    const hits = matches().filter((o) =>
+      !s || `${shortId(o.id)} ${o.pos} ${o.spk} ${o.layout}`.toLowerCase().includes(s));
+    grid.innerHTML = hits.map((o) => `
+      <button class="scard${o.id === S.live.sid ? ' on' : ''}" data-id="${o.id}">
+        <span class="sclab">Pos ${o.pos}, Spk ${o.spk} (${shortId(o.id)})</span>
+        <img class="scimg" src="/api/thumb/${o.id}.jpg?v=${S.rv}" alt="" loading="lazy">
+      </button>`).join('') || '<div class="pbmore">no match</div>';
+    grid.querySelectorAll('.scard').forEach((b) => (b.onclick = () => pickSample(b.dataset.id)));
+    // Only autoscroll when the box isn't being typed in, so picking a sample elsewhere
+    // (scatter, a workbench probe) jumps the grid to it without fighting an active filter.
+    // Scroll the grid's own scrollTop, not scrollIntoView -- that walks every scrollable
+    // ancestor (including the page) and jumps the whole screen to center the card.
+    if (document.activeElement === q) return;
+    const on = grid.querySelector('.scard.on');
+    if (!on) return;
+    const gr = grid.getBoundingClientRect(), or = on.getBoundingClientRect();
+    if (or.top < gr.top) grid.scrollTop -= gr.top - or.top;
+    else if (or.bottom > gr.bottom) grid.scrollTop += or.bottom - gr.bottom;
+  };
+  q.oninput = host._draw;
+  host._draw();
+}
+
 const drawPickers = () =>
   ['#datasetbox', '#samplebox', '#objectbox', '#nobjbox', '#layoutbox']
     .forEach((id) => $(id)?._draw?.());
@@ -1504,22 +1606,31 @@ const FILTER_KEYS = ['objects', 'layouts', 'nobj', 'spk'];
    box), and picked speakers show lit on the ring -- so this shared bar is just the
    summary and the one "clear all" that spans every filter. Fixed to a single line, so
    adding filters never nudges step 2 below it. */
-function renderFilterChips() {
+// How many distinct values of each facet the CURRENT matches actually span -- distinct
+// from the picker counts above, which tally against the OTHER filters, not this one.
+const plural = (c, w) => `${c} ${w}${c === 1 ? '' : 's'}`;
+function facetSummary(m) {
+  const uniq = (get) => new Set(m.flatMap(get)).size;
+  return [plural(S.datasets.length, 'dataset'), plural(uniq((s) => s.objects), 'object'),
+          plural(uniq((s) => [s.n]), 'n_obj'), plural(uniq((s) => [s.layout]), 'layout')]
+    .join(' · ');
+}
+
+function renderFilterChips(m) {
   const el = $('#filterchips');
   if (!el) return;
   const n = FILTER_KEYS.reduce(
     (a, k) => a + [...S.f[k]].filter((v) => typeof v !== 'symbol').length, 0);
   const blocked = FILTER_KEYS.some((k) => [...S.f[k]].some((v) => typeof v === 'symbol'));
-  if (!n && !blocked) {
-    el.innerHTML = '<span class="fnone">no filters — every sample in this dataset</span>';
-    return;
-  }
-  el.innerHTML =
-    `<span class="fnone">${blocked
-      ? 'a “none” filter is set — 0 samples'
-      : `${n} filter value${n === 1 ? '' : 's'} applied`}</span>` +
-    '<button class="fchip clr" id="fclear" title="clear all filters">clear filters</button>';
-  $('#fclear').onclick = () => {
+  const status = !n && !blocked ? 'no filters — every sample in this dataset'
+    : blocked ? 'a “none” filter is set — 0 samples'
+    : `${n} filter value${n === 1 ? '' : 's'} applied`;
+  el.innerHTML = `<span class="fnone">${status}</span>` +
+    (n || blocked
+      ? '<button class="fchip clr" id="fclear" title="clear all filters">clear filters</button>'
+      : '') +
+    `<span class="ffacets">${facetSummary(m)}</span>`;
+  if (n || blocked) $('#fclear').onclick = () => {
     FILTER_KEYS.forEach((k) => S.f[k].clear());
     applyFilter();
   };
@@ -1528,16 +1639,19 @@ function renderFilterChips() {
 function applyFilter() {
   const m = matches();
   drawPickers();
-  renderFilterChips();
+  renderFilterChips(m);
   $('#nmatch').textContent = m.length;
   $('#nmatchsub').textContent = `/${S.all.length}`;
   $('#nmatch').title = `${m.length} of ${S.all.length} samples in this dataset pass the filter`;
   buildScatter();
   // Keep the current sample if it still passes; otherwise stay at the same position under
   // the new filter (e.g. a speaker toggle shouldn't also bounce you to a different spot in
-  // the box), falling back to the first match only if that position has none.
-  if (m.length && !pass(S.byId[S.live.sid] || {})) {
-    const pos = S.byId[S.live.sid]?.pos;
+  // the box), falling back to the first match only if that position has none. Also fires
+  // when the sample is just gone outright (deleted out from under a live view) -- pass()
+  // assumes an object with .objects etc, so check existence first rather than fake one.
+  const cur = S.byId[S.live.sid];
+  if (m.length && (!cur || !pass(cur))) {
+    const pos = cur?.pos;
     const atPos = m.filter((s) => s.pos === pos && !s.empty);
     select((atPos[0] || m[0]).id);
   }
@@ -1569,7 +1683,16 @@ function buildScatter() {
     + '<circle class="hot" r="3.4" hidden/>';
   const near = (ev) => {
     const b = svg.getBoundingClientRect();
-    const x = ((ev.clientX - b.left) / b.width) * SW, y = ((ev.clientY - b.top) / b.height) * SH;
+    // The viewBox (SW x SH) and the element's own box rarely share an aspect ratio, so the
+    // default xMidYMid "meet" scaling letterboxes it -- content fills one dimension exactly
+    // and is centered with margin on the other. A plain (clientX-b.left)/b.width style
+    // mapping ignores that margin, so it was wrong on whichever axis had letterboxing
+    // (here, always y: 300x140 vs a 250x78 viewBox) and clicks landed on the wrong point.
+    const boxAr = b.width / b.height, vbAr = SW / SH;
+    let cw = b.width, ch = b.height, ox = 0, oy = 0;
+    if (boxAr > vbAr) { cw = b.height * vbAr; ox = (b.width - cw) / 2; }
+    else { ch = b.width / vbAr; oy = (b.height - ch) / 2; }
+    const x = ((ev.clientX - b.left - ox) / cw) * SW, y = ((ev.clientY - b.top - oy) / ch) * SH;
     let best = null, bd = 1e9;
     POS().forEach((p, i) => {
       const d = Math.hypot(s.x(s.pts[i][1]) - x, s.y(s.pts[i][0]) - y);
@@ -1869,22 +1992,20 @@ function pin() {
   S.probes.push(p);
   reshade();
   S.flash = p.id;
-  renderProbes(); paintAll(); multiples();
+  renderProbes(); paintAll(); allMasks();
   clearTimeout(pin._t);
-  pin._t = setTimeout(() => { S.flash = null; paintAll(); multiples(); }, 1400);
+  pin._t = setTimeout(() => { S.flash = null; paintAll(); allMasks(); }, 1400);
 }
 
-/* The full identity of a probe, in one place, so the live readout and the pinned rows can
-   never disagree about what you are looking at. */
-function identity(p) {
-  const m = p.meta;
+/* A sample's identity, in one place, so the viewer, the workbench and every probe row
+   agree on what they're showing: box/pos/spk/id, then layout + its objects -- or "empty
+   box" when it has none, keeping the same "N obj: ..." shape either way. */
+function sampleMeta(s) {
+  const objs = s.empty ? 'empty box' :
+    (Object.entries(s.objcounts || {}).map(([o, n]) => `${n} ${o}${n === 1 ? '' : 's'}`).join(', ') || '—');
   return {
-    sid: shortId(p.sid),
-    line1: `${m.box}  pos ${m.pos}  spk ${m.spk}`,
-    line2: m.layout,
-    // "L42 y  1000 Hz" -- the widest this can get still fits the column without wrapping,
-    // which is what keeps the card from changing height as you hover.
-    line3: `L${p.laser} ${p.ch}  ${fmt(p.hzv)} Hz`,
+    line1: `Pos <b>${s.pos}</b>, Spk <b>${s.spk}</b> (<b>${shortId(s.id)}</b>) ${s.box}`,
+    line2: `objs: ${objs} (${s.layout || '—'} layout)`,
   };
 }
 
@@ -1899,20 +2020,19 @@ function renderNow() {
   const laser = S.hoverLaser != null ? S.hoverLaser : S.live.laser;
   const fi = S.hoverFi != null ? S.hoverFi : S.fi;
   const prev = S.hoverLaser != null || S.hoverFi != null;
-  const lcf = `L${laser} · ${S.live.ch} · ${fmt(hz(fi))} Hz`;
+  const lcf = `L${laser}, C${S.live.ch}, F${fmt(hz(fi))}Hz`;
   const ds = S.info.dataset ?? S.info.box ?? '—';
+
+  const { line1, line2 } = sampleMeta(s);
 
   const dl = $('#curmeta');
   if (dl) {
     dl.classList.toggle('muted', S.muted);
     dl.innerHTML =
       `<div class="top">${lcf}${prev ? ' <u>preview</u>' : ''}</div>` +
-      `<dt>dataset</dt><dd>${ds}</dd>` +
-      `<dt>position</dt><dd>${s.pos}</dd>` +
-      `<dt>speaker</dt><dd>${s.spk}</dd>` +
-      `<dt>sample id</dt><dd>${shortId(s.id)}</dd>` +
-      `<dt>layout</dt><dd>${s.layout}</dd>` +
-      `<dt>n_objects</dt><dd>${s.n}</dd>`;
+      `<dt>sample</dt><dd>${line1}</dd>` +
+      `<dt>objects</dt><dd>${line2}</dd>` +
+      `<dt>dataset</dt><dd>${ds}</dd>`;
   }
 
   const row = $('#nowrow');
@@ -1920,8 +2040,7 @@ function renderNow() {
     row.classList.toggle('muted', S.muted);
     row.innerHTML =
       `<span class="sw" style="background:${css('--ink')}"></span>` +
-      `<span class="id"><b>${shortId(s.id)}${prev ? ' <u>preview</u>' : ''}</b>` +
-      `${s.box}  pos ${s.pos}  spk ${s.spk}<br>${s.layout}<br>${lcf}</span>`;
+      `<span class="id">${line1}${prev ? ' <u>preview</u>' : ''}<br>${line2}<br>${lcf}<br>DATASET ${ds}</span>`;
   }
 
   renderViewer();
@@ -1936,15 +2055,17 @@ function renderViewer() {
   const s = S.byId[S.live.sid];
   if (!s) return;
   const laser = S.hoverLaser != null ? S.hoverLaser : S.live.laser;
+  const fi = S.hoverFi != null ? S.hoverFi : S.fi;
   const ds = S.info.dataset ?? S.info.box ?? '—';
-  // one header block: pos/spk/id loud, then laser/layout/n_objects/xy, then the dataset
-  const [cy, cx] = s.com || [-1, -1];
-  const xy = cx >= 0 && cy >= 0 ? `${cx | 0}, ${cy | 0}` : '—';
+  // one header block: pos/spk/id/box loud, then layout+objects, then laser/channel/freq,
+  // then the dataset last
+  const { line1, line2 } = sampleMeta(s);
   const top = $('#svtop');
   if (top) top.innerHTML =
-    `<div class="svk">pos <b>${s.pos}</b><s>·</s>spk <b>${s.spk}</b><s>·</s>id <b>${shortId(s.id)}</b></div>` +
-    `<div class="svk2">L${laser}·${S.live.ch}<s>·</s>${s.layout || '—'}<s>·</s>${s.n} obj<s>·</s>xy ${xy}</div>` +
-    `<div class="svds">${ds}</div>`;
+    `<div class="svk">${line1}</div>` +
+    `<div class="svk2">${line2}</div>` +
+    `<div class="svk2">L${laser}, C${S.live.ch}, F${fmt(hz(fi))}Hz</div>` +
+    `<div class="svds">DATASET ${ds}</div>`;
   comMarks(s);
 }
 
@@ -1994,10 +2115,16 @@ function viewerMedia(sid) {
     };
     mk.src = `/api/mask/${sid}.png?v=${S.rv}`;
   }
-  setMedia('#svvidsrc', `/api/source_video/${sid}.mp4`);
-  setMedia('#svaudsrc', `/api/source_audio/${sid}.wav`);
-  setMedia('#svvidrec', `/api/recovered_video/${sid}.mp4`);
-  setMedia('#svaudrec', `/api/recovered_audio/${sid}.wav`);
+  // The mp4 already has the audio muxed in (utils/viz.py:make_spectrogram_video), so one
+  // element with sound does both -- no separate <audio> fetch/player needed.
+  setMedia('#svvidsrc', `/api/source_video/${sid}.mp4?v=${S.rv}`);
+  setMedia('#svvidrec', `/api/recovered_video/${sid}.mp4?v=${S.rv}`);
+  // The chirp's own params (src/data/audio.py), not the sample's -- what band and how much
+  // silence padding it was generated with, in place of the generic "played stimulus" label.
+  const st = $('#svstim'), sp = S.d?.stim;
+  if (st) st.textContent = sp && sp.f_start != null
+    ? `${fmt(sp.f_start)}–${fmt(sp.f_end)} Hz · t ${sp.T_start.toFixed(2)}–${sp.T_end.toFixed(2)}s`
+    : 'played stimulus';
 }
 
 function setMedia(sel, url) {
@@ -2030,46 +2157,48 @@ function renderProbes() {
   $('#heldh').querySelector('.link').style.display = S.probes.length ? '' : 'none';
   $('#plist').innerHTML = S.probes.map((p) => {
     const m = p.meta;
-    // Two lines, not four: the coloured left border already identifies the probe, so the
-    // swatch is redundant, and the layout name belongs in the tooltip rather than a row.
+    // Two lines, not four: the coloured left border already identifies the probe, and
+    // everything else (layout, objects, dataset) is one click away in the sample viewer --
+    // this card only needs to say WHICH sample and WHICH curve.
     return `<div class="probe card2${p.hidden ? ' off' : ''}" data-id="${p.id}" style="--c:${col(p)}"
-      title="${m.box}  ${shortId(p.sid)}  pos ${m.pos}  spk ${m.spk}  ${m.layout}${p.hidden ? '  (hidden — click to show)' : '  (click to hide from plots)'}">
+      title="${m.box}  ${shortId(p.sid)}  pos ${m.pos}  spk ${m.spk}  ${m.layout}  --  click to view, click the eye to ${p.hidden ? 'show in' : 'hide from'} plots">
       <img class="thumb mask" src="/api/masks.png?ids=${p.sid}&colors=${probeHex(p)}&v=${S.rv}" alt="">
       <div class="meta">
         <div class="ln1"><b>${shortId(p.sid)}</b><span class="sub${m.box !== S.info.box ? ' foreign' : ''}">${m.box} p${m.pos} s${m.spk}</span>
           <span class="eye" aria-hidden="true">${EYE}</span>
           <button class="x" data-x="${p.id}">×</button></div>
-        <div class="ln3">L${p.laser} ${p.ch}  ${fmt(p.hzv)} Hz</div>
+        <div class="ln3">L${p.laser}, C${p.ch}, F${fmt(p.hzv)}Hz</div>
       </div>
     </div>`;
   }).join('');
   $('#plist').querySelectorAll('.probe').forEach((el) => {
     const p = S.probes.find((q) => q.id === +el.dataset.id);
-    // Click the card (anywhere but ×) to drop it from the plots and back; the eye in the
-    // row shows which state it is in.
+    // Click the eye to drop the probe from the plots and back; click anywhere else on the
+    // card (not the eye or ×) to jump the viewer to that sample -- the same "make this the
+    // current sample" gesture as the scatter dot, the sample search and the position jump.
     el.onclick = (e) => {
       if (e.target.closest('.x')) return;
-      p.hidden = !p.hidden;
-      S.hot = null;
-      paintAll(); multiples();
+      if (e.target.closest('.eye')) {
+        p.hidden = !p.hidden;
+        S.hot = null;
+        paintAll(); allMasks();
+        return;
+      }
+      select(p.sid);
     };
     el.onmouseenter = () => {
       if (p.hidden) return;                 // a hidden probe has nothing to bring forward
-      S.hot = p; drawSpec(); drawShifts(); markHot(); probeTicks(); fieldGrid();
+      S.hot = p; drawSpec(); drawShifts(); markHot(); probeTicks(); fieldGrid(); recoveredGrid();
     };
-    el.onmouseleave = () => { S.hot = null; drawSpec(); drawShifts(); markHot(); probeTicks(); fieldGrid(); };
+    el.onmouseleave = () => { S.hot = null; drawSpec(); drawShifts(); markHot(); probeTicks(); fieldGrid(); recoveredGrid(); };
   });
   $('#plist').querySelectorAll('.x').forEach((b) => (b.onclick = (e) => {
     e.stopPropagation();
     S.probes = S.probes.filter((q) => q.id !== +b.dataset.x);
     reshade();                            // the fan re-spaces around what is left
-    renderProbes(); paintAll(); multiples();
+    renderProbes(); paintAll(); allMasks();
   }));
 }
-
-// The scene can never overlay, so pinned probes get thumbnails.
-// Thumbnails live inside each probe card now, so there is no separate strip.
-function multiples() { heldAudio(); allMasks(); }
 
 /* Every scene currently in play, in one image: the live sample plus each pinned probe,
    each mask in that probe's own color so it reads against the curves and ticks. */
@@ -2130,9 +2259,9 @@ function legends() {
       sp.style.cursor = 'pointer';
       sp.onmouseenter = () => {
         S.hot = S.probes.find((q) => q.id === +sp.dataset.id);
-        drawSpec(); drawShifts(); markHot(); probeTicks(); fieldGrid();
+        drawSpec(); drawShifts(); markHot(); probeTicks(); fieldGrid(); recoveredGrid();
       };
-      sp.onmouseleave = () => { S.hot = null; drawSpec(); drawShifts(); markHot(); probeTicks(); fieldGrid(); };
+      sp.onmouseleave = () => { S.hot = null; drawSpec(); drawShifts(); markHot(); probeTicks(); fieldGrid(); recoveredGrid(); };
     });
   }
   markHot();
@@ -2147,18 +2276,6 @@ function markHot() {
 }
 
 /* One player per pinned probe, so you can compare what they sound like. */
-function heldAudio() {
-  const el = $('#heldaudio');
-  if (!el) return;
-  el.innerHTML = S.probes.map((p) => {
-    const ch = audioCh(p.ch);
-    return `<div class="ha" style="--c:${col(p)}">
-      <span class="tag">${shortId(p.sid)}  L${p.laser}  ${ch}</span>
-      <audio controls preload="none" src="/api/audio/${p.sid}.wav?ch=${ch}&laser=${p.laser}"></audio>
-    </div>`;
-  }).join('');
-}
-
 /* ***** wiring ***** */
 function seg(id, fn) {
   $(id).onclick = (e) => {
@@ -2169,8 +2286,19 @@ function seg(id, fn) {
   };
 }
 
+// Controls only on hover: otherwise the video is just a still frame, so the original and
+// recovered spectrograms sit side by side like two comparable images. Leaving pauses it in
+// place (rather than muting the controls on a still-playing video) so what's left behind is
+// actually a static frame, not a silently animating one.
+function wireHoverControls(v) {
+  v.addEventListener('mouseenter', () => { v.controls = true; });
+  v.addEventListener('mouseleave', () => { v.controls = false; v.pause(); });
+}
+function hoverControls(sel) { const v = $(sel); if (v) wireHoverControls(v); }
+
 function wire() {
   buildOverlays();
+  hoverControls('#svvidsrc'); hoverControls('#svvidrec');
   document.querySelectorAll('#p1, #p2').forEach((el) => freqAxis(el.parentElement));
   ['p1', 'p2', 'p3'].forEach((id) => zoomable($('#' + id).parentElement, id));
   $('#sigreset').onclick = () => resetZoom();
@@ -2192,11 +2320,11 @@ function wire() {
   $('#spknext').onclick = () => cycleSpk(1);
 
   seg('#ch', (v) => { S.live.ch = v; reviewChannel(); });
-  seg('#specmode', (v) => { S.specMode = v; phVis(); drawSpec(); buildPeaks(); peakList(); cursors(); axes(); });
-  seg('#phmode', (v) => { S.phmode = v; drawSpec(); axes(); });
+  seg('#specmode', (v) => { S.specMode = v; phVis(); drawSpec(); buildPeaks(); peakList(); cursors(); axes(); refreshTip(); });
+  seg('#phmode', (v) => { S.phmode = v; drawSpec(); axes(); refreshTip(); });
   // axes() too: lin/log swaps the y label between |FFT| and log |FFT|, and without it
   // the label kept whatever text the previous mode left behind.
-  seg('#speclog', (v) => { S.log.spec = +v; drawSpec(); buildPeaks(); peakList(); cursors(); axes(); });
+  seg('#speclog', (v) => { S.log.spec = +v; drawSpec(); buildPeaks(); peakList(); cursors(); axes(); refreshTip(); });
   seg('#kind', (v) => { S.kind = v; reviewChannel(); });
   wheel($('#fkey2d'));                    // the square 2-D key, drawn once
   seg('#modeview', (v) => { S.modeview = v; viewCtls(); drawMode(); });
@@ -2206,7 +2334,7 @@ function wire() {
     drawMode();
   };
 
-  $('#clear').onclick = () => { S.probes = []; renderProbes(); paintAll(); multiples(); };
+  $('#clear').onclick = () => { S.probes = []; renderProbes(); paintAll(); allMasks(); };
 
   // Both sliders read out their value beside the label, in the same `.cl em` slot the
   // laser and peak counts already use, so the rail keeps one style of readout.

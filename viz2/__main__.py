@@ -17,6 +17,17 @@ def free_port(host, port):
     return port
 
 
+def _cell(vals):
+    """'N: a, b, c' -- the count, then every value (not a truncated sample of them)."""
+    return f"{len(vals)}: {', '.join(str(v) for v in vals) or 'none'}"
+
+
+def _table(headers, rows):
+    widths = [max(len(str(c)) for c in col) for col in zip(headers, *rows)]
+    fmt = lambda r: "  ".join(str(c).ljust(w) for c, w in zip(r, widths))
+    return "\n".join([fmt(headers), "  ".join("-" * w for w in widths), *map(fmt, rows)])
+
+
 def main():
     ap = argparse.ArgumentParser(prog="viz2", description=__doc__)
     ap.add_argument("dataset", type=Path,
@@ -29,8 +40,10 @@ def main():
     n = m.init(a.dataset)
     from viz2 import data
     port = free_port(a.host, a.port)
-    print(f"[viz2] {n} dataset(s) from {a.dataset}; loaded {data.CURRENT} "
-          f"({len(data.DIRS)} samples)")
+    print(f"[viz2] {n} dataset(s) from {a.dataset}")
+    rows = [[name, len(s['positions']), _cell(s['speakers']), _cell(s['objects'])]
+            for name in sorted(data.DATASETS) if (s := data.summarize(name))]
+    print(_table(["dataset", "n_positions", "speakers", "objects"], rows))
     print(f"[viz2] http://{a.host}:{port}")
     uvicorn.run(m.app, host=a.host, port=port, log_level="warning")
 

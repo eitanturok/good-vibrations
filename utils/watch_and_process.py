@@ -51,12 +51,14 @@ class LocalEngine:
     def __init__(self, pclk_mode: str, pclk_batch_size: int, verbose: int, cleanup_raw_vibrations: str, use_pc: bool = True):
         self.pclk_mode, self.pclk_batch_size, self.verbose, self.cleanup_raw_vibrations, self.use_pc = pclk_mode, pclk_batch_size, verbose, cleanup_raw_vibrations, use_pc
         self.q: queue.Queue[Path] = queue.Queue()
-        self.done = set()
+        self.done = {}   # sid -> raw file's mtime already queued, so a delete + re-record
+                          # under the same sid (new mtime) isn't blocked forever
         threading.Thread(target=self._worker, daemon=True).start()
 
-    def submit(self, sample_dir: Path):
-        if sample_dir.name in self.done: return
-        self.done.add(sample_dir.name)
+    def submit(self, sample_dir: Path, mtime: float):
+        sid = sample_dir.name
+        if self.done.get(sid) == mtime: return
+        self.done[sid] = mtime
         self.q.put(sample_dir)
 
     def _worker(self):
@@ -81,11 +83,11 @@ class ModalEngine:
         self.poll_rate = poll_rate
         self.ledger_path = watch_path / "jobs.jsonl"
         self.failed_path = watch_path / "failed_samples.jsonl"
-        self.jobs = {}       # sample_id -> {"status", "call_id", "sample_dir"}
+        self.jobs = {}       # sample_id -> {"status", "call_id", "sample_dir", "mtime"}
         self.lock = threading.Lock()
         if self.ledger_path.exists():
             latest = {r["sample_id"]: r for r in load(self.ledger_path)}
-            self.jobs.update({sid: {k: r[k] for k in ("status", "call_id", "sample_dir")}
+            self.jobs.update({sid: {k: r.get(k) for k in ("status", "call_id", "sample_dir", "mtime")}
                                for sid, r in latest.items() if r["status"] in ("done", "running")})
             running = sum(j["status"] == "running" for j in self.jobs.values())
             if running: print(f"🔄 reconnected to {running} in-flight modal job(s) from ledger.")
@@ -94,11 +96,13 @@ class ModalEngine:
         self.download_pool = ThreadPoolExecutor(max_workers=download_workers, thread_name_prefix="down")
         threading.Thread(target=self._poll_loop, daemon=True).start()
 
-    def _set_status(self, sid, status, sample_dir, call_id=None):
+    def _set_status(self, sid, status, sample_dir, call_id=None, mtime=None):
+        if mtime is None:
+            mtime = self.jobs.get(sid, {}).get("mtime")   # carry forward across status transitions
         row = {"sample_id": sid, "status": status, "call_id": call_id, "sample_dir": str(sample_dir),
-               "time": datetime.now(timezone.utc).isoformat()}
+               "mtime": mtime, "time": datetime.now(timezone.utc).isoformat()}
         with self.lock:
-            self.jobs[sid] = {"status": status, "call_id": call_id, "sample_dir": str(sample_dir)}
+            self.jobs[sid] = {"status": status, "call_id": call_id, "sample_dir": str(sample_dir), "mtime": mtime}
             append(row, self.ledger_path)
 
     def _record_failure(self, sid, sample_dir, phase, error, tb, call_id=None):
@@ -107,11 +111,12 @@ class ModalEngine:
         with self.lock:
             append(row, self.failed_path)
 
-    def submit(self, sample_dir: Path):
+    def submit(self, sample_dir: Path, mtime: float):
         sid = sample_dir.name
         with self.lock:
-            if sid in self.jobs and self.jobs[sid]["status"] != "failed": return
-        self._set_status(sid, "uploading", sample_dir)
+            j = self.jobs.get(sid)
+            if j and j["status"] != "failed" and j.get("mtime") == mtime: return
+        self._set_status(sid, "uploading", sample_dir, mtime=mtime)
         self.upload_pool.submit(self._upload_worker, sample_dir)
 
     def _upload_worker(self, sample_dir: Path):
@@ -197,7 +202,9 @@ def main():
     print("=" * 80)
 
     def watch_loop(engine):
-        seen_done = set()
+        seen_done = {}  # sid -> raw file's mtime when last handled; a delete + re-record
+                         # under the same sample id lands a raw file with a new mtime, so
+                         # it reads as unseen and gets (re)queued instead of skipped forever
         while True:
             # a whole tick is wrapped so one bad/deleted file never kills the watcher --
             # e.g. rglob walking into a directory that gets deleted mid-scan raises here,
@@ -206,24 +213,28 @@ def main():
                 for npy_path in watch_path.rglob("**/vibration/01_raw_vibrations.npy"):
                     sample_dir = npy_path.parents[1]
                     sid = sample_dir.name
-                    if sid in seen_done: continue
+                    try:
+                        mtime = npy_path.stat().st_mtime
+                    except OSError:
+                        continue  # raw file vanished since rglob listed it -- retry next tick
+                    if seen_done.get(sid) == mtime: continue
                     if not is_file_ready(npy_path): continue
                     if (sample_dir / "vibration/02_raw_shifts.npy").exists():
                         # pclk already computed (e.g. from a prior watcher run, with the raw file
                         # kept around) -- skip resubmitting, no need to recompute or re-upload
                         print(f"⏭️  [sample {sid}] pclk already computed, skipping.")
-                        seen_done.add(sid)
+                        seen_done[sid] = mtime
                         continue
                     try:
                         size_gb = npy_path.stat().st_size / 1e9
                     except OSError:
                         continue  # raw file vanished since is_file_ready checked it (e.g. deleted by hand) -- retry next tick, not in seen_done yet
                     print(f"📥 [sample {sid}] raw ready ({size_gb:.2f} GB) -- pclk + {cleanup_raw_vibrations or 'keep'}. Queuing...")
-                    engine.submit(sample_dir)
+                    engine.submit(sample_dir, mtime)
                     # mark as seen once queued, not on some "done" file -- the raw .npy only
                     # disappears once _process_vibrations compresses/deletes it, and relying on
                     # e.g. fft.npz existing missed samples processed before this step existed
-                    seen_done.add(sid)
+                    seen_done[sid] = mtime
             except (KeyboardInterrupt, SystemExit):
                 raise
             except Exception as e:
