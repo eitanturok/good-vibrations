@@ -20,6 +20,7 @@ from composer.callbacks import LRMonitor, SpeedMonitor, NaNMonitor, OptimizerMon
 from composer.optim import CosineAnnealingWithWarmupScheduler  # noqa: E402
 
 from model.dataset import build_dataset  # noqa: E402
+from model.callbacks import OutputSaver  # noqa: E402
 from src5.latent_model import LDMSegVibrationModel  # noqa: E402
 from src5.viz import VisualizePointRend, VisualizeSMaskAccum  # noqa: E402
 
@@ -66,6 +67,12 @@ def get_parser() -> argparse.ArgumentParser:
     p.add_argument("--full-res-decode", action="store_true",
                     help="decode at 512x512 (paper's native res) instead of the default 256x256 -- "
                          "+66%% samples/sec, -49%% memory at 256; see src5/SPEEDUP_LOG.md")
+    p.add_argument("--same-label", action="store_true",
+                    help="read the src5/precompute_latents.py --same-label cache (every object "
+                         "bit-encoded with the same id) instead of the default per-instance-id "
+                         "cache -- the model then only learns to detect where objects are, not "
+                         "which object is which. Requires that cache to already exist -- run "
+                         "`python src5/precompute_latents.py --same-label` once first.")
     # train
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--weight-decay", type=float, default=1e-2)
@@ -135,7 +142,7 @@ def main(args: argparse.Namespace) -> None:
         data_dir=args.data_dir, data_info=data_info, d_model=args.d_model, encoder=args.encoder,
         latent_loss_weight=args.latent_loss_weight, ce_loss_weight=args.ce_loss_weight,
         mask_loss_weight=args.mask_loss_weight, warmstart_checkpoint=args.warmstart_checkpoint,
-        compile=args.compile, decode_interpolate=args.full_res_decode)
+        compile=args.compile, decode_interpolate=args.full_res_decode, same_label=args.same_label)
 
     loggers = [FileLogger(f"runs/{{run_name}}/logs-rank{{rank}}.txt")]
     if args.run_name:
@@ -159,10 +166,17 @@ def main(args: argparse.Namespace) -> None:
         # --viz-interval epochs per split, accumulated across all of that split's batches
         # (up to max_samples=108) -- not just the first batch. VisualizePointRend (--log-points)
         # logs the same panels overlaid with the actual PointRend sample locations used that step.
+        # OutputSaver (model/callbacks.py, same one src/run.py uses) dumps mask_pred/info .pt
+        # files to runs/{run_name}/outputs_history/ -- this is the ONLY thing that makes a run
+        # show up in viz/ (viz/data.py's scan_runs only lists runs with an outputs_history/ dir);
+        # LDMSegVibrationModel's forward() output already has the same 'mask_pred' key the
+        # generic OUTPUT_EXTRACTORS reads, so the default output_keys=('mask_pred','info') work
+        # unmodified here.
         callbacks=[NaNMonitor(), LRMonitor(), SpeedMonitor(1),
                    OptimizerMonitor(log_optimizer_metrics=True),
                    VisualizeSMaskAccum(args.viz_interval, max_samples=108),
-                   *([VisualizePointRend(args.viz_interval, max_samples=108)] if args.log_points else [])])
+                   *([VisualizePointRend(args.viz_interval, max_samples=108)] if args.log_points else []),
+                   OutputSaver(args.eval_interval, "runs/{run_name}/outputs_history", overwrite=True)])
 
     # step-0 baseline: eval (train split too, via train_eval_loader -- unaugmented/unshuffled)
     # and log its predicted-vs-true mask images, before any weight update happens. Label is

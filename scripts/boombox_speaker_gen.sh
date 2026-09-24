@@ -42,6 +42,12 @@
 set -eu
 cd "$(dirname "$0")/.."
 export PYTHONPATH=.
+# torch DataLoader workers leak fds (one per tensor handed back to the main process, held open
+# until consumed) -- the inherited default (1024 here) gets exhausted over a long multi-run sweep
+# and silently deadlocks the process (a worker's feeder thread dies with "Too many open files",
+# but that exception never propagates to the main process -- it just hangs forever). Bit us on
+# run 2/13 (bb-spk-1-8k-v1) of this exact script on 2026-09-22. Raise it up front.
+ulimit -n 65536
 
 TAG="${TAG:-v1}"
 GROUP="boombox-speaker-gen-$TAG"

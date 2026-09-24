@@ -48,11 +48,17 @@ def _target_class_map(instance_masks: torch.Tensor, target_classes: torch.Tensor
     return out
 
 
-def load_latents(sample_ids: torch.Tensor, data_dir: Path, device, decode_res: int = 512) -> dict:
+def load_latents(sample_ids: torch.Tensor, data_dir: Path, device, decode_res: int = 512,
+                  cache_name: str = "05_ldmseg_latent.npz") -> dict:
     """Loads each sample's precomputed LDMSeg latent (src5/precompute_latents.py) by sample_id.
     Targets are cached at 512x512 (encode-time resolution, fixed by the frozen AE); if the model
     decodes at a lower `decode_res` (see LDMSegVibrationModel's `decode_interpolate`), downsample
     them once (nearest, to keep mask edges binary) to match before the loss ever sees them.
+
+    `cache_name` picks the file written by precompute_latents.py: the default
+    "05_ldmseg_latent.npz" (a distinct id per instance) or, with --same-label,
+    "05_ldmseg_latent_same_label.npz" (every instance encoded with the same id -- z_gt only
+    carries object presence, not identity).
 
     Profiling a real training step (torch.profiler) showed cudaStreamSynchronize/
     cudaDeviceSynchronize eating ~91% of CPU time, driven by this function doing up to 2 separate
@@ -60,7 +66,7 @@ def load_latents(sample_ids: torch.Tensor, data_dir: Path, device, decode_res: i
     Fixed by concatenating across the whole batch first and transferring once."""
     z_gt, class_map, masks_list, classes_list = [], [], [], []
     for sid in sample_ids.tolist():
-        npz = np.load(data_dir / "samples" / f"{sid:06d}" / "image" / "05_ldmseg_latent.npz")
+        npz = np.load(data_dir / "samples" / f"{sid:06d}" / "image" / cache_name)
         masks, classes = torch.from_numpy(npz["masks_512"]), torch.from_numpy(npz["target_classes"])
         z_gt.append(torch.from_numpy(npz["z_gt"]))
         class_map.append(_target_class_map(masks, classes))
@@ -116,12 +122,16 @@ class LDMSegVibrationModel(ComposerModel):
                  fuse: str = "concat", freq_dropout: float = 0.0, laser_dropout: float = 0.0,
                  latent_loss_weight: float = 0.1, ce_loss_weight: float = 1.0,
                  mask_loss_weight: float = 1.0, warmstart_checkpoint: str | None = None,
-                 compile: bool = False, decode_interpolate: bool = True):
+                 compile: bool = False, decode_interpolate: bool = True, same_label: bool = False):
         super().__init__()
         self.data_dir = Path(data_dir)
         self.data_info = data_info
         self.latent_loss_weight, self.ce_loss_weight, self.mask_loss_weight = (
             latent_loss_weight, ce_loss_weight, mask_loss_weight)
+        # same_label: read the "every object same id" cache written by
+        # precompute_latents.py --same-label instead of the default per-instance-id cache --
+        # z_gt/target_class_map then only ever encode object presence, never identity.
+        self.cache_name = "05_ldmseg_latent_same_label.npz" if same_label else "05_ldmseg_latent.npz"
         # decode_interpolate=False: skip the frozen AE's final bilinear upsample (512x512 ->
         # 256x256, see src5/ldmseg_ae.py's interpolation_factor), a real 4x reduction in the
         # single biggest tensor in the pipeline. See src5/SPEEDUP_LOG.md for the measured effect.
@@ -163,7 +173,8 @@ class LDMSegVibrationModel(ComposerModel):
         # Decoder.forward returns (B,H,W,out_c) (channels-last) whenever out_c != 1 -- its RGB-
         # output convention -- so permute back to the (B,C,H,W) the frozen AE's decode() expects.
         z_pred = self.decoder(emb).permute(0, 3, 1, 2).contiguous()
-        latents = load_latents(batch["info"]["sample_id"], self.data_dir, z_pred.device, self.decode_res)
+        latents = load_latents(batch["info"]["sample_id"], self.data_dir, z_pred.device, self.decode_res,
+                                self.cache_name)
         outputs = self.mask_ae.decode(z_pred, interpolate=self.decode_interpolate)
         out_h, out_w = self.data_info["out_h"], self.data_info["out_w"]
         mask_pred = foreground_prob(outputs, latents["target_classes"], out_h, out_w)

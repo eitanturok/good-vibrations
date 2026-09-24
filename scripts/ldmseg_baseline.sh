@@ -34,6 +34,12 @@
 set -u
 cd "$(dirname "$0")/.."
 export PYTHONPATH=.
+# torch's DataLoader workers leak file descriptors (one per tensor handed back to the main
+# process, held open until consumed) -- the inherited default of 1024 gets exhausted over a long
+# run and deadlocks the training process silently (a worker's feeder thread dies with "Too many
+# open files", but that exception never propagates to the main process, which just hangs forever
+# waiting on a queue that will never get fed again). Raise it up front.
+ulimit -n 65536
 
 TAG="${TAG:-v9}"
 
