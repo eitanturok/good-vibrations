@@ -31,6 +31,13 @@ MAX_OVERHEAD = [1, 1]               # largest cropped-overhead [w, h] over ALL d
 DIRS: dict[str, Path] = {}   # sample id -> dir; the only id->path map
 META: dict[str, dict] = {}
 INFO: dict = {}
+# Bumped whenever rescan/rescan_datasets/_load actually change a sample -- folded into the
+# client's cache-busting `rv` (see app.py::_payload) so a sample deleted and recaptured
+# under the SAME id gets a fresh image URL. Without this, thumb/scene/mask are served with
+# Cache-Control: immutable, so the browser keeps showing whatever photo it first fetched
+# for that id forever -- looking exactly like "another sample's" image, because it is one:
+# whatever used to be at that id before the redo.
+EPOCH = 0
 
 
 def _meta(d: Path) -> dict:
@@ -249,13 +256,19 @@ def rescan_datasets() -> int:
         else:
             DIRS.clear(); META.clear(); INFO.clear()
         changed += 1
+    if changed:
+        global EPOCH
+        EPOCH += 1
+        box_photo.cache_clear()   # keyed by dataset name -- a redone dataset needs a fresh pick
     return changed
 
 
 def rescan() -> int:
     """Reconcile DIRS/META for the current dataset against what's on disk: pick up samples
-    the watcher finished writing, and drop ones whose directory (or FFT) is gone -- e.g. a
-    bad capture deleted mid-collection. Returns how many samples changed either way."""
+    the watcher finished writing, drop ones whose directory (or FFT) is gone -- e.g. a bad
+    capture deleted mid-collection -- and refresh META for samples reprocessed in place
+    (same id, new metadata.jsonl) so a stale label doesn't survive a resample. Returns how
+    many samples changed either way."""
     if CURRENT not in DATASETS:
         return 0
     try:
@@ -267,12 +280,24 @@ def rescan() -> int:
         del DIRS[sid]; del META[sid]
         changed += 1
     for name, d in on_disk.items():
-        if name not in DIRS and _fft(d):
+        if not _fft(d):
+            continue
+        m = _meta_row(name, d, CURRENT)
+        if name not in DIRS or META[name] != m:
             DIRS[name] = d
-            META[name] = _meta_row(name, d, CURRENT)
+            META[name] = m
             changed += 1
     if changed:
+        global EPOCH
         COUNTS[CURRENT] = len(DIRS)   # keep the box picker's count for the live dataset honest
+        EPOCH += 1
+        # fft()/shifts() are lru_cached by sid alone; _load() clears them on a full dataset
+        # switch, but a same-dataset redo goes through here instead -- without this, a
+        # sample deleted and recaptured under the same id keeps serving its OLD spectrum/
+        # mode/probe data from cache even after the image itself (fixed via EPOCH) refreshes.
+        fft.cache_clear()
+        shifts.cache_clear()
+        box_photo.cache_clear()   # the redone sample might be this dataset's box-picker photo
     return changed
 
 
@@ -301,8 +326,9 @@ def _load(name: str) -> None:
     """(Re)populate DIRS / META / INFO for one dataset. Keep only samples that really
     have an FFT -- this is what drops gastronorm's 000009 (images but no vibration data),
     with no special case."""
-    global CURRENT
+    global CURRENT, EPOCH
     CURRENT = name
+    EPOCH += 1
     ds = DATASETS[name]
     DIRS.clear(); META.clear()
     fft.cache_clear(); shifts.cache_clear()

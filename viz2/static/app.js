@@ -11,13 +11,18 @@ const S = {
   log: { spec: 1 },
   specMode: 'magphase', phmode: 'cos', fieldbg: false, kind: 'clean',
   modeview: 'quiver',
+  // How the sample gallery's thumbnails render (see galThumbUrl) -- independent toggles,
+  // like #fieldbg's background checkbox for the mode plot.
+  gal: { bg: true, mask: false },
   // Per-plot box-zoom windows, as fractions [0..1] of each axis (see the zoom section).
   zoom: { p1: fullView(), p2: fullView(), p3: fullView() },
   dragging: false,
   empty: false, anim: 0, asize: 1, frame: 0,
   // empty set == no constraint. `objects` matches on object TYPE (a sample lists several),
-  // `nobj` on the object COUNT -- independent axes.
-  f: { objects: new Set(), layouts: new Set(), nobj: new Set(), spk: new Set([1]) },
+  // `nobj` on the object COUNT -- independent axes. `boxes` is the physical box a sample
+  // was captured in (metadata's own "box", not which dataset dir is loaded -- one dataset
+  // can span several boxes).
+  f: { boxes: new Set(), objects: new Set(), layouts: new Set(), nobj: new Set(), spk: new Set([1]) },
 };
 
 window.__S = S;
@@ -25,7 +30,8 @@ const hasObj = (s) => s.objects.some((o) => S.f.objects.has(o));
 /* One filter, applied everywhere downstream: the sample list, the position scatter and
    the speaker ring all read from this, so they can never disagree about what exists. */
 function pass(s) {
-  return (!S.f.objects.size || hasObj(s)) &&
+  return (!S.f.boxes.size || S.f.boxes.has(s.box)) &&
+         (!S.f.objects.size || hasObj(s)) &&
          (!S.f.layouts.size || S.f.layouts.has(s.layout)) &&
          (!S.f.nobj.size || S.f.nobj.has(s.n)) &&
          (!S.f.spk.size || S.f.spk.has(s.spk));
@@ -37,7 +43,8 @@ const matches = () => S.all.filter(pass);
    for every layout -- how many 1-object samples that layout has -- and picking a speaker
    updates all of them. `skip` is the facet whose own constraint is dropped. */
 function passExcept(s, skip) {
-  return (skip === 'objects' || !S.f.objects.size || hasObj(s)) &&
+  return (skip === 'boxes' || !S.f.boxes.size || S.f.boxes.has(s.box)) &&
+         (skip === 'objects' || !S.f.objects.size || hasObj(s)) &&
          (skip === 'layouts' || !S.f.layouts.size || S.f.layouts.has(s.layout)) &&
          (skip === 'nobj' || !S.f.nobj.size || S.f.nobj.has(s.n)) &&
          (skip === 'spk' || !S.f.spk.size || S.f.spk.has(s.spk));
@@ -63,12 +70,13 @@ const objectValues = () => [...new Set(S.all.flatMap((s) => s.objects))].sort();
    emptied set just means "no constraint", so a switch can never land on zero matches. */
 function pruneFilters() {
   const have = {
+    boxes: new Set(S.all.map((s) => s.box)),
     objects: new Set(S.all.flatMap((s) => s.objects)),
     layouts: new Set(S.all.map((s) => s.layout)),
     nobj: new Set(S.all.map((s) => s.n)),
     spk: new Set(S.all.map((s) => s.spk)),
   };
-  for (const k of ['objects', 'layouts', 'nobj', 'spk'])
+  for (const k of ['boxes', 'objects', 'layouts', 'nobj', 'spk'])
     for (const v of [...S.f[k]]) if (!have[k].has(v)) S.f[k].delete(v);
 }
 
@@ -149,10 +157,12 @@ const css = (n) => getComputedStyle(document.body).getPropertyValue(n).trim();
 
 // Live: watch_and_process.py drops new samples (and new experiment dirs) under the watch
 // path while it's running. /api/samples rescans both each call; only rebuild the UI when
-// something actually moved.
+// something actually moved. rv (not sample/dataset COUNT) is the right signal -- it's
+// bumped server-side on any add/remove/reprocess, including a sample deleted and
+// recaptured under the same id, which leaves the count unchanged but the content stale.
 async function poll() {
   const j = await api('/api/samples');
-  if (j.samples.length !== S.all.length || j.datasets.length !== S.datasets.length) loadPayload(j);
+  if (j.rv !== S.rv) loadPayload(j);
 }
 
 /* Swap in another dataset (box). The samples, positions, speaker ring, grid and scales
@@ -182,15 +192,19 @@ function loadPayload(j) {
 const firstSample = () => select(
   (S.all.find((s) => !s.empty && pass(s)) || S.all.find((s) => !s.empty) || S.all[0]).id);
 
-/* Each box renders at its own aspect ratio and its own size: the mode panel is scaled by
-   the box's cropped-overhead pixels against the largest box in the set, so a physically
-   bigger box stays visibly bigger. */
+/* The panel's WIDTH is scaled by the box's cropped-overhead pixels against the largest box
+   in the set, so a physically bigger box stays visibly bigger. Its HEIGHT follows the laser
+   grid's own rows/cols ratio, not the photo's -- arrows() lays out cells as w/cols by
+   h/rows, so any other height makes cells non-square and the whole plot looks stretched
+   (e.g. a rectangular photo with an actually-square 10x10 laser grid). */
 function sizeModePanel() {
-  const [ow, oh] = S.info.overhead, big = Math.max(...S.info.max_overhead);
-  const k = 460 / big;                    // 460px for the largest box's long side
+  const [ow] = S.info.overhead, big = Math.max(...S.info.max_overhead);
+  const { rows, cols } = S.info;
+  const w = (460 / big) * ow;             // 460px for the largest box's long side
+  const h = w * (rows / cols);
   const root = document.documentElement.style;
-  root.setProperty('--mw', `${Math.round(ow * k)}px`);
-  root.setProperty('--mh', `${Math.round(oh * k)}px`);
+  root.setProperty('--mw', `${Math.round(w)}px`);
+  root.setProperty('--mh', `${Math.round(h)}px`);
 }
 
 /* ***** selection ***** */
@@ -921,16 +935,19 @@ function recoveredGrid() {
   const sig = sets.map((s) => `${s.id}:${s.sid}`).join(',');
   if (box.dataset.sig !== sig) {          // rebuild only on a SET change -- reloading a
     box.dataset.sig = sig;                // <video>'s src mid-playback would restart it
-    const tile = (s) => `<figure data-id="${s.id}"><video preload="metadata" playsinline></video>` +
+    const tile = (s) => `<figure data-id="${s.id}"><div class="vidwrap"><video preload="metadata" playsinline></video>` +
+      `<div class="vidctl"><button class="vidplay" type="button">▶</button>` +
+      `<input class="vidseek" type="range" min="0" max="0" step="0.01" value="0">` +
+      `<span class="vidtime">0.00s / 0.00s</span></div></div>` +
       `<figcaption style="border-left-color:${s.c}">${s.t}</figcaption></figure>`;
     box.innerHTML =
       (cur ? `<div class="fgrid-cur">${tile(cur)}</div>` : '') +
       `<div class="fgrid-rest">${rest.map(tile).join('')}</div>`;
     box.querySelectorAll('figure').forEach((f, i) => {
-      const v = f.querySelector('video');
-      wireHoverControls(v);
-      v.onerror = () => { f.style.display = 'none'; };   // this sample has no rendered video
-      v.src = `/api/recovered_video/${sets[i].sid}.mp4?v=${S.rv}`;
+      const wrap = f.querySelector('.vidwrap');
+      wireVideoControls(wrap);
+      wrap.querySelector('video').onerror = () => { f.style.display = 'none'; };  // no rendered video for this sample
+      wrap.querySelector('video').src = `/api/recovered_video/${sets[i].sid}.mp4?v=${S.rv}`;
     });
   }
   box.querySelectorAll('figure').forEach((f) =>
@@ -1494,14 +1511,52 @@ const tally = (key) => {
 // A distinct, stable hue per index/value -- the coloured dot beside a layout or count.
 const hueOf = (n) => (28 + n * 47) % 360;
 
+// "{box} box, spk {spk}" as two live dropdowns above the scatter -- both are single,
+// EXCLUSIVE picks WITHIN the current filtered set (like the box/speaker filters, but a
+// single choice standing in for the current sample's own box/speaker, not a set of
+// candidates). Switching dataset already has its own picker in the filter row; a box here
+// is the metadata box, and one dataset can span several.
+function buildBoxSpkTitle() {
+  syncBoxSel();
+  syncSpkSel();
+}
+
+// Options respect EVERY active filter (matches(), not passExcept) -- if the box filter has
+// narrowed to one box, this dropdown offers only that box too, not every box that would be
+// valid if the box filter were lifted. Re-run on every filter change (applyFilter), not
+// just when the picker is first built.
+function syncBoxSel() {
+  const bx = $('#boxsel');
+  if (!bx) return;
+  const boxes = [...new Set(matches().map((s) => s.box))].sort();
+  const cur = bx.value;
+  bx.innerHTML = boxes.map((v) => `<option value="${v}">${v}</option>`).join('');
+  if (boxes.includes(cur)) bx.value = cur;   // keep the pick if it's still a valid option
+  bx.onchange = () => { S.f.boxes = new Set([bx.value]); applyFilter(); };
+}
+
+// Same idea, for speaker: a filter ring narrowed to speaker 1 leaves this dropdown offering
+// only speaker 1 too.
+function syncSpkSel() {
+  const sp = $('#spksel');
+  if (!sp) return;
+  const spks = [...new Set(matches().map((s) => s.spk))].sort((a, b) => a - b);
+  const cur = sp.value;
+  sp.innerHTML = spks.map((v) => `<option value="${v}">${v}</option>`).join('');
+  if (spks.includes(+cur)) sp.value = cur;   // keep the pick if it's still a valid option
+  sp.onchange = () => { S.f.spk = new Set([+sp.value]); applyFilter(); };
+}
+
 function buildFilters() {
   // Unfiltered totals -- how many distinct values this picker HAS, not how many currently
   // pass (that's the .ffacets line by the filter chips). Always the whole dataset's count,
   // so it doesn't shrink as you filter and start looking like the picker itself shrank.
   $('#dscount').textContent = `(${S.datasets.length})`;
+  $('#boxcount').textContent = `(${new Set(S.all.map((s) => s.box)).size})`;
   $('#objcount').textContent = `(${objectValues().length})`;
   $('#nobjcount').textContent = `(${new Set(S.all.map((s) => s.n)).size})`;
   $('#lycount').textContent = `(${new Set(S.all.map((s) => s.layout)).size})`;
+  buildBoxSpkTitle();
   pickbox($('#datasetbox'), {
     // Each row carries a thumbnail of the bare box, so the datasets are told apart at a
     // glance rather than by reading long names.
@@ -1513,6 +1568,17 @@ function buildFilters() {
     placeholder: 'change dataset',
   });
   buildSampleGrid();
+  pickbox($('#boxbox'), {
+    // The physical box a sample was captured in -- a dataset can span several. Multi-select,
+    // same as layout/n_objects: a sample passes if it's in ANY of the picked boxes.
+    opts: () => {
+      const f = facetTally('box', 'boxes');
+      return tally('box').map(([b], i) => ({ v: b, label: b, count: f.get(b) || 0, hue: hueOf(i) }));
+    },
+    on: (v) => S.f.boxes.has(v),
+    pick: (v) => { toggle(S.f.boxes, v); applyFilter(); },
+    multi: true, placeholder: 'filter boxes',
+  });
   pickbox($('#objectbox'), {
     // Object TYPE, regardless of count. Multi-select: a sample passes if it holds ANY of
     // the picked types. Count is faceted against the other filters.
@@ -1559,18 +1625,28 @@ function buildFilters() {
 
 function pickSample(id) {
   if (!S.byId[id]) return;
-  if (!pass(S.byId[id])) { S.f.objects.clear(); S.f.layouts.clear(); S.f.nobj.clear(); applyFilter(); }
+  if (!pass(S.byId[id])) { S.f.boxes.clear(); S.f.objects.clear(); S.f.layouts.clear(); S.f.nobj.clear(); applyFilter(); }
   select(id);
 }
 
+// bg and mask are independent checkboxes; bg off with mask also off has nothing left to
+// show, so it falls back to the plain photo -- same fallback render.thumb() applies
+// server-side if a sample has no mask at all (e.g. an empty box).
+const galThumbUrl = (id) => {
+  const bg = S.gal.bg || !S.gal.mask;
+  return `/api/thumb/${id}.jpg?mask=${S.gal.mask ? 1 : 0}&bg=${bg ? 1 : 0}&v=${S.rv}`;
+};
+
 /* The sample list, as a scrollable photo grid (5/row): overhead thumbnail + "Pos x, Spk y
    (id)" caption. select() redraws it on every pick -- from here, the scatter or a workbench
-   probe -- so the current sample is always highlighted and scrolled into view. */
+   probe -- so the current sample is always highlighted and scrolled into view.
+   #samplebox holds only the search input now, sitting beside #posjump at half width each;
+   the grid itself is #samplegrid, a SEPARATE sibling spanning the full row underneath both
+   -- nesting it inside #samplebox capped it to #samplebox's own (half) width instead. */
 function buildSampleGrid() {
-  const host = $('#samplebox');
-  host.innerHTML = '<input class="pbq" spellcheck="false" autocomplete="off" placeholder="search by sample id">' +
-    '<div class="sgrid"></div>';
-  const q = host.querySelector('.pbq'), grid = host.querySelector('.sgrid');
+  const host = $('#samplebox'), grid = $('#samplegrid');
+  host.innerHTML = '<input class="pbq" spellcheck="false" autocomplete="off" placeholder="search by sample id">';
+  const q = host.querySelector('.pbq');
   host._draw = () => {
     const s = q.value.trim().toLowerCase();
     const hits = matches().filter((o) =>
@@ -1578,9 +1654,16 @@ function buildSampleGrid() {
     grid.innerHTML = hits.map((o) => `
       <button class="scard${o.id === S.live.sid ? ' on' : ''}" data-id="${o.id}">
         <span class="sclab">Pos ${o.pos}, Spk ${o.spk} (${shortId(o.id)})</span>
-        <img class="scimg" src="/api/thumb/${o.id}.jpg?v=${S.rv}" alt="" loading="lazy">
+        <img class="scimg" src="${galThumbUrl(o.id)}" alt="" loading="lazy">
       </button>`).join('') || '<div class="pbmore">no match</div>';
-    grid.querySelectorAll('.scard').forEach((b) => (b.onclick = () => pickSample(b.dataset.id)));
+    grid.querySelectorAll('.scard').forEach((b) => {
+      b.onclick = () => pickSample(b.dataset.id);
+      // Show where this card's sample sits in the box, without committing to it -- same
+      // "hover previews, click picks" pattern as hovering a workbench probe.
+      const pos = S.byId[b.dataset.id]?.pos;
+      b.onmouseenter = () => hoverGalleryPos(pos);
+      b.onmouseleave = () => hoverGalleryPos(null);
+    });
     // Only autoscroll when the box isn't being typed in, so picking a sample elsewhere
     // (scatter, a workbench probe) jumps the grid to it without fighting an active filter.
     // Scroll the grid's own scrollTop, not scrollIntoView -- that walks every scrollable
@@ -1597,10 +1680,10 @@ function buildSampleGrid() {
 }
 
 const drawPickers = () =>
-  ['#datasetbox', '#samplebox', '#objectbox', '#nobjbox', '#layoutbox']
+  ['#datasetbox', '#samplebox', '#boxbox', '#objectbox', '#nobjbox', '#layoutbox']
     .forEach((id) => $(id)?._draw?.());
 
-const FILTER_KEYS = ['objects', 'layouts', 'nobj', 'spk'];
+const FILTER_KEYS = ['boxes', 'objects', 'layouts', 'nobj', 'spk'];
 
 /* Per-value chips now live in each filter's own lane (the .pbsel strip above its search
    box), and picked speakers show lit on the ring -- so this shared bar is just the
@@ -1611,7 +1694,8 @@ const FILTER_KEYS = ['objects', 'layouts', 'nobj', 'spk'];
 const plural = (c, w) => `${c} ${w}${c === 1 ? '' : 's'}`;
 function facetSummary(m) {
   const uniq = (get) => new Set(m.flatMap(get)).size;
-  return [plural(S.datasets.length, 'dataset'), plural(uniq((s) => s.objects), 'object'),
+  return [plural(S.datasets.length, 'dataset'), plural(uniq((s) => [s.box]), 'box'),
+          plural(uniq((s) => s.objects), 'object'),
           plural(uniq((s) => [s.n]), 'n_obj'), plural(uniq((s) => [s.layout]), 'layout')]
     .join(' · ');
 }
@@ -1639,6 +1723,8 @@ function renderFilterChips(m) {
 function applyFilter() {
   const m = matches();
   drawPickers();
+  syncBoxSel();
+  syncSpkSel();
   renderFilterChips(m);
   $('#nmatch').textContent = m.length;
   $('#nmatchsub').textContent = `/${S.all.length}`;
@@ -1775,7 +1861,11 @@ function renderScatter() {
   // Moving it last puts it on top; the fill is semi-transparent (see .pt.on) so the
   // dots underneath stay visible rather than being blotted out.
   if (sel) sel.parentNode.appendChild(sel);
-  $('#poscount').textContent = `${POS().length}  spk ${S.byId[S.live.sid]?.spk ?? '-'}`;
+  $('#poscount').textContent = `${POS().length} positions`;
+  // Reflect the current sample's speaker in the dropdown -- box/spk text is now the
+  // titles's job (buildBoxSpkTitle), not this count.
+  const sp = $('#spksel'), curSpk = S.byId[S.live.sid]?.spk;
+  if (sp && curSpk != null) sp.value = String(curSpk);
 }
 
 // y_frac has 0 at the BOTTOM (draw_speaker flips it), so invert for SVG.
@@ -1814,23 +1904,19 @@ function selectedSpks() {
   return [...S.f.spk].filter((v) => typeof v !== 'symbol').sort((a, b) => a - b);
 }
 
-function cycleSpk(dir) {
-  const s = S.byId[S.live.sid];
-  const at = S.byPos[s?.pos] || {};
-  const avail = selectedSpks().filter((sp) => at[sp]);
-  if (avail.length < 2) return;
-  const i = avail.indexOf(s.spk);
-  select(at[avail[(i + dir + avail.length) % avail.length]]);
-}
-
-function renderSpkCycle() {
-  const el = $('#spkcycle');
-  if (!el) return;
+// Lives in the SEARCH section, not the filter: a direct pick, not a step, among whichever
+// of the selected speakers actually have a sample at the position you're looking at.
+function renderSpkAt() {
+  const wrap = $('#spkatwrap');
+  if (!wrap) return;
   const s = S.byId[S.live.sid], at = S.byPos[s?.pos] || {};
   const avail = selectedSpks().filter((sp) => at[sp]);
-  el.hidden = avail.length < 2;
+  wrap.hidden = avail.length < 2;
   if (avail.length < 2) return;
-  $('#spkcyclelbl').textContent = `spk ${s.spk} (${avail.indexOf(s.spk) + 1}/${avail.length})`;
+  $('#spkat').innerHTML = avail.map((sp) =>
+    `<button class="pbchip${sp === s.spk ? ' on' : ''}" data-s="${sp}">spk ${sp}</button>`).join('');
+  $('#spkat').querySelectorAll('button').forEach((b) =>
+    (b.onclick = () => select(at[+b.dataset.s])));
 }
 
 /* The 8-speaker ring drawn AROUND the overhead in the "current" panel -- a static readout
@@ -1873,7 +1959,7 @@ function renderSpk() {
     // dimmed when the speaker filter excludes it, or this position has no such sample
     g.classList.toggle('off', !absent && ((S.f.spk.size && !S.f.spk.has(s)) || !at[s]));
   });
-  renderSpkCycle();
+  renderSpkAt();
 }
 
 function buildGrid() {
@@ -1999,13 +2085,13 @@ function pin() {
 
 /* A sample's identity, in one place, so the viewer, the workbench and every probe row
    agree on what they're showing: box/pos/spk/id, then layout + its objects -- or "empty
-   box" when it has none, keeping the same "N obj: ..." shape either way. */
+   box" when it has none. */
 function sampleMeta(s) {
   const objs = s.empty ? 'empty box' :
     (Object.entries(s.objcounts || {}).map(([o, n]) => `${n} ${o}${n === 1 ? '' : 's'}`).join(', ') || '—');
   return {
     line1: `Pos <b>${s.pos}</b>, Spk <b>${s.spk}</b> (<b>${shortId(s.id)}</b>) ${s.box}`,
-    line2: `objs: ${objs} (${s.layout || '—'} layout)`,
+    line2: `${objs} (${s.layout || '—'} layout)`,
   };
 }
 
@@ -2119,6 +2205,9 @@ function viewerMedia(sid) {
   // element with sound does both -- no separate <audio> fetch/player needed.
   setMedia('#svvidsrc', `/api/source_video/${sid}.mp4?v=${S.rv}`);
   setMedia('#svvidrec', `/api/recovered_video/${sid}.mp4?v=${S.rv}`);
+  // Step 4's ground truth is the same original video, shown again bigger next to the
+  // recovered-video small multiples -- same source, same reasoning as svvidsrc above.
+  setMedia('#gtvid', `/api/source_video/${sid}.mp4?v=${S.rv}`);
   // The chirp's own params (src/data/audio.py), not the sample's -- what band and how much
   // silence padding it was generated with, in place of the generic "played stimulus" label.
   const st = $('#svstim'), sp = S.d?.stim;
@@ -2286,19 +2375,47 @@ function seg(id, fn) {
   };
 }
 
-// Controls only on hover: otherwise the video is just a still frame, so the original and
-// recovered spectrograms sit side by side like two comparable images. Leaving pauses it in
-// place (rather than muting the controls on a still-playing video) so what's left behind is
-// actually a static frame, not a silently animating one.
-function wireHoverControls(v) {
-  v.addEventListener('mouseenter', () => { v.controls = true; });
-  v.addEventListener('mouseleave', () => { v.controls = false; v.pause(); });
+// Always-visible play/pause + seek, but as our OWN bar sitting below the video -- native
+// <video controls> overlays the bottom of the picture itself, which would cover part of
+// the spectrogram; a separate bar underneath never blocks anything.
+const fmtTime = (s) => `${Math.max(0, s || 0).toFixed(2)}s`;
+
+function wireVideoControls(wrap) {
+  const v = wrap.querySelector('video'), btn = wrap.querySelector('.vidplay'),
+        rng = wrap.querySelector('.vidseek'), time = wrap.querySelector('.vidtime');
+  let seeking = false;
+  const setIcon = () => { btn.textContent = v.paused ? '▶' : '❚❚'; };
+  const setTime = () => { time.textContent = `${fmtTime(v.currentTime)} / ${fmtTime(v.duration)}`; };
+  btn.onclick = () => (v.paused ? v.play() : v.pause());
+  v.addEventListener('play', setIcon);
+  v.addEventListener('pause', setIcon);
+  v.addEventListener('loadedmetadata', () => { rng.max = v.duration || 0; setTime(); });
+  v.addEventListener('timeupdate', () => { if (!seeking) rng.value = v.currentTime; setTime(); });
+  rng.addEventListener('pointerdown', () => { seeking = true; });
+  rng.addEventListener('pointerup', () => { seeking = false; v.currentTime = +rng.value; });
+  rng.addEventListener('input', () => { v.currentTime = +rng.value; setTime(); });
+  setIcon(); setTime();
 }
-function hoverControls(sel) { const v = $(sel); if (v) wireHoverControls(v); }
+// The search column's height should match the viewer's, but the viewer must never be
+// influenced back (a CSS align-items:stretch tried this and could balloon both columns --
+// see .s1cols in style.css). A ResizeObserver on the viewer is one-directional and correct
+// regardless of what changes the viewer's height (images loading, content changing, window
+// resize): .s1search's flex chain (s1srow -> .gallerycol -> #samplegrid, all flex:1) then
+// distributes that fixed height down to the gallery on its own.
+function wireViewerHeightSync() {
+  const viewer = $('.s1viewer'), search = $('.s1search');
+  if (!viewer || !search || typeof ResizeObserver === 'undefined') return;
+  const sync = () => { search.style.height = `${viewer.getBoundingClientRect().height}px`; };
+  new ResizeObserver(sync).observe(viewer);
+  sync();
+}
+
+function videoControls(sel) { const w = $(sel)?.closest('.vidwrap'); if (w) wireVideoControls(w); }
 
 function wire() {
   buildOverlays();
-  hoverControls('#svvidsrc'); hoverControls('#svvidrec');
+  wireViewerHeightSync();
+  videoControls('#svvidsrc'); videoControls('#svvidrec'); videoControls('#gtvid');
   document.querySelectorAll('#p1, #p2').forEach((el) => freqAxis(el.parentElement));
   ['p1', 'p2', 'p3'].forEach((id) => zoomable($('#' + id).parentElement, id));
   $('#sigreset').onclick = () => resetZoom();
@@ -2316,8 +2433,10 @@ function wire() {
     else { pj.classList.add('miss'); setTimeout(() => pj.classList.remove('miss'), 600); }
   };
 
-  $('#spkprev').onclick = () => cycleSpk(-1);
-  $('#spknext').onclick = () => cycleSpk(1);
+  // The gallery's own view toggles -- redraw through #samplebox's current _draw (reassigned
+  // on every buildSampleGrid(), e.g. a dataset switch), not a reference captured here.
+  $('#galbg').onchange = (e) => { S.gal.bg = e.target.checked; $('#samplebox')._draw(); };
+  $('#galmask').onchange = (e) => { S.gal.mask = e.target.checked; $('#samplebox')._draw(); };
 
   seg('#ch', (v) => { S.live.ch = v; reviewChannel(); });
   seg('#specmode', (v) => { S.specMode = v; phVis(); drawSpec(); buildPeaks(); peakList(); cursors(); axes(); refreshTip(); });

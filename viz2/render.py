@@ -91,13 +91,33 @@ def masks_overlay(masks, colors, w=300):
     return b.getvalue()
 
 
-def thumb(path, box=(160, 120)):
-    """A tiny JPEG of a cropped-overhead photo, for the row icons in the step-1 pickers."""
+def _jpeg(im, quality=78):
+    b = io.BytesIO()
+    im.save(b, "JPEG", quality=quality)
+    return b.getvalue()
+
+
+def thumb(path, mask=None, bg=True, box=(160, 120)):
+    """A tiny JPEG for the step-1 pickers and the sample gallery.
+
+    No mask: the bare cropped photo, as always. With a mask: bg=True tints the photo green
+    where segmented (scene()'s composite, scaled down); bg=False drops the photo and shows
+    the segmentation alone, on mask_png's flat field. bg=False with no mask (nothing to show
+    instead) falls back to the bare photo rather than an empty thumbnail.
+    """
     im = Image.open(path).convert("RGB")
     im.thumbnail(box)
-    b = io.BytesIO()
-    im.save(b, "JPEG", quality=78)
-    return b.getvalue()
+    if mask is None:
+        return _jpeg(im)
+    m = np.asarray(mask) > 0.5
+    if not bg:
+        img = np.full((*m.shape, 3), (238, 238, 235), np.uint8)
+        img[m] = (24, 160, 100)
+        out = Image.fromarray(img)
+        out.thumbnail(box, Image.NEAREST)
+        return _jpeg(out)
+    mm = Image.fromarray(m.astype(np.uint8) * 110).resize(im.size)
+    return _jpeg(Image.composite(Image.new("RGB", im.size, (24, 160, 100)), im, mm))
 
 
 def scene(photo, mask, w=900):

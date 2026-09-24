@@ -60,13 +60,22 @@ h2 em { font-style:normal; color:var(--accent); font-family:var(--mono);
    SEARCH (pick one sample), and the SAMPLE VIEWER -- are told apart only by a small
    colour-coded label and a hairline rule, so the step still reads as one thing.
    The viewer takes 2/5 of the width and duplicates the pinned column; that is deliberate. */
-.s1grid { display:grid; grid-template-columns:3fr 2fr; gap:0;
-          margin-top:10px; align-items:stretch; }
-.s1left { display:flex; flex-direction:column; min-width:0; }
+.s1grid { display:flex; flex-direction:column; margin-top:10px; }
 
 /* areas share the card's surface -- no border, no inset background */
 .s1part { position:relative; min-width:0; padding:4px 0 16px; }
-.s1left .s1part + .s1part { border-top:1px solid var(--line); padding-top:15px; }
+/* SEARCH (left) and the VIEWER (right) start on the same row, below the full-width filter.
+   minmax(0,...), not bare 3fr/2fr: a plain fr track won't shrink below its content's
+   min-content size, so a wide child (the 5-col sample gallery) was forcing this whole
+   track wider than 3fr and bleeding into the viewer column next to it.
+   align-items:start (not stretch): stretch made the ROW's height the max of both columns'
+   natural content, and if the gallery's own minimum ever exceeded the viewer's natural
+   height, the row -- and the gallery filling it -- ballooned past the viewer instead of
+   matching it. The viewer must stay at its own independent natural height; search's height
+   is set to match it directly in JS instead (see wireViewerHeightSync in app.js), which has
+   no such feedback risk. */
+.s1cols { display:grid; grid-template-columns:minmax(0,3fr) minmax(0,2fr); gap:0; align-items:start;
+          border-top:1px solid var(--line); padding-top:15px; }
 .s1viewer { display:flex; flex-direction:column;
             border-left:1px solid var(--line); margin-left:22px; padding-left:22px; }
 .s1phead { font:600 9px/1 var(--sans); letter-spacing:.16em; text-transform:uppercase;
@@ -75,6 +84,13 @@ h2 em { font-style:normal; color:var(--accent); font-family:var(--mono);
 .s1phead::before { content:''; width:14px; height:2px; border-radius:1px;
                    background:var(--firm); align-self:center; }
 .s1filter .s1phead::before { background:var(--k-filter); }
+/* Hard backstop: this grid-column's content (the sample gallery) has twice now overflowed
+   its box and painted over .s1viewer next to it, via min-content propagating up through
+   nested flex/grid layers. min-width:0 lets it shrink to fit; overflow-x:hidden guarantees
+   containment even if some future child reintroduces the same min-content problem.
+   display:flex column: lets .s1srow (flex:1, below) grow to fill the height .s1cols'
+   align-items:stretch now gives this column, so the gallery inside it can grow too. */
+.s1search { display:flex; flex-direction:column; min-width:0; overflow-x:hidden; }
 .s1search .s1phead::before { background:var(--k-search); }
 .s1viewer .s1phead::before { background:var(--k-view); }
 .s1psub { font-weight:400; letter-spacing:.03em; text-transform:none; color:var(--ink3);
@@ -85,6 +101,7 @@ h2 em { font-style:normal; color:var(--accent); font-family:var(--mono);
 .s1frow .pk { width:auto; }
 .s1frow .pk.pb { width:206px; }
 .s1frow .pk.pb.ds { width:288px; }          /* dataset: room for long box names */
+.s1frow .pk.pb.bx { width:206px; }          /* box: same as object/n_objects */
 .s1frow .pk.pb.ly { width:258px; }          /* layout: show the full layout name */
 .s1frow .pk.pb.nb { width:132px; }          /* n_objects: a short digit column */
 /* the layout column is sized to fit its names, so let them show in full */
@@ -107,21 +124,17 @@ h2 em { font-style:normal; color:var(--accent); font-family:var(--mono);
 .spkchips::-webkit-scrollbar { display:none; }
 .spkchips:empty::before { content:'—'; font:9px var(--mono); color:var(--ink3); opacity:.45; }
 .s1frow #spk { width:174px; height:108px; }   /* bigger, keeping the ring's aspect */
-/* prev/next between the currently-selected speakers, AT this position -- only meaningful
-   once 2+ speakers are picked (hidden otherwise, see renderSpkCycle) */
-.spkcycle { display:flex; align-items:center; justify-content:center; gap:8px;
-            margin-top:4px; font:10px var(--mono); color:var(--ink2); }
-.spkcycle button { font:12px var(--mono); line-height:1; padding:2px 8px;
-                   border:1px solid var(--firm); border-radius:4px; background:var(--s1);
-                   color:var(--ink); cursor:pointer; }
-.spkcycle button:hover { border-color:var(--accent); color:var(--accent); }
 /* the filtered / total count sits at the right end of the FILTER label row: x/y samples */
 .s1phead .s1count { margin-left:auto; font:9px/1 var(--mono); letter-spacing:.06em;
                     text-transform:uppercase; color:var(--ink3); }
 .s1phead .s1count b { font:600 15px/1 var(--mono); color:var(--ink); }
 .s1phead .s1count #nmatchsub { color:var(--ink3); font-weight:400; }
 
-.s1srow { display:flex; flex-wrap:wrap; gap:16px 22px; align-items:flex-start; }
+/* flex:1 (grow into whatever height .s1search's stretch gave it) + min-height:0 (so that
+   height can actually be smaller than this row's own natural content -- required for a
+   flex item to shrink/be constrained rather than always sizing to its content). */
+.s1srow { display:flex; flex-wrap:wrap; gap:16px 22px; align-items:flex-start; min-width:0;
+          flex:1; min-height:0; }
 
 /* Per-value chips live in each filter's own lane now; this bar is just the running
    summary + a single "clear all". One fixed line, so it never reflows step 2. */
@@ -136,16 +149,14 @@ h2 em { font-style:normal; color:var(--accent); font-family:var(--mono);
 /* "clear filters" sits in the gutter right of the pickers, just under the count */
 .s1filter #fclear { position:absolute; top:34px; right:0; margin:0; z-index:1; }
 
-/* SEARCH: the sample grid grows to fill the row beside the scatter -- 5 photos need more
-   room than the old single-column list did. */
-.s1search .pk.samp { flex:1 1 480px; max-width:none; }
-
 /* ***** step 1: the sample viewer *****
    The overhead + segmentation images are the point of this panel -- stacked and large so
    they fill the height of the filter+search column beside them. The spectrogram clips are
    a small squarish reference at the foot. */
-.svbody { display:flex; flex-direction:column; gap:12px; flex:1; min-height:0;
-          justify-content:space-between; }   /* spread the slack, don't pool it at the foot */
+/* Always this natural height -- never influenced by search. app.js's wireViewerHeightSync
+   measures it and sets .s1search's height to match (see .pk.gallerycol/#samplegrid for how
+   that height gets distributed down to the gallery). */
+.svbody { display:flex; flex-direction:column; gap:12px; }
 /* the viewer's whole info block: pos/spk/id loud, then laser/layout/objects/xy, then dataset */
 .svtop { display:flex; flex-direction:column; gap:5px; padding-bottom:10px;
          border-bottom:1px solid var(--line); font-family:var(--mono); }
@@ -181,6 +192,16 @@ h2 em { font-style:normal; color:var(--accent); font-family:var(--mono);
 .svmh { font:8px/1.3 var(--mono); letter-spacing:.06em; text-transform:uppercase;
         color:var(--ink3); margin-bottom:4px; }
 .svmh em { display:block; font-style:normal; opacity:.7; }
+/* Always-visible play/seek, but BELOW the video rather than the native overlay -- so the
+   controls never sit on top of (and hide part of) the spectrogram itself. */
+.vidwrap { display:flex; flex-direction:column; gap:4px; }
+.vidctl { display:flex; align-items:center; gap:6px; }
+.vidplay { flex:none; width:20px; height:20px; padding:0; display:flex; align-items:center;
+           justify-content:center; border:1px solid var(--firm); border-radius:4px;
+           background:var(--s1); color:var(--ink2); font-size:9px; cursor:pointer; }
+.vidplay:hover { border-color:var(--accent); color:var(--accent); }
+.vidseek { flex:1; min-width:24px; height:16px; }
+.vidtime { flex:none; font:9px var(--mono); color:var(--ink3); white-space:nowrap; }
 /* 2:1 to match make_spectrogram_video's figsize=(6,3); contain (not cover) so the whole
    spectrogram shows -- this is the primary way you watch+listen now, not a muted thumbnail
    beside a separate audio player, so it gets real width instead of a small cropped square. */
@@ -188,14 +209,19 @@ h2 em { font-style:normal; color:var(--accent); font-family:var(--mono);
              border-radius:3px; background:#000; }
 .svm video.missing { display:none; }
 /* Recovered small-multiples: same .fgrid-cur/.fgrid-rest skeleton as the mode grid, sized
-   for these 2:1 videos instead of square mode canvases. */
-#recgrid .fgrid-rest { grid-template-columns:repeat(auto-fill, 180px); }
-#recgrid video { width:100%; max-width:180px; aspect-ratio:2/1; object-fit:contain;
+   for these 2:1 videos instead of square mode canvases -- 220px so 3 of .fgrid-rest's
+   pinned-probe tiles fit in a row beside .fgrid-cur (the current sample's own tile). */
+#recgrid .fgrid-rest { grid-template-columns:repeat(auto-fill, 220px); }
+#recgrid video { width:100%; max-width:220px; aspect-ratio:2/1; object-fit:contain;
                   display:block; border-radius:3px; background:#000; }
+/* The ground-truth video is the one big reference (step 4's answer to the overlaid mode
+   plot), so it gets real size instead of the 280px side-by-side cap. */
+#svm-gt { width:680px; }
+#svm-gt video { max-width:none; }
 
 /* the whole step-1 grid stacks once the content column gets tight */
 @media (max-width:1180px) {
-  .s1grid { grid-template-columns:1fr; }
+  .s1cols { grid-template-columns:1fr; }
   .s1viewer { border-left:0; border-top:1px solid var(--line);
               margin-left:0; padding-left:0; margin-top:14px; padding-top:15px; }
 }
@@ -217,7 +243,6 @@ h2 em { font-style:normal; color:var(--accent); font-family:var(--mono);
    highlighted. */
 .pk.pb { width:150px; }
 .pk.pb.ds { width:230px; }                    /* dataset: room for the long box names */
-.pk.pb.samp { width:auto; }                   /* sample: flexes to fill the search row */
 .pk > span { align-self:stretch; }           /* full-width header so all / none sit hard right */
 .pickbox { display:flex; flex-direction:column; gap:3px; width:100%; }
 .pbq { width:100%; font:12px var(--mono); padding:4px 7px; border:1px solid var(--firm);
@@ -272,8 +297,17 @@ h2 em { font-style:normal; color:var(--accent); font-family:var(--mono);
 #datasetbox .pblist { max-height:200px; }
 /* The sample list: a scrollable photo grid, 5 per row -- caption above thumbnail so the
    pos/spk/id reads before the picture. */
-.sgrid { display:grid; grid-template-columns:repeat(5, 1fr); gap:8px;
-         max-height:320px; overflow-y:auto; overscroll-behavior:contain;
+/* minmax(0,1fr), not bare 1fr: a plain fr track won't shrink below its content's
+   min-content size, and nowrap caption text's min-content IS its full untruncated width
+   regardless of text-overflow:ellipsis (that's paint-time only, it doesn't affect layout's
+   min-content calculation) -- so without the 0 floor here, this grid (and everything
+   containing it, all the way up to the search column) got forced wider than its box and
+   visually overflowed into the sample viewer next to it. */
+/* flex:1 (was a flat max-height:320px): grows to fill whatever height .gallerycol's
+   align-self:stretch actually gave it -- i.e. the sample viewer's height -- showing more
+   rows on a tall viewport, fewer on a short one, but always scrollable either way. */
+.sgrid { display:grid; grid-template-columns:repeat(5, minmax(0, 1fr)); gap:8px;
+         flex:1; min-height:220px; overflow-y:auto; overscroll-behavior:contain;
          border:1px solid var(--line); border-radius:var(--r); background:var(--s1); padding:6px; }
 .scard { display:flex; flex-direction:column; gap:3px; border:1px solid transparent;
          background:none; border-radius:4px; padding:3px; cursor:pointer; text-align:center; }
@@ -288,13 +322,51 @@ h2 em { font-style:normal; color:var(--accent); font-family:var(--mono);
 /* Dataset names are long -- let the row wrap to two lines instead of a very wide column. */
 #datasetbox .pbl { white-space:normal; overflow:visible; line-height:1.2;
                    overflow-wrap:anywhere; }
-.pk.pos { width:300px; }
-/* The jump box sits above the scatter, the same width, so the two read as one control. */
-#posjump { width:100%; -moz-appearance:textfield; }
+/* Box/title + scatter on the LEFT (fixed width, the scatter's own natural size); the
+   search pair + 5-col photo gallery (buildSampleGrid) fill the rest of the row to its
+   RIGHT, growing with whatever space is left. */
+.pk.boxcol { flex:0 0 300px; }
+/* align-self:stretch: take the full height .s1srow's own stretch (from .s1cols) gives
+   this row, instead of .s1srow's default flex-start sizing everything to its own content
+   -- .boxcol/.spkat don't need the extra height so they're left at flex-start. */
+.pk.gallerycol { display:flex; flex-direction:column; gap:8px; flex:1 1 480px; min-width:0;
+                 align-self:stretch; }
+/* "{box} box, spk {spk}" as two native <select>s standing in for plain text -- styled to
+   read as a label, not an obvious form control, but still a real dropdown. Long dataset
+   names get clipped rather than blowing out the row (see .s1frow .pk.pb.ds for the same
+   problem solved with real width instead, which this row doesn't have to spare). */
+.boxspktitle { display:flex; align-items:baseline; gap:5px; font:13px var(--mono);
+               color:var(--ink3); margin-bottom:8px; }
+.boxspktitle #poscount { margin-left:auto; font-size:11px; color:var(--ink3); }
+/* The dropdowns are the actual content of this "title" -- bigger and bold, like the
+   pos/spk/id headline in the sample viewer (.svk b) -- while "box," and "spk" stay small,
+   plain connective text around them. */
+.boxspksel { font:700 16px var(--mono); color:var(--ink); background:none; border:0;
+             border-bottom:1px dashed var(--firm); padding:0 1px; cursor:pointer; max-width:160px; }
+#boxsel.boxspksel { max-width:180px; }
+/* Position jump beside the gallery's own "search by sample id" input, EACH exactly half
+   of .gallerycol's own width (the gap between them doesn't count against that split).
+   #samplegrid (the 5-col grid, buildSampleGrid) is a separate sibling below -- NOT nested
+   inside #samplebox, which would cap it to #samplebox's own half-width instead of the
+   full row under both search bars. */
+/* The gallery's view toggles (.galctl) sit on the same line, right-aligned -- .searchpair
+   grows to fill what's left, .galctl stays its natural width at the far end. */
+.searchrow { display:flex; gap:14px; align-items:center; }
+.searchpair { display:flex; gap:8px; align-items:flex-start; flex:1; min-width:0; }
+#posjump { flex:1 1 0; width:auto; min-width:0; -moz-appearance:textfield; }
 #posjump[hidden] { display:none; }
+.searchpair .pickbox { flex:1; min-width:0; }
+.galctl { display:flex; gap:12px; flex:none; white-space:nowrap; }
+/* Speaker-at-this-position: only appears with 2+ speakers selected in the filter above
+   (see renderSpkAt) -- a direct pick, not a step, among whichever of them have a sample
+   here. Lives in SEARCH, since it picks a specific sample, not a filter value. */
+.pk.spkat { width:300px; }
+#spkat { display:flex; flex-wrap:wrap; gap:5px; }
+#spkat .pbchip.on { background:var(--accent-sf); border-color:var(--accent); color:var(--ink);
+                    font-weight:600; }
 /* The scatter is the primary spatial picker now, so it is bigger than the old top-bar
    strip -- clicking a dot and arrow-stepping both want the room. */
-#scatter { width:300px; height:140px; background:var(--s2);
+#scatter { width:100%; height:140px; background:var(--s2);
            border:1px solid var(--firm); border-radius:4px; }
 #spk { width:132px; height:84px; border:1px solid var(--line); border-radius:6px;
        background:var(--s1); padding:2px; overflow:visible; }
@@ -302,9 +374,9 @@ h2 em { font-style:normal; color:var(--accent); font-family:var(--mono);
         align-self:center; }
 /* Empty-box drift repeats: always shown, in their own labelled strip under the scatter --
    they have no spatial COM so they can't be scatter points. */
-.repeatslab { width:300px; margin-top:10px; font-size:9px; letter-spacing:.06em;
+.repeatslab { width:100%; margin-top:10px; font-size:9px; letter-spacing:.06em;
               text-transform:uppercase; color:var(--ink3); }
-#repeats { display:flex; flex-wrap:wrap; gap:4px; width:300px; align-content:start;
+#repeats { display:flex; flex-wrap:wrap; gap:4px; width:100%; align-content:start;
            margin-top:5px; }
 .rep { font:10px var(--mono); padding:3px 8px; border:1px solid var(--line); border-radius:4px;
        background:var(--s1); color:var(--ink2); cursor:pointer; line-height:1.2; }
@@ -365,15 +437,6 @@ main { flex:1; display:grid; grid-template-columns:minmax(0,1fr) 280px; gap:12px
           border-radius:4px; background:var(--s1); color:var(--ink2); }
 .zreset.show { display:inline-block; }
 .zreset:hover { color:var(--ink); border-color:var(--accent); }
-.audio { display:flex; align-items:center; justify-content:center; gap:10px; }
-.audio audio { height:34px; width:min(520px,100%); }
-#heldaudio { display:flex; flex-direction:column; gap:5px; align-items:center;
-             margin-top:8px; }
-#heldaudio:empty { display:none; }
-.ha { display:flex; align-items:center; gap:8px; }
-.ha .tag { font:10px var(--mono); color:var(--c); min-width:120px; text-align:right; }
-.ha audio { height:28px; width:min(420px,60vw); }
-
 /* --mw / --mh are the mode canvas size: set per box by sizeModePanel() so each box keeps
    its true aspect ratio, scaled so a physically bigger box draws bigger. */
 :root { --mw:460px; --mh:460px; }
@@ -515,8 +578,12 @@ svg:focus, .plot:focus { outline:1px solid var(--accent); outline-offset:2px; }
 .probe { display:flex; gap:6px; align-items:flex-start; padding:4px 3px; border-radius:4px; cursor:pointer; }
 .probe:hover { background:var(--s2); }
 .probe .sw { width:9px; height:9px; border-radius:50%; flex:none; margin-top:3px; }
-.probe .id { font:9.5px/1.3 var(--mono); color:var(--ink2); flex:1; min-width:0; }
-.probe .id b { color:var(--ink); font-weight:600; display:block; }
+/* Same overflow-wrap as #curmeta dd -- this line embeds the dataset name verbatim
+   (sampleMeta's line1), and those run long with no spaces to break on, so without it a
+   long name just overflows the narrow sidebar instead of wrapping cleanly. */
+.probe .id { font:9.5px/1.3 var(--mono); color:var(--ink2); flex:1; min-width:0;
+             overflow-wrap:anywhere; }
+.probe .id b { color:var(--ink); font-weight:600; }
 .probe.live { cursor:default; border:1px dashed var(--firm); background:var(--s0); }
 .probe.live.muted { opacity:.4; }
 .probe.live.muted::after { content:'esc — hidden'; font:9px var(--mono);
@@ -656,6 +723,11 @@ h2 em.soft { color:var(--ink3); font-weight:400; margin-left:auto; }
 .moderight { flex:1; min-width:0; }
 .modeleft .modewrap { display:inline-block; }
 .modeleft .mhint { display:block; margin:2px 0 0 64px; }
+/* Step 4's version of .modesplit: the ground-truth video fixed on the left (its own
+   natural width, not the mode canvas's), the recovered-video tiles filling the rest. */
+.vidsplit { display:flex; gap:20px; align-items:flex-start; }
+.vidsplit-gt { flex:none; }
+.vidsplit-rest { flex:1; min-width:0; }
 .ghint { display:block; margin:0 0 6px; }
 .fgrid { margin-top:0; }
 /* ***** workbench probe cards *****
@@ -704,7 +776,7 @@ h2 em.soft { color:var(--ink3); font-weight:400; margin-left:auto; }
 /* Probe fields are separated by two spaces rather than a dot: the units (Hz, L55) already
    label each field, so the dot was decoration that cost width. HTML collapses runs of
    whitespace, so the gap has to be preserved explicitly. */
-.legend span, .ha .tag, .probe .id, .card2 .ln3, .fgrid figcaption i,
+.legend span, .probe .id, .card2 .ln3, .fgrid figcaption i,
 .summary, #poscount { white-space:pre-wrap; }
 /* NOT on flex containers (.meta, .ln1): there the whitespace between child elements
    becomes real text nodes and stacks the row vertically. */

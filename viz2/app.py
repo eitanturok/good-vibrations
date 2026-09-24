@@ -58,8 +58,12 @@ def _payload():
     # rv is the cache-buster on every sid-keyed media URL (thumb/scene/mask/heat/...), and
     # those endpoints are "immutable" cached forever -- sample ids are only unique WITHIN a
     # dataset (both loaded datasets can have a "000009"), so rv must fold in the dataset
-    # name too, or switching datasets serves the old dataset's cached image back.
-    return {"samples": list(data.META.values()), "info": data.INFO, "rv": f"{RENDER_V}-{data.CURRENT}",
+    # name too, or switching datasets serves the old dataset's cached image back. It also
+    # folds in data.EPOCH, which data.py bumps whenever a sample is actually added/removed/
+    # reprocessed -- otherwise a sample deleted and recaptured under the same id keeps
+    # serving its old (wrong) cached photo forever, since nothing else about the URL changed.
+    return {"samples": list(data.META.values()), "info": data.INFO,
+            "rv": f"{RENDER_V}-{data.EPOCH}-{data.CURRENT}",
             "datasets": sorted(data.DATASETS), "dataset": data.CURRENT,
             "dataset_counts": data.COUNTS}
 
