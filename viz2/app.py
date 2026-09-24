@@ -13,7 +13,12 @@ from viz2 import data, render
 app = FastAPI()
 STATIC = Path(__file__).parent / "static"
 CACHE = {"Cache-Control": "public, max-age=31536000, immutable"}
-RENDER_V = int(Path(render.__file__).stat().st_mtime)
+# The cache-buster every rendered-media URL carries (see api/samples' "rv"). Every file
+# whose code actually decides what a byte on the wire looks like, not just render.py -- a
+# thumb size/quality change made here in app.py (e.g. the box= passed to render.thumb)
+# wouldn't bump this otherwise, and every browser would keep serving its year-cached,
+# immutable copy from before the change forever, since the URL never changed either.
+RENDER_V = int(max(Path(render.__file__).stat().st_mtime, Path(__file__).stat().st_mtime))
 
 
 @app.get("/")
@@ -99,13 +104,25 @@ def box_thumb(name: str):
 
 
 @app.get("/api/thumb/{sid}.jpg")
-def sample_thumb(sid: str):
-    """Row icon for the sample picker: that sample's cropped-overhead photo."""
-    _d(sid)
+def sample_thumb(sid: str, mask: int = 0, bg: int = 1):
+    """Row icon for the sample picker: that sample's cropped-overhead photo. With bg=1, the
+    object's ground-truth outline is always traced in green -- independent of `mask`, which
+    only adds the translucent fill (the gallery's "segmentation mask" checkbox); with bg=0,
+    `mask` switches between the bare photo and the segmentation alone on a flat field."""
+    d = _d(sid)
     p = data.sample_photo(sid)
     if not p:
         raise HTTPException(404, "no photo")
-    return Response(render.thumb(p), media_type="image/jpeg", headers=CACHE)
+    m = None
+    if (bg or mask) and data.INFO["mask"] and (d / data.INFO["mask"]).exists():
+        m = np.load(d / data.INFO["mask"])
+    # The gallery grid renders these wide -- box_thumb's 160x120 default was for the much
+    # smaller dataset-picker row icon; used here too, it forced the browser to upscale a
+    # small JPEG to fill a much bigger box, which is the blur. 480x360 (still the same 4:3,
+    # still a fraction of the source photo's ~1300px) covers the card's actual on-screen
+    # size, including a retina display's 2x pixel density, without the crop losing detail.
+    return Response(render.thumb(p, mask=m, fill=bool(mask), bg=bool(bg), box=(480, 360)),
+                     media_type="image/jpeg", headers=CACHE)
 
 
 @app.get("/api/sample/{sid}")
@@ -193,7 +210,7 @@ def heatrange(sid: str, ch: str = "avg", q: str = "logmag", kind: str = "clean")
 def probe(sid: str, ch: str = "avg", laser: str = "avg", kind: str = "clean"):
     """Everything a probe needs from one round trip."""
     _d(sid)
-    f, freqs = data.fft(sid)
+    f, _ = data.fft(sid)
     z = data.pick(data.chan(f, ch), laser)
     mag = np.abs(z)
     s = data.pick(data.chan(data.shifts(sid, kind), ch), laser)
@@ -201,7 +218,7 @@ def probe(sid: str, ch: str = "avg", laser: str = "avg", kind: str = "clean"):
     return {
         "mag": r(mag), "logmag": r(data.logmag(mag)), "phase": r(np.angle(z)),
         "re": r(z.real), "im": r(z.imag),
-        "peaks": data.peaks(mag, freqs),
+        "peaks": data.peaks(sid),
         "shifts": [round(float(x), 5) for x in data.envelope(s)],
         "dur": len(s) / data.INFO["fps"],
     }

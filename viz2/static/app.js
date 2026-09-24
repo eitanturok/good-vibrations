@@ -26,7 +26,10 @@ const S = {
 };
 
 window.__S = S;
-const hasObj = (s) => s.objects.some((o) => S.f.objects.has(o));
+// Sentinel object-filter value standing in for "no objects" (an empty-box sample): real
+// object names come straight from the dataset, so this can't collide with one.
+const NONE_OBJ = '∅ (empty box)';
+const hasObj = (s) => (s.objects.length ? s.objects.some((o) => S.f.objects.has(o)) : S.f.objects.has(NONE_OBJ));
 /* One filter, applied everywhere downstream: the sample list, the position scatter and
    the speaker ring all read from this, so they can never disagree about what exists. */
 function pass(s) {
@@ -59,10 +62,16 @@ function facetTally(field, skip) {
 function facetObjTally() {
   const c = new Map();
   for (const s of S.all)
-    if (passExcept(s, 'objects')) for (const o of s.objects) c.set(o, (c.get(o) || 0) + 1);
+    if (passExcept(s, 'objects')) {
+      if (s.objects.length) for (const o of s.objects) c.set(o, (c.get(o) || 0) + 1);
+      else c.set(NONE_OBJ, (c.get(NONE_OBJ) || 0) + 1);
+    }
   return c;
 }
-const objectValues = () => [...new Set(S.all.flatMap((s) => s.objects))].sort();
+function objectValues() {
+  const vals = [...new Set(S.all.flatMap((s) => s.objects))].sort();
+  return S.all.some((s) => !s.objects.length) ? [...vals, NONE_OBJ] : vals;
+}
 
 /* Filters are per-dataset: a layout name, object count or speaker held over from the old
    box may not exist in the new one, which would leave every picker (scatter, speaker
@@ -71,7 +80,7 @@ const objectValues = () => [...new Set(S.all.flatMap((s) => s.objects))].sort();
 function pruneFilters() {
   const have = {
     boxes: new Set(S.all.map((s) => s.box)),
-    objects: new Set(S.all.flatMap((s) => s.objects)),
+    objects: new Set(S.all.flatMap((s) => (s.objects.length ? s.objects : [NONE_OBJ]))),
     layouts: new Set(S.all.map((s) => s.layout)),
     nobj: new Set(S.all.map((s) => s.n)),
     spk: new Set(S.all.map((s) => s.spk)),
@@ -236,10 +245,14 @@ async function refresh(paint = true) {
   } else {
     S.probe = await q(ch); S.probeY = null;
   }
-  if (S.fi == null) {
-    S.fi = strongestPeak() ?? Math.floor(S.d.freqs.length / 3);
-    S.peakMode = true;               // so the arrows walk peaks straight away
-  }
+  // NOT S.peakMode = true here: every sample switch (gallery, box position, anywhere)
+  // routes through here with S.fi reset to null, so unconditionally arming peak-mode on
+  // every single one hijacked the very next arrow press into walking peaks -- via the
+  // keydown handler's onPeak check, which runs BEFORE the unified zone dispatch -- no
+  // matter which zone (gallery, boxpos, ...) the user actually meant. Peak mode is armed
+  // by actually interacting with a peak (clicking one, in peakList()/buildPeaks()); Shift
+  // still always walks peaks regardless, unaffected by this.
+  if (S.fi == null) S.fi = strongestPeak() ?? Math.floor(S.d.freqs.length / 3);
   await loadMode();
   if (paint) paintAll();
 }
@@ -281,14 +294,21 @@ function paintAll() {
 // mask in one go while the card stays put.
 const shownProbes = () => S.probes.filter((p) => !p.hidden);
 
+// S.hot names whichever curve is highlighted right now -- a pinned probe object (by
+// identity), or the sentinel strings 'live'/'preview' for the other two curve kinds. Every
+// curve drawn in section 2 checks it the same way, so hovering ANY of them (the legend, the
+// workbench card, or the rendered line itself) dims everything else consistently.
+const isHot = (who) => S.hot != null && S.hot === who;
+const othersDim = () => S.hot != null;
+
 function series() {
   const pinned = shownProbes().flatMap((p) => {
-    const c = col(p, S.hot && S.hot !== p ? 0.18 : 0.9);
-    const w = p.id === S.flash ? 2.6 : 1.6;
+    const c = col(p, othersDim() && !isHot(p) ? 0.18 : 0.9);
+    const w = p.id === S.flash || isHot(p) ? 2.6 : 1.6;
     // A "both" probe is one probe drawn as two curves: same colour, x solid / y dashed.
     return p.dataY
-      ? [{ p, d: p.data, c, w, dash: DASH.x }, { p, d: p.dataY, c, w, dash: DASH.y }]
-      : [{ p, d: p.data, c, w, dash: p.dash }];
+      ? [{ p, who: p, d: p.data, c, w, dash: DASH.x }, { p, who: p, d: p.dataY, c, w, dash: DASH.y }]
+      : [{ p, who: p, d: p.data, c, w, dash: p.dash }];
   });
   // A just-pinned probe is drawn last for a moment so you see it appear; otherwise the
   // live trace stays in front, because that is the one you are steering.
@@ -297,14 +317,19 @@ function series() {
   // In "both" the live trace is two curves of one colour, separated by dash: x SOLID,
   // y dashed with a wide gap. One solid line reads faster than two dashed ones, and the
   // gap has to be wide or the two textures blur together at this line density.
+  const liveDim = othersDim() ? !isHot('live') : !!S.preview;
+  const liveW = isHot('live') ? 2.6 : 1.7;
   const live = S.muted ? []
-    : [{ p: null, d: S.probe, c: css('--ink'), w: 1.7, dim: !!S.preview, dash: DASH.x },
-       ...(S.probeY ? [{ p: null, d: S.probeY, c: css('--ink'), w: 1.7, dim: !!S.preview, dash: DASH.y }] : [])];
+    : [{ p: null, who: 'live', d: S.probe, c: css('--ink'), w: liveW, dim: liveDim, dash: DASH.x },
+       ...(S.probeY ? [{ p: null, who: 'live', d: S.probeY, c: css('--ink'), w: liveW, dim: liveDim, dash: DASH.y }] : [])];
+  const previewDim = othersDim() && !isHot('preview');
   return [
     ...back,
     ...live,
     ...front,
-    ...(S.preview && !S.muted ? [{ p: null, d: S.preview, c: css('--accent'), w: 1.7 }] : []),
+    ...(S.preview && !S.muted
+      ? [{ p: null, who: 'preview', d: S.preview, c: css('--accent'), w: isHot('preview') ? 2.6 : 1.7, dim: previewDim }]
+      : []),
   ];
 }
 
@@ -435,6 +460,26 @@ async function drawHeat() {
     $(`#cb${i + 1}`).innerHTML =
       `${fmtTick(r.hi)}<b style="background:linear-gradient(0deg,${stops.join(',')})"></b>${fmtTick(r.lo)}`;
   });
+}
+
+// Hovering a rendered line, not just its legend row, highlights it the same way: whichever
+// series passes closest (in pixel Y, at the already-hovered frequency bin) to the cursor.
+// Reuses S.rng[cvid] -- the lo/hi/h that multi() just drew this canvas with -- so the pixel
+// math here can never disagree with what's actually on screen.
+function nearestSeries(cvid, key, my) {
+  const rng = S.rng[cvid];
+  if (!rng || S.hoverFi == null) return null;
+  const { lo, hi, h } = rng;
+  let best = null, bd = Infinity;
+  for (const s of series()) {
+    if (!s.d) continue;
+    const v = vals(s.d, key)?.[S.hoverFi];
+    if (v == null) continue;
+    const Y = yMap(Math.min(hi, Math.max(lo, v)), lo, hi, h);
+    const d = Math.abs(Y - my);
+    if (d < bd) { bd = d; best = s; }
+  }
+  return best && bd <= 16 ? best.who : null;
 }
 
 // Which quantity each spectrum plot draws -- shared with the hover tooltip, so a value it
@@ -1139,11 +1184,15 @@ function peakList() {
     setFi(+b.dataset.fi);
     el.focus();
   }));
-  el.tabIndex = 0;
-  el.onfocus = () => { S.peakMode = true; el.classList.add('armed'); };
-  el.onblur = () => el.classList.remove('armed');
-  el.onpointerenter = () => { S.peakMode = true; el.classList.add('armed'); };
-  el.onpointerleave = () => { if (document.activeElement !== el) el.classList.remove('armed'); };
+  // Navigate the grid exactly as drawn (2 columns, PK_COLS) -- same as clicking a row, just
+  // by arrow key, whether this list is hovered or was the last thing clicked.
+  registerZone('peaks', el, (dx, dy) => stepGrid(dx, dy));
+  if (!el.dataset.armedVis) {
+    el.dataset.armedVis = '1';
+    el.tabIndex = 0;
+    const sync = () => el.classList.toggle('armed', hoverZone === 'peaks' || armedZone === 'peaks');
+    ['pointerenter', 'pointerleave', 'focusin', 'focusout'].forEach((ev) => el.addEventListener(ev, sync));
+  }
 }
 
 function buildPeaks() {
@@ -1163,6 +1212,11 @@ function buildPeaks() {
   g.querySelectorAll('.pk').forEach((c) => (c.onclick = (e) => {
     e.stopPropagation();
     S.peakMode = true;
+    // Clicking a peak marker ON THE PLOT is the one zone-worthy click that doesn't happen
+    // on a registerZone'd element (the plot itself isn't a zone) -- set armedZone directly
+    // so it's consistent with every other "click something, arrows now act on it" case, and
+    // so hovering #pklist right after still shows it as armed.
+    armedZone = 'peaks';
     setFi(+c.dataset.fi);
   }));
 }
@@ -1293,21 +1347,21 @@ function axes() {
    Wandb-style: a dark box near the cursor, one row per shown probe (color + label + value)
    plus the live probe when it is actually drawn. Piggybacks on freqAxis's own hoverFi, so
    it can never disagree with the crosshair line about which bin is hovered. */
-function ttRow(c, lab, v) {
-  return { c, lab, v };
+function ttRow(c, lab, v, who) {
+  return { c, lab, v, who };
 }
 function seriesAt(key, fi) {
   const rows = shownProbes().flatMap((p) => {
     const c = probeHex(p), lab = `${shortId(p.sid)} L${p.laser}`;
     return p.dataY
-      ? [ttRow(c, `${lab} x`, vals(p.data, key)?.[fi]), ttRow(c, `${lab} y`, vals(p.dataY, key)?.[fi])]
-      : [ttRow(c, lab, vals(p.data, key)?.[fi])];
+      ? [ttRow(c, `${lab} x`, vals(p.data, key)?.[fi], p), ttRow(c, `${lab} y`, vals(p.dataY, key)?.[fi], p)]
+      : [ttRow(c, lab, vals(p.data, key)?.[fi], p)];
   });
   if (!S.muted && S.probe) {
     const c = css('--ink');
     rows.push(...(S.probeY
-      ? [ttRow(c, 'current x', vals(S.probe, key)?.[fi]), ttRow(c, 'current y', vals(S.probeY, key)?.[fi])]
-      : [ttRow(c, 'current', vals(S.probe, key)?.[fi])]));
+      ? [ttRow(c, 'current x', vals(S.probe, key)?.[fi], 'live'), ttRow(c, 'current y', vals(S.probeY, key)?.[fi], 'live')]
+      : [ttRow(c, 'current', vals(S.probe, key)?.[fi], 'live')]));
   }
   return rows.filter((r) => r.v != null).sort((a, b) => b.v - a.v);
 }
@@ -1322,8 +1376,14 @@ function showTip(el, cvid, e) {
   const rows = seriesAt(specKey(cvid), S.hoverFi);
   const tt = ttEl(el);
   if (!rows.length) { tt.style.display = 'none'; return; }
-  tt.innerHTML = `<b>${fmt(hz(S.hoverFi))} Hz</b>` + rows.map((r) =>
-    `<span><i style="background:${r.c}"></i>${r.lab}<em>${fmtTick(r.v)}</em></span>`).join('');
+  tt.innerHTML = `<b>${fmt(hz(S.hoverFi))} Hz</b>` + rows.map((r) => {
+    // Every row's text is already its own curve's color, so the tooltip reads like the plot
+    // does; whichever one is hot (hovered on the plot, its legend, or its workbench card)
+    // also gets bolded -- same "highlight travels everywhere" rule the curves follow.
+    const hot = isHot(r.who);
+    return `<span style="color:${r.c};${hot ? 'font-weight:700' : ''}">` +
+      `<i style="background:${r.c}"></i>${r.lab}<em>${fmtTick(r.v)}</em></span>`;
+  }).join('');
   tt.style.display = 'block';
   const r = el.getBoundingClientRect();
   let x = e.clientX - r.left + 14, y = e.clientY - r.top + 14;
@@ -1358,6 +1418,11 @@ function freqAxis(el) {
     previewMode(S.hoverFi);
     showTip(el, cvid, e);
     lastHover = { el, cvid, e };
+    // Landing near an actual curve highlights it everywhere (section 2's other plots and
+    // legends), same as hovering its legend row or workbench card -- just triggered by the
+    // line itself instead.
+    const hit = nearestSeries(cvid, specKey(cvid), e.clientY - b.top);
+    if (hit !== S.hot) { S.hot = hit; drawSpec(); drawShifts(); markHot(); probeTicks(); fieldGrid(); recoveredGrid(); }
   });
   el.addEventListener('pointerleave', () => {
     S.hoverFi = null;
@@ -1365,6 +1430,7 @@ function freqAxis(el) {
     if (S.modePreview) previewMode(null);
     cursors(); readout();
     hideTip(el);
+    if (S.hot != null) { S.hot = null; drawSpec(); drawShifts(); markHot(); probeTicks(); fieldGrid(); recoveredGrid(); }
   });
   el.addEventListener('click', () => {
     if (S.hoverFi == null) return;
@@ -1585,7 +1651,7 @@ function buildFilters() {
     opts: () => {
       const f = facetObjTally();
       return objectValues().map((o, i) =>
-        ({ v: o, label: o, count: f.get(o) || 0, hue: hueOf(i * 2 + 1) }));
+        ({ v: o, label: o === NONE_OBJ ? 'no-object' : o, count: f.get(o) || 0, hue: hueOf(i * 2 + 1) }));
     },
     on: (v) => S.f.objects.has(v),
     pick: (v) => { toggle(S.f.objects, v); applyFilter(); },
@@ -1625,6 +1691,12 @@ function buildFilters() {
 
 function pickSample(id) {
   if (!S.byId[id]) return;
+  // Set directly, not inferred from a mousedown/focusin bubbling up from the clicked card:
+  // select(), below, rebuilds #samplegrid's innerHTML SYNCHRONOUSLY as part of choosing a
+  // sample (to move the "current" highlight) -- which destroys the very button that was
+  // just clicked before the browser gets to natively focus it. Relying on that focus would
+  // silently drop the gallery back out of "armed" on every single pick.
+  armedZone = 'gallery';
   if (!pass(S.byId[id])) { S.f.boxes.clear(); S.f.objects.clear(); S.f.layouts.clear(); S.f.nobj.clear(); applyFilter(); }
   select(id);
 }
@@ -1651,10 +1723,15 @@ function buildSampleGrid() {
     const s = q.value.trim().toLowerCase();
     const hits = matches().filter((o) =>
       !s || `${shortId(o.id)} ${o.pos} ${o.spk} ${o.layout}`.toLowerCase().includes(s));
+    grid._hits = hits;                 // for the gallery zone's arrow-key stepping, below
     grid.innerHTML = hits.map((o) => `
       <button class="scard${o.id === S.live.sid ? ' on' : ''}" data-id="${o.id}">
         <span class="sclab">Pos ${o.pos}, Spk ${o.spk} (${shortId(o.id)})</span>
-        <img class="scimg" src="${galThumbUrl(o.id)}" alt="" loading="lazy">
+        <div class="scimgwrap">
+          <img class="scimg" src="${galThumbUrl(o.id)}" alt="" loading="lazy">
+          <svg class="spkring" viewBox="0 0 160 120" aria-hidden="true">${
+            spkRingDots(o.spk, 160, 120, { r: 4.5, rOn: 7, margin: 10 })}</svg>
+        </div>
       </button>`).join('') || '<div class="pbmore">no match</div>';
     grid.querySelectorAll('.scard').forEach((b) => {
       b.onclick = () => pickSample(b.dataset.id);
@@ -1677,8 +1754,44 @@ function buildSampleGrid() {
   };
   q.oninput = host._draw;
   host._draw();
+  // The gallery's bg/mask checkboxes only change what each thumbnail's <img> POINTS AT --
+  // not which samples are shown, their order, or anything else about the grid -- so they
+  // go through here instead of host._draw(), which rebuilds the whole grid's innerHTML and
+  // made every card (labels, borders, all of it) flash at once. Even scoped to just the
+  // <img> tags, swapping `src` directly still blanks each one while its new URL loads; the
+  // first time a bg/mask combination is requested nothing is cached yet, so that fetch is
+  // slow enough for the blank to actually be visible. Preloading off-DOM and only swapping
+  // `src` on that Image's own load event keeps the OLD thumbnail on screen the whole time.
+  grid._updateThumbs = () => {
+    grid.querySelectorAll('.scard').forEach((b) => {
+      const img = b.querySelector('.scimg');
+      if (!img) return;
+      const url = galThumbUrl(b.dataset.id);
+      const pre = new Image();
+      pre.onload = () => { img.src = url; };
+      pre.src = url;
+    });
+  };
+  // must match .sgrid's grid-template-columns (style.css) for up/down to land in the
+  // right visual row rather than just off by whatever the real column count is.
+  const GALLERY_COLS = 5;
+  registerZone('gallery', grid, (dx, dy) => {
+    const hits = grid._hits || [];
+    if (!hits.length) return;
+    const at = hits.findIndex((o) => o.id === S.live.sid);
+    const next = (at === -1 ? 0 : at) + dx + dy * GALLERY_COLS;
+    if (next < 0 || next >= hits.length) return;   // stay put at the edges
+    pickSample(hits[next].id);
+  });
 }
 
+/* Wheel routing for the sample gallery row: scrolling over the grid itself scrolls the
+   grid; scrolling anywhere else in the row (the box/position selector to its left, the
+   search bars above it, the empty margin around them) scrolls the PAGE instead, so the box
+   selector stays put -- "frozen" -- while you're just paging through samples. Driven
+   explicitly with scrollTop rather than left to the browser's own overflow/bubbling: this
+   row's nested flex layout was letting wheel input land on the grid even with the pointer
+   nowhere near it (and, from directly over the grid, sometimes doing nothing at all). */
 const drawPickers = () =>
   ['#datasetbox', '#samplebox', '#boxbox', '#objectbox', '#nobjbox', '#layoutbox']
     .forEach((id) => $(id)?._draw?.());
@@ -1787,13 +1900,10 @@ function buildScatter() {
     return bd < 6 ? best : null;
   };
   svg.onclick = (e) => { const p = near(e); if (p != null) goPos(p); svg.focus(); };
-  svg.onkeydown = (e) => {
-    const d = { ArrowLeft: [-1, 0], ArrowRight: [1, 0], ArrowUp: [0, -1], ArrowDown: [0, 1] }[e.key];
-    if (!d) return;
-    e.preventDefault();
-    const p = neighbour(s, d);
+  registerZone('boxpos', svg, (dx, dy) => {
+    const p = neighbour(s, [dx, dy]);
     if (p != null) goPos(p);
-  };
+  });
 }
 
 /* Positions are captured as a SERPENTINE raster -- each row sweeps back the way the last
@@ -1842,6 +1952,10 @@ function neighbour(s, [dx, dy]) {
    does not filter. Prefer one on the current sample's speaker so stepping around the box
    holds the speaker steady; fall back to any filtered sample there. */
 function goPos(pos) {
+  // Same reasoning as pickSample's armedZone line: set directly rather than relying on
+  // svg.focus() (called after this, back in the click handler) surviving whatever
+  // select() below rebuilds in the meantime.
+  armedZone = 'boxpos';
   const spk = S.byId[S.live.sid]?.spk;
   const at = matches().filter((s) => s.pos === pos && !s.empty);
   const s = at.find((x) => x.spk === spk) || at[0];
@@ -1922,6 +2036,31 @@ function renderSpkAt() {
 /* The 8-speaker ring drawn AROUND the overhead in the "current" panel -- a static readout
    of where this sample's active speaker sat, in the same layout as the filter ring
    (1,2 right / 3-6 top / 7,8 left). */
+/* A compact version of the same ring -- dots only, no numbers, no box -- for drawing
+   directly over a photo (the gallery thumbnails, the sample viewer's overhead) where
+   #scenering's labelled, wide-margin style would eat too much of the image. viewBox is
+   given in the CALLER's own units (pixels for the overhead photo, matching comMarks;
+   arbitrary for a thumbnail) so circles never distort regardless of the photo's aspect
+   ratio -- margin/r/rOn scale with whatever unit that is. */
+function spkRingDots(curSpk, w, h, { r, rOn, margin }) {
+  // Every one of the box's 8 physical slots, not just the ones this dataset actually used
+  // -- filtering those out was making the ring unreadable, not just small: half the layout
+  // was simply missing, no dot to make bigger. Unused slots stay in, just dimmed, so the
+  // full layout still reads at a glance and the numbers are legible either way.
+  const present = new Set(S.all.map((s) => s.spk));
+  const bw = w - 2 * margin, bh = h - 2 * margin;
+  return Object.entries(SPK).map(([id, [xf, yf]]) => {
+    const cx = margin + xf * bw, cy = margin + (1 - yf) * bh;
+    const on = +id === curSpk;
+    const used = present.has(+id);
+    const rr = on ? rOn : r;
+    const cls = `spkdot${on ? ' on' : ''}${used ? '' : ' unused'}`;
+    return `<g class="${cls}">` +
+      `<circle cx="${cx}" cy="${cy}" r="${rr}"/>` +
+      `<text x="${cx}" y="${cy}" font-size="${rr * 1.15}">${id}</text></g>`;
+  }).join('');
+}
+
 function renderSpkRing() {
   const svg = $('#scenering');
   if (!svg) return;
@@ -1995,17 +2134,15 @@ function buildGrid() {
     svg.querySelectorAll('.ls').forEach((x) => x.classList.remove('hot'));
     if (S.hoverLaser != null) { S.hoverLaser = null; previewLaser(null); cursors(); readout(); }
   };
-  svg.onkeydown = (e) => {
+  registerZone('laser', svg, (dx, dy) => {
     const cur = S.live.laser;
     const i = (cur === 'avg' || cur === 'all') ? 55 : +cur;
     const C = S.info.cols, N = S.info.n_lasers;
-    const d = { ArrowLeft: -1, ArrowRight: 1, ArrowUp: -C, ArrowDown: C }[e.key];
-    if (!d) return;
-    e.preventDefault();
-    if (cur === 'avg' || cur === 'all') return setLaser(e.key === 'ArrowDown' ? 0 : cur);
+    const d = dx + dy * C;
+    if (cur === 'avg' || cur === 'all') return setLaser(dy > 0 ? 0 : cur);
     const next = i + d;
     setLaser(next < 0 ? 'avg' : Math.min(N - 1, next));
-  };
+  });
 }
 
 async function setLaser(i) {
@@ -2087,8 +2224,8 @@ function pin() {
    agree on what they're showing: box/pos/spk/id, then layout + its objects -- or "empty
    box" when it has none. */
 function sampleMeta(s) {
-  const objs = s.empty ? 'empty box' :
-    (Object.entries(s.objcounts || {}).map(([o, n]) => `${n} ${o}${n === 1 ? '' : 's'}`).join(', ') || '—');
+  const objs = s.empty ? 'no-object' :
+    (Object.entries(s.objcounts || {}).map(([o, n]) => `${n} ${o}${n === 1 ? '' : 's'}`).join(', ') || 'no-object');
   return {
     line1: `Pos <b>${s.pos}</b>, Spk <b>${s.spk}</b> (<b>${shortId(s.id)}</b>) ${s.box}`,
     line2: `${objs} (${s.layout || '—'} layout)`,
@@ -2182,6 +2319,13 @@ function comMarks(s) {
   const note = $('#comnote');
   if (note) note.textContent = pts.length
     ? `· ${pts.length} com${pts.length > 1 ? 's' : ''}` : '';
+  const spkEl = $('#svphotospk');
+  if (spkEl) {
+    spkEl.setAttribute('viewBox', `0 0 ${ow} ${oh}`);
+    spkEl.setAttribute('preserveAspectRatio', 'none');
+    const m = Math.max(ow, oh) * 0.035;
+    spkEl.innerHTML = spkRingDots(s.spk, ow, oh, { r: m * 0.55, rOn: m, margin: m * 1.6 });
+  }
 }
 
 /* Point the viewer's images and players at the current sample. A missing artefact (some
@@ -2249,14 +2393,16 @@ function renderProbes() {
     // Two lines, not four: the coloured left border already identifies the probe, and
     // everything else (layout, objects, dataset) is one click away in the sample viewer --
     // this card only needs to say WHICH sample and WHICH curve.
+    const objs = m.objects.length ? m.objects.join(', ') : 'no-object';
     return `<div class="probe card2${p.hidden ? ' off' : ''}" data-id="${p.id}" style="--c:${col(p)}"
-      title="${m.box}  ${shortId(p.sid)}  pos ${m.pos}  spk ${m.spk}  ${m.layout}  --  click to view, click the eye to ${p.hidden ? 'show in' : 'hide from'} plots">
+      title="${m.box}  ${shortId(p.sid)}  pos ${m.pos}  spk ${m.spk}  ${m.layout}  ${objs}  --  click to view, click the eye to ${p.hidden ? 'show in' : 'hide from'} plots">
       <img class="thumb mask" src="/api/masks.png?ids=${p.sid}&colors=${probeHex(p)}&v=${S.rv}" alt="">
       <div class="meta">
         <div class="ln1"><b>${shortId(p.sid)}</b><span class="sub${m.box !== S.info.box ? ' foreign' : ''}">${m.box} p${m.pos} s${m.spk}</span>
           <span class="eye" aria-hidden="true">${EYE}</span>
           <button class="x" data-x="${p.id}">×</button></div>
         <div class="ln3">L${p.laser}, C${p.ch}, F${fmt(p.hzv)}Hz</div>
+        <div class="ln3 objs">${objs}</div>
       </div>
     </div>`;
   }).join('');
@@ -2326,9 +2472,9 @@ function legends() {
   const ink = css('--ink');
   const live = S.muted ? '' :
     (S.live.ch === 'both'
-      ? `<span data-live="1">${swatch(ink, DASH.x)}x ${swatch(ink, DASH.y)}y` +
+      ? `<span data-live="1" data-hot="live">${swatch(ink, DASH.x)}x ${swatch(ink, DASH.y)}y` +
         ` — current  L${S.live.laser}</span>`
-      : `<span data-live="1">${swatch(ink, DASH[S.live.ch])}` +
+      : `<span data-live="1" data-hot="live">${swatch(ink, DASH[S.live.ch])}` +
         `current — L${S.live.laser}  ${S.live.ch}</span>`);
   const rows = shownProbes().map((p) => {
     const c = col(p), tail = `${fmt(p.hzv)} Hz  ${shortId(p.sid)}  L${p.laser}`;
@@ -2339,7 +2485,7 @@ function legends() {
       : `<span data-id="${p.id}" style="color:${c}">${swatch(c, p.dash)}${tail}  ${p.ch}</span>`;
   }).join('');
   const prev = S.preview
-    ? `<span><b style="color:${css('--accent')}"></b>preview — L${S.hoverLaser}</span>` : '';
+    ? `<span data-hot="preview"><b style="color:${css('--accent')}"></b>preview — L${S.hoverLaser}</span>` : '';
   $('#siglegend').innerHTML = S.probes.length || S.preview ? live + rows + prev : '';
   // The big mode plot always overlays every probe, so the legend always applies.
   $('#modelegend').innerHTML = S.probes.length ? live + rows : '';
@@ -2359,20 +2505,57 @@ function legends() {
 function markHot() {
   for (const el of [$('#siglegend'), $('#modelegend')]) {
     el.classList.toggle('dim', !!S.hot);
-    el.querySelectorAll('span').forEach((sp) =>
-      sp.classList.toggle('hot', !!S.hot && +sp.dataset.id === S.hot.id));
+    el.querySelectorAll('span').forEach((sp) => sp.classList.toggle('hot', !!S.hot && (
+      sp.dataset.hot ? sp.dataset.hot === S.hot : +sp.dataset.id === S.hot?.id)));
   }
+}
+
+/* ***** unified arrow-key navigation *****
+   Every "steppable" control (the sample gallery, the box/position picker, each signal-2
+   toggle group, the laser grid, the peak list) registers a zone: a name, its element, and a
+   step(dx, dy) function. Priority: whichever zone the mouse is PHYSICALLY hovering wins; off
+   every zone -- most often because you're hovering a plot, which isn't one -- arrows fall
+   back to whichever zone was last clicked (armedZone). armedZone starts on the gallery, so
+   arrows always do SOMETHING sane before you've clicked anything.
+   Hovering only ever sets/clears hoverZone; it never touches armedZone, so mousing over a
+   plot on your way to the gallery doesn't un-arm whatever you'd last clicked -- exactly the
+   "hovering a plot should still refer to the last thing I clicked" rule this exists for. */
+const ZONES = {};
+const zoneWired = new WeakSet();
+let hoverZone = null, armedZone = 'gallery';
+
+function registerZone(name, el, step) {
+  if (!el) return;
+  ZONES[name] = step;                 // refreshed every call -- cheap, keeps closures current
+  if (zoneWired.has(el)) return;      // listeners attached once per element, ever
+  zoneWired.add(el);
+  el.addEventListener('pointerenter', () => { hoverZone = name; });
+  el.addEventListener('pointerleave', () => { if (hoverZone === name) hoverZone = null; });
+  el.addEventListener('mousedown', () => { armedZone = name; });
+  el.addEventListener('focusin', () => { armedZone = name; });
 }
 
 /* One player per pinned probe, so you can compare what they sound like. */
 /* ***** wiring ***** */
 function seg(id, fn) {
-  $(id).onclick = (e) => {
-    const b = e.target.closest('button');
-    if (!b) return;
-    $(id).querySelectorAll('button').forEach((x) => x.classList.toggle('on', x === b));
-    fn(b.dataset.v);
+  const el = $(id);
+  const buttons = () => [...el.querySelectorAll('button')];
+  const pick = (v) => {
+    buttons().forEach((x) => x.classList.toggle('on', x.dataset.v === v));
+    fn(v);
   };
+  el.onclick = (e) => {
+    const b = e.target.closest('button');
+    if (b) pick(b.dataset.v);
+  };
+  // Arrow-key cycling through this group's own options, in the order they're drawn --
+  // vertical arrows have no meaning for a single row of buttons, so only dx does anything.
+  registerZone(id.slice(1), el, (dx) => {
+    if (!dx) return;
+    const bs = buttons(), cur = bs.findIndex((b) => b.classList.contains('on'));
+    const next = bs[Math.max(0, Math.min(bs.length - 1, (cur === -1 ? 0 : cur) + dx))];
+    if (next) pick(next.dataset.v);
+  });
 }
 
 // Always-visible play/pause + seek, but as our OWN bar sitting below the video -- native
@@ -2396,16 +2579,19 @@ function wireVideoControls(wrap) {
   rng.addEventListener('input', () => { v.currentTime = +rng.value; setTime(); });
   setIcon(); setTime();
 }
-// The search column's height should match the viewer's, but the viewer must never be
+// The gallery grid's height should match the viewer's, but the viewer must never be
 // influenced back (a CSS align-items:stretch tried this and could balloon both columns --
-// see .s1cols in style.css). A ResizeObserver on the viewer is one-directional and correct
-// regardless of what changes the viewer's height (images loading, content changing, window
-// resize): .s1search's flex chain (s1srow -> .gallerycol -> #samplegrid, all flex:1) then
-// distributes that fixed height down to the gallery on its own.
+// see .s1cols in style.css; a flex chain from .s1search down to #samplegrid tried it next
+// and never actually bounded anything, since .s1cols' align-items:start means the two
+// columns never stretch to match each other in the first place -- see .sgrid in style.css).
+// A ResizeObserver on the viewer, setting #samplegrid's height directly, is one-directional
+// (correct regardless of what changes the viewer's height: images loading, content
+// changing, window resize) and self-contained (nothing between here and the grid has to
+// cooperate for it to work).
 function wireViewerHeightSync() {
-  const viewer = $('.s1viewer'), search = $('.s1search');
-  if (!viewer || !search || typeof ResizeObserver === 'undefined') return;
-  const sync = () => { search.style.height = `${viewer.getBoundingClientRect().height}px`; };
+  const viewer = $('.s1viewer'), grid = $('#samplegrid');
+  if (!viewer || !grid || typeof ResizeObserver === 'undefined') return;
+  const sync = () => { grid.style.height = `${viewer.getBoundingClientRect().height}px`; };
   new ResizeObserver(sync).observe(viewer);
   sync();
 }
@@ -2433,10 +2619,11 @@ function wire() {
     else { pj.classList.add('miss'); setTimeout(() => pj.classList.remove('miss'), 600); }
   };
 
-  // The gallery's own view toggles -- redraw through #samplebox's current _draw (reassigned
-  // on every buildSampleGrid(), e.g. a dataset switch), not a reference captured here.
-  $('#galbg').onchange = (e) => { S.gal.bg = e.target.checked; $('#samplebox')._draw(); };
-  $('#galmask').onchange = (e) => { S.gal.mask = e.target.checked; $('#samplebox')._draw(); };
+  // The gallery's own view toggles -- through #samplegrid's current _updateThumbs
+  // (reassigned on every buildSampleGrid(), e.g. a dataset switch, not a reference captured
+  // here), which only touches each thumbnail's image, not the whole grid.
+  $('#galbg').onchange = (e) => { S.gal.bg = e.target.checked; $('#samplegrid')._updateThumbs(); };
+  $('#galmask').onchange = (e) => { S.gal.mask = e.target.checked; $('#samplegrid')._updateThumbs(); };
 
   seg('#ch', (v) => { S.live.ch = v; reviewChannel(); });
   seg('#specmode', (v) => { S.specMode = v; phVis(); drawSpec(); buildPeaks(); peakList(); cursors(); axes(); refreshTip(); });
@@ -2522,29 +2709,27 @@ function wire() {
       S.muted = !S.muted;
       return paintAll();
     }
-    // Shift+arrows always walk the peaks, and plain arrows do too once you have clicked
-    // one -- otherwise clicking a peak and pressing -> would silently change SAMPLE,
-    // which is what it used to do.
-    const onPeak = S.peakMode && (S.probe?.peaks || []).includes(S.fi);
-    const inList = $('#pklist')?.classList.contains('armed');
-    if (e.shiftKey || onPeak) {
-      const K = { ArrowLeft: [-1, 0], ArrowRight: [1, 0], ArrowUp: [0, -1], ArrowDown: [0, 1] };
-      const d = K[e.key];
-      if (!d) { /* fall through */ }
-      else if (inList) {                 // the list: navigate the grid as drawn
+    const K = { ArrowLeft: [-1, 0], ArrowRight: [1, 0], ArrowUp: [0, -1], ArrowDown: [0, 1] }[e.key];
+    if (K) {
+      // Shift+arrows always walk the peaks, and plain arrows do too once you've clicked a
+      // peak marker ON THE PLOT (S.peakMode) -- that's a click on neither #pklist nor any
+      // other registered zone (the plot itself isn't one), so it's handled as its own
+      // override, ahead of the unified dispatch below. Left/right walk frequency order
+      // (what makes sense on a spectrum plot); up/down still walk rank, same as the list.
+      const onPeak = S.peakMode && (S.probe?.peaks || []).includes(S.fi);
+      if (e.shiftKey || onPeak) {
         e.preventDefault();
-        return stepGrid(d[0], d[1]);
-      } else if (d[1] === 0) {           // the plot: left/right walk frequency
-        e.preventDefault();
-        return stepPeak(d[0]);
-      } else if (onPeak) {               // the plot: up/down still walk rank
-        e.preventDefault();
-        return stepGrid(0, d[1]);
+        return K[1] === 0 ? stepPeak(K[0]) : stepGrid(0, K[1]);
       }
+      // Unified hover/click navigation (see registerZone, above seg()): whichever zone the
+      // mouse is physically over wins; off every zone -- hovering a plot, most often --
+      // arrows fall back to whichever zone was last clicked (armedZone starts on gallery,
+      // so arrows always do something sane before you've clicked anything at all).
+      const zone = ZONES[hoverZone] ? hoverZone : armedZone;
+      if (zone && ZONES[zone]) { e.preventDefault(); ZONES[zone](K[0], K[1]); }
+      return;
     }
     if (e.target.closest('.plot, svg')) return;   // panel-local keys win
-    const ps = matches();
-    const i = ps.findIndex((s) => s.id === S.live.sid);
     if (e.key === 'p') return pin();
     if (e.key === 'x' || e.key === 'y' || e.key === 'a') {
       const v = e.key === 'a' ? 'avg' : e.key;
@@ -2552,8 +2737,6 @@ function wire() {
       $('#ch').querySelectorAll('button').forEach((b) => b.classList.toggle('on', b.dataset.v === v));
       return refresh();
     }
-    if (e.key === 'ArrowLeft' && i > 0) select(ps[i - 1].id);
-    if (e.key === 'ArrowRight' && i < ps.length - 1) select(ps[i + 1].id);
   });
 
   addEventListener('resize', () => paintAll());

@@ -10,6 +10,7 @@ symmetrically about zero.
 
 import io
 
+import cv2
 import numpy as np
 from PIL import Image
 
@@ -97,27 +98,38 @@ def _jpeg(im, quality=78):
     return b.getvalue()
 
 
-def thumb(path, mask=None, bg=True, box=(160, 120)):
+def thumb(path, mask=None, fill=False, bg=True, box=(160, 120)):
     """A tiny JPEG for the step-1 pickers and the sample gallery.
 
-    No mask: the bare cropped photo, as always. With a mask: bg=True tints the photo green
-    where segmented (scene()'s composite, scaled down); bg=False drops the photo and shows
-    the segmentation alone, on mask_png's flat field. bg=False with no mask (nothing to show
-    instead) falls back to the bare photo rather than an empty thumbnail.
+    No mask: the bare cropped photo, as always. With a mask and bg=True: the photo, with the
+    object's ground-truth outline traced in green -- ALWAYS, independent of `fill`, so you
+    can always see where the object is without covering the photo itself. `fill` additionally
+    washes the segmented area in a translucent green tint (the old "segmentation mask"
+    checkbox behavior), under the outline. bg=False drops the photo and shows the
+    segmentation alone, on a flat field; bg=False with no mask (nothing to show instead)
+    falls back to the bare photo rather than an empty thumbnail.
     """
     im = Image.open(path).convert("RGB")
     im.thumbnail(box)
     if mask is None:
         return _jpeg(im)
-    m = np.asarray(mask) > 0.5
+    # Resize the mask to the THUMBNAIL's own resolution (NEAREST, not a smooth resample --
+    # a small object is only a handful of pixels here, and blurring shrinks it toward
+    # nothing) and do everything below -- fill, contour -- at that scale, not full-res: a
+    # contour traced at full res and then shrunk gets just as lost as an unscaled fill did.
+    m = np.asarray(Image.fromarray((np.asarray(mask) > 0.5).astype(np.uint8) * 255)
+                    .resize(im.size, Image.NEAREST)) > 127
     if not bg:
         img = np.full((*m.shape, 3), (238, 238, 235), np.uint8)
         img[m] = (24, 160, 100)
-        out = Image.fromarray(img)
-        out.thumbnail(box, Image.NEAREST)
-        return _jpeg(out)
-    mm = Image.fromarray(m.astype(np.uint8) * 110).resize(im.size)
-    return _jpeg(Image.composite(Image.new("RGB", im.size, (24, 160, 100)), im, mm))
+        return _jpeg(Image.fromarray(img))
+    arr = np.array(im)
+    if fill and m.any():
+        arr[m] = (0.43 * np.array((24, 160, 100)) + 0.57 * arr[m]).astype(np.uint8)
+    if m.any():
+        contours, _ = cv2.findContours(m.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        cv2.drawContours(arr, contours, -1, (24, 160, 100), 2)
+    return _jpeg(Image.fromarray(arr))
 
 
 def scene(photo, mask, w=900):

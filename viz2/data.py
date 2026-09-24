@@ -12,8 +12,7 @@ from pathlib import Path
 
 import numpy as np
 from PIL import Image
-from scipy.ndimage import median_filter
-from scipy.signal import find_peaks, resample
+from scipy.signal import find_peaks, resample, savgol_filter
 
 # Older experiments name the FFT file singular; everything else about the payload matches.
 FFTS = ["vibration/04_ffts.npz", "vibration/04_fft.npz"]
@@ -331,7 +330,7 @@ def _load(name: str) -> None:
     EPOCH += 1
     ds = DATASETS[name]
     DIRS.clear(); META.clear()
-    fft.cache_clear(); shifts.cache_clear()
+    fft.cache_clear(); shifts.cache_clear(); peaks.cache_clear()
 
     for d in sorted((ds / "samples").iterdir()):
         if _fft(d):
@@ -458,16 +457,43 @@ def logmag(z):
     return np.log10(np.abs(z) + 1e-8)
 
 
-def peaks(mag, freqs, k=12):
-    """The k strongest resonances, as a residual against a smooth baseline
-    (notebooks/53 cell 9). Ranked by prominence rather than thresholded: the spectrum is
-    genuinely peaky (100+ pass any sane threshold), so the count is the honest knob."""
-    db = 20 * np.log10(np.abs(mag) + 1e-8)
-    resid = db - median_filter(db, size=201, mode="nearest")
-    dist = max(1, int(5.0 / (freqs[1] - freqs[0])))
-    idx, props = find_peaks(resid, prominence=3.0, distance=dist)
-    best = idx[np.argsort(props["prominences"])[::-1][:k]]
-    return sorted(int(i) for i in best)
+def _odd(n):
+    return n if n % 2 == 1 else n + 1
+
+
+def _hz_to_bins(hz, df):
+    return max(1, int(round(hz / df)))
+
+
+@lru_cache(maxsize=64)
+def peaks(sid, k_prom: float = 4.0, distance_hz: float = 5.0, smooth_hz: float = 5.0,
+          baseline_hz: float = 25.0):
+    """Resonance-mode frequencies, pooled across every laser point rather than one probe's
+    single-channel spectrum: a real mode shows up as DISAGREEMENT between points (a
+    mode-shape peak or valley), while uncorrelated noise varies about the same everywhere.
+    std-across-points is therefore a much cleaner signal to pick peaks from than any one
+    point's magnitude -- same idea as Bagon et al., "Hearing the Room Through the Shape of
+    the Drum" (CVPR 2026), sec. 4: sigma(w) = std_n(|V_n(w)|), smoothed and peak-picked with
+    a MAD-based robust prominence floor rather than a fixed dB threshold.
+
+    Independent of ch/laser -- cached per sid only, so switching the probe's channel or
+    laser selection never recomputes this."""
+    f, freqs = fft(sid)                                     # (L,F,C)
+    Sw = np.concatenate([f[..., 0], f[..., 1]], axis=0)      # [2L, F]
+    S = np.abs(Sw).std(0)                                    # [F]
+    df = float(freqs[1] - freqs[0])
+    S = savgol_filter(S, _odd(2 * _hz_to_bins(smooth_hz, df) + 1), 3)
+    baseline = savgol_filter(S, _odd(2 * _hz_to_bins(baseline_hz, df) + 1), 3)
+    resid = S - baseline
+    sigma = 1.4826 * np.median(np.abs(resid - np.median(resid)))
+    prominence = max(1e-12, k_prom * sigma)
+    idx, _ = find_peaks(
+        S,
+        distance=_hz_to_bins(distance_hz, df),
+        prominence=prominence,
+        wlen=_odd(2 * _hz_to_bins(baseline_hz, df) + 1),
+    )
+    return sorted(int(i) for i in idx)
 
 
 def mode(sid, fi):

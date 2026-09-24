@@ -74,7 +74,13 @@ h2 em { font-style:normal; color:var(--accent); font-family:var(--mono);
    matching it. The viewer must stay at its own independent natural height; search's height
    is set to match it directly in JS instead (see wireViewerHeightSync in app.js), which has
    no such feedback risk. */
-.s1cols { display:grid; grid-template-columns:minmax(0,3fr) minmax(0,2fr); gap:0; align-items:start;
+/* 1fr : a fixed cap (was fr:fr ratios, first 3:2 then 2:1) -- an fr share is a PROPORTION
+   of the row, not what the column's content actually needs, so the viewer column was
+   claiming a fixed fraction of the row regardless of whether its photos/videos (which
+   never need more than ~460px) actually used it, leaving real, visible empty space between
+   the gallery and the viewer. Capping the viewer's track at a fixed width and giving the
+   search column a bare 1fr means the gallery gets literally everything else, always. */
+.s1cols { display:grid; grid-template-columns:1fr minmax(0,540px); gap:0; align-items:start;
           border-top:1px solid var(--line); padding-top:15px; }
 .s1viewer { display:flex; flex-direction:column;
             border-left:1px solid var(--line); margin-left:22px; padding-left:22px; }
@@ -86,11 +92,15 @@ h2 em { font-style:normal; color:var(--accent); font-family:var(--mono);
 .s1filter .s1phead::before { background:var(--k-filter); }
 /* Hard backstop: this grid-column's content (the sample gallery) has twice now overflowed
    its box and painted over .s1viewer next to it, via min-content propagating up through
-   nested flex/grid layers. min-width:0 lets it shrink to fit; overflow-x:hidden guarantees
-   containment even if some future child reintroduces the same min-content problem.
+   nested flex/grid layers. min-width:0 lets it shrink to fit; overflow-x:clip guarantees
+   containment even if some future child reintroduces the same min-content problem --
+   NOT overflow-x:hidden: setting only one overflow axis to hidden forces the other to an
+   implicit auto (CSS overflow spec), which would silently turn this into its own scroll
+   container and break .pk.boxcol's position:sticky below (it would stick relative to HERE
+   instead of #flow, the page's real scroller). clip has no such side effect.
    display:flex column: lets .s1srow (flex:1, below) grow to fill the height .s1cols'
    align-items:stretch now gives this column, so the gallery inside it can grow too. */
-.s1search { display:flex; flex-direction:column; min-width:0; overflow-x:hidden; }
+.s1search { display:flex; flex-direction:column; min-width:0; overflow-x:clip; }
 .s1search .s1phead::before { background:var(--k-search); }
 .s1viewer .s1phead::before { background:var(--k-view); }
 .s1psub { font-weight:400; letter-spacing:.03em; text-transform:none; color:var(--ink3);
@@ -303,12 +313,29 @@ h2 em { font-style:normal; color:var(--accent); font-family:var(--mono);
    min-content calculation) -- so without the 0 floor here, this grid (and everything
    containing it, all the way up to the search column) got forced wider than its box and
    visually overflowed into the sample viewer next to it. */
-/* flex:1 (was a flat max-height:320px): grows to fill whatever height .gallerycol's
-   align-self:stretch actually gave it -- i.e. the sample viewer's height -- showing more
-   rows on a tall viewport, fewer on a short one, but always scrollable either way. */
-.sgrid { display:grid; grid-template-columns:repeat(5, minmax(0, 1fr)); gap:8px;
-         flex:1; min-height:220px; overflow-y:auto; overscroll-behavior:contain;
+/* Height, not flex:1: flex:1 only bounds a child if the flex container ITSELF has a
+   bounded cross size to hand out, and .pk.gallerycol's "align-self:stretch to match the
+   sample viewer" has nothing to stretch to -- .s1cols (the grid that holds the search
+   column and the viewer column) uses align-items:start, not stretch, so neither column
+   matches the other's height. flex:1 in an unbounded flex column just grows to fit ALL of
+   its content, which is exactly "the gallery has no cap and bleeds down the page."
+   min-height is a floor for before wireViewerHeightSync's ResizeObserver (app.js) has run
+   or found anything to measure yet; once it has, the inline height it sets is what actually
+   governs -- self-contained, and it doesn't depend on any OTHER element's own layout
+   working out, unlike the flex chain it replaced. */
+.sgrid { display:grid; grid-template-columns:repeat(5, minmax(0, 1fr)); gap:10px;
+         min-height:220px; overflow-y:auto;
          border:1px solid var(--line); border-radius:var(--r); background:var(--s1); padding:6px; }
+/* No overscroll-behavior:contain here (unlike the other scrollable pickers): `contain`
+   blocks wheel scroll from chaining to the page the moment this element is "at its
+   boundary" -- which is ALWAYS true when it has no overflow (0 scroll position is both
+   edges at once). With the picked filters often leaving too few samples to fill this box,
+   that made hovering the grid a dead zone -- scrolling did nothing, neither moving the grid
+   (nothing to scroll) nor the page (chaining blocked) -- while scrolling just to its side
+   worked fine. Leaving it off restores the native, correct behavior: scroll the grid while
+   it has room to, and chain to the page exactly when there's nothing left to scroll here
+   (whether that's because you hit its edge or because it was never scrollable to begin
+   with). */
 .scard { display:flex; flex-direction:column; gap:3px; border:1px solid transparent;
          background:none; border-radius:4px; padding:3px; cursor:pointer; text-align:center; }
 .scard:hover { background:var(--s2); }
@@ -317,6 +344,24 @@ h2 em { font-style:normal; color:var(--accent); font-family:var(--mono);
          white-space:nowrap; }
 .scard.on .sclab { color:var(--ink); font-weight:600; }
 .scimg { width:100%; aspect-ratio:4/3; object-fit:cover; border-radius:3px; background:var(--s2); }
+.scimgwrap { position:relative; }
+/* The compact speaker ring (spkRingDots): dots only, no box like #scenering has -- no
+   numbers there either, once upon a time, but at gallery-thumbnail size that read as
+   meaningless confetti; both size and stroke are bumped up (per-call in app.js, and here)
+   until the numbers are actually legible, not just present. */
+.spkring { position:absolute; inset:0; width:100%; height:100%; pointer-events:none; }
+.spkring .spkdot circle { fill:var(--s1); stroke:var(--firm); stroke-width:1.4; opacity:.95; }
+/* No font-size here -- each dot sets its own via the SVG font-size attribute (CSS would
+   win over that and flatten every dot to one size, big and small rings alike). */
+.spkring .spkdot text { font-family:var(--mono); font-weight:700; fill:var(--ink2);
+                         text-anchor:middle; dominant-baseline:central; pointer-events:none; }
+.spkring .spkdot.on circle { fill:var(--accent); stroke:var(--accent); opacity:1; }
+.spkring .spkdot.on text { fill:#fff; }
+/* A slot this box doesn't actually use -- kept in the ring (not filtered out) so the full
+   physical layout still reads, just dimmed enough to stay out of the way of the ones that
+   matter. Still its own full size and stroke, so the number itself stays readable. */
+.spkring .spkdot.unused circle { fill:var(--s2); stroke:var(--line); opacity:.55; }
+.spkring .spkdot.unused text { fill:var(--ink3); opacity:.75; }
 .pbdot { width:8px; height:8px; border-radius:50%; flex:none;
          background:hsl(var(--h) 58% 52%); }
 /* Dataset names are long -- let the row wrap to two lines instead of a very wide column. */
@@ -325,12 +370,27 @@ h2 em { font-style:normal; color:var(--accent); font-family:var(--mono);
 /* Box/title + scatter on the LEFT (fixed width, the scatter's own natural size); the
    search pair + 5-col photo gallery (buildSampleGrid) fill the rest of the row to its
    RIGHT, growing with whatever space is left. */
-.pk.boxcol { flex:0 0 300px; }
+/* Locked in place while the gallery beside it scrolls: position:sticky relative to #flow
+   (the page's own scroll container -- nothing between here and there sets overflow or a
+   transform, so it can see past every intermediate ancestor). This also settles the
+   "hovering the box picker scrolls the gallery instead of the page" mixup for free: a
+   sticky element has no scroll container of its own, so a wheel event over it has nowhere
+   to go but up to #flow, same as hovering any other static bit of the page. background is
+   set so the gallery's grid doesn't show through the gaps between this column's own pieces
+   (the title, the scatter, the repeats list) as it scrolls past underneath. */
+.pk.boxcol { flex:0 0 340px; position:sticky; top:0; align-self:flex-start; z-index:1;
+             background:var(--s0); padding-bottom:8px; }
 /* align-self:stretch: take the full height .s1srow's own stretch (from .s1cols) gives
    this row, instead of .s1srow's default flex-start sizing everything to its own content
-   -- .boxcol/.spkat don't need the extra height so they're left at flex-start. */
-.pk.gallerycol { display:flex; flex-direction:column; gap:8px; flex:1 1 480px; min-width:0;
-                 align-self:stretch; }
+   -- .boxcol/.spkat don't need the extra height so they're left at flex-start.
+   align-items:stretch (overriding the base .pk rule's align-items:flex-start): WIDTH, not
+   height. .searchrow and #samplegrid neither one sets its own width, so under flex-start
+   they were sizing to their OWN content instead of stretching to fill whatever width this
+   column actually has -- the real cause of the dead space to the gallery's right. Every
+   sibling .pk (e.g. .boxcol) never showed this because its children set width:100%
+   themselves, which is a definite size and ignores align-items either way. */
+.pk.gallerycol { display:flex; flex-direction:column; gap:8px; flex:1 1 600px; min-width:0;
+                 align-self:stretch; align-items:stretch; }
 /* "{box} box, spk {spk}" as two native <select>s standing in for plain text -- styled to
    read as a label, not an obvious form control, but still a real dropdown. Long dataset
    names get clipped rather than blowing out the row (see .s1frow .pk.pb.ds for the same
@@ -476,7 +536,7 @@ main { flex:1; display:grid; grid-template-columns:minmax(0,1fr) 280px; gap:12px
 .yl::before { content:''; }
 .yl { writing-mode:vertical-rl; transform:rotate(180deg); width:12px; }
 
-.h160 { height:170px; } .h150 { height:160px; } .h110 { height:120px; }
+.h160 { height:170px; } .h150 { height:230px; } .h110 { height:180px; }
 
 .plot canvas, .plot img { width:100%; height:100%; display:block; }
 
@@ -748,6 +808,7 @@ h2 em.soft { color:var(--ink3); font-weight:400; margin-left:auto; }
               overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .card2 .sub.foreign { color:var(--accent); }   /* probe kept from another box */
 .card2 .ln3 { font-size:9.5px; color:var(--ink2); white-space:nowrap; }
+.card2 .ln3.objs { overflow:hidden; text-overflow:ellipsis; }
 .card2 .x { border:0; background:none; color:var(--ink3); font-size:13px;
             line-height:1; padding:0 1px; margin-left:2px; cursor:pointer; }
 .card2 .x:hover { color:var(--ink); }
