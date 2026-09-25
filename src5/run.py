@@ -78,7 +78,7 @@ def get_parser() -> argparse.ArgumentParser:
     p.add_argument("--weight-decay", type=float, default=1e-2)
     p.add_argument("--t-warmup", default="100ba")
     p.add_argument("--max-duration", default="500ep")
-    p.add_argument("--eval-interval", default="10ep")
+    p.add_argument("--eval-interval", default="50ep")
     p.add_argument("--checkpoint-interval", default="50ep")
     p.add_argument("--viz-interval", default="50ep",
                     help="log predicted-vs-ground-truth mask images (train + each eval split) every N epochs")

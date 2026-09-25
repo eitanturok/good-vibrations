@@ -7,6 +7,9 @@ import argparse, socket
 from pathlib import Path
 import uvicorn
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+DATASET_DIR = REPO_ROOT / "experiments"  # the parent dir holding every experiment/dataset
+
 
 def free_port(host, port):
     """The dashboard should start, not refuse over a busy port."""
@@ -30,8 +33,9 @@ def _table(headers, rows):
 
 def main():
     ap = argparse.ArgumentParser(prog="viz2", description=__doc__)
-    ap.add_argument("dataset", type=Path,
-                    help="one dataset dir, or a dir containing several")
+    ap.add_argument("dataset", type=Path, nargs="?", default=DATASET_DIR,
+                    help="one dataset dir, or a dir containing several "
+                         f"(default: {DATASET_DIR}, the dir holding every experiment)")
     ap.add_argument("--port", type=int, default=8505)
     ap.add_argument("--host", default="127.0.0.1")
     a = ap.parse_args()
