@@ -60,19 +60,54 @@ def zoom_at_point(old_zoom: float, steps: float, zoom_step: float, zoom_min: flo
     return max(zoom_min, min(zoom_max, old_zoom * (zoom_step ** steps)))
 
 
+def readout_columns(x_start: int, x_end: int, sensor_w: int = 1920, align: int = 16, min_width: int = 128) -> tuple[int, int]:
+    """The camera's horizontal readout window (OffsetX, Width) covering sensor columns
+    [x_start, x_end): both multiples of 16, Width >= 128, OffsetX + Width <= sensor_w.
+    Rounds OUT (offset down, width up) so no ROI is ever cut off."""
+    offset = (x_start // align) * align
+    width = max(min_width, -(-(x_end - offset) // align) * align)
+    offset = max(0, min(offset, sensor_w - width))
+    return offset, min(width, sensor_w - offset)
+
+
 def compute_roi_grid(row_clicks: list[tuple[float, float]], col_clicks: list[tuple[float, float]],
-                      roi_width: int, roi_height: int) -> list[tuple[int, int, int, int]]:
-    """Build the final (x, y, w, h) ROI boxes from N_rows horizontal-line click points and
-    N_cols vertical-line click points -- ports src/record.ipynb cells 36-50's two-pass
-    calibration math (row-major order, matching cell 50 exactly). Only each row click's y
-    and each column click's x are used; row bands are laid out edge-to-edge starting at 0
-    (row i spans y in [i*roi_height, (i+1)*roi_height)) -- the click y-positions there only
-    ever fed the *hardware* row-index registers (set_rows(), a separate concern handled by
-    MikrotronCamera, not this pure box layout)."""
-    rois = []
-    for row in range(len(row_clicks)):
-        y = row * roi_height
-        for x_click, _y_click in col_clicks:
-            x = int(round(x_click - roi_width / 2))
-            rois.append((x, y, roi_width, roi_height))
-    return rois
+                      roi_width: int, roi_height: int, sensor_w: int = 1920, sensor_h: int = 1080):
+    """ROI grid from N_rows horizontal-line clicks (only y used) and N_cols vertical-line
+    clicks (only x used), in any click order: rows sort top-to-bottom, columns left-to-right,
+    each ROI centered on its click and clamped inside the sensor.
+
+    Returns (rois, row_positions, offset_x) -- the camera reads only the selected row bands,
+    stacked edge-to-edge, over the column window starting at offset_x:
+    - rois: (x, y, w, h) per ROI, row-major, in the camera's OUTPUT frame (what the saved raw
+      frames and post-processing index): x = sensor x - offset_x, y = band * roi_height
+    - row_positions: the (even) sensor row each band starts at -- the camera addresses rows in pairs
+    - offset_x: the sensor column the output frame starts at"""
+    xs = sorted(int(round(min(max(x - roi_width / 2, 0), sensor_w - roi_width))) for x, _ in col_clicks)
+    row_positions = sorted(2 * int(round(min(max(y - roi_height / 2, 0), sensor_h - roi_height) / 2)) for _, y in row_clicks)
+    offset_x, _ = readout_columns(xs[0], xs[-1] + roi_width, sensor_w)
+    rois = [(x - offset_x, band * roi_height, roi_width, roi_height) for band in range(len(row_positions)) for x in xs]
+    return rois, row_positions, offset_x
+
+
+def sensor_rois(rois, row_positions, offset_x: int, roi_height: int):
+    """Output-frame rois -> the same boxes in full-sensor coordinates."""
+    return [(x + offset_x, row_positions[y // roi_height], w, h) for x, y, w, h in rois]
+
+
+def compose_sensor_view(frame, rois, row_positions, offset_x: int, roi_height: int, background=None, sensor_shape=(1080, 1920)):
+    """A full-sensor image from one output frame: each row band pasted back at its sensor
+    position (on `background`, e.g. a dimmed wide-open snapshot, or black)."""
+    import numpy as np
+    out = np.zeros(sensor_shape, dtype=frame.dtype) if background is None else background.copy()
+    w = min(frame.shape[1], sensor_shape[1] - offset_x)
+    for band, y0 in enumerate(row_positions):
+        out[y0:y0 + roi_height, offset_x:offset_x + w] = frame[band * roi_height:(band + 1) * roi_height, :w]
+    return out
+
+
+def resize_roi_grid(rois, row_positions, offset_x: int, roi_size: int, new_size: int, sensor_w: int = 1920, sensor_h: int = 1080):
+    """The same grid at a new ROI size: every ROI stays centered where it was (i.e. on the
+    lines you clicked). Returns (rois, row_positions, offset_x) like compute_roi_grid."""
+    col_centers = sorted({x + offset_x + roi_size / 2 for x, y, w, h in rois})
+    row_clicks = [(0, y0 + roi_size / 2) for y0 in row_positions]
+    return compute_roi_grid(row_clicks, [(x, 0) for x in col_centers], new_size, new_size, sensor_w, sensor_h)

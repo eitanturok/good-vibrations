@@ -24,10 +24,10 @@ def _object_color(name: str, idx: int, colormap) -> tuple:
 def draw_smask(ax, seg_results: list[dict], crop_overhead: np.ndarray, object_names: list[str]):
     """One colored overlay per object's mask(s), on a black background -- ports
     src/record.ipynb cell 67's plot_smask()."""
-    import matplotlib.cm as cm
+    import matplotlib
     img_h, img_w = crop_overhead.shape[:2]
     ax.imshow(np.zeros((img_h, img_w, 3)))
-    colormap = cm.get_cmap("tab10")
+    colormap = matplotlib.colormaps["tab10"]  # cm.get_cmap was removed in matplotlib 3.9
     for obj_idx, (name, result) in enumerate(zip(object_names, seg_results)):
         color = _object_color(name, obj_idx, colormap)
         for mask in result.get("masks", []):
@@ -45,7 +45,7 @@ def draw_coverage(ax, coverage_mask: np.ndarray, n_samples: int, layout: str):
     ax.set_title(f"Box Coverage {layout} ({n_samples} samples)")
 
 
-def draw_shifts(ax, shifts: np.ndarray, fps: float, laser_idx: int):
+def draw_shifts(ax, shifts: np.ndarray, fps: float, laser_idx: int, title: str | None = None):
     """x/y pixel shift over time for one laser ROI -- ports src/record.ipynb cell 67's
     plot_shifts(), fixed to a single laser_idx (the live preview is always single-ROI)."""
     shifts = np.asarray(shifts).squeeze()
@@ -56,10 +56,10 @@ def draw_shifts(ax, shifts: np.ndarray, fps: float, laser_idx: int):
     ax.set_xlabel("Time (s)")
     ax.set_ylabel("Shift (pixels)")
     ax.legend()
-    ax.set_title(f"Shifts laser={laser_idx}")
+    ax.set_title(title or f"Shifts laser={laser_idx}")
 
 
-def draw_freqs(ax, fft: np.ndarray, freqs: np.ndarray, laser_idx: int):
+def draw_freqs(ax, fft: np.ndarray, freqs: np.ndarray, laser_idx: int, title: str | None = None):
     """FFT magnitude spectrum for one laser ROI -- ports src/record.ipynb cell 67's
     plot_fft_magnitude(), fixed to a single laser_idx."""
     fft = np.asarray(fft).squeeze()
@@ -70,7 +70,7 @@ def draw_freqs(ax, fft: np.ndarray, freqs: np.ndarray, laser_idx: int):
     ax.set_xlabel("Frequency (Hz)")
     ax.set_ylabel("Magnitude")
     ax.legend()
-    ax.set_title(f"FFT Magnitude laser={laser_idx}")
+    ax.set_title(title or f"FFT Magnitude laser={laser_idx}")
 
 
 def figure_to_array(fig) -> np.ndarray:

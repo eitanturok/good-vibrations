@@ -97,7 +97,10 @@ def main(args):
     make_spectrogram_video(freqs_spec, times, Sxx, audio, args.fs, out_dir / 'spectrogram.mp4', label=spec_label, max_freq=args.f_end)
 
     print(f"saved audio.wav, metadata.jsonl, fft.npz, fft.png, spectrogram.npz, spectrogram.png, spectrogram.mp4 to {out_dir}")
-    return audio
+    # always read back from disk rather than returning the in-memory `audio` array directly --
+    # one consistent (samples, fs) shape regardless of whether this run just generated the
+    # file or the early-return above loaded a cached one
+    return load(out_dir / 'audio.wav')
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)

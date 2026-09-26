@@ -221,7 +221,8 @@ class Camera:
             image_data.unlock()
             return frame,timestamp
         else:
-            print('failed')
+            self.last_error = ret  # callers get None; the uEye code is kept here (no print -- a
+                                   # polling thread would spam it into every notebook cell)
             
     def set_rolling_shutter(self):
         const = ueye.INT(1)

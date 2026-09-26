@@ -47,3 +47,14 @@ def test_log_prints_and_enqueues(capsys):
     captured = capsys.readouterr()
     assert "hello world" in captured.out
     assert ec.log_queue.get_nowait() == "hello world"
+
+
+def test_task_failure_is_reported(capsys):
+    """Real bug: plot_smask crashed on every run and the smask panel just never appeared --
+    nothing joins a plot task, so a stored-only exception was invisible."""
+    def plot_smask():
+        raise AttributeError("module 'matplotlib.cm' has no attribute 'get_cmap'")
+
+    Task(plot_smask).join()
+    err = capsys.readouterr().err
+    assert "plot_smask" in err and "get_cmap" in err
