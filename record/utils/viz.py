@@ -18,7 +18,8 @@ COLOR_WORDS = ["red", "green", "blue", "yellow", "purple", "orange", "pink", "bl
 
 
 def _object_color(name: str, idx: int, colormap) -> tuple:
-    return next((to_rgb(w) for w in COLOR_WORDS if w in name.lower()), colormap(idx % colormap.N))
+    # always RGB: a colormap returns RGBA, and callers append their own alpha
+    return next((to_rgb(w) for w in COLOR_WORDS if w in name.lower()), colormap(idx % colormap.N)[:3])
 
 
 def draw_smask(ax, seg_results: list[dict], crop_overhead: np.ndarray, object_names: list[str]):
@@ -37,12 +38,53 @@ def draw_smask(ax, seg_results: list[dict], crop_overhead: np.ndarray, object_na
     ax.axis("off")
 
 
-def draw_coverage(ax, coverage_mask: np.ndarray, n_samples: int, layout: str):
-    """Heatmap of how much of the box floor has been covered by segmented objects so
-    far, for one layout -- ports src/record.ipynb cell 67's plot_coverage()."""
-    im = ax.imshow(coverage_mask, cmap="Blues")
-    ax.figure.colorbar(im, ax=ax, label="coverage")
-    ax.set_title(f"Box Coverage {layout} ({n_samples} samples)")
+N_RECENT_POSITIONS = 5  # the last 5 positions fade from dark to light; older ones all share the lightest color
+
+
+def add_coverage(coverage: dict, layout: str, smask: np.ndarray, position_id: int | None):
+    """Accumulate one sample's smask into coverage[layout], in place and O(pixels): `last_seen` is
+    the per-pixel index of the latest position covering it (0 = never), so recency needs no
+    history replay; `last_mask` is the latest sample's smask. Every speaker of a position shares
+    one smask, so a position is one step however many speakers it has. An empty box (all-False
+    smask) only bumps n_samples."""
+    entry = coverage.get(layout)
+    if entry is not None and entry["last_seen"].shape != smask.shape:
+        entry = None  # shape guard -- crop is GUI-editable
+    if entry is None:
+        entry = {"n_samples": 0, "n_positions": 0, "position_id": None,
+                 "last_seen": np.zeros(smask.shape, dtype=np.int32), "last_mask": smask}
+    entry["n_samples"] += 1
+    entry["last_mask"] = smask
+    if smask.any():
+        if position_id is None or entry["position_id"] != position_id:
+            entry["position_id"], entry["n_positions"] = position_id, entry["n_positions"] + 1
+        entry["last_seen"][smask] = entry["n_positions"]
+    coverage[layout] = entry
+
+
+def coverage_age(entry: dict) -> np.ndarray:
+    """Per pixel: how many positions ago it was last covered (0 = the latest), capped at
+    N_RECENT_POSITIONS; NaN where nothing was ever covered."""
+    age = np.minimum(entry["n_positions"] - entry["last_seen"], N_RECENT_POSITIONS).astype(np.float32)
+    age[entry["last_seen"] == 0] = np.nan
+    return age
+
+
+def draw_coverage(ax, entry: dict, layout: str):
+    """Where objects have been on the box floor, for one layout, colored only by recency: the
+    latest position darkest, lighter over the last N_RECENT_POSITIONS, older ones all the same
+    light blue; a red border around the latest sample."""
+    from matplotlib.cm import ScalarMappable
+    from matplotlib.colors import ListedColormap, Normalize
+    import matplotlib
+    cmap = ListedColormap(matplotlib.colormaps["Blues"](np.linspace(1.0, 0.25, 256)))  # dark (new) -> light, never white
+    norm = Normalize(vmin=0, vmax=N_RECENT_POSITIONS)
+    ax.imshow(coverage_age(entry), cmap=cmap, norm=norm, interpolation="nearest")  # NaN (never covered) is left blank
+    if entry["last_mask"].any():
+        ax.contour(entry["last_mask"], levels=[0.5], colors="red", linewidths=1.5)
+    cbar = ax.figure.colorbar(ScalarMappable(norm, cmap), ax=ax, label="positions ago")
+    cbar.set_ticks(range(N_RECENT_POSITIONS + 1), labels=[*map(str, range(N_RECENT_POSITIONS)), f"{N_RECENT_POSITIONS}+"])
+    ax.set_title(f"Box Coverage {layout} ({entry['n_positions']} positions)")
 
 
 def draw_shifts(ax, shifts: np.ndarray, fps: float, laser_idx: int, title: str | None = None):

@@ -69,14 +69,9 @@ def stop_then_close(resource):
 
 
 def log(experiment_config, msg: str):
-    """The one lifecycle-message helper -- always prints (visible in the notebook's cell
-    output regardless of whether the GUI is up) AND enqueues onto
-    `experiment_config.log_queue` (a plain queue.Queue, drained by the GUI's own `.after()`
-    tick into its status-log widget -- the same thread-safe hand-off already used for
-    frames). No callback parameter threaded through every pipeline function: callers just
-    call `log(ec, ...)` directly."""
+    """The one lifecycle-message helper: prints to the notebook's cell output. The GUI shows
+    per-sample stage progress instead (record.utils.status), not these messages."""
     print(msg)
-    experiment_config.log_queue.put(msg)
 
 
 def buffer_sizes_dividing(n_frames, smallest=25):

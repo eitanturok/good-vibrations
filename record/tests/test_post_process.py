@@ -15,12 +15,13 @@ def test_preview_vibrations_shape_and_no_disk_io(tmp_path):
                                     # edge cases a tiny synthetic clip would trigger
     raw_vibrations = rng.integers(0, 255, (n_frames, h, w), dtype=np.uint8)
     roi = (0, 0, w, h)  # (x, y, w, h) spanning the whole synthetic frame
-    fps = 2500.0  # matches this project's real laser-camera frame rate; MIN/MAX_FREQ (50-1000Hz)
-                  # requires fps > 2*max_freq (Nyquist), so a low fps here is a bug, not a shortcut
+    fps = 2500.0  # matches this project's real laser-camera frame rate; the chirp's band (up to
+                  # 1000 Hz) requires fps > 2*max_freq (Nyquist), so a low fps here is a bug, not a shortcut
 
-    result = preview_vibrations(raw_vibrations, roi, fps, laser_idx=0, pclk_batch_size=64)
+    result = preview_vibrations(raw_vibrations, roi, fps, laser_idx=0, min_freq=100.0, max_freq=1000.0, pclk_batch_size=64)
 
     assert set(result) >= {"shifts", "fft", "freqs", "n_samples", "recovered_audio", "spec_freqs", "spec_times", "Sxx"}
     assert result["shifts"].shape == (1, n_frames, 2)  # one (x, y) shift per frame
     assert result["laser_idx"] == 0
+    assert result["freqs"].min() >= 100.0 and result["freqs"].max() <= 1000.0  # the chirp's band, passed in
     assert len(list(tmp_path.iterdir())) == 0  # no disk I/O happened anywhere

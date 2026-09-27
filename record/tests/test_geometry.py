@@ -2,8 +2,22 @@ import pytest
 
 from record.utils.geometry import (
     compute_fit_scale, clamp_view_center, compute_transform, canvas_to_sensor_coords,
-    zoom_at_point, compute_roi_grid, resize_roi_grid, sensor_rois,
+    zoom_at_point, compute_roi_grid, resize_roi_grid, sensor_rois, roi_mosaic, crop_rois,
+    compose_sensor_view,
 )
+
+
+def test_crop_rois_is_what_the_camera_sends():
+    import numpy as np
+    sensor = np.random.default_rng(0).integers(0, 256, (1080, 1920), dtype=np.uint8)
+    rois, row_positions, offset_x = compute_roi_grid([(0, 300), (0, 700)], [(500, 0), (900, 0)], 32, 32)
+    out = crop_rois(sensor, rois, row_positions, offset_x, 32)
+    assert out.shape[0] == 2 * 32
+    for (x, y, w, h), (sx, sy, _, _) in zip(rois, sensor_rois(rois, row_positions, offset_x, 32)):
+        assert (out[y:y + h, x:x + w] == sensor[sy:sy + h, sx:sx + w]).all()  # each ROI's own pixels
+    back = compose_sensor_view(out, rois, row_positions, offset_x, 32)
+    for sx, sy, w, h in sensor_rois(rois, row_positions, offset_x, 32):
+        assert (back[sy:sy + h, sx:sx + w] == sensor[sy:sy + h, sx:sx + w]).all()
 
 
 def test_compute_fit_scale_fits_the_smaller_dimension():
@@ -83,3 +97,15 @@ def test_resize_roi_grid_keeps_every_roi_centered_where_it_was():
     assert len(after) == len(before) and all(w == h == 48 for _, _, w, h in after)
     centers = lambda boxes: [(x + w / 2, y + h / 2) for x, y, w, h in boxes]
     assert all(abs(a - b) <= 1 for c1, c2 in zip(centers(before), centers(after)) for a, b in zip(c1, c2))
+
+
+def test_roi_mosaic_shows_only_the_roi_cells():
+    """The zoomed view: every ROI cell cut out of the frame and tiled in its grid position, touching
+    (one continuous image -- only the grid lines drawn over it separate the cells)."""
+    import numpy as np
+    rois, row_positions, offset_x = compute_roi_grid([(0, 300), (0, 700)], [(500, 0), (900, 0), (1300, 0)], 32, 32)
+    frame = np.random.default_rng(0).integers(0, 255, (64, 1920), dtype=np.uint8)
+    mosaic, tiles = roi_mosaic(frame, rois, n_cols=3)
+    assert mosaic.shape == (2 * 32, 3 * 32) and len(tiles) == len(rois)
+    for (x, y, w, h), (tx, ty, tw, th) in zip(rois, tiles):
+        assert (mosaic[ty:ty + th, tx:tx + tw] == frame[y:y + h, x:x + w]).all()

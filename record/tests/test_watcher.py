@@ -33,7 +33,7 @@ def test_watcher_survives_a_failing_item_and_keeps_processing(tmp_path):
 
     handler.start(tmp_path)
 
-    for name in ["a.marker", "bad.marker", "b.marker", "c.marker"]:
+    for name in ["a.marker", "bad.marker", "b.marker", "c.marker"]:  # never written: submit doesn't need the file yet
         handler.submit(tmp_path / name)
 
     assert _wait_until(lambda: len(processed) == 3)
@@ -60,14 +60,64 @@ def test_submit_before_start_raises():
         handler.submit(Path("whatever"))
 
 
-def test_double_start_raises(tmp_path):
-    @watch(pattern="*.marker")
+def test_start_again_reuses_the_worker(tmp_path):
+    """Real bug: re-running the notebook's ExperimentConfig cell called .start() again and
+    raised "post_process.start() was already called". Re-running must just work: still one
+    worker (no second GPU job in parallel), now watching the latest directory."""
+    processed = []
+
+    @watch(pattern="*.marker", poll_rate=0.05)
     def handler(item):
-        pass
+        processed.append(item)
+
+    first = handler.start(tmp_path / "old")
+    (tmp_path / "new").mkdir()
+    assert handler.start(tmp_path / "new") is first  # same watcher, same single worker
+    (tmp_path / "new" / "x.marker").write_text("x" * (2**20 + 1), encoding="utf-8")
+    assert _wait_until(lambda: tmp_path / "new" / "x.marker" in processed, timeout=5.0)
+    assert first.failed_path == tmp_path / "new" / "failed_samples.jsonl"
+
+
+def test_submitted_and_scanned_sample_is_processed_once(tmp_path):
+    """Real bug: save_raw_vibration submitted the sample DIR while the scan found its raw FILE --
+    two keys, so every sample was queued twice; the 2nd run found the raw file already deleted by
+    the 1st and failed ("...01_raw_vibrations.npy\\metadata.jsonl" not found). An item is the
+    matched file, so the direct hand-off and the scan dedupe against each other."""
+    processed = []
+
+    @watch(pattern="**/vibration/01_raw_vibrations.npy", poll_rate=0.05)
+    def handler(raw_path):
+        processed.append(raw_path)
+        time.sleep(0.3)  # still processing while the scan ticks
+        raw_path.unlink()  # like post_process: the raw file is deleted once done
 
     handler.start(tmp_path)
-    with pytest.raises(RuntimeError):
-        handler.start(tmp_path)
+    raw = tmp_path / "samples/000063/vibration/01_raw_vibrations.npy"
+    raw.parent.mkdir(parents=True)
+    raw.write_bytes(b"x" * (2**20 + 1))
+    with pytest.raises(ValueError):
+        handler.submit(tmp_path / "samples/000063")  # not the matched file: rejected, not silently double-queued
+    handler.submit(raw)
+
+    assert _wait_until(lambda: not raw.exists(), timeout=5.0)
+    time.sleep(1.5)  # several scan ticks (each waits ~1 s for the size to settle)
+    assert processed == [raw] and not (tmp_path / "failed_samples.jsonl").exists()
+
+
+def test_on_event_reports_when_each_item_starts_and_ends(tmp_path):
+    """The GUI's status list shows when post-processing starts and ends (or fails) per sample."""
+    events = []
+
+    @watch(pattern="*.marker")
+    def handler(item):
+        if item.name == "bad.marker":
+            raise OSError("boom")
+
+    handler.start(tmp_path, on_event=lambda item, event: events.append((item.name, event)))
+    handler.submit(tmp_path / "a.marker")
+    handler.submit(tmp_path / "bad.marker")
+    assert _wait_until(lambda: len(events) == 4)
+    assert events == [("a.marker", "start"), ("a.marker", "end"), ("bad.marker", "start"), ("bad.marker", "failed")]
 
 
 def test_periodic_scan_picks_up_files_not_directly_submitted(tmp_path):

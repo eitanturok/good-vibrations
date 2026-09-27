@@ -1,4 +1,3 @@
-import queue
 import time
 
 from record.utils import Task, log
@@ -36,17 +35,10 @@ def test_task_timing_attributes_populated():
     assert t.end_time >= t.launch_time
 
 
-class _FakeExperimentConfig:
-    def __init__(self):
-        self.log_queue = queue.Queue()
-
-
-def test_log_prints_and_enqueues(capsys):
-    ec = _FakeExperimentConfig()
-    log(ec, "hello world")
-    captured = capsys.readouterr()
-    assert "hello world" in captured.out
-    assert ec.log_queue.get_nowait() == "hello world"
+def test_log_prints(capsys):
+    # the GUI shows per-sample stages instead; messages go to the notebook output only
+    log(object(), "hello world")
+    assert "hello world" in capsys.readouterr().out
 
 
 def test_task_failure_is_reported(capsys):

@@ -31,8 +31,9 @@ def _is_file_ready(path: Path, check_interval: float = 1.0) -> bool:
 
 
 class _Watcher:
-    def __init__(self, fn, dir: Path, pattern: str, poll_rate: float):
+    def __init__(self, fn, dir: Path, pattern: str, poll_rate: float, on_event=None):
         self.fn, self.dir, self.pattern, self.poll_rate = fn, Path(dir), pattern, poll_rate
+        self.on_event = on_event  # on_event(item, "start" | "end" | "failed"), e.g. for a status display
         self.q: "queue.Queue[Path]" = queue.Queue()
         self._seen: dict[str, float] = {}  # str(path) -> mtime already queued/handled, so a
                                             # delete + re-record under the same path (new
@@ -42,7 +43,11 @@ class _Watcher:
         threading.Thread(target=self._scan_loop, daemon=True, name=f"watch-{fn.__name__}-scan").start()
 
     def submit(self, item):
+        # an item IS the matched file -- the same key the scan uses, so a directly submitted
+        # item and the scan finding it dedupe against each other instead of running twice
         item = Path(item)
+        if not item.match(self.pattern):
+            raise ValueError(f"{item} doesn't match {self.pattern!r}: submit the matched file itself")
         try:
             mtime = item.stat().st_mtime if item.exists() else time.time()
         except OSError:
@@ -60,8 +65,11 @@ class _Watcher:
             # persistent worker -- every other queued item still needs processing for the
             # rest of the session.
             try:
+                self._event(item, "start")
                 self.fn(item)
+                self._event(item, "end")
             except Exception as e:
+                self._event(item, "failed")
                 row = {"item": str(item), "error": f"{type(e).__name__}: {e}",
                        "traceback": traceback.format_exc(), "time": datetime.now(timezone.utc).isoformat()}
                 try:
@@ -69,6 +77,13 @@ class _Watcher:
                 except Exception:
                     pass  # even the failure ledger write failing must not kill the worker
                 print(f"[watch:{self.fn.__name__}] {item} FAILED: {e}", file=sys.stderr)
+
+    def _event(self, item, event):
+        if self.on_event is not None:
+            try:
+                self.on_event(item, event)
+            except Exception as e:  # a broken display hook must never stop processing
+                print(f"[watch:{self.fn.__name__}] on_event failed: {e!r}", file=sys.stderr)
 
     def _scan_loop(self):
         while True:
@@ -101,8 +116,9 @@ def watch(pattern: str, poll_rate: float = 2.0):
     submitted, e.g. after a kernel crash, or an old item you want to backfill by hand.
 
     `pattern` is fixed at decoration time; the directory to watch is bound later, via the
-    decorated function's own `.start(dir)` (called once, e.g. at notebook startup once
-    `experiment_dir` is known) -- `.submit()` raises until `.start()` has been called.
+    decorated function's own `.start(dir)` (e.g. at notebook startup once `experiment_dir` is
+    known; calling it again just points the same worker at the new dir) -- `.submit()` raises
+    until `.start()` has been called.
 
     Crash isolation: the worker wraps EACH item's call to the decorated function in its own
     try/except -- a failing item is logged to `<dir>/failed_samples.jsonl` and skipped,
@@ -110,10 +126,12 @@ def watch(pattern: str, poll_rate: float = 2.0):
     def decorator(fn):
         state: dict[str, _Watcher | None] = {"watcher": None}
 
-        def start(dir):
-            if state["watcher"] is not None:
-                raise RuntimeError(f"{fn.__name__}.start() was already called")
-            state["watcher"] = _Watcher(fn, dir, pattern, poll_rate)
+        def start(dir, on_event=None):
+            w = state["watcher"]
+            if w is None:
+                state["watcher"] = _Watcher(fn, dir, pattern, poll_rate, on_event)
+            else:  # started again (a re-run notebook cell): keep the one worker, watch `dir` now
+                w.dir, w.failed_path, w.on_event = Path(dir), Path(dir) / "failed_samples.jsonl", on_event
             return state["watcher"]
 
         def submit(item):

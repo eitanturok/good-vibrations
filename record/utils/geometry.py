@@ -105,9 +105,33 @@ def compose_sensor_view(frame, rois, row_positions, offset_x: int, roi_height: i
     return out
 
 
+def crop_rois(sensor_frame, rois, row_positions, offset_x: int, roi_height: int):
+    """Inverse of compose_sensor_view: a full-sensor frame cut down to what the cropped camera
+    sends -- its row bands stacked edge-to-edge, columns from offset_x."""
+    import numpy as np
+    width = max(x + w for x, y, w, h in rois)
+    return np.concatenate([sensor_frame[y0:y0 + roi_height, offset_x:offset_x + width] for y0 in row_positions])
+
+
 def resize_roi_grid(rois, row_positions, offset_x: int, roi_size: int, new_size: int, sensor_w: int = 1920, sensor_h: int = 1080):
     """The same grid at a new ROI size: every ROI stays centered where it was (i.e. on the
     lines you clicked). Returns (rois, row_positions, offset_x) like compute_roi_grid."""
     col_centers = sorted({x + offset_x + roi_size / 2 for x, y, w, h in rois})
     row_clicks = [(0, y0 + roi_size / 2) for y0 in row_positions]
     return compute_roi_grid(row_clicks, [(x, 0) for x in col_centers], new_size, new_size, sensor_w, sensor_h)
+
+
+def roi_mosaic(frame, rois, n_cols: int):
+    """The zoomed view: each ROI cell cut out of `frame` and tiled in its grid position (row-major,
+    touching -- one continuous image; the tile boxes drawn over it are the grid lines).
+    Returns (mosaic, tile boxes (x, y, w, h))."""
+    import numpy as np
+    w, h = rois[0][2], rois[0][3]
+    n_rows = -(-len(rois) // n_cols)
+    mosaic = np.zeros((n_rows * h, n_cols * w), dtype=frame.dtype)
+    tiles = []
+    for i, (x, y, _, _) in enumerate(rois):
+        tx, ty = (i % n_cols) * w, (i // n_cols) * h
+        mosaic[ty:ty + h, tx:tx + w] = frame[y:y + h, x:x + w]
+        tiles.append((tx, ty, w, h))
+    return mosaic, tiles

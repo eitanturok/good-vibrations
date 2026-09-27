@@ -142,31 +142,39 @@ def load_notebook(cam):
     """Exec the ROIConfig, LaserCameraConfig and MikrotronCamera cells, as-is, with the
     fake grabber standing in for egrabber."""
     cells = ["".join(c["source"]) for c in json.loads(NB.read_text(encoding="utf-8"))["cells"] if c["cell_type"] == "code"]
-    ns = dict(np=np, dataclass=dataclass, field=field, geometry=geometry,
+    ns = dict(np=np, dataclass=dataclass, field=field, geometry=geometry, dataclasses=__import__('dataclasses'),
               close_previous_instance=close_previous_instance, stop_then_close=stop_then_close,
               EGenTL=lambda: None, EGrabber=make_grabber_cls(cam), ct=ct, threading=threading,
               Buffer=FakeBuffer, BUFFER_INFO_BASE="base", BUFFER_INFO_CUSTOM_PART_SIZE="part_size",
               BUFFER_INFO_CUSTOM_NUM_DELIVERED_PARTS="delivered", INFO_DATATYPE_PTR=None, INFO_DATATYPE_SIZET=None)
     for marker in ("class ROIConfig", "class LaserCameraConfig", "class MikrotronCamera"):
         exec(next(src for src in cells if marker in src), ns)
+    roi_cell = next((src for src in cells if "def rois_from_clicks" in src), None)
+    if roi_cell is not None:  # the ROI section's functions (shared by the notebook and the GUI)
+        exec(roi_cell, ns)
     return ns
+
+
+def grid_config(ns, **kwargs):
+    """The laser camera config with the default ROI grid (Section 4's roi_config)."""
+    return ns["LaserCameraConfig"](roi=ns["ROIConfig"].spread(1920, 1080), **kwargs)
 
 
 @pytest.mark.parametrize("left_acquiring", [False, True], ids=["fresh", "left-acquiring-by-previous-session"])
 def test_construct(left_acquiring):
     ns = load_notebook(Camera(acquiring=left_acquiring))
-    ns["MikrotronCamera"](ns["laser_camera_config"])
+    ns["MikrotronCamera"](grid_config(ns))
 
 
 def test_construct_wide_open():
     """rois=None is what the GUI's Reset-ROIs calibration flow builds -- full sensor, no grid."""
     ns = load_notebook(Camera(acquiring=True))
-    ns["MikrotronCamera"](ns["LaserCameraConfig"](roi=ns["ROIConfig"]()))
+    ns["MikrotronCamera"](ns["LaserCameraConfig"]())  # roi=None: wide-open
 
 
 def test_default_grid_spans_sensor():
     ns = load_notebook(Camera())
-    roi = ns["default_roi"]
+    roi = ns["ROIConfig"].spread(1920, 1080)
     xs = [x for x, y, w, h in roi.rois]
     assert (roi.roi_width, roi.roi_height) == (32, 32)
     assert min(xs) == 0 and max(xs) + roi.roi_width == 1920
@@ -178,21 +186,21 @@ def test_full_buffer_fills_before_capture_timeout():
     capture_vibrations waits 5s per buffer. Real bug: the camera kept its old 25 fps, so one
     1625-frame buffer took 65s and the capture timed out."""
     ns = load_notebook(Camera())
-    laser = ns["MikrotronCamera"](ns["laser_camera_config"])
+    laser = ns["MikrotronCamera"](grid_config(ns))
     assert laser.grabber.stream.get("BufferPartCount") / laser.get_frame_rate() < 5
 
 
 def test_construct_twice_in_a_row():
     ns = load_notebook(Camera())
-    ns["MikrotronCamera"](ns["laser_camera_config"])
-    ns["MikrotronCamera"](ns["laser_camera_config"])
+    ns["MikrotronCamera"](grid_config(ns))
+    ns["MikrotronCamera"](grid_config(ns))
 
 
 def test_capture_while_live_preview_polls():
     """Real bug: the GUI's live-preview thread loops capture_vibrations(1); run_experiment then
     reads the same grabber from another thread -> ClientError('EGrabber is busy in another thread')."""
     ns = load_notebook(Camera())
-    laser = ns["MikrotronCamera"](ns["LaserCameraConfig"](buffer_part_count=2))
+    laser = ns["MikrotronCamera"](grid_config(ns, buffer_part_count=2))
     poller = threading.Thread(target=lambda: [laser.capture_vibrations(1) for _ in range(3)])
     poller.start()
     laser.grabber.popping.wait()  # the preview thread is mid-pop
@@ -206,7 +214,7 @@ def test_construct_after_a_previous_horizontal_crop():
     the default full-width grid then set Width=1920 before resetting OffsetX ->
     'GenApi error code 52: Width cannot be greater than 1472'."""
     ns = load_notebook(Camera(offset_x=448))
-    ns["MikrotronCamera"](ns["laser_camera_config"])
+    ns["MikrotronCamera"](grid_config(ns))
 
 
 def test_construct_from_any_leftover_camera_state():
@@ -214,7 +222,7 @@ def test_construct_from_any_leftover_camera_state():
     so construction must start from a known state rather than patch each leftover."""
     cam = Camera(acquiring=True, offset_x=448, offset_y=900)
     ns = load_notebook(cam)
-    ns["MikrotronCamera"](ns["laser_camera_config"])
+    ns["MikrotronCamera"](grid_config(ns))
     assert cam.features["OffsetY"] == 0
 
 
@@ -223,7 +231,7 @@ def test_any_row_count_is_valid(n_rows):
     """Real rule: selected rows x 2 must be a multiple of 4 -- with 30px ROIs an odd row count
     crashed set_rows. ROI heights are kept to multiples of 4, so every row count works."""
     ns = load_notebook(Camera())
-    roi = ns["ROIConfig"].spread(n_rows=n_rows, roi_width=30, roi_height=30)
+    roi = ns["ROIConfig"].spread(1920, 1080, n_rows=n_rows, roi_width=30, roi_height=30)
     assert roi.roi_height % 4 == 0
     ns["MikrotronCamera"](ns["LaserCameraConfig"](roi=roi))
 
@@ -233,7 +241,7 @@ def test_preview_frame_copies_one_frame_not_the_whole_buffer():
     frames and capture_vibrations allocated + copied ALL of them (~1 GB per preview frame at
     320x1920) -- the laser preview and its zoom lagged."""
     ns = load_notebook(Camera())
-    laser = ns["MikrotronCamera"](ns["LaserCameraConfig"](buffer_part_count=50))
+    laser = ns["MikrotronCamera"](grid_config(ns, buffer_part_count=50))
     laser.capture_vibrations(1)  # warm up (fake DMA memory allocated once)
     tracemalloc.start()
     frame = laser.capture_vibrations(1)
@@ -245,7 +253,7 @@ def test_preview_frame_copies_one_frame_not_the_whole_buffer():
 
 def test_capture_keeps_frame_order_across_buffers():
     ns = load_notebook(Camera())
-    laser = ns["MikrotronCamera"](ns["LaserCameraConfig"](buffer_part_count=4))
+    laser = ns["MikrotronCamera"](grid_config(ns, buffer_part_count=4))
     video = laser.capture_vibrations(6)  # 1.5 buffers
     assert video.shape[0] == 6
     assert [int(f[0, 0]) for f in video] == [0, 1, 2, 3, 4, 5]
@@ -256,7 +264,7 @@ def test_preview_frame_is_the_newest():
     20 filled buffers (0.65 s each) and the preview popped the OLDEST one, then showed its
     OLDEST frame. The preview must show the newest frame of a fresh buffer."""
     ns = load_notebook(Camera())
-    laser = ns["MikrotronCamera"](ns["LaserCameraConfig"](buffer_part_count=4))
+    laser = ns["MikrotronCamera"](grid_config(ns, buffer_part_count=4))
     laser.grabber.produced = laser.grabber.queued = 20  # the preview fell behind: 20 buffers waiting
     frame = laser.capture_latest_frame()
     assert int(frame[0, 0]) == (20 * 4 + 3) % 256  # buffer 20 (fresh), its last frame
@@ -267,7 +275,7 @@ def test_preview_keeps_updating_during_a_recording():
     the whole capture, and the preview waited on the same lock. While recording, the preview
     must show the frames the recording is capturing, without waiting."""
     ns = load_notebook(Camera())
-    laser = ns["MikrotronCamera"](ns["LaserCameraConfig"](buffer_part_count=4))
+    laser = ns["MikrotronCamera"](grid_config(ns, buffer_part_count=4))
     recording = threading.Thread(target=laser.capture_vibrations, args=(80,))  # 20 buffers, ~1 s
     recording.start()
     while laser.grabber.produced < 3:  # a few buffers into the recording
@@ -319,7 +327,7 @@ def test_change_frames_per_buffer_while_streaming():
     1625 frames). Changing it at runtime must leave the camera streaming and capturing."""
     cam = Camera()
     ns = load_notebook(cam)
-    laser = ns["MikrotronCamera"](ns["LaserCameraConfig"](buffer_part_count=1625))
+    laser = ns["MikrotronCamera"](grid_config(ns, buffer_part_count=1625))
     laser.change_buffer_part_count(250)
     assert laser.grabber.stream.get("BufferPartCount") == 250 and cam.acquiring
     assert laser.capture_vibrations(600).shape[0] == 600
@@ -334,7 +342,7 @@ def test_live_preview_thread_delivers_frames_during_a_recording():
     ns = load_notebook(Camera())
     ns.update(queue=queue, time=time, sys=sys)
     exec(next(src for src in cells if "class _LivePoller" in src), ns)
-    laser = ns["MikrotronCamera"](ns["LaserCameraConfig"](buffer_part_count=4))
+    laser = ns["MikrotronCamera"](grid_config(ns, buffer_part_count=4))
     frames = queue.Queue(maxsize=1)
     poller = ns["_LivePoller"](laser.preview_frame, frames, threading.Event())
     poller.start()
@@ -362,6 +370,7 @@ def test_default_buffer_fits_the_capture_margin():
     ((chirp + margin) * fps frames) a whole number of buffers, so nothing waits after the audio."""
     ns = load_notebook(Camera())
     config = ns["LaserCameraConfig"]()
+    assert config.buffer_part_count == 125  # 50 ms per buffer at 2500 fps: preview frames twice as often as 250
     assert config.buffer_part_count / config.fps <= config.capture_margin_s
     n_frames = math.ceil((1.0 + config.capture_margin_s) * config.fps)  # 1 s chirp
     assert n_frames % config.buffer_part_count == 0
@@ -371,3 +380,91 @@ def test_buffer_size_options_divide_the_capture():
     from record.utils import buffer_sizes_dividing
     sizes = buffer_sizes_dividing(2750)
     assert 250 in sizes and all(2750 % b == 0 and b >= 25 for b in sizes)
+
+
+def test_roi_section_functions_calibrate_then_crop():
+    """The ROI section's functions -- the notebook's select_rois and the GUI's Reset ROIs both
+    use them: wide-open camera to click on, clicks -> ROI grid, camera cropped to that grid."""
+    cam = Camera()
+    ns = load_notebook(cam)
+    config = ns["LaserCameraConfig"](exposure_us=123.0)
+    calibration = ns["open_calibration_camera"](config)
+    assert calibration.config.roi is None and calibration.grabber.stream.get("BufferPartCount") == 1
+    assert cam.features["Width"] == 1920 and cam.features["Height"] == 1080  # full sensor to click on
+
+    roi = ns["rois_from_clicks"](config, [(0, 700), (0, 300)], [(900, 0), (500, 0)], roi_size=32)
+    assert (roi.n_rows, roi.n_cols, roi.roi_width) == (2, 2, 32) and roi.row_positions == [284, 684]
+
+    laser = ns["camera_with_rois"](config, roi)
+    assert laser.config.roi is roi and laser.config.exposure_us == 123.0
+    assert laser.grabber.stream.get("BufferPartCount") == config.buffer_part_count  # back to recording buffers
+
+
+def test_laser_camera_starts_without_rois():
+    """Section 3 builds the laser camera before any ROIs exist: wide-open, full sensor from its
+    config, streaming; Section 4 then rebuilds it cropped to the ROI grid."""
+    cam = Camera(offset_x=448)
+    ns = load_notebook(cam)
+    laser = ns["MikrotronCamera"](ns["laser_camera_config"])
+    assert laser.config.roi is None and cam.acquiring
+    assert (cam.features["Width"], cam.features["Height"]) == (laser.config.sensor_width, laser.config.sensor_height)
+    assert laser.capture_latest_frame().shape == (1080, 1920)
+
+
+def test_roi_section_runs_twice():
+    """Real bug: re-running Section 4 crashed in plot_roi_steps ("could not broadcast (32,960)
+    into (0,960)") -- the second time, laser_cam was already cropped, so the "wide-open" frame
+    was a 320-row ROI frame, not the full sensor."""
+    from matplotlib.figure import Figure
+    from matplotlib.patches import Rectangle
+    from PIL import Image
+    from record.utils import viz
+    ns = load_notebook(Camera())
+    ns.update(Figure=Figure, Rectangle=Rectangle, Image=Image, viz=viz)
+    cells = ["".join(c["source"]) for c in json.loads(NB.read_text(encoding="utf-8"))["cells"] if c["cell_type"] == "code"]
+    params = next(src for src in cells if "roi_config = ROIConfig.spread(" in src)
+    run = next(src for src in cells if "plot_roi_steps(wide_open_frame" in src and "def " not in src)
+    ns["laser_cam"] = ns["MikrotronCamera"](ns["laser_camera_config"])  # Section 3
+    ns["select_rois"] = lambda laser_cam, roi_config: roi_config  # no clicking in a test
+    for _ in range(2):
+        exec(params, ns)
+        exec(run, ns)
+        assert ns["wide_open_frame"].shape == (1080, 1920)
+
+
+def test_roi_plots_without_cropping_the_camera():
+    """Real bug: with select_rois and the camera rebuild commented out, plot_roi_steps crashed
+    ('NoneType' has no attribute 'row_positions') -- it read the ROIs off the still-wide-open
+    camera. The plots come from roi_config and the wide-open frame alone."""
+    from matplotlib.figure import Figure
+    from matplotlib.patches import Rectangle
+    from PIL import Image
+    from record.utils import viz
+    ns = load_notebook(Camera())
+    ns.update(Figure=Figure, Rectangle=Rectangle, Image=Image, viz=viz)
+    cells = ["".join(c["source"]) for c in json.loads(NB.read_text(encoding="utf-8"))["cells"] if c["cell_type"] == "code"]
+    exec(next(src for src in cells if "roi_config = ROIConfig.spread(" in src), ns)
+    run = next(src for src in cells if "plot_roi_steps(wide_open_frame" in src and "def " not in src)
+    skip = ("select_rois(", "dataclasses.replace(laser_camera_config", "laser_cam = MikrotronCamera(")
+    run = "\n".join("# " + l if any(s in l for s in skip) else l for l in run.splitlines())
+    exec(run, ns)
+    assert ns["laser_cam"].config.roi is None  # never cropped
+
+
+def test_roi_views_full_sensor_and_zoomed():
+    """One function gives both laser views (the GUI's two views and the notebook's plots 3-4):
+    the full sensor with the grid on it, and the zoomed mosaic of only the ROI cells."""
+    ns = load_notebook(Camera())
+    config = grid_config(ns)
+    roi = config.roi
+    frame = np.full((roi.n_rows * roi.roi_height, 1920), 200, dtype=np.uint8)  # what the cropped camera sends
+    views = ns["roi_views"](frame, roi, config)
+    full, full_boxes = views["full"]
+    zoomed, zoomed_boxes = views["rois"]
+    assert full.shape == (1080, 1920) and len(zoomed_boxes) == len(roi.rois)
+    assert zoomed.shape[0] < full.shape[0]
+    for x, y, w, h in zoomed_boxes:  # each tile is ROI-cell pixels
+        assert zoomed[y:y + h, x:x + w].min() == 200
+    assert zoomed.min() == 200  # tiles touch: no gaps between them
+    for x, y, w, h in full_boxes:  # every grid box sits on live pixels pasted back at its sensor position
+        assert full[y:y + h, x:x + w].min() == 200
