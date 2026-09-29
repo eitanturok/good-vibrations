@@ -62,17 +62,18 @@ const S = {
   // relative=false is the default on purpose: a fixed [0,1] domain is the only scale
   // under which two cells mean the same thing, which is the point of a comparison table.
   // background is an on/off switch (the "b" key, the checkbox); bgOp is the level it
-  // returns to when switched back on, so the two are stored separately. maskOp scales
-  // the mask -- the cube -- alone, which is why it is applied as a canvas alpha and an
-  // <img> opacity rather than to the cell, whose backdrop must not move with it.
+  // returns to when switched back on, so the two are stored separately. maskOp is the
+  // Prediction slider: it fades predicted masks only (never ground truth), applied as a
+  // per-layer canvas alpha rather than to the cell, whose backdrop must not move with it.
   // rowMode "dataset" (default): each loaded run's column is grouped by which dataset(s)
   // it was trained on and independently resolves its own row content -- see computeGroups
   // and S.groups, below. "single": today's original behaviour, one shared sample per row
   // across every column, via the flat S.order.
-  view: { mode: "pred", rowMode: "dataset", background: true, relative: false, coms: true, bgOp: 1, maskOp: 1 },
+  view: { mode: "pred", rowMode: "dataset", background: true, relative: false, coms: false, bgOp: 1, maskOp: 1 },
   groups: null,   // computed in applyFilters() when rowMode is "dataset" -- see computeGroups
   domain: {}, positions: [], activePos: -1, modalRow: -1,
   hidden: new Map(),  // filter key -> samples that ONLY that filter is holding back
+  focus: null,        // run shown full screen as a grid (setFocus), or null for the table
   renderVersion: 0,   // from /api/runs; part of image URLs to defeat immutable caching
   lut: null,          // colormaps from the server, so client and server agree on colour
   epochIdx: null,     // null = each run's latest; otherwise an index into the epoch list
@@ -157,7 +158,7 @@ async function boot() {
   // which is now composited by the browser, can match them without hardcoding 0.85.
   document.documentElement.style.setProperty("--gt-gain", String(lut.gain ?? 1));
   S.meta = runs;
-  S.renderVersion = runs.render_version ?? 0;
+  S.renderVersion = runs.render_version ?? "0";
   S.samples = samples.samples;
   // --mask-w/--mask-h are a fixed MAX cell footprint (literals in style.css); each row
   // scales its own box up to fit inside it without distortion -- see containedSize() and
@@ -761,83 +762,89 @@ function renderHeader() {
   h.querySelector("#gt-hide").onclick = () => setGtCol(false);
   h.querySelector("#gt-show").onclick = () => setGtCol(true);
 
-  for (const name of S.runOrder) {
-    const r = S.runs[name], st = statsFor(name);
-    const sorted = S.sort.run === name;
-    const cell = document.createElement("div");
-    cell.className = "hcell run" + (sorted ? " sorted" : S.sort.run ? " dim" : "");
-    const warn = r.entry && r.entry.family === "unknown"
-      ? `<span class="warnbadge" title="No eval split directories; dataset identity unconfirmed">?</span>` : "";
-    const skipped = r.skipped_files.length
-      ? ` · <span title="${r.skipped_files.join(", ")}">${r.skipped_files.length} file(s) skipped</span>` : "";
-    // A run can pass the compatibility scan and still score nothing -- targets exist at
-    // its grid but none decoded, or no predicted sample belongs to this dataset. Saying
-    // which is the difference between "this run is broken" and "viz is broken".
-    const why = r.reason && !r.n
-      ? `<div class="hmeta empty" title="${r.reason}">empty: ${r.reason}</div>` : "";
-    // Read status from the latest poll, not the snapshot taken when the run was added --
-    // a run that finishes or crashes while open must update its badge.
-    const live = S.meta.runs.find((x) => x.name === name);
-    const status = (live && live.status) || "unknown";
-    // Two lines: the name owns the first one (it is the column's identity and the longest
-    // string), the epoch and status chips sit together on the second. They shared a line
-    // with the name until the column narrowed to the sample image's width, where the chips
-    // ate the name down to "norm-4-...". Grip and close ride the top-right corner.
-    cell.innerHTML = `
-      <div class="htop">
-        <div class="hname" title="Click to cycle sort by this run">${name}${warn}</div>
-        <span class="hgrip" title="Drag to reorder this column">⠿</span>
-        <button class="hclose" title="Remove this run">&times;</button>
-      </div>
-      <div class="hchips">
-        <span class="hep">${epochLabel(name)}</span>
-        ${statusChip(status)}
-        ${fmtParams(r.n_params) ? `<span class="pchip" title="${
-          r.n_params.toLocaleString()} trainable parameters">${fmtParams(r.n_params)}<span class="k">&nbsp;params</span></span>` : ""}
-      </div>
-      ${why}
-      ${skipped ? `<div class="hmeta">${skipped.replace(/^ · /, "")}</div>` : ""}
-      <div class="hstats">${METRICS.map((m) => {
-        const s = st[m.key];
-        return `<span><span class="k">${m.short}</span> <b>${s ? fmt(s.mean, 3) : "–"}</b>${
-          s ? `<span class="k">±${fmt(s.sd, 3)}</span>` : ""}</span>`;
-      }).join("")}</div>
-      <div class="hsort">
-        <select>${METRICS.map((m) =>
-          `<option value="${m.key}" ${sorted && S.sort.metric === m.key ? "selected" : ""}>${m.label}</option>`).join("")}</select>
-        <button class="dir ${sorted ? "on" : ""}">${sorted ? (S.sort.dir === "worst" ? "↓ worst" : "↑ best") : "sort"}</button>
-      </div>`;
-
-    makeDraggable(cell, name);
-
-    cell.querySelector(".hclose").onclick = (e) => {
-      e.stopPropagation();          // must not also cycle the column's sort
-      removeRun(name);
-    };
-    cell.querySelector(".hname").onclick = () => {
-      // Selecting the name to copy it ends in a click here, which would re-sort the whole
-      // table as a side effect of highlighting text. If the user just dragged out a
-      // selection inside this name, that was the intent -- leave the sort alone.
-      const sel = window.getSelection();
-      if (sel && !sel.isCollapsed && sel.anchorNode
-          && cell.querySelector(".hname").contains(sel.anchorNode)) return;
-      if (S.sort.run !== name) S.sort = { run: name, metric: S.sort.metric, dir: "worst" };
-      else if (S.sort.dir === "worst") S.sort.dir = "best";
-      else S.sort = { run: null, metric: S.sort.metric, dir: "worst" };
-      refresh(true);
-    };
-    cell.querySelector("select").onchange = (e) => {
-      S.sort = { run: name, metric: e.target.value, dir: S.sort.run === name ? S.sort.dir : "worst" };
-      refresh(true);
-    };
-    cell.querySelector(".dir").onclick = () => {
-      if (S.sort.run !== name) S.sort = { run: name, metric: S.sort.metric, dir: "worst" };
-      else S.sort.dir = S.sort.dir === "worst" ? "best" : "worst";
-      refresh(true);
-    };
-    h.appendChild(cell);
-  }
+  for (const name of S.runOrder) h.appendChild(runHeaderCell(name));
   return h;
+}
+
+/* One run's header cell. Shared by the table header and the focus view's header, so the
+   two can never disagree about a run's stats or sort state. */
+function runHeaderCell(name) {
+  const r = S.runs[name], st = statsFor(name);
+  const sorted = S.sort.run === name;
+  const cell = document.createElement("div");
+  cell.className = "hcell run" + (sorted ? " sorted" : S.sort.run ? " dim" : "");
+  const warn = r.entry && r.entry.family === "unknown"
+    ? `<span class="warnbadge" title="No eval split directories; dataset identity unconfirmed">?</span>` : "";
+  const skipped = r.skipped_files.length
+    ? ` · <span title="${r.skipped_files.join(", ")}">${r.skipped_files.length} file(s) skipped</span>` : "";
+  // A run can pass the compatibility scan and still score nothing -- targets exist at
+  // its grid but none decoded, or no predicted sample belongs to this dataset. Saying
+  // which is the difference between "this run is broken" and "viz is broken".
+  const why = r.reason && !r.n
+    ? `<div class="hmeta empty" title="${r.reason}">empty: ${r.reason}</div>` : "";
+  // Read status from the latest poll, not the snapshot taken when the run was added --
+  // a run that finishes or crashes while open must update its badge.
+  const live = S.meta.runs.find((x) => x.name === name);
+  const status = (live && live.status) || "unknown";
+  // Two lines: the name owns the first one (it is the column's identity and the longest
+  // string), the epoch and status chips sit together on the second. They shared a line
+  // with the name until the column narrowed to the sample image's width, where the chips
+  // ate the name down to "norm-4-...". Grip and close ride the top-right corner.
+  cell.innerHTML = `
+    <div class="htop">
+      <div class="hname">${name}${warn}</div>
+      <span class="hgrip" title="Drag to reorder this column">⠿</span>
+      <button class="hclose" title="Remove this run">&times;</button>
+    </div>
+    <div class="hchips">
+      <span class="hep">${epochLabel(name)}</span>
+      ${statusChip(status)}
+      ${fmtParams(r.n_params) ? `<span class="pchip" title="${
+        r.n_params.toLocaleString()} trainable parameters">${fmtParams(r.n_params)}<span class="k">&nbsp;params</span></span>` : ""}
+    </div>
+    ${why}
+    ${skipped ? `<div class="hmeta">${skipped.replace(/^ · /, "")}</div>` : ""}
+    <div class="hstats">${METRICS.map((m) => {
+      const s = st[m.key];
+      return `<span><span class="k">${m.short}</span> <b>${s ? fmt(s.mean, 3) : "–"}</b>${
+        s ? `<span class="k">±${fmt(s.sd, 3)}</span>` : ""}</span>`;
+    }).join("")}</div>
+    <div class="hsort">
+      <select>${METRICS.map((m) =>
+        `<option value="${m.key}" ${sorted && S.sort.metric === m.key ? "selected" : ""}>${m.label}</option>`).join("")}</select>
+      <button class="dir ${sorted ? "on" : ""}">${sorted ? (S.sort.dir === "worst" ? "↓ worst" : "↑ best") : "sort"}</button>
+    </div>`;
+
+  const focused = S.focus === name;
+  cell.title = focused ? "Click to go back to the table" : "Click to expand this run full screen";
+  // Reordering only makes sense in the table; the focus view has one column.
+  if (!focused) makeDraggable(cell, name);
+  else cell.querySelector(".hgrip").remove();
+
+  cell.querySelector(".hclose").onclick = (e) => {
+    e.stopPropagation();          // must not also toggle the focus view
+    removeRun(name);
+  };
+  // A click anywhere on the header toggles the full-screen view of this run. Sorting is
+  // ONLY the sort button and the metric dropdown, so the controls are excluded here.
+  cell.onclick = (e) => {
+    if (e.target.closest("button, select, .hgrip, b.goep, a, input")) return;
+    // Selecting the name to copy it ends in a click here, which would toggle the view
+    // as a side effect of highlighting text. A selection inside this cell was the intent.
+    const sel = window.getSelection();
+    if (sel && !sel.isCollapsed && sel.anchorNode && cell.contains(sel.anchorNode)) return;
+    setFocus(focused ? null : name);
+  };
+  cell.querySelector("select").onchange = (e) => {
+    S.sort = { run: name, metric: e.target.value, dir: S.sort.run === name ? S.sort.dir : "worst" };
+    refresh(true);
+  };
+  cell.querySelector(".dir").onclick = () => {
+    if (S.sort.run !== name) S.sort = { run: name, metric: S.sort.metric, dir: "worst" };
+    else S.sort.dir = S.sort.dir === "worst" ? "best" : "worst";
+    refresh(true);
+  };
+  return cell;
 }
 
 /* Images are cached `immutable`, so the render version is part of the URL: bumping
@@ -889,49 +896,53 @@ function buildRow() {
 function syncRowCells(el) {
   while (el._runCells.length > S.runOrder.length) el.removeChild(el._runCells.pop());
   while (el._runCells.length < S.runOrder.length) {
-    const c = document.createElement("div");
-    c.className = "cell run";
-    // One rendering path: every prediction cell is a canvas drawn from local mask values
-    // over a CSS backdrop. Keeping a parallel server-PNG path meant two renderers that
-    // had to agree on gamma, alpha and backdrop geometry -- and they drifted.
-    // A second canvas for the ground-truth half, shown only in stacked mode.
-    // Canvas dims come from the server's mask shape, never hardcoded: the grid is 20x40
-    // on some datasets and 30x30 on others, and a fixed 40x20 buffer would letterbox the
-    // mask into the wrong cells entirely.
-    // Sized per column in paintRow, since each run may predict at its own grid; these
-    // are just starting dimensions for a canvas that has not been painted yet.
-    const { h: mh, w: mw } = S.lut;
-    c.innerHTML = `<div class="ctitle run-head"></div>` +
-      `<div class="maskbox predbox"><canvas class="mask predmask" width="${mw}" height="${mh}"></canvas><span class="shapelabel"></span></div>` +
-      `<div class="maskbox truthbox" hidden><canvas class="mask truthmask" width="${mw}" height="${mh}"></canvas><span class="shapelabel"></span></div>` +
-      `<div class="tags subtags"></div>`;
+    const c = buildRunCell();
     el.appendChild(c);
     el._runCells.push(c);
   }
 }
 
-// In "by dataset" row mode a row is no longer one shared sample -- each run column
-// resolves ITS OWN dataset group's Nth (filtered/sorted) sample independently, so two
-// columns only show the same scene when their runs actually share a dataset. Returns
-// undefined past the end of that group's own row list (a shorter group than others, or
-// the padding before a combined run's trailing second-dataset rows -- see computeGroups).
-function sampleForGroup(name, rank) {
+function buildRunCell() {
+  const c = document.createElement("div");
+  c.className = "cell run";
+  // One rendering path: every prediction cell is a canvas drawn from local mask values
+  // over a CSS backdrop. Keeping a parallel server-PNG path meant two renderers that
+  // had to agree on gamma, alpha and backdrop geometry -- and they drifted.
+  // A second canvas for the ground-truth half, shown only in stacked mode.
+  // Canvas dims come from the server's mask shape, never hardcoded: the grid is 20x40
+  // on some datasets and 30x30 on others, and a fixed 40x20 buffer would letterbox the
+  // mask into the wrong cells entirely.
+  // Sized per column in paintRow, since each run may predict at its own grid; these
+  // are just starting dimensions for a canvas that has not been painted yet.
+  const { h: mh, w: mw } = S.lut;
+  c.innerHTML = `<div class="ctitle run-head"></div>` +
+    `<div class="maskbox predbox"><canvas class="mask predmask" width="${mw}" height="${mh}"></canvas><span class="shapelabel"></span></div>` +
+    `<div class="maskbox truthbox" hidden><canvas class="mask truthmask" width="${mw}" height="${mh}"></canvas><span class="shapelabel"></span></div>` +
+    `<div class="tags subtags"></div>`;
+  return c;
+}
+
+// The row list a run's column is painted against. In "by dataset" row mode a row is no
+// longer one shared sample -- each run column resolves ITS OWN dataset group's Nth
+// (filtered/sorted) sample, so two columns only show the same scene when their runs share
+// a dataset. Entries are undefined past the end of a group (a shorter group, or the
+// padding before a combined run's trailing second-dataset rows -- see computeGroups).
+function orderFor(name) {
   const g = S.groups && S.groups.find((g) => g.runs.includes(name));
-  return g ? g.order[rank] : undefined;
+  return g ? g.order : S.order;
 }
 
 function paintRow(el, rank) {
   // "Single sample" mode is exactly today's behaviour: one shared sample across the whole
   // row, via the flat S.order. "By dataset" mode has no single shared sample -- each
-  // column below resolves its own via sampleForGroup -- so the dedicated ground-truth
+  // column below resolves its own via orderFor -- so the dedicated ground-truth
   // column (which can only ever show ONE thing) is force-collapsed in that mode (see
   // setRowMode) and left unpainted here.
-  const grouped = S.view.rowMode === "dataset";
   const s = S.order[rank];
   el.style.transform = `translateY(${rank * rowH()}px)`;
   el.querySelector(".idxn").textContent = rank + 1;
 
-  if (!grouped) {
+  if (S.view.rowMode !== "dataset") {
     // The true pixel shape stamped in every mask cell's corner (see .shapelabel) -- every
     // cell in the row needs it, ground truth included, so it is computed once up front
     // rather than separately per cell.
@@ -1002,131 +1013,130 @@ function paintRow(el, rank) {
   // times per repaint (28 pooled rows x 5 columns) at scroll frame rate.
   const mixed = mixedShapes();
   S.runOrder.forEach((name, k) => {
-    const c = el._runCells[k];
-    // The sample THIS column paints against -- shared with every other column in "single
-    // sample" mode, resolved independently per dataset group in "by dataset" mode.
-    const cs = grouped ? sampleForGroup(name, rank) : s;
-    const head = c.querySelector(".run-head");
-    const predBox = c.querySelector(".predbox");
-    const m = predBox.querySelector(".mask");
-    const chips = c.querySelector(".subtags");
-    const [rh, rw] = runShape(name);
-
-    if (grouped) {
-      // Per-cell rather than per-row: different columns can be showing different
-      // datasets' boxes at once, each with its own real aspect to preserve.
-      const [rmw, rmh] = containedSize(cs ? cs.aspect : 0);
-      c.style.setProperty("--row-mask-w", `${Math.round(rmw)}px`);
-      c.style.setProperty("--row-mask-h", `${Math.round(rmh)}px`);
-    }
-
-    if (!cs) {
-      // This rank is past the end of THIS column's own dataset group -- another group (or
-      // a combined run's trailing second-dataset tail) is longer. Nothing to show here at
-      // all, not even "not in run": there is no sample, not just no prediction.
-      chips.innerHTML = "";
-      head.innerHTML = `<span class="t1 run"><span class="txt" title="${name}">${name}</span></span>`;
-      predBox.hidden = true;
-      m.style.backgroundImage = ""; m.dataset.bd = "";
-      if (!c._np) { c._np = document.createElement("div"); c._np.className = "nopred"; c.appendChild(c._np); }
-      c._np.className = "nopred nosample";
-      c._np.textContent = "—";
-      c._np.title = "no sample at this row for this run's dataset";
-      c._np.hidden = false;
-      return;
-    }
-
-    const shape = grouped ? shapeLabel(cs) : shapeLabel(s);
-    const e = S.runs[name].samples[cs.i];
-
-    // Split and epoch are both PER-CELL facts, which is why neither can be left to the
-    // column header: dataloaders assign splits independently, so one sample can be train
-    // in one run and held out in another, and runs save on different cadences, so at one
-    // slider position two columns can legitimately show different epochs.
-    const cellEp = epochFor(name);
-    const shownEp = cellEp == null ? (S.runs[name].epochs || []).slice(-1)[0] : cellEp;
-    const latest = cellEp == null;
-    const split = e ? e.split : (S.runs[name].splitOf || {})[cs.i];
-    // The grid is shown only when columns disagree on it. Both metrics are
-    // grid-normalized so the numbers share a scale, but a coarser grid is systematically
-    // easier -- a small cross-size gap is not evidence of a better model, so the reader
-    // needs to see which size they are looking at.
-    const gs = mixed ? `<span class="tag gsz" title="mask grid">${rh}x${rw}</span>` : "";
-    const epchip = `<span class="epchip${latest ? "" : " scrub"}" title="epoch ${shownEp ?? "?"}${
-      latest ? " (latest saved)" : " (scrubbed)"}"><b>${shownEp ?? "–"}</b><span class="k">ep</span></span>`;
-    // Epoch sits on the RUN's own line -- it is a fact about the run, not the sample --
-    // right-aligned against the name so the two never run together. Split sits on the
-    // SAMPLE's line instead, since it is a fact about how this run's dataloader filed
-    // THIS sample, also right-aligned. Both describe the prediction, which is why neither
-    // lived below the image before: they are closer in kind to a title than to a metric.
-    // identity(cs) is also where a grouped cell's OWN dataset becomes visible -- see
-    // identity()'s "(sample_id, dataset)" suffix -- since neighbouring columns in
-    // different groups can be showing entirely different datasets at this same rank.
-    head.innerHTML =
-      `<span class="t1 run"><span class="txt" title="${name}">${name}</span>${epchip}</span>` +
-      `<span class="t2"><span class="txt">${identity(cs)}</span>${splitChip(split)}</span>`;
-
-    if (!e) {
-      chips.innerHTML = "";
-      predBox.hidden = true;
-      m.style.backgroundImage = ""; m.dataset.bd = "";   // keep the cache flag honest
-      predBox.querySelector(".shapelabel").textContent = "";
-      if (!c._np) { c._np = document.createElement("div"); c._np.className = "nopred"; c.appendChild(c._np); }
-      // Three different situations used to read "no prediction" alike, which made a
-      // 250ms debounce look identical to data that was never written:
-      //   loading  -- metrics for this epoch are in flight
-      //   not saved -- the run covers this sample, but this epoch did not save it. The
-      //               train loader uses drop_last + shuffle, so each epoch discards a
-      //               different remainder (see src/model/dataset.py build_dataset).
-      //   not in run -- the sample is outside this run's split entirely.
-      const covered = (S.runs[name].splitOf || {})[cs.i];
-      const st = S.runs[name].metricsPending !== undefined ? ["loading", "loading…", "fetching metrics for this epoch"]
-        : covered ? ["unsaved", "not saved", `this run covers this sample, but epoch ${shownEp ?? "?"} saved no prediction for it`]
-        : ["nopred", "not in run", "this sample is not in this run's split"];
-      c._np.className = "nopred " + st[0];
-      c._np.textContent = st[1];
-      c._np.title = st[2];
-      c._np.hidden = false;
-      return;
-    }
-    if (c._np) c._np.hidden = true;
-    // Split and epoch moved up to the title (see head.innerHTML above); this is just the
-    // grid-size tag, when shown, followed by the metrics.
-    chips.innerHTML =
-      gs +
-      METRICS.map((mm) => {
-        const v = e[mm.key];
-        return `<span class="tag"><span class="k">${mm.short}</span> <b>${
-          v == null ? "–" : fmt(v, 3)}</b></span>`;
-      }).join("");
-    predBox.hidden = false;
-    predBox.querySelector(".shapelabel").textContent = shape;
-    // Match the canvas buffer to THIS run's grid. Rows are recycled across runs, so a
-    // pooled cell can arrive still sized for a column of a different resolution.
-    sizeMaskCanvas(m, rw, rh);
-    m.dataset.run = name; m.dataset.sid = cs.i;
-    m.onclick = () => openNeighbors(name, cs.i);
-    m.className = "mask predmask" + (S.view.background ? " bg" : " nobg");
-    setBackdrop(m, cs.i);
-    paintCanvas(m, name, cs.i, epochFor(name));
-
-    // Stacked: the target gets its own box directly below the prediction, so the two are
-    // adjacent instead of the ground truth being columns away in the leftmost cell.
-    const tmBox = c.querySelector(".truthbox");
-    const tm = tmBox.querySelector(".mask");
-    tmBox.hidden = S.view.mode !== "stacked";
-    if (!tmBox.hidden) {
-      tm.className = "mask truthmask" + (S.view.background ? " bg" : " nobg");
-      setBackdrop(tm, cs.i);
-      sizeMaskCanvas(tm, rw, rh);
-      tmBox.querySelector(".shapelabel").textContent = shape;
-      const truth = S.truthCache[truthKey(cs.i, rh, rw)];
-      // The stacked target half shows the target's own objects and nothing else: the
-      // prediction marks and the connecting lines belong on the prediction above it.
-      if (truth) drawMask(tm, truth, "truth", null, [rh, rw], comsFor(name, cs.i), true);
-      else ensureTruth(cs.i, rh, rw);
-    }
+    paintRunCell(el._runCells[k], name, orderFor(name)[rank], mixed);
   });
+}
+
+/* Paints one run's cell for one sample: a table cell, or a tile in the focus grid. */
+function paintRunCell(c, name, cs, mixed) {
+  const head = c.querySelector(".run-head");
+  const predBox = c.querySelector(".predbox");
+  const m = predBox.querySelector(".mask");
+  const chips = c.querySelector(".subtags");
+  const [rh, rw] = runShape(name);
+
+  // Per-cell rather than per-row: columns in different dataset groups (and tiles in the
+  // focus grid) show different boxes at once, each with its own real aspect to preserve.
+  const [rmw, rmh] = containedSize(cs ? cs.aspect : 0);
+  c.style.setProperty("--row-mask-w", `${Math.round(rmw)}px`);
+  c.style.setProperty("--row-mask-h", `${Math.round(rmh)}px`);
+
+  if (!cs) {
+    // This rank is past the end of THIS column's own dataset group -- another group (or
+    // a combined run's trailing second-dataset tail) is longer. Nothing to show here at
+    // all, not even "not in run": there is no sample, not just no prediction.
+    chips.innerHTML = "";
+    head.innerHTML = `<span class="t1 run"><span class="txt" title="${name}">${name}</span></span>`;
+    predBox.hidden = true;
+    m.style.backgroundImage = ""; m.dataset.bd = "";
+    if (!c._np) { c._np = document.createElement("div"); c._np.className = "nopred"; c.appendChild(c._np); }
+    c._np.className = "nopred nosample";
+    c._np.textContent = "—";
+    c._np.title = "no sample at this row for this run's dataset";
+    c._np.hidden = false;
+    return;
+  }
+
+  const shape = shapeLabel(cs);
+  const e = S.runs[name].samples[cs.i];
+
+  // Split and epoch are both PER-CELL facts, which is why neither can be left to the
+  // column header: dataloaders assign splits independently, so one sample can be train
+  // in one run and held out in another, and runs save on different cadences, so at one
+  // slider position two columns can legitimately show different epochs.
+  const cellEp = epochFor(name);
+  const shownEp = cellEp == null ? (S.runs[name].epochs || []).slice(-1)[0] : cellEp;
+  const latest = cellEp == null;
+  const split = e ? e.split : (S.runs[name].splitOf || {})[cs.i];
+  // The grid is shown only when columns disagree on it. Both metrics are
+  // grid-normalized so the numbers share a scale, but a coarser grid is systematically
+  // easier -- a small cross-size gap is not evidence of a better model, so the reader
+  // needs to see which size they are looking at.
+  const gs = mixed ? `<span class="tag gsz" title="mask grid">${rh}x${rw}</span>` : "";
+  const epchip = `<span class="epchip${latest ? "" : " scrub"}" title="epoch ${shownEp ?? "?"}${
+    latest ? " (latest saved)" : " (scrubbed)"}"><b>${shownEp ?? "–"}</b><span class="k">ep</span></span>`;
+  // Epoch sits on the RUN's own line -- it is a fact about the run, not the sample --
+  // right-aligned against the name so the two never run together. Split sits on the
+  // SAMPLE's line instead, since it is a fact about how this run's dataloader filed
+  // THIS sample, also right-aligned. Both describe the prediction, which is why neither
+  // lived below the image before: they are closer in kind to a title than to a metric.
+  // identity(cs) is also where a grouped cell's OWN dataset becomes visible -- see
+  // identity()'s "(sample_id, dataset)" suffix -- since neighbouring columns in
+  // different groups can be showing entirely different datasets at this same rank.
+  head.innerHTML =
+    `<span class="t1 run"><span class="txt" title="${name}">${name}</span>${epchip}</span>` +
+    `<span class="t2"><span class="txt">${identity(cs)}</span>${splitChip(split)}</span>`;
+
+  if (!e) {
+    chips.innerHTML = "";
+    predBox.hidden = true;
+    m.style.backgroundImage = ""; m.dataset.bd = "";   // keep the cache flag honest
+    predBox.querySelector(".shapelabel").textContent = "";
+    if (!c._np) { c._np = document.createElement("div"); c._np.className = "nopred"; c.appendChild(c._np); }
+    // Three different situations used to read "no prediction" alike, which made a
+    // 250ms debounce look identical to data that was never written:
+    //   loading  -- metrics for this epoch are in flight
+    //   not saved -- the run covers this sample, but this epoch did not save it. The
+    //               train loader uses drop_last + shuffle, so each epoch discards a
+    //               different remainder (see src/model/dataset.py build_dataset).
+    //   not in run -- the sample is outside this run's split entirely.
+    const covered = (S.runs[name].splitOf || {})[cs.i];
+    const st = S.runs[name].metricsPending !== undefined ? ["loading", "loading…", "fetching metrics for this epoch"]
+      : covered ? ["unsaved", "not saved", `this run covers this sample, but epoch ${shownEp ?? "?"} saved no prediction for it`]
+      : ["nopred", "not in run", "this sample is not in this run's split"];
+    c._np.className = "nopred " + st[0];
+    c._np.textContent = st[1];
+    c._np.title = st[2];
+    c._np.hidden = false;
+    return;
+  }
+  if (c._np) c._np.hidden = true;
+  // Split and epoch moved up to the title (see head.innerHTML above); this is just the
+  // grid-size tag, when shown, followed by the metrics.
+  chips.innerHTML =
+    gs +
+    METRICS.map((mm) => {
+      const v = e[mm.key];
+      return `<span class="tag"><span class="k">${mm.short}</span> <b>${
+        v == null ? "–" : fmt(v, 3)}</b></span>`;
+    }).join("");
+  predBox.hidden = false;
+  predBox.querySelector(".shapelabel").textContent = shape;
+  // Match the canvas buffer to THIS run's grid. Rows are recycled across runs, so a
+  // pooled cell can arrive still sized for a column of a different resolution.
+  sizeMaskCanvas(m, rw, rh);
+  m.dataset.run = name; m.dataset.sid = cs.i;
+  m.onclick = () => openNeighbors(name, cs.i);
+  m.className = "mask predmask" + (S.view.background ? " bg" : " nobg");
+  setBackdrop(m, cs.i);
+  paintCanvas(m, name, cs.i, epochFor(name));
+
+  // Stacked: the target gets its own box directly below the prediction, so the two are
+  // adjacent instead of the ground truth being columns away in the leftmost cell.
+  const tmBox = c.querySelector(".truthbox");
+  const tm = tmBox.querySelector(".mask");
+  tmBox.hidden = S.view.mode !== "stacked";
+  if (!tmBox.hidden) {
+    tm.className = "mask truthmask" + (S.view.background ? " bg" : " nobg");
+    setBackdrop(tm, cs.i);
+    sizeMaskCanvas(tm, rw, rh);
+    tmBox.querySelector(".shapelabel").textContent = shape;
+    const truth = S.truthCache[truthKey(cs.i, rh, rw)];
+    // The stacked target half shows the target's own objects and nothing else: the
+    // prediction marks and the connecting lines belong on the prediction above it.
+    if (truth) drawMask(tm, truth, "truth", null, [rh, rw], comsFor(name, cs.i), true);
+    else ensureTruth(cs.i, rh, rw);
+  }
 }
 
 /* Which rows are on screen. Row k occupies [hh + k*rowH(), hh + (k+1)*rowH()) in scroll
@@ -1142,8 +1152,61 @@ function visibleRange(pad = 3) {
   };
 }
 
+/* ***** focus view *****
+   Clicking a run's header shows that run full screen as a grid of its own samples, in the
+   table's filtered/sorted order; clicking the header again goes back. Tiles are the same
+   cells the table paints (buildRunCell/paintRunCell), so every view setting carries over. */
+function setFocus(name) {
+  S.focus = name;
+  $("#focus-scroller").scrollTop = 0;
+  refresh();
+}
+
+function renderFocusHeader() {
+  const name = S.focus, r = S.runs[name];
+  S.focusList = orderFor(name).filter((s) => s && (r.samples[s.i] || (r.splitOf || {})[s.i]));
+  $("#focus-head").replaceChildren(runHeaderCell(name));
+  $("#focus-head").insertAdjacentHTML("beforeend", `<div class="finfo"><span><b>${S.focusList.length}</b> samples</span>` +
+    `<span class="k">click the header or press Esc to go back to the table</span></div>`);
+}
+
+/* The tiles on screen, as [first, last) indices into S.focusList. Tiles are exactly one
+   table column wide, which is what the focus header's run cell measures. */
+function focusRange() {
+  const sc = $("#focus-scroller"), tw = $("#focus-head .hcell").offsetWidth, th = rowH();
+  const cols = Math.max(1, Math.floor(sc.clientWidth / tw)), n = S.focusList.length;
+  const r0 = Math.max(0, Math.floor(sc.scrollTop / th) - 1);
+  const r1 = Math.ceil((sc.scrollTop + sc.clientHeight) / th) + 1;
+  return { cols, tw, th, n, first: Math.min(n, r0 * cols), last: Math.min(n, r1 * cols) };
+}
+
+const focusPool = [];
+function renderFocus() {
+  const sc = $("#focus-scroller");
+  const { cols, tw, th, n, first, last } = focusRange();
+  const x0 = Math.max(0, Math.floor((sc.clientWidth - cols * tw) / 2));
+  $("#focus-spacer").style.height = `${Math.ceil(n / cols) * th}px`;
+  $("#focus-empty").hidden = n > 0;
+  while (focusPool.length < last - first) {
+    const c = buildRunCell();
+    c.classList.add("ftile");
+    $("#focus-tiles").appendChild(c); focusPool.push(c);
+  }
+  const mixed = mixedShapes();
+  focusPool.forEach((c, k) => {
+    const i = first + k;
+    c.hidden = i >= last;
+    if (c.hidden) return;
+    c.style.cssText = `width:${tw}px;height:${th}px;transform:translate(${x0 + (i % cols) * tw}px,${Math.floor(i / cols) * th}px)`;
+    paintRunCell(c, S.focus, S.focusList[i], mixed);
+  });
+}
+
 const pool = [];
 function renderVisible() {
+  // The focus view covers the table, and both share one frame store per run: painting
+  // the hidden table too would have each view evict the other's window forever.
+  if (S.focus) { renderFocus(); return; }
   const { first, last } = visibleRange();
   const need = Math.max(0, last - first);
   const rowsEl = $("#rows");
@@ -1162,6 +1225,8 @@ function onScroll() {
 }
 
 function refresh(toTop = false) {
+  if (!S.runs[S.focus]) S.focus = null;   // its run was removed
+  $("#focus").hidden = !S.focus;
   // toTop is passed exactly by the sort controls, which is also the signal that the user
   // asked for a new order -- so it releases any pin the epoch scrubber holds.
   if (toTop) thawOrder();
@@ -1169,6 +1234,8 @@ function refresh(toTop = false) {
   // Re-sorting puts different samples at rank 1, so keeping the old scroll offset would
   // strand the user mid-list; jump back to the top whenever the order itself changes.
   if (toTop) $("#scroller").scrollTop = 0;
+  if (toTop && S.focus) $("#focus-scroller").scrollTop = 0;
+  if (S.focus) renderFocusHeader();
   const head = $("#scroller").querySelector(".hrow");
   if (head) head.remove();
   const hdr = renderHeader();
@@ -1613,7 +1680,7 @@ async function fetchFrames(run, sids) {
   const eps = (S.runs[run] && S.runs[run].epochs) || [];
   const q = eps.length ? `&epochs=${eps.join(",")}` : "";
   const r = await fetch(
-    `/api/frames?run=${encodeURIComponent(run)}&sids=${sids.join(",")}${q}`);
+    `/api/frames?run=${encodeURIComponent(run)}&sids=${sids.join(",")}${q}&v=${S.renderVersion}`);
   if (!r.ok) throw new Error("frames");
   const raw = new Uint16Array(await r.arrayBuffer());
   return {
@@ -1765,18 +1832,21 @@ function drawMask(canvas, values, mode, truth, shape, coms, gtOnly) {
   // Overlay draws the target underneath and the prediction over it, in one box; stacked
   // draws them as two boxes (handled by the caller, which paints each half).
   const soloLut = mode === "diff" ? S.lut.diff : mode === "truth" ? S.lut.truth : S.lut.pred;
+  // `op`: the Prediction slider fades predicted layers only -- the target stays at full
+  // strength, so a faded prediction reads against an unchanged truth.
+  const predOp = S.view.maskOp;
   const layers = mode === "overlay"
-    ? [{ v: truth, lut: S.lut.truth, k: 0.72 }, { v: values, lut: S.lut.pred, k: 0.82 }]
-    : [{ v: values, lut: soloLut, k: gain }];
+    ? [{ v: truth, lut: S.lut.truth, k: 0.72, op: 1 }, { v: values, lut: S.lut.pred, k: 0.82, op: predOp }]
+    : [{ v: values, lut: soloLut, k: gain, op: mode === "truth" ? 1 : predOp }];
 
   ctx.clearRect(0, 0, CW, CH);
   // Off: the mask must stay hard-edged blocks. This is the same rendering CSS's
   // image-rendering:pixelated was doing, just moved into the buffer.
   ctx.imageSmoothingEnabled = false;
-  // The cube slider scales every layer as it is composited, so the backdrop -- an element
-  // background, outside the canvas -- keeps whatever the background slider gave it.
-  ctx.globalAlpha = S.view.maskOp;
-  for (const { v, lut, k } of layers) {
+  // Each layer is composited at its own `op`, so the backdrop -- an element background,
+  // outside the canvas -- keeps whatever the background slider gave it.
+  for (const { v, lut, k, op } of layers) {
+    ctx.globalAlpha = op;
     // Per-sample domain, matching render.domain_of on the server. Computed per LAYER so
     // overlay scales truth and prediction independently, as the server does.
     const dom = S.view.relative ? sampleDomain(v, truth, mode, n) : null;
@@ -1880,12 +1950,11 @@ async function ensureFrames(run) {
       framesStale.delete(run);
       const first = Math.max(0, Math.floor(Math.max(0, $("#scroller").scrollTop) / rowH()) - 4);
       // In "by dataset" row mode this run's cells are painted against ITS OWN group's row
-      // list (see paintRow's sampleForGroup), not the flat S.order -- fetching S.order's
+      // list (see orderFor), not the flat S.order -- fetching S.order's
       // window here would almost never contain the sample actually on screen for this
       // column, so paintCanvas kept finding a miss and re-triggering this fetch forever.
-      const grouped = S.view.rowMode === "dataset" && S.groups;
-      const src = grouped ? (S.groups.find((g) => g.runs.includes(run)) || { order: [] }).order : S.order;
-      const sids = src.slice(first, first + 24).filter(Boolean).map((s) => s.i);
+      const f = S.focus === run, w = f ? focusRange() : { first, last: first + 24 };
+      const sids = (f ? S.focusList : orderFor(run)).slice(w.first, w.last).filter(Boolean).map((s) => s.i);
       if (!sids.length) return;
       const d = await fetchFrames(run, sids);
       // Replace rather than merge: a store holds one contiguous window, and its raw blob
@@ -1908,7 +1977,7 @@ async function ensureTruth(sid, h, w) {
     // `shape` picks which resolution's target to return, so a 16x16 column and a 30x30
     // column each diff against a mask of their own size.
     const q = h ? `&shape=${h}x${w}` : "";
-    const d = await api(`/api/values?sid=${sid}${q}`);
+    const d = await api(`/api/values?sid=${sid}${q}&v=${S.renderVersion}`);
     S.truthCache[key] = d.v.flat();
     renderVisible();
   } finally {
@@ -2266,7 +2335,7 @@ async function valuesFor(run, sid, mode) {
   const q = run ? "" : `&shape=${gh}x${gw}`;
   const k = `${run}|${sid}|${mode}${q}`;
   if (!valueCache.has(k))
-    valueCache.set(k, api(`/api/values?sid=${sid}&run=${encodeURIComponent(run)}&mode=${mode}${q}`));
+    valueCache.set(k, api(`/api/values?sid=${sid}&run=${encodeURIComponent(run)}&mode=${mode}${q}&v=${S.renderVersion}`));
   return valueCache.get(k);   // {v} or, in overlay/stacked mode, {v, t}
 }
 
@@ -2436,7 +2505,7 @@ async function openModal(rank) {
   $("#m-body").innerHTML = `
     <div class="msec">
       <h3>Overhead — mask, center of mass, speaker</h3>
-      <img class="hero" src="/api/overhead/${s.i}.png" alt="overhead view of sample ${d.sample_id}">
+      <img class="hero" src="/api/overhead/${s.i}.png?v=${S.renderVersion}" alt="overhead view of sample ${d.sample_id}">
       <p class="note">${d.description || ""}</p>
     </div>
     <div class="mgrid">
@@ -2468,8 +2537,8 @@ async function openModal(rank) {
           <dt>min freq</dt><dd>${d.min_freq} Hz</dd>
           <dt>max freq</dt><dd>${d.max_freq} Hz</dd>
         </dl>
-        ${d.has.spectrogram ? `<img class="specimg" src="/api/vibration/${s.i}/spectrogram.png" alt="spectrogram">` : ""}
-        ${d.has.fft ? `<img class="specimg" src="/api/vibration/${s.i}/fft.png" alt="FFT">` : ""}
+        ${d.has.spectrogram ? `<img class="specimg" src="/api/vibration/${s.i}/spectrogram.png?v=${S.renderVersion}" alt="spectrogram">` : ""}
+        ${d.has.fft ? `<img class="specimg" src="/api/vibration/${s.i}/fft.png?v=${S.renderVersion}" alt="FFT">` : ""}
       </div>
     </div>`;
   $("#modal").hidden = false;
@@ -2563,6 +2632,7 @@ function stepModal(delta) {
 
 function bindUI() {
   $("#scroller").addEventListener("scroll", onScroll, { passive: true });
+  $("#focus-scroller").addEventListener("scroll", onScroll, { passive: true });
 
   /* Clicking a column header's epoch pins every column there. Delegated on the scroller
      because renderHeader rebuilds the header row on every refresh. */
@@ -2574,6 +2644,9 @@ function bindUI() {
   });
 
   window.addEventListener("resize", renderVisible);
+  // The focus grid's column count follows its own width, which also changes when the
+  // sidebar collapses -- not only on a window resize.
+  new ResizeObserver(() => S.focus && renderFocus()).observe($("#focus-scroller"));
 
   /* Collapsing the sidebar hands its 268px to the table, which matters when comparing
      several runs side by side. Purely a CSS width change: the virtualizer keys off
@@ -2617,9 +2690,8 @@ function bindUI() {
   $("#bg-toggle").onchange = (e) => setBackground(e.target.checked);
 
   /* The two opacity sliders. Both write a CSS variable, which is all the backdrop needs
-     -- its veil is pure CSS, so dragging costs no repaint. The cube is drawn INTO the
-     canvases, so that one also has to repaint; the ground-truth image follows the
-     variable on its own. */
+     -- its veil is pure CSS, so dragging costs no repaint. The prediction is drawn INTO
+     the canvases, so that one also has to repaint; the ground-truth image ignores it. */
   const opacity = (id, key, cssVar, repaint) => {
     const el = $(id);
     const out = el.parentElement.querySelector(".opval");
@@ -2709,6 +2781,8 @@ function bindUI() {
   $("#m-next").onclick = () => stepModal(1);
 
   document.addEventListener("keydown", (e) => {
+    // Esc backs out one layer at a time: the sample modal first, then the focus view.
+    if (e.key === "Escape" && S.focus && $("#modal").hidden && !pickerOpen()) { setFocus(null); return; }
     if (e.key === "Escape") { document.querySelectorAll(".overlay").forEach((o) => (o.hidden = true)); closePicker(); }
     if (!$("#modal").hidden) {
       if (e.key === "ArrowLeft") { e.preventDefault(); stepModal(-1); }

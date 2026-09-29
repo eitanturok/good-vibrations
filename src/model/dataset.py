@@ -1,4 +1,5 @@
 import hashlib, json, os, random, shutil
+from functools import partial
 from pathlib import Path
 
 import numpy as np
@@ -147,7 +148,8 @@ def hash_samples(samples: list[tuple[Path, dict]], out_h: int | None = None, out
                   augment_fft: bool = True, signal_mode: str = "magnitude", normalize_mode: str = "std", patch_size: int = 64,
                   subtract_speaker_mean: bool = False, subtract_empty_box: bool = False,
                   mag_recipe: str | None = None, rgb: bool = False,
-                  phase_arm: str | None = None, phase_weight: float = 1.0, laser_cols=None, laser_rows=None) -> str:
+                  phase_arm: str | None = None, phase_weight: float = 1.0, laser_cols=None, laser_rows=None,
+                  split_key: str | None = None) -> str:
     h = hashlib.sha256()
     if rgb: h.update(b"rgb")  # different target entirely, so it needs its own cache
     if mag_recipe is not None: h.update(f"recipe{mag_recipe}".encode())  # changes the stored tensor
@@ -159,6 +161,10 @@ def hash_samples(samples: list[tuple[Path, dict]], out_h: int | None = None, out
     if subtract_speaker_mean: h.update(f"spkmean{signal_mode}".encode())
     if subtract_empty_box: h.update(f"emptybox{signal_mode}".encode())
     if normalize_mode.split('+')[0] in DATASET_STATS_MODES: h.update(f"stats{normalize_mode}{signal_mode}".encode())
+    # which samples are train -- only passed when a train-split statistic is baked into the dir
+    # (see uses_train_stats in build_dataset). Otherwise the dir holds the same bytes for every
+    # split, so it is left out and existing caches keep their hash.
+    if split_key is not None: h.update(f"split{split_key}".encode())
     for sample_dir, meta in sorted(samples, key=lambda s: s[0].name):
         h.update(sample_dir.name.encode())
         h.update(json.dumps(meta, sort_keys=True).encode())
@@ -351,7 +357,7 @@ def extract_signal(x: torch.Tensor, signal_mode: str) -> torch.Tensor:
     if signal_mode == "complex": return torch.cat([x.real, x.imag], dim=-1)
     if signal_mode == "mag_phase": return torch.cat([x.abs(), x.angle()], dim=-1)
     if signal_mode == "mag_trig_phase": return torch.cat([x.abs(), torch.sin(x.angle()), torch.cos(x.angle())], dim=-1)
-    # if signal_mode == "mag_trig_phase"
+    if signal_mode == "none": return x.real[..., :0]  # no magnitude block: phase-only, the --phase-arm supplies every channel
     raise ValueError(f"Unknown signal mode: {signal_mode}")
 
 def subtract_speaker_mean(x: torch.Tensor, speaker_mean: torch.Tensor | None) -> torch.Tensor:
@@ -370,7 +376,7 @@ def subtract_empty_box_ref(x: torch.Tensor, empty_box_ref: torch.Tensor | None) 
 DATASET_STATS_MODES = ("per_bin_z",)  # these normalize against train-split stats, not the sample itself
 
 def normalize_fft(x: torch.Tensor, normalize_mode: str, stats: dict[str, torch.Tensor] | None = None) -> torch.Tensor:
-    if normalize_mode is None: return x
+    if normalize_mode is None or x.shape[-1] == 0: return x  # empty under signal_mode='none'
     normalize_mode = normalize_mode.split('+')[0]  # trailing parts are token-level, see normalize_token
     x64 = x.double()
     if normalize_mode == 'std':
@@ -455,7 +461,7 @@ def augment_vibration(x: torch.Tensor, freqs: torch.Tensor, n_control: int = 5, 
     gain = gain[None, None, :, None]
     return x * gain
 
-def process_vibration(fft: torch.Tensor, freqs: torch.Tensor, signal_mode: str, normalize_mode: str, patch_size: int, augment: float = 0.5, gain_kwargs: dict | None = None, speaker_mean: torch.Tensor | None = None, stats: dict[str, torch.Tensor] | None = None, empty_box_ref: torch.Tensor | None = None, mag_recipe: str | None = None, phase_arm: str | None = None, phase_weight: float = 1.0) -> torch.Tensor:
+def process_vibration(fft: torch.Tensor, freqs: torch.Tensor, signal_mode: str, normalize_mode: str, patch_size: int, augment: float = 0.5, gain_kwargs: dict | None = None, speaker_mean: torch.Tensor | None = None, stats: dict[str, torch.Tensor] | None = None, empty_box_ref: torch.Tensor | None = None, mag_recipe: str | None = None, phase_arm: str | None = None, phase_weight: float = 1.0, phase_ref: torch.Tensor | None = None) -> torch.Tensor:
     """fft -> tokens.
 
     `mag_recipe` selects one of the 11 arms in normalizations.MAG_RECIPES and REPLACES
@@ -488,12 +494,13 @@ def process_vibration(fft: torch.Tensor, freqs: torch.Tensor, signal_mode: str, 
         # first is also what puts the two blocks on a common scale, so `phase_weight` sets a
         # meaningful mix instead of fighting the raw |Z| dynamic range.
         from model.normalizations import apply_phase_arm
-        x = torch.cat([x, phase_weight * apply_phase_arm(fft, phase_arm).float()], dim=-1)
+        x = torch.cat([x, phase_weight * apply_phase_arm(fft, phase_arm, ref=phase_ref).float()], dim=-1)
     return normalize_token(tokenize(x, patch_size), normalize_mode)
 
 SPEAKER_MEANS_FILE = "speaker_means.npz"
 DATASET_STATS_FILE = "dataset_stats.npz"
 EMPTY_BOX_REF_FILE = "empty_box_ref.npz"
+PHASE_REF_FILE = "phase_ref.npz"
 
 def load_signal(sample_dir: Path, signal_mode: str, laser_idx: np.ndarray | None = None) -> torch.Tensor:
     """(1,L,F,C) raw fft off disk -> extract_signal, in float64 so long sums don't drift."""
@@ -562,6 +569,61 @@ def load_empty_box_ref(path: Path) -> dict[int, torch.Tensor]:
     d = np.load(path)
     return {int(s): torch.from_numpy(d[s]).unsqueeze(0) for s in d.files}
 
+AUDIO_DIR = Path(__file__).resolve().parents[2] / "data" / "audio"  # the played stimuli, data/audio/<name>/audio.wav
+
+def source_phasor(audio_dir: str, freqs: np.ndarray) -> torch.Tensor:
+    """Unit phasor (F,) of the played stimulus, evaluated exactly at the capture's fft bins.
+
+    metadata records the capture machine's absolute path, so only its basename is used. The wav
+    (44.1 kHz) is DTFT'd directly at `freqs` rather than resampled to the camera rate: with t=0 at
+    the first sample of both recordings this equals the capture's rfft grid, and the chirp is
+    band-limited below the camera Nyquist so nothing aliases. The true playback-to-capture offset
+    is unknown -- it leaves a linear-in-f ramp this cannot remove."""
+    import soundfile as sf
+    name = audio_dir.replace("\\", "/").rstrip("/").split("/")[-1]
+    wav, fs = sf.read(AUDIO_DIR / name / "audio.wav", dtype="float64")
+    if wav.ndim > 1: wav = wav.mean(axis=1)
+    t = np.arange(len(wav)) / fs
+    spec = np.stack([wav @ np.exp(-2j * np.pi * f * t) for f in np.asarray(freqs)])
+    return torch.from_numpy(spec / (np.abs(spec) + 1e-20)).to(torch.complex64)
+
+def _unit(z: torch.Tensor) -> torch.Tensor: return z / (z.abs() + 1e-20)
+
+def compute_phase_ref(samples: list[tuple[Path, dict]], phase_arm: str, keep_idxs: list[int] | None = None, verbose: int = 1, laser_idx: np.ndarray | None = None) -> dict[int, torch.Tensor]:
+    """{speaker: complex unit phasor (1,L,F,C)} that normalizations.torch_referenced_phase
+    subtracts from the sample's phase.
+
+    'src'     the stimulus phase S(f), the same for every speaker.
+    'src_eb'  S(f) times the speaker's empty-box phase E, where E is the circular mean of
+              angle(Z . conj(S)) over that speaker's train empty-box samples. E is taken on
+              source-REFERENCED phase, since the empty-box recording already contains S --
+              referencing against raw empty-box phase would cancel S and then subtract it again.
+    """
+    stimuli = {m.get("audio_dir") for _, m in samples}
+    if len(stimuli) != 1: raise ValueError(f"phase ref assumes one stimulus per dataset, found {sorted(map(str, stimuli))}")
+    freqs = np.load(fft_path(samples[0][0]))["freqs"]
+    src = source_phasor(stimuli.pop(), freqs)[None, None, :, None]  # (1,1,F,1)
+    speakers = sorted({int(m.get("speaker", -1)) for _, m in samples})
+    if phase_arm == "src": return {s: src for s in speakers}
+
+    sums, counts = {}, {}
+    for sample_dir, meta in tqdm(_keep(samples, keep_idxs), desc="computing empty-box phase ref", disable=not verbose):
+        if meta.get("layout") != EMPTY_BOX_LAYOUT: continue
+        speaker = int(meta.get("speaker", -1))
+        X = torch.from_numpy(load_fft(sample_dir, laser_idx)).unsqueeze(0)
+        sums[speaker] = sums.get(speaker, 0) + _unit(X * src.conj())
+        counts[speaker] = counts.get(speaker, 0) + 1
+    if not sums: raise ValueError(f"no {EMPTY_BOX_LAYOUT!r} samples found; cannot build the empty-box phase ref")
+    if verbose: print("empty-box phase ref: " + ", ".join(f"speaker {s}={counts[s]} samples, resultant R={(sums[s] / counts[s]).abs().mean():.3f}" for s in sorted(counts)))
+    return {s: src * _unit(sums[s]) for s in sums}
+
+def save_phase_ref(ref: dict[int, torch.Tensor], path: Path) -> None:
+    np.savez(path, **{str(s): m.squeeze(0).numpy() for s, m in ref.items()})
+
+def load_phase_ref(path: Path) -> dict[int, torch.Tensor]:
+    d = np.load(path)
+    return {int(s): torch.from_numpy(d[s]).unsqueeze(0) for s in d.files}
+
 def compute_dataset_stats(samples: list[tuple[Path, dict]], signal_mode: str = "magnitude", keep_idxs: list[int] | None = None, verbose: int = 1, laser_idx: np.ndarray | None = None) -> dict[str, torch.Tensor]:
     """Per-(laser,freq,channel) mean and std over the train split, for normalize_mode='per_bin_z'."""
     samples = _keep(samples, keep_idxs)
@@ -582,7 +644,7 @@ def load_dataset_stats(path: Path) -> dict[str, torch.Tensor]:
     d = np.load(path)
     return {k: torch.from_numpy(d[k]).unsqueeze(0) for k in d.files}
 
-def precompute_vibration_samples(samples: list[tuple[Path, dict]], signal_mode: str, normalize_mode: str, patch_size: int, verbose: int = 1, speaker_means: dict[int, torch.Tensor] | None = None, stats: dict[str, torch.Tensor] | None = None, empty_box_ref: dict[int, torch.Tensor] | None = None, mag_recipe: str | None = None, phase_arm: str | None = None, phase_weight: float = 1.0, laser_idx: np.ndarray | None = None, laser_cols=None, laser_rows=None) -> None:
+def precompute_vibration_samples(samples: list[tuple[Path, dict]], signal_mode: str, normalize_mode: str, patch_size: int, verbose: int = 1, speaker_means: dict[int, torch.Tensor] | None = None, stats: dict[str, torch.Tensor] | None = None, empty_box_ref: dict[int, torch.Tensor] | None = None, mag_recipe: str | None = None, phase_arm: str | None = None, phase_weight: float = 1.0, laser_idx: np.ndarray | None = None, laser_cols=None, laser_rows=None, phase_ref: dict[int, torch.Tensor] | None = None) -> None:
     freqs = torch.from_numpy(np.load(fft_path(samples[0][0]))["freqs"])
     for sample_dir, meta in tqdm(samples, desc="precomputing fft", disable=not verbose):
         X = np.load(fft_path(sample_dir))["fft"]  # (1, L, F, C) complex64
@@ -592,7 +654,8 @@ def precompute_vibration_samples(samples: list[tuple[Path, dict]], signal_mode: 
         speaker = int(meta.get("speaker", -1))
         speaker_mean = speaker_means[speaker] if speaker_means is not None else None
         ref = empty_box_ref[speaker] if empty_box_ref is not None else None
-        X = process_vibration(X, freqs, signal_mode, normalize_mode, patch_size, augment=0.0, speaker_mean=speaker_mean, stats=stats, empty_box_ref=ref, mag_recipe=mag_recipe, phase_arm=phase_arm, phase_weight=phase_weight).squeeze(0).numpy()
+        pref = phase_ref[speaker] if phase_ref is not None else None
+        X = process_vibration(X, freqs, signal_mode, normalize_mode, patch_size, augment=0.0, speaker_mean=speaker_mean, stats=stats, empty_box_ref=ref, mag_recipe=mag_recipe, phase_arm=phase_arm, phase_weight=phase_weight, phase_ref=pref).squeeze(0).numpy()
         np.save(sample_dir / precomputed_fft_name(signal_mode, normalize_mode, patch_size, speaker_means is not None, empty_box_ref is not None, phase_arm, phase_weight, laser_cols, laser_rows), X)
 
 #***** 5 define dataset *****
@@ -607,6 +670,10 @@ class VibrationDataset(StreamingDataset):
         # MDS dirs built before this sidecar existed; __getitem__ emits 0 there, see below.
         geom_path = Path(local) / BOX_GEOM_FILE
         self.box_geom = json.loads(geom_path.read_text()) if geom_path.exists() else {}
+        # the experiment dir's name (local = <experiment>/mds/<hash>), saved per row so viz can
+        # match a prediction to its capture by name -- box + sample id is ambiguous, since
+        # several captures share a box and all number samples from 000001.
+        self.experiment = Path(local).resolve().parent.parent.name
         # only needed on the raw-fft path; the precomputed path already applied both offline
         raw = not self.pk["mds_precomputed_fft"]
         means_path, stats_path = Path(local) / SPEAKER_MEANS_FILE, Path(local) / DATASET_STATS_FILE
@@ -614,6 +681,8 @@ class VibrationDataset(StreamingDataset):
         self.speaker_means = load_speaker_means(means_path) if means_path.exists() and raw else None
         self.stats = load_dataset_stats(stats_path) if stats_path.exists() and raw else None
         self.empty_box_ref = load_empty_box_ref(ref_path) if ref_path.exists() and raw else None
+        phase_ref_path = Path(local) / PHASE_REF_FILE
+        self.phase_ref = load_phase_ref(phase_ref_path) if phase_ref_path.exists() and raw else None
 
     def __getitem__(self, idx):
         s = super().__getitem__(idx)
@@ -627,10 +696,11 @@ class VibrationDataset(StreamingDataset):
         # "unknown" (pre-sidecar MDS dir) -- renderers must check for it and fall back to the
         # grid's own aspect rather than dividing by it.
         box_w, box_h = self.box_geom.get(str(s["box"]), (0, 0))
-        info = dict(sample_id=s["sample_id"], position_id=s["position_id"], n_objects=n_objects, speaker=s["speaker"], box=s["box"], is_empty_box=s["is_empty_box"], x_com=s["downsampled_com_x"], y_com=s["downsampled_com_y"], box_w=box_w, box_h=box_h)
+        info = dict(sample_id=s["sample_id"], position_id=s["position_id"], n_objects=n_objects, speaker=s["speaker"], box=s["box"], is_empty_box=s["is_empty_box"], experiment=self.experiment, x_com=s["downsampled_com_x"], y_com=s["downsampled_com_y"], box_w=box_w, box_h=box_h)
         speaker_mean = self.speaker_means[int(s["speaker"])].to(self.pk["device"]) if self.speaker_means is not None else None
         ref = self.empty_box_ref[int(s["speaker"])].to(self.pk["device"]) if self.empty_box_ref is not None else None
-        fft = X if self.pk["mds_precomputed_fft"] else process_vibration(X, self.pk["freqs"], self.pk["signal_mode"], self.pk["normalize_mode"], self.pk["patch_size"], augment=self.pk["augment_fft"], speaker_mean=speaker_mean, stats=self.stats, empty_box_ref=ref, mag_recipe=self.pk.get("mag_recipe"), phase_arm=self.pk.get("phase_arm"), phase_weight=self.pk.get("phase_weight", 1.0))
+        pref = self.phase_ref[int(s["speaker"])].to(self.pk["device"]) if self.phase_ref is not None else None
+        fft = X if self.pk["mds_precomputed_fft"] else process_vibration(X, self.pk["freqs"], self.pk["signal_mode"], self.pk["normalize_mode"], self.pk["patch_size"], augment=self.pk["augment_fft"], speaker_mean=speaker_mean, stats=self.stats, empty_box_ref=ref, mag_recipe=self.pk.get("mag_recipe"), phase_arm=self.pk.get("phase_arm"), phase_weight=self.pk.get("phase_weight", 1.0), phase_ref=pref)
         mask_true = process_image(y, self.pk["out_h"], self.pk["out_w"], augment=self.pk["augment_mask"])
         return dict(fft=fft.squeeze(0), mask_true=mask_true.squeeze(0), info=info)
 
@@ -1224,6 +1294,200 @@ def shoebox_ring(mds_path, test_size=0.15, seed=42, speakers=None, n_objects=Non
     return _shoebox_object_split(mds_path, "ring", test_size, seed, speakers, n_objects, box, n_samples, verbose, index)
 
 
+# ***** 2026_09_27_gastronorm_four_objs *****
+#
+# Positions dropped from every split (no overhead image, candle mislabeled as empty, failed
+# segmentation, partial raw vibration, a deleted sample's leftover dir, ...).
+FOUR_OBJS_IGNORE_POSITIONS = {1, 184, 189, 259, 279, 293, 294, 295, 296, 297, 298, 409, 474, 534,
+                              536, 537, 539, 540, 541, 542, 543, 544, 581, 582, 583, 584, 1102}
+
+# eval label -> the layouts pooled under it. Split groups hold out FOUR_OBJS_EVAL_FRAC of their
+# positions (whole position_id, so a position is never in both train and eval); eval-only groups
+# go wholly to eval; empty boxes wholly to train.
+FOUR_OBJS_SPLIT_GROUPS = {
+    "vase": ["vase-grid-1"],
+    "candle": ["candle"],
+    "one-cube": ["red-cube-grid1", "red-cube-grid2", "red-cube-grid3_test"],
+    "soap-dispenser": ["soap-dispenser-grid-1", "soap-dispenser-grid-2", "soap-dispenser-grid-3"],
+    "cube-vase": ["cube-vase"],
+    "two-cubes": ["two-cubes-grid-1", "two-cubes-grid-2"],
+}
+FOUR_OBJS_EVAL_ONLY = ["red-cube-lid", "cylinder-1000g", "cylinder-500g", "cylinder-100g", "coffee-pot",
+                       "soap-dispenser-sideways"]
+FOUR_OBJS_TRAIN_ONLY = ["empty-box-1", "empty-box-2", "empty-box-3", "empty-box-4"]
+FOUR_OBJS_EVAL_FRAC = 0.2
+
+def gastronorm_four_objs(mds_path, test_size=FOUR_OBJS_EVAL_FRAC, seed=42, speakers=None, n_objects=None, box=None,
+                         n_samples=None, verbose=1, index=None):
+    """train + one eval/<label> per FOUR_OBJS_SPLIT_GROUPS entry and per FOUR_OBJS_EVAL_ONLY layout.
+    Any layout not named above (e.g. leftover 'empty'/'empty-box' rows) is left out, and reported."""
+    index = _load_index(mds_path, index)
+    keep = [i for i, r in enumerate(index)
+            if _matches(r, speakers, n_objects, box) and int(r["position_id"]) not in FOUR_OBJS_IGNORE_POSITIONS]
+    if n_samples is not None: keep = keep[:n_samples]
+    by_layout = {}
+    for i in keep: by_layout.setdefault(index[i]["layout"], []).append(i)
+
+    train, evals = [i for l in FOUR_OBJS_TRAIN_ONLY for i in by_layout.get(l, [])], {}
+    for label, layouts in FOUR_OBJS_SPLIT_GROUPS.items():
+        tr, evl = _split_positions(index, [i for l in layouts for i in by_layout.get(l, [])], test_size, seed)
+        train += tr
+        evals[f"eval/{label}"] = evl
+    for layout in FOUR_OBJS_EVAL_ONLY:
+        evals[f"eval/{layout}"] = sorted(by_layout.get(layout, []))
+
+    splits = {"train": sorted(train), **evals}
+    if verbose:
+        for label, idxs in splits.items(): print(f"{label}: {len(idxs)} samples")
+        used = {*FOUR_OBJS_TRAIN_ONLY, *FOUR_OBJS_EVAL_ONLY, *(l for ls in FOUR_OBJS_SPLIT_GROUPS.values() for l in ls)}
+        if unused := {l: len(v) for l, v in by_layout.items() if l not in used}:
+            print(f"not in any split (layout: samples): {unused}")
+    return splits
+
+def gastronorm_four_objs_2(mds_path, test_size=0.2, seed=42, verbose=1, index=None, **filters):
+    """gastronorm_four_objs, self-contained. Each group holds out `frac` of its POSITIONS, so every
+    speaker at a position lands on the same side -- no position is in both train and eval."""
+    assert all(v is None for v in filters.values()), f"gastronorm_four_objs_2 has no filters: {filters}"
+    if index is None: index = [json.loads(l) for l in open(Path(mds_path) / "metadata.jsonl") if l.strip()]
+    ignore = {1, 184, 189, 259, 279, 293, 294, 295, 296, 297, 298, 409, 474, 534,
+              536, 537, 539, 540, 541, 542, 543, 544, 581, 582, 583, 584, 1102}
+    groups = {  # label: (fraction of positions held out for eval, layouts)
+        "train":                   (0.0, ["empty-box-1", "empty-box-2", "empty-box-3", "empty-box-4"]),
+        "vase":                    (test_size, ["vase-grid-1"]),
+        "candle":                  (test_size, ["candle"]),
+        "one-cube":                (test_size, ["red-cube-grid1", "red-cube-grid2", "red-cube-grid3_test"]),
+        "soap-dispenser":          (test_size, ["soap-dispenser-grid-1", "soap-dispenser-grid-2", "soap-dispenser-grid-3"]),
+        "cube-vase":               (test_size, ["cube-vase"]),
+        "two-cubes":               (test_size, ["two-cubes-grid-1", "two-cubes-grid-2"]),
+        "red-cube-lid":            (1.0, ["red-cube-lid"]),
+        "cylinder-1000g":          (1.0, ["cylinder-1000g"]),
+        "cylinder-500g":           (1.0, ["cylinder-500g"]),
+        "cylinder-100g":           (1.0, ["cylinder-100g"]),
+        "coffee-pot":              (1.0, ["coffee-pot"]),
+        "soap-dispenser-sideways": (1.0, ["soap-dispenser-sideways"]),
+    }
+    splits = {"train": []}
+    for label, (frac, layouts) in groups.items():
+        rows = [i for i, r in enumerate(index) if r["layout"] in layouts and r["position_id"] not in ignore]
+        positions = sorted({index[i]["position_id"] for i in rows})
+        random.Random(seed).shuffle(positions)
+        held = set(positions[:round(frac * len(positions))])
+        splits["train"] += [i for i in rows if index[i]["position_id"] not in held]
+        if label != "train": splits[f"eval/{label}"] = [i for i in rows if index[i]["position_id"] in held]
+    splits["train"].sort()
+    # check for leakage
+    train_pos = {index[i]["position_id"] for i in splits["train"]}
+    for label, idxs in splits.items():
+        if label == "train": continue
+        leaked = train_pos & {index[i]["position_id"] for i in idxs}
+        assert not leaked, f"{label} shares positions with train: {sorted(leaked)[:10]}"
+    if verbose:
+        for label, idxs in splits.items(): print(f"{label}: {len(idxs)} samples")
+    return splits
+
+def gastronorm_four_objs_speakers(mds_path, test_size=0.2, seed=42, verbose=1, index=None, control=False, **filters):
+    """Speaker-4 holdout. Same eval sets as gastronorm_four_objs_2; trains only on the empty box and the
+    four main objects (every train position).
+      control=False: train on speakers 1, 2, 3, 5, 7 (four_objs has one speaker-5 sample, so really
+                     1, 2, 3, 7) and add eval/<obj>-spk4-seenpos: speaker 4 at the TRAIN positions, i.e. a
+                     new speaker at a seen position.
+      control=True:  the same positions, but 4 random speakers per position (speaker 4 included), so the
+                     same number of samples -- the only difference is whether speaker 4 was ever heard."""
+    assert all(v is None for v in filters.values()), f"gastronorm_four_objs_speakers has no filters: {filters}"
+    if index is None: index = [json.loads(l) for l in open(Path(mds_path) / "metadata.jsonl") if l.strip()]
+    ignore = {1, 184, 189, 259, 279, 293, 294, 295, 296, 297, 298, 409, 474, 534,
+              536, 537, 539, 540, 541, 542, 543, 544, 581, 582, 583, 584, 1102}
+    groups = {  # label: (fraction of positions held out for eval, trained on, layouts)
+        "train":                   (0.0, True, ["empty-box-1", "empty-box-2", "empty-box-3", "empty-box-4"]),
+        "vase":                    (test_size, True, ["vase-grid-1"]),
+        "candle":                  (test_size, True, ["candle"]),
+        "one-cube":                (test_size, True, ["red-cube-grid1", "red-cube-grid2", "red-cube-grid3_test"]),
+        "soap-dispenser":          (test_size, True, ["soap-dispenser-grid-1", "soap-dispenser-grid-2", "soap-dispenser-grid-3"]),
+        "cube-vase":               (test_size, False, ["cube-vase"]),
+        "two-cubes":               (test_size, False, ["two-cubes-grid-1", "two-cubes-grid-2"]),
+        "red-cube-lid":            (1.0, False, ["red-cube-lid"]),
+        "cylinder-1000g":          (1.0, False, ["cylinder-1000g"]),
+        "cylinder-500g":           (1.0, False, ["cylinder-500g"]),
+        "cylinder-100g":           (1.0, False, ["cylinder-100g"]),
+        "coffee-pot":              (1.0, False, ["coffee-pot"]),
+        "soap-dispenser-sideways": (1.0, False, ["soap-dispenser-sideways"]),
+    }
+    splits = {"train": []}
+    for label, (frac, trained, layouts) in groups.items():
+        rows = [i for i, r in enumerate(index) if r["layout"] in layouts and r["position_id"] not in ignore]
+        positions = sorted({index[i]["position_id"] for i in rows})
+        random.Random(seed).shuffle(positions)
+        held = set(positions[:round(frac * len(positions))])
+        train = [i for i in rows if index[i]["position_id"] not in held] if trained else []
+        if control:  # 4 random speakers at each train position, drawn per position
+            spk = {}
+            for i in train: spk.setdefault(index[i]["position_id"], set()).add(index[i]["speaker"])
+            keep = {p: set(random.Random(seed * 100_003 + p).sample(sorted(s), min(4, len(s)))) for p, s in spk.items()}
+            train = [i for i in train if index[i]["speaker"] in keep[index[i]["position_id"]]]
+        else:
+            if trained and label != "train": splits[f"eval/{label}-spk4-seenpos"] = [i for i in train if index[i]["speaker"] == 4]
+            train = [i for i in train if index[i]["speaker"] != 4]
+        splits["train"] += train
+        if label != "train": splits[f"eval/{label}"] = [i for i in rows if index[i]["position_id"] in held]
+    splits["train"].sort()
+    # check for leakage: no eval position is in train -- except -seenpos, which shares positions with train
+    # by design; there no sample may be in train and speaker 4 must never be trained on
+    train_pos, train_set = {index[i]["position_id"] for i in splits["train"]}, set(splits["train"])
+    for label, idxs in splits.items():
+        if label == "train": continue
+        if label.endswith("-seenpos"):
+            assert not train_set & set(idxs) and all(index[i]["speaker"] != 4 for i in train_set), f"{label} leaks"
+            continue
+        leaked = train_pos & {index[i]["position_id"] for i in idxs}
+        assert not leaked, f"{label} shares positions with train: {sorted(leaked)[:10]}"
+    if verbose:
+        for label, idxs in splits.items(): print(f"{label}: {len(idxs)} samples")
+    return splits
+
+def gastronorm_four_objs_scale(mds_path, test_size=0.2, seed=42, verbose=1, index=None, n_positions=None, **filters):
+    """Scaling. Same eval sets as gastronorm_four_objs_2; trains on every empty box plus `n_positions`
+    random train positions of each of the four main objects (None = all), every speaker.
+    n_positions=125 -> 60 + 4 x 125 x 5 = 2560 samples ~ the old gastronorm run's 2553."""
+    assert all(v is None for v in filters.values()), f"gastronorm_four_objs_scale has no filters: {filters}"
+    if index is None: index = [json.loads(l) for l in open(Path(mds_path) / "metadata.jsonl") if l.strip()]
+    ignore = {1, 184, 189, 259, 279, 293, 294, 295, 296, 297, 298, 409, 474, 534,
+              536, 537, 539, 540, 541, 542, 543, 544, 581, 582, 583, 584, 1102}
+    groups = {  # label: (fraction of positions held out for eval, train positions kept, layouts); 0 = not trained
+        "train":                   (0.0, None, ["empty-box-1", "empty-box-2", "empty-box-3", "empty-box-4"]),
+        "vase":                    (test_size, n_positions, ["vase-grid-1"]),
+        "candle":                  (test_size, n_positions, ["candle"]),
+        "one-cube":                (test_size, n_positions, ["red-cube-grid1", "red-cube-grid2", "red-cube-grid3_test"]),
+        "soap-dispenser":          (test_size, n_positions, ["soap-dispenser-grid-1", "soap-dispenser-grid-2", "soap-dispenser-grid-3"]),
+        "cube-vase":               (test_size, 0, ["cube-vase"]),
+        "two-cubes":               (test_size, 0, ["two-cubes-grid-1", "two-cubes-grid-2"]),
+        "red-cube-lid":            (1.0, 0, ["red-cube-lid"]),
+        "cylinder-1000g":          (1.0, 0, ["cylinder-1000g"]),
+        "cylinder-500g":           (1.0, 0, ["cylinder-500g"]),
+        "cylinder-100g":           (1.0, 0, ["cylinder-100g"]),
+        "coffee-pot":              (1.0, 0, ["coffee-pot"]),
+        "soap-dispenser-sideways": (1.0, 0, ["soap-dispenser-sideways"]),
+    }
+    splits = {"train": []}
+    for label, (frac, n, layouts) in groups.items():
+        rows = [i for i, r in enumerate(index) if r["layout"] in layouts and r["position_id"] not in ignore]
+        positions = sorted({index[i]["position_id"] for i in rows})
+        random.Random(seed).shuffle(positions)
+        held = set(positions[:round(frac * len(positions))])
+        kept = [p for p in positions if p not in held][:n]  # still shuffled; [:None] = all
+        assert n is None or len(kept) == n, f"{label}: asked for {n} train positions, have {len(kept)}"
+        splits["train"] += [i for i in rows if index[i]["position_id"] in set(kept)]
+        if label != "train": splits[f"eval/{label}"] = [i for i in rows if index[i]["position_id"] in held]
+    splits["train"].sort()
+    # check for leakage
+    train_pos = {index[i]["position_id"] for i in splits["train"]}
+    for label, idxs in splits.items():
+        if label == "train": continue
+        leaked = train_pos & {index[i]["position_id"] for i in idxs}
+        assert not leaked, f"{label} shares positions with train: {sorted(leaked)[:10]}"
+    if verbose:
+        for label, idxs in splits.items(): print(f"{label}: {len(idxs)} samples")
+    return splits
+
 #***** 8 build dataloaders *****
 
 SPLIT_METHODS = {"exp25": exp25_split, "gastronorm": gastronorm, "gastronorm_speaker_gen": gastronorm_speaker_gen,
@@ -1236,7 +1500,14 @@ SPLIT_METHODS = {"exp25": exp25_split, "gastronorm": gastronorm, "gastronorm_spe
                  "plastic": plastic, "plastic_one_cube": plastic_one_cube, "plastic_two_cubes": plastic_two_cubes,
                  "wood": wood, "cardboard": cardboard, "shoebox": shoebox,
                  "shoebox_cube": shoebox_cube, "shoebox_cylinder": shoebox_cylinder,
-                 "shoebox_mug": shoebox_mug, "shoebox_ring": shoebox_ring}
+                 "shoebox_mug": shoebox_mug, "shoebox_ring": shoebox_ring,
+                 "gastronorm_four_objs": gastronorm_four_objs, "gastronorm_four_objs_2": gastronorm_four_objs_2,
+                 # scripts/four_objs_ablation.sh
+                 "gastronorm_four_objs_spk_holdout": gastronorm_four_objs_speakers,
+                 "gastronorm_four_objs_spk_control": partial(gastronorm_four_objs_speakers, control=True),
+                 "gastronorm_four_objs_scale_s": partial(gastronorm_four_objs_scale, n_positions=53),
+                 "gastronorm_four_objs_scale_m": partial(gastronorm_four_objs_scale, n_positions=125),
+                 "gastronorm_four_objs_scale_l": gastronorm_four_objs_scale}
 
 #***** 7 pair two speakers into one sample *****
 
@@ -1310,6 +1581,8 @@ def build_dataset(data_dir: str | Path, split: str = "exp25", batch_size: int = 
         from model.normalizations import PHASE_ARMS
         if phase_arm not in PHASE_ARMS:
             raise ValueError(f"unknown {phase_arm=}; expected one of {sorted(PHASE_ARMS)}")
+    if signal_mode == "none" and phase_arm is None:
+        raise ValueError("signal_mode='none' drops the magnitude block, so it needs a --phase-arm to have any input at all")
 
     if split not in SPLIT_METHODS: raise ValueError(f"Unknown split {split!r}, expected one of {sorted(SPLIT_METHODS)}")
     if not 0 <= augment_fft <= 1: raise ValueError(f"{augment_fft=} must be a probability in [0, 1]")
@@ -1341,7 +1614,16 @@ def build_dataset(data_dir: str | Path, split: str = "exp25", batch_size: int = 
     # reduce over L -- see only the kept lasers. Slicing any later would normalize against
     # lasers the model never gets.
     laser_idx = laser_indices(laser_cols, n_laser_rows, n_laser_cols, laser_rows)
-    mds_dir = data_dir / "mds" / hash_samples(samples, out_h, out_w, raw_fft, signal_mode, normalize_mode, patch_size, subtract_speaker_mean, subtract_empty_box, mag_recipe, rgb, phase_arm, phase_weight, laser_cols, laser_rows)[:16]
+    # Speaker means, the empty-box refs, per-bin stats and the src_eb phase ref are computed on the
+    # TRAIN split and saved inside the dir, so the dir is only valid for the split that produced
+    # it: the split name and every argument that moves a sample between train and eval (seed,
+    # test_size, speakers, ...) go into the hash. Without them, a second split reused the first
+    # split's statistics -- built partly from what are now its eval samples. Runs with none of
+    # these statistics hash exactly as before, so their existing caches stay valid.
+    needs_stats = normalize_mode.split('+')[0] in DATASET_STATS_MODES
+    uses_train_stats = bool(subtract_speaker_mean or subtract_empty_box or needs_stats or phase_arm == "src_eb")
+    split_key = json.dumps({"split": split, "seed": seed, **split_kwargs}, sort_keys=True, default=str) if uses_train_stats else None
+    mds_dir = data_dir / "mds" / hash_samples(samples, out_h, out_w, raw_fft, signal_mode, normalize_mode, patch_size, subtract_speaker_mean, subtract_empty_box, mag_recipe, rgb, phase_arm, phase_weight, laser_cols, laser_rows, split_key)[:16]
     done = mds_dir / "metadata.jsonl"  # last file convert_to_mds writes -- its presence means the build completed
 
     if force_rebuild_data and mds_dir.exists():
@@ -1352,20 +1634,22 @@ def build_dataset(data_dir: str | Path, split: str = "exp25", batch_size: int = 
         if mds_dir.exists(): shutil.rmtree(mds_dir)  # clear out a partial/crashed build
 
         # train-only, so eval spectra don't leak into either set of statistics
-        needs_stats = normalize_mode.split('+')[0] in DATASET_STATS_MODES
-        train_idxs = SPLIT_METHODS[split](mds_dir, seed=seed, verbose=0, index=[m for _, m in samples], **split_kwargs)["train"] if subtract_speaker_mean or subtract_empty_box or needs_stats else None
+        train_idxs = SPLIT_METHODS[split](mds_dir, seed=seed, verbose=0, index=[m for _, m in samples], **split_kwargs)["train"] if uses_train_stats else None
 
         empty_box_ref = compute_empty_box_ref(samples, signal_mode, keep_idxs=train_idxs, verbose=verbose, laser_idx=laser_idx) if subtract_empty_box else None
         speaker_means = compute_speaker_means(samples, signal_mode, keep_idxs=train_idxs, verbose=verbose, empty_box_ref=None, laser_idx=laser_idx) if subtract_speaker_mean else None
         stats = compute_dataset_stats(samples, signal_mode, keep_idxs=train_idxs, verbose=verbose, laser_idx=laser_idx) if needs_stats else None
+        from model.normalizations import PHASE_REF_ARMS
+        phase_ref = compute_phase_ref(samples, phase_arm, keep_idxs=train_idxs, verbose=verbose, laser_idx=laser_idx) if phase_arm in PHASE_REF_ARMS else None
 
         # downsample image, precompute fft, and convert to mds
         downsample_samples(samples, out_h, out_w, verbose=verbose, rgb=rgb)
-        if not raw_fft: precompute_vibration_samples(samples, signal_mode, normalize_mode, patch_size, verbose=verbose, speaker_means=speaker_means, stats=stats, empty_box_ref=empty_box_ref, mag_recipe=mag_recipe, phase_arm=phase_arm, phase_weight=phase_weight, laser_idx=laser_idx, laser_cols=laser_cols, laser_rows=laser_rows)
+        if not raw_fft: precompute_vibration_samples(samples, signal_mode, normalize_mode, patch_size, verbose=verbose, speaker_means=speaker_means, stats=stats, empty_box_ref=empty_box_ref, mag_recipe=mag_recipe, phase_arm=phase_arm, phase_weight=phase_weight, laser_idx=laser_idx, laser_cols=laser_cols, laser_rows=laser_rows, phase_ref=phase_ref)
         convert_to_mds(mds_dir, samples, out_h, out_w, verbose=verbose, augment_fft=raw_fft, signal_mode=signal_mode, normalize_mode=normalize_mode, patch_size=patch_size, subtract_speaker_mean=subtract_speaker_mean, subtract_empty_box=subtract_empty_box, rgb=rgb, phase_arm=phase_arm, phase_weight=phase_weight, laser_idx=laser_idx, laser_cols=laser_cols, laser_rows=laser_rows)
         if speaker_means is not None: save_speaker_means(speaker_means, mds_dir / SPEAKER_MEANS_FILE)
         if stats is not None: save_dataset_stats(stats, mds_dir / DATASET_STATS_FILE)
         if empty_box_ref is not None: save_empty_box_ref(empty_box_ref, mds_dir / EMPTY_BOX_REF_FILE)
+        if phase_ref is not None: save_phase_ref(phase_ref, mds_dir / PHASE_REF_FILE)
     elif verbose:
         print(f"Reusing existing MDS at {mds_dir}")
     (mds_dir / LASER_GRID_FILE).write_text(json.dumps(grid))

@@ -11,6 +11,7 @@ every field, argument and map is keyed by.
 import json
 import os
 import re
+from datetime import datetime
 import resource
 import time
 from dataclasses import dataclass, field
@@ -252,6 +253,50 @@ def _as_box_list(info: dict, n: int) -> list:
     return list(v) if v is not None else [None] * n
 
 
+def _as_exp_list(info: dict, n: int) -> list:
+    """info['experiment'] per-row (the experiment dir NAME the sample came from), or `n`
+    Nones on a run saved before training wrote that field -- Registry.resolve then falls
+    back to the run's wandb config (_config_experiments), then to `box`."""
+    v = info.get("experiment")
+    return list(v) if v is not None else [None] * n
+
+
+_CONFIG_EXPS: dict[str, list[str]] = {}
+RUN_PY_DEFAULT_DATA_DIR = "31_07_2026_gastronorm_exp1"  # src/run.py --data-dir default
+
+def _config_experiments(run_dir: Path) -> list[str]:
+    """Experiment dir names a run trained on (data_dir, then data_dir_2), from its wandb
+    dir -- the only on-disk record of the dataset for runs saved before info['experiment']
+    existed. Newest wandb dir for that exact run name wins. config.yaml is only written when
+    a run ENDS, so a killed run falls back to the command line in wandb-metadata.json (where
+    an omitted --data-dir means run.py's default). [] when there is no wandb dir."""
+    key = str(run_dir)
+    if key in _CONFIG_EXPS: return _CONFIG_EXPS[key]
+    import yaml
+    # exact run-<YYYYMMDD>_<HHMMSS>-<name>: a bare `run-*-<name>` glob also matches other
+    # runs whose name merely ENDS in this one (ps128 vs g4cfg-2130-ps128).
+    pat = re.compile(rf"run-\d{{8}}_\d{{6}}-{re.escape(run_dir.name)}")
+    dirs = sorted(d for d in run_dir.parent.parent.glob("wandb/run-*") if pat.fullmatch(d.name))
+    out: list[str] = []
+    for d in reversed(dirs):
+        try:
+            if (d / "files" / "config.yaml").is_file():
+                cfg = yaml.safe_load((d / "files" / "config.yaml").read_text()) or {}
+                vals = [(cfg.get(k) or {}).get("value") for k in ("data_dir", "data_dir_2")]
+            elif (d / "files" / "wandb-metadata.json").is_file():
+                args = json.loads((d / "files" / "wandb-metadata.json").read_text()).get("args") or []
+                get = lambda flag: args[args.index(flag) + 1] if flag in args[:-1] else None
+                vals = [get("--data-dir") or RUN_PY_DEFAULT_DATA_DIR, get("--data-dir-2")]
+            else:
+                continue
+        except Exception:
+            continue
+        out = [Path(str(v)).name for v in vals if v]
+        break
+    _CONFIG_EXPS[key] = out
+    return out
+
+
 def run_status(run_dir: Path) -> str:
     """running | finished | crashed | unknown, read from the tail of the training log.
 
@@ -356,6 +401,7 @@ def _probe(files: list[Path]) -> tuple[dict | None, str | None]:
     base = None
     ids: list[int] = []
     boxes: list = []   # which physical box each id in `ids` came from, aligned index-wise
+    exps: list = []    # and its experiment name (None on older runs), same alignment
     for p in files[:5]:
         try:
             obj = torch.load(p, map_location="cpu", weights_only=False)
@@ -367,6 +413,7 @@ def _probe(files: list[Path]) -> tuple[dict | None, str | None]:
             batch_ids = _as_int_array(sid).tolist()
             ids.extend(batch_ids)
             boxes.extend(_as_box_list(info, len(batch_ids)))
+            exps.extend(_as_exp_list(info, len(batch_ids)))
         if base is None:
             # Keep only the few facts classification needs; holding the tensors would
             # pin hundreds of MB across every scanned run for no benefit. Schema is fixed
@@ -375,7 +422,7 @@ def _probe(files: list[Path]) -> tuple[dict | None, str | None]:
             base = {"shape": tuple(mask.shape[-2:]) if mask is not None else None,
                     "info_keys": set(info)}
     if base is not None:
-        result = (base | {"sample_ids": ids, "boxes": boxes}, None)
+        result = (base | {"sample_ids": ids, "boxes": boxes, "exps": exps}, None)
     _PROBE_CACHE[key] = result
     return result
 
@@ -424,11 +471,20 @@ def _classify(name: str, outputs: Path, files: list[Path], obj: dict | None,
     probe_boxes = obj["boxes"]
     families = set()
     experiments = set()
-    for sid, box in zip(probe_ids, probe_boxes):
-        gi = registry.route(sid, box)
+    probe_exps = obj.get("exps") or [None] * len(probe_ids)
+    run_exps = _config_experiments(outputs.parent)
+    routed = registry.resolve(probe_ids, probe_boxes, probe_exps, run_exps, files[0].stat().st_mtime)
+    for sid, box, exp, gi in zip(probe_ids, probe_boxes, probe_exps, routed):
         if gi is None:
-            reason = (f"box {box!r} has no loaded experiment" if box is not None
-                      else "different dataset (sample ids not in any loaded experiment)")
+            named = [exp] if exp is not None else run_exps
+            if named:
+                missing = [n for n in named if n not in registry._gi_by_exp]
+                reason = (f"experiment {', '.join(missing)} not loaded" if missing
+                          else f"sample {sid} not in experiment {', '.join(named)}")
+            else:
+                reason = (f"no experiment recorded, and box {box!r} + sample id match "
+                          f"no single loaded experiment" if box is not None
+                          else "different dataset (sample ids not in any loaded experiment)")
             return RunEntry(name, False, reason, eval_splits=splits)
         gt = registry.gts[gi]
         # has_shape(), not masks_at(): classification only needs to know whether targets
@@ -799,7 +855,7 @@ def load_run(name: str, runs_dir: Path, registry: "Registry", family: str = "unk
     against the numbers in the run's own logs-rank0.txt.
     """
     outputs = runs_dir / name / config.OUTPUTS_SUBDIR
-    ids, masks, splits, boxes, skipped = [], [], [], [], []
+    ids, masks, splits, boxes, exps, skipped = [], [], [], [], [], []
     want, epoch = epoch, 0
     _t0 = time.perf_counter()
     _n_files = 0   # see the [viz] load_run print at the end of this function
@@ -829,6 +885,7 @@ def load_run(name: str, runs_dir: Path, registry: "Registry", family: str = "unk
                 masks.append(obj["mask_pred"].float().numpy())
                 splits += [split] * len(sid)
                 boxes += _as_box_list(obj["info"], len(sid))
+                exps += _as_exp_list(obj["info"], len(sid))
                 got = True
                 _n_files += 1
             if got:
@@ -863,7 +920,9 @@ def load_run(name: str, runs_dir: Path, registry: "Registry", family: str = "unk
     # one experiment and are not unique across them, so this can no longer be one shared
     # id->row lookup. Drop rows that route to nothing rather than indexing something
     # arbitrary -- a stray id would otherwise be scored against a real but unrelated mask.
-    routed = [registry.route(int(s), b) for s, b in zip(sample_ids, boxes_arr)]
+    # a split dir's mtime = when its newest prediction file was written (see resolve's legacy rule)
+    run_time = max((d.stat().st_mtime for _, d in _split_dirs(outputs)), default=None)
+    routed = registry.resolve(sample_ids, boxes_arr, exps, _config_experiments(runs_dir / name), run_time)
     keep = np.array([r is not None for r in routed], dtype=bool)
     gi_arr = np.array([r for r in routed if r is not None], dtype=np.int64)
     if not keep.all():
@@ -1015,26 +1074,26 @@ class Registry:
     def _index_experiments(self) -> None:
         """Build the flat row space: `_row_base[gi]` is where experiment gi's rows start,
         and `row_of` maps a GLOBAL sample id straight to its global row. Also builds
-        `_gi_by_box`, which `route()` uses to send a prediction to the RIGHT experiment
-        even when its local sample id happens to collide with another experiment's."""
+        `_gi_by_exp` (experiment dir name -> gi), which `resolve()` uses to send a
+        prediction to the RIGHT experiment. Experiments are keyed by their full dir name,
+        never by `box`: several captures share a box name (three gastronorm experiments
+        today) and all number their samples from 000001, so box + id is ambiguous."""
         self._row_base: list[int] = []
         self.row_of: dict[int, int] = {}
-        self._gi_by_box: dict[str, int] = {}
+        self._gi_by_exp: dict[str, int] = {}
+        self._boxes_of: list[set] = []
+        self._recorded_at: list[float] = []
         base = 0
         for gi, gt in enumerate(self.gts):
             self._row_base.append(base)
             for local, sid in enumerate(gt.sample_ids):
                 self.row_of[self.global_id(gi, int(sid))] = base + local
             base += len(gt)
-            # Every experiment on disk today holds exactly one box, so first-seen-wins is
-            # unambiguous; if that ever changes, this only affects the box->experiment
-            # fast path in route() -- id-overlap still catches a sample whose box lookup
-            # picked the wrong one, so a shared box name fails loud (id not in that
-            # experiment) rather than silently scoring against the wrong ground truth.
-            for m in gt.meta:
-                b = m.get("box")
-                if b is not None:
-                    self._gi_by_box.setdefault(b, gi)
+            self._gi_by_exp[gt.experiment_dir.name] = gi
+            self._boxes_of.append({m.get("box") for m in gt.meta} - {None})
+            # when the capture STARTED (earliest sample timestamp; 0 = unknown, never excluded)
+            ts = [m["timestamp"] for m in gt.meta if isinstance(m.get("timestamp"), str)]
+            self._recorded_at.append(datetime.fromisoformat(min(ts)).timestamp() if ts else 0.0)
         self.n_samples = base
 
     def global_id(self, gi, local_sample_id):
@@ -1044,28 +1103,37 @@ class Registry:
         Registry._index_experiments and app.py's scalar call sites use)."""
         return gi * ID_STRIDE + local_sample_id
 
-    def route(self, local_sample_id: int, box: str | None) -> int | None:
-        """Which experiment (gi) a PREDICTED row belongs to, by its own `box` field.
+    def resolve(self, sample_ids, boxes, exps, run_exps=(), run_time: float | None = None) -> list[int | None]:
+        """Which experiment (gi) each PREDICTED row belongs to, keyed by experiment NAME.
 
-        A run can predict samples from more than one box (a "combined" training run), and
-        local sample ids are not unique across experiments -- two boxes can both have a
-        "000010" -- so `box` (saved per-row in the .pt's info, present on runs trained
-        after that field was added) is the reliable signal, checked first. Falls back to
-        id-overlap against every loaded experiment for older runs with no `box` in info.
-        A `box` that names an experiment NOT loaded, or whose experiment doesn't have this
-        id, resolves to None rather than falling through to id-overlap -- trusting a wrong
-        guess over an honest "unresolvable" is exactly the bug this method exists to avoid.
+        Per row, the experiment is named by (first that exists):
+          1. the row's own info['experiment'] (written by training since 2026-09-28);
+          2. the run's wandb config data_dir / data_dir_2 (`run_exps`) -- with two, the one
+             whose box matches the row's `box` (a combined run trains on two boxes);
+          3. legacy runs with neither: the experiments carrying the row's `box` (every
+             experiment if the row has no box) that hold this sample id -- only if exactly
+             ONE does, ignoring captures recorded after `run_time` (the run's newest
+             prediction file) -- a run cannot have predicted a capture that didn't exist yet.
+             Box + id is otherwise ambiguous across captures of the same box, and an honest
+             None beats scoring against an unrelated capture's mask.
+        A named experiment that isn't loaded, or doesn't hold the id, gives None.
         """
-        local_sample_id = int(local_sample_id)
-        if box is not None:
-            gi = self._gi_by_box.get(box)
-            if gi is not None and local_sample_id in self.gts[gi].row_of:
-                return gi
-            return None
-        for gi, gt in enumerate(self.gts):
-            if local_sample_id in gt.row_of:
-                return gi
-        return None
+        out: list[int | None] = []
+        for sid, box, exp in zip(sample_ids, boxes, exps):
+            sid = int(sid)
+            names = [exp] if exp is not None else list(run_exps)
+            if len(names) > 1 and box is not None:
+                names = [n for n in names if n in self._gi_by_exp
+                         and box in self._boxes_of[self._gi_by_exp[n]]]
+            if names:
+                cands = [self._gi_by_exp[n] for n in names if n in self._gi_by_exp]
+            else:
+                cands = [gi for gi in range(len(self.gts))
+                         if (box is None or box in self._boxes_of[gi])
+                         and (run_time is None or self._recorded_at[gi] <= run_time)]
+            cands = [gi for gi in cands if sid in self.gts[gi].row_of]
+            out.append(cands[0] if len(cands) == 1 else None)
+        return out
 
     def locate(self, row: int) -> tuple[int, GtIndex, int]:
         """(experiment index, its GtIndex, local row) for a global row.

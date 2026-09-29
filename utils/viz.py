@@ -67,50 +67,68 @@ def plot_spectrogram(freqs:np.ndarray, times:np.ndarray, Sxx:np.ndarray, out_pat
 
     return out_path
 
-def make_spectrogram_video(freqs:np.ndarray, times:np.ndarray, Sxx:np.ndarray, audio:np.ndarray, sample_rate:int, out_path:Path, fps:int=20, figsize:tuple[float,float]=(6, 3), dpi:int=80, label:str='', max_freq:float|None=None, enabled:bool=True):
+def render_spectrogram_frame(freqs:np.ndarray, times:np.ndarray, Sxx:np.ndarray, figsize:tuple[float,float]=(6, 3), dpi:int=200, label:str='', max_freq:float|None=None):
+    """The spectrogram figure make_spectrogram_video plays over, as an (H, W, 3) uint8 RGB
+    image, plus where a playback line belongs on it: `axes` is (left, right, top, bottom)
+    in image pixels and `xlim` the time range those left/right edges map to. Uses a bare
+    Figure rather than pyplot so it is safe to call from a server's worker threads."""
+    from matplotlib.figure import Figure
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
+
+    fig = Figure(figsize=figsize, dpi=dpi)
+    FigureCanvasAgg(fig)
+    ax = fig.add_subplot()
+    im = _draw_spectrogram(ax, freqs, times, Sxx, label, max_freq)
+    fig.colorbar(im, ax=ax, label='Power (dB)')
+    fig.tight_layout()
+    fig.canvas.draw()
+    rgb = np.asarray(fig.canvas.buffer_rgba())[:, :, :3].copy()
+    # display coords are bottom-up, the buffer is top-down
+    x0, y0, x1, y1 = ax.get_window_extent().extents
+    h = rgb.shape[0]
+    return rgb, (x0, x1, h - y1, h - y0), ax.get_xlim()
+
+def make_spectrogram_video(freqs:np.ndarray, times:np.ndarray, Sxx:np.ndarray, audio:np.ndarray, sample_rate:int, out_path:Path, fps:int=20, figsize:tuple[float,float]=(6, 3), dpi:int=200, label:str='', max_freq:float|None=None, enabled:bool=True):
     """Render an mp4 of the spectrogram (dB scale) with a vertical line tracking playback
     position, muxed with `audio` as the soundtrack. Requires the `imageio-ffmpeg` package
-    (bundles a portable ffmpeg binary, no system install needed). Pixel size is figsize*dpi."""
+    (bundles a portable ffmpeg binary, no system install needed). Pixel size is figsize*dpi.
+    The figure is drawn once; each frame is that image with the playback line painted in
+    numpy, so cost barely grows with dpi. Frames are piped straight into libx264."""
     if not enabled: return
     import subprocess, tempfile
-    import cv2
     import imageio_ffmpeg
-    from matplotlib.backends.backend_agg import FigureCanvasAgg
 
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     n_frames = max(1, int(len(audio) / sample_rate * fps))
 
-    fig, ax = plt.subplots(figsize=figsize, dpi=dpi)
-    FigureCanvasAgg(fig)
-    im = _draw_spectrogram(ax, freqs, times, Sxx, label, max_freq)
-    fig.colorbar(im, ax=ax, label='Power (dB)')
-    line = ax.axvline(times[0], color='red', linewidth=2)
-    fig.tight_layout()
+    background, (x0, x1, top, bottom), (t0, t1) = render_spectrogram_frame(freqs, times, Sxx, figsize, dpi, label, max_freq)
+    h, w = background.shape[:2]
+    top, bottom = int(round(top)), int(round(bottom))
+    half = max(1, round(2 * dpi / 72)) / 2  # 2pt line, as axvline(linewidth=2) drew it
+    to_px = lambda t: x0 + (t - t0) / (t1 - t0) * (x1 - x0)
 
     with tempfile.TemporaryDirectory() as tmp:
-        tmp = Path(tmp)
-        video_path, audio_path = tmp / 'video.mp4', tmp / 'audio.wav'
+        audio_path = Path(tmp) / 'audio.wav'
         wav_write(audio_path, sample_rate, audio)
-
-        fig.canvas.draw()
-        w, h = fig.canvas.get_width_height()
-        writer = cv2.VideoWriter(str(video_path), cv2.VideoWriter_fourcc(*'mp4v'), fps, (w, h))
+        cmd = [imageio_ffmpeg.get_ffmpeg_exe(), '-y', '-loglevel', 'error',
+               '-f', 'rawvideo', '-pix_fmt', 'rgb24', '-s', f'{w}x{h}', '-r', str(fps), '-i', '-',
+               '-i', str(audio_path),
+               '-vf', 'pad=ceil(iw/2)*2:ceil(ih/2)*2',  # yuv420p needs even dimensions
+               '-c:v', 'libx264', '-crf', '18', '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-shortest', str(out_path)]
+        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
         try:
+            frame = np.empty_like(background)
             for i in range(n_frames):
-                t = i / fps
-                line.set_xdata([t, t])
-                fig.canvas.draw()
-                frame = np.asarray(fig.canvas.buffer_rgba())[:, :, :3]
-                writer.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+                x = to_px(i / fps)
+                l, r = int(round(x - half)), int(round(x + half))
+                frame[:] = background
+                frame[top:bottom, max(l, int(x0)):min(r, int(np.ceil(x1)))] = (255, 0, 0)
+                proc.stdin.write(frame.tobytes())
         finally:
-            writer.release()
-            plt.close(fig)
-
-        ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
-        subprocess.run([ffmpeg_exe, '-y', '-i', str(video_path), '-i', str(audio_path),
-                         '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-shortest', str(out_path)],
-                        check=True, capture_output=True)
+            proc.stdin.close()
+            err = proc.stderr.read()
+            if proc.wait() != 0: raise RuntimeError(f'ffmpeg failed: {err.decode()}')
 
     return out_path
 

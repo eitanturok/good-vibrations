@@ -6,6 +6,8 @@
   --accent:#256abf; --accent-sf:#e8f0fc;
   /* step-1 part accents: filter / search / viewer, so the three read as distinct zones */
   --k-filter:#256abf; --k-search:#2f8f5f; --k-view:#b06a2c;
+  --seg:#28dc64;
+  --mbg:#ffffff;                         /* per-object mask field: nothing segmented */                         /* segmentation colour -- render.SEG */
   --r:6px;
   --mono: ui-monospace, SFMono-Regular, Menlo, monospace;
   --sans: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
@@ -17,6 +19,7 @@
     --ink:#f0efec; --ink2:#b8b7b1; --ink3:#86867e;
     --accent:#3987e5; --accent-sf:#12233a;
     --k-filter:#3987e5; --k-search:#43b17d; --k-view:#d98635;
+    --mbg:#000000;
   }
 }
 * { box-sizing:border-box; }
@@ -50,149 +53,134 @@ h2 em { font-style:normal; color:var(--accent); font-family:var(--mono);
 .hint { color:var(--ink3); font-style:normal; font-size:11px; }
 
 /* ***** top bar ***** */
-#bar { flex:none; background:var(--s1); border-bottom:1px solid var(--line); padding:6px 14px 8px; }
-.bhead { display:flex; align-items:baseline; gap:14px; }
-.brand { font-weight:600; letter-spacing:.02em; }
-.summary { font-family:var(--mono); color:var(--ink2); cursor:pointer; padding:2px 0; }
-.summary:hover { color:var(--accent); }
-/* ***** step 1: filter -> search on the left, the current sample shown big on the right *****
-   One continuous panel, not three boxes. The three areas -- FILTER (narrow the set),
-   SEARCH (pick one sample), and the SAMPLE VIEWER -- are told apart only by a small
-   colour-coded label and a hairline rule, so the step still reads as one thing.
-   The viewer takes 2/5 of the width and duplicates the pinned column; that is deliberate. */
-.s1grid { display:flex; flex-direction:column; margin-top:10px; }
+.summary { font-family:var(--mono); color:var(--ink2); padding:2px 0; }
+/* ***** step 1: filter | gallery | sample viewer *****
+   Three columns told apart by hairlines only, so the step still reads as one thing.
+   Step 1 is exactly one screen tall (#flow's visible height) and nothing inside may push
+   it taller: the filter column and the gallery scroll in place, and the viewer's only
+   flexible parts are the photo and the mask canvas, which shrink together (in proportion)
+   only when the rest -- header, mask table, spectrograms, 6-line metadata -- leaves them
+   less than their full width's worth of height. On a tall screen nothing shrinks.
+   minmax(0,...) so a wide child can't force its column wider than its share. */
+.step1 { flex:none; height:100%; display:flex; flex-direction:column; }
+.s1grid { flex:1; min-height:0; display:grid;
+          grid-template-columns:220px minmax(0,1fr) minmax(0,540px);
+          grid-template-rows:minmax(0,1fr); align-items:stretch; margin-top:10px; }
+.s1filter { overflow-y:auto; overscroll-behavior:contain; padding-right:4px; }
+.s1gallery { display:flex; flex-direction:column; gap:8px; min-width:0; min-height:0;
+             border-left:1px solid var(--line); margin-left:16px; padding-left:16px; }
+.s1gallery .sgrid { flex:1; min-height:0; }
+.s1viewer { min-width:0; min-height:0; display:flex; flex-direction:column;
+            overflow-y:auto; overscroll-behavior:contain;
+            border-left:1px solid var(--line); margin-left:16px; padding-left:16px; }
 
-/* areas share the card's surface -- no border, no inset background */
-.s1part { position:relative; min-width:0; padding:4px 0 16px; }
-/* SEARCH (left) and the VIEWER (right) start on the same row, below the full-width filter.
-   minmax(0,...), not bare 3fr/2fr: a plain fr track won't shrink below its content's
-   min-content size, so a wide child (the 5-col sample gallery) was forcing this whole
-   track wider than 3fr and bleeding into the viewer column next to it.
-   align-items:start (not stretch): stretch made the ROW's height the max of both columns'
-   natural content, and if the gallery's own minimum ever exceeded the viewer's natural
-   height, the row -- and the gallery filling it -- ballooned past the viewer instead of
-   matching it. The viewer must stay at its own independent natural height; search's height
-   is set to match it directly in JS instead (see wireViewerHeightSync in app.js), which has
-   no such feedback risk. */
-/* 1fr : a fixed cap (was fr:fr ratios, first 3:2 then 2:1) -- an fr share is a PROPORTION
-   of the row, not what the column's content actually needs, so the viewer column was
-   claiming a fixed fraction of the row regardless of whether its photos/videos (which
-   never need more than ~460px) actually used it, leaving real, visible empty space between
-   the gallery and the viewer. Capping the viewer's track at a fixed width and giving the
-   search column a bare 1fr means the gallery gets literally everything else, always. */
-.s1cols { display:grid; grid-template-columns:1fr minmax(0,540px); gap:0; align-items:start;
-          border-top:1px solid var(--line); padding-top:15px; }
-.s1viewer { display:flex; flex-direction:column;
-            border-left:1px solid var(--line); margin-left:22px; padding-left:22px; }
-.s1phead { font:600 9px/1 var(--sans); letter-spacing:.16em; text-transform:uppercase;
-           color:var(--ink3); margin-bottom:12px; display:flex; gap:9px; align-items:baseline; }
-/* a short colour tab before each label -- the only zone cue that remains */
-.s1phead::before { content:''; width:14px; height:2px; border-radius:1px;
-                   background:var(--firm); align-self:center; }
-.s1filter .s1phead::before { background:var(--k-filter); }
-/* Hard backstop: this grid-column's content (the sample gallery) has twice now overflowed
-   its box and painted over .s1viewer next to it, via min-content propagating up through
-   nested flex/grid layers. min-width:0 lets it shrink to fit; overflow-x:clip guarantees
-   containment even if some future child reintroduces the same min-content problem --
-   NOT overflow-x:hidden: setting only one overflow axis to hidden forces the other to an
-   implicit auto (CSS overflow spec), which would silently turn this into its own scroll
-   container and break .pk.boxcol's position:sticky below (it would stick relative to HERE
-   instead of #flow, the page's real scroller). clip has no such side effect.
-   display:flex column: lets .s1srow (flex:1, below) grow to fill the height .s1cols'
-   align-items:stretch now gives this column, so the gallery inside it can grow too. */
-.s1search { display:flex; flex-direction:column; min-width:0; overflow-x:clip; }
-.s1search .s1phead::before { background:var(--k-search); }
-.s1viewer .s1phead::before { background:var(--k-view); }
-.s1psub { font-weight:400; letter-spacing:.03em; text-transform:none; color:var(--ink3);
-          font-size:9.5px; }
+/* the filtered / total count and "clear all N filters", in the step's own header */
+.step1 h2 { display:flex; align-items:center; gap:10px; }
+.s1count { font:11px/1 var(--mono); letter-spacing:.06em; text-transform:uppercase;
+           color:var(--ink3); font-weight:400; }
+.s1count b { font:600 22px/1 var(--mono); color:var(--ink); }
+.s1count #nmatchsub { font-size:14px; }
+.fclear { font:600 12px var(--sans); cursor:pointer; padding:5px 12px;
+          border:1px solid var(--accent); border-radius:var(--r);
+          background:var(--accent-sf); color:var(--accent); }
+.fclear:hover { background:var(--accent); color:#fff; }
 
-.s1frow { display:flex; flex-wrap:wrap; gap:14px 18px; align-items:flex-start; }
-.s1frow.hid { display:none; }               /* click the header summary to collapse */
-.s1frow .pk { width:auto; }
-.s1frow .pk.pb { width:206px; }
-.s1frow .pk.pb.ds { width:288px; }          /* dataset: room for long box names */
-.s1frow .pk.pb.bx { width:206px; }          /* box: same as object/n_objects */
-.s1frow .pk.pb.ly { width:258px; }          /* layout: show the full layout name */
-.s1frow .pk.pb.nb { width:132px; }          /* n_objects: a short digit column */
-/* the layout column is sized to fit its names, so let them show in full */
-#layoutbox .pbl { white-space:nowrap; overflow:visible; text-overflow:clip; }
-#layoutbox .pbrow i { min-width:2.5ch; padding-left:6px; }
-.s1frow .pk > span { align-self:stretch; }
-/* all / none: a tight pair, hard right of the picker label */
-.s1frow .pk > span .an { margin-left:auto; display:inline-flex; gap:6px; }
-.s1frow .pk > span .an .link { margin-left:0; font-size:10px; }
-.s1frow .pblist { max-height:150px; }
-.s1frow #datasetbox .pblist { max-height:176px; }
-/* dataset and speaker have no chip lane -- reserve its height so every filter's search
-   box / ring still lines up across the row */
-.s1frow #datasetbox::before { content:''; display:block; height:26px; flex:none; }
-.s1frow .pk.sp { width:174px; }
-/* selected-speaker chips: same lane geometry as the other filters' .pbsel strip, so the
-   ring below it lines up with their lists and the all/none row sits at one height */
-.spkchips { display:flex; flex-wrap:nowrap; gap:4px; height:22px; margin-bottom:4px;
-            overflow-x:auto; scrollbar-width:none; }
-.spkchips::-webkit-scrollbar { display:none; }
-.spkchips:empty::before { content:'—'; font:9px var(--mono); color:var(--ink3); opacity:.45; }
-.s1frow #spk { width:174px; height:108px; }   /* bigger, keeping the ring's aspect */
-/* the filtered / total count sits at the right end of the FILTER label row: x/y samples */
-.s1phead .s1count { margin-left:auto; font:9px/1 var(--mono); letter-spacing:.06em;
-                    text-transform:uppercase; color:var(--ink3); }
-.s1phead .s1count b { font:600 15px/1 var(--mono); color:var(--ink); }
-.s1phead .s1count #nmatchsub { color:var(--ink3); font-weight:400; }
+/* FILTER: one filter under the next -- chips, label + all/none, list (scrolls in place) */
+.s1filter { display:flex; flex-direction:column; gap:14px; min-width:0; }
+.s1filter .pk { align-items:stretch; min-width:0; }
+.s1filter .pk > span .an { margin-left:auto; display:inline-flex; gap:6px; }
+.s1filter .pk > span .an .link { margin-left:0; font-size:10px; }
+.s1filter .pblist { max-height:150px; }
+.s1filter .pbrow { padding:3px 4px; gap:5px; }
+.s1filter .pbrow i { min-width:2.5ch; padding-left:4px; }
+.s1filter .pbsel:empty { display:none; }
+.s1filter #spk { width:100%; height:auto; aspect-ratio:126 / 78; }   /* the ring's viewBox */
 
-/* flex:1 (grow into whatever height .s1search's stretch gave it) + min-height:0 (so that
-   height can actually be smaller than this row's own natural content -- required for a
-   flex item to shrink/be constrained rather than always sizing to its content). */
-.s1srow { display:flex; flex-wrap:wrap; gap:16px 22px; align-items:flex-start; min-width:0;
-          flex:1; min-height:0; }
-
-/* Per-value chips live in each filter's own lane now; this bar is just the running
-   summary + a single "clear all". One fixed line, so it never reflows step 2. */
-#filterchips { display:flex; align-items:center; gap:10px; min-height:22px; }
-.fnone { font:10px var(--mono); color:var(--ink3); }
-/* distinct dataset/object/n_obj/layout counts among the current matches -- hard right,
-   opposite the "clear filters" chip */
-.ffacets { margin-left:auto; font:9px var(--mono); letter-spacing:.04em; color:var(--ink3); }
-.fchip.clr { border:1px solid var(--line); background:var(--s1); color:var(--accent);
-             font:10px var(--mono); padding:2px 8px; border-radius:4px; cursor:pointer; }
-.fchip.clr:hover { border-color:var(--accent); }
-/* "clear filters" sits in the gutter right of the pickers, just under the count */
-.s1filter #fclear { position:absolute; top:34px; right:0; margin:0; z-index:1; }
+/* GALLERY: sample-id search + the view toggles, then the grid */
+.galrow { display:flex; gap:12px; align-items:center; white-space:nowrap; }
+#galposjump { flex:0 1 185px; min-width:0; }
+.galsort { display:inline-flex; align-items:center; gap:5px; margin-right:auto;
+           font:600 9px var(--sans); letter-spacing:.1em; text-transform:uppercase; color:var(--ink3); }
+.galsort select { font:11px var(--mono); padding:3px 4px; border:1px solid var(--firm);
+                  border-radius:var(--r); background:var(--s1); color:var(--ink); }
+.galsort button { width:24px; padding:2px 0; border:1px solid var(--firm); border-radius:var(--r);
+                  background:var(--s1); color:var(--ink); font-size:12px; cursor:pointer; }
+.galsort button:hover { border-color:var(--accent); color:var(--accent); }
 
 /* ***** step 1: the sample viewer *****
-   The overhead + segmentation images are the point of this panel -- stacked and large so
-   they fill the height of the filter+search column beside them. The spectrogram clips are
-   a small squarish reference at the foot. */
-/* Always this natural height -- never influenced by search. app.js's wireViewerHeightSync
-   measures it and sets .s1search's height to match (see .pk.gallerycol/#samplegrid for how
-   that height gets distributed down to the gallery). */
-.svbody { display:flex; flex-direction:column; gap:12px; }
-/* the viewer's whole info block: pos/spk/id loud, then laser/layout/objects/xy, then dataset */
-.svtop { display:flex; flex-direction:column; gap:5px; padding-bottom:10px;
+   The overhead + segmentation images are the point of this panel -- stacked and large. The
+   spectrogram clips are a small reference at the foot. Everything but the photo and the
+   mask row is flex:none; those two are flex:0 1 auto with their natural (aspect-ratio)
+   height as the basis, so when space runs short they give it up in proportion. */
+.svbody { flex:1; min-height:0; display:flex; flex-direction:column; gap:12px; }
+.svbody > * { flex:none; }
+.svbody > .svphoto { flex:0 1 auto; min-height:0; }
+/* the viewer's info block: pos-spk layout box as the title, then laser/channel/frequency
+   and the dataset as its subtitle */
+.svtop { display:flex; flex-direction:column; gap:4px; padding-bottom:10px;
          border-bottom:1px solid var(--line); font-family:var(--mono); }
-.svtop .svk { font-size:16px; color:var(--ink3); letter-spacing:.01em; }
-.svtop .svk b { color:var(--ink); font-weight:700; }
+.svtop .svk { font-size:19px; font-weight:700; color:var(--ink); letter-spacing:.01em; }
 .svtop .svk2 { font-size:11px; color:var(--ink2); }
-.svtop .svds { font-size:10px; color:var(--ink3); }
+.svtop .svk2 i { font-style:normal; margin-left:1.4em; color:var(--ink3); }
 .svtop s { text-decoration:none; color:var(--firm); margin:0 7px; }
 .svtop .svk2 s { margin:0 5px; }
 
-/* overhead + segmentation sit SIDE BY SIDE so neither one eats the panel's height */
-.svimgs { display:grid; grid-template-columns:1fr 1fr; gap:10px; align-items:start; }
-.svimgs figure { margin:0; display:flex; flex-direction:column; gap:5px; }
-.svimgwrap { position:relative; }
-.svimgwrap img { width:100%; height:auto; display:block;
-                 border:1px solid var(--line); border-radius:5px; background:var(--s2); }
-.comov { position:absolute; inset:0; width:100%; height:100%; overflow:visible;
-         pointer-events:none; }
-.comov line { stroke:var(--k-view); stroke-width:2; vector-effect:non-scaling-stroke;
-              stroke-linecap:round; }
-.comov text { fill:var(--k-view); text-anchor:start; paint-order:stroke;
-              stroke:#fff; stroke-width:3px; font-family:var(--mono); font-weight:700; }
-.svimgs figure.missing { display:none; }
-.svimgs figcaption { text-align:center; font:9.5px var(--mono);
-                     letter-spacing:.08em; text-transform:uppercase; color:var(--ink3); }
-.comnote { font-style:normal; text-transform:none; letter-spacing:.02em; color:var(--k-view); }
+/* collapsible raw metadata: keys bold, values as JSON */
+.svbody > details > summary { font:600 9px var(--sans); letter-spacing:.12em;
+                              text-transform:uppercase; color:var(--ink3); cursor:pointer; }
+.svbody > details > :not(summary) { margin-top:6px; }
+#svmeta pre { margin:6px 0 0; padding:8px; height:calc(14 * 1.45em + 16px); overflow:auto; resize:vertical;
+              background:var(--s2); border-radius:var(--r); font:10.5px/1.45 var(--mono);
+              color:var(--ink2); white-space:pre-wrap; overflow-wrap:anywhere; }
+#svmeta pre b { color:var(--accent); font-weight:600; }
+
+/* one photo, the viewer's full width, with its own background / mask toggles */
+.svphoto { margin:0; display:flex; flex-direction:column; gap:5px; }
+/* The photo is the viewer's one flexible part: natural height is its aspect ratio at full
+   width, and it shrinks (container-query units keep the figure inside its box) only when
+   step 1's fixed height runs short -- folding masks/audio/metadata gives it the room back. */
+#svphotobox { min-height:120px; aspect-ratio:var(--arp); container-type:size;
+              display:flex; justify-content:center; }
+#svphotobox .pfig { width:min(100cqw, 100cqh * var(--arp)); flex:none; }
+
+/* the viewer's objects table */
+#smtable { border-collapse:collapse; font:10.5px var(--mono); color:var(--ink2); }
+#smtable tr:last-child td { border-top:1px solid var(--line); }
+#smtable th { text-align:left; font:600 8.5px var(--sans); text-transform:uppercase;
+              color:var(--ink3); padding:0 8px 4px 0; border-bottom:1px solid var(--line); }
+#smtable td { padding:3px 8px 3px 0; white-space:nowrap; cursor:pointer; }
+#smtable tr:hover td { background:var(--s2); }
+#smtable tr.on td { background:var(--accent-sf); color:var(--ink); }
+#smtable b { display:inline-block; width:9px; height:9px; border-radius:2px; margin-right:5px; }
+
+/* ***** the sample photo (app.js photoFig) -- gallery cards, sample viewer, sidebar *****
+   .pfig is the whole frame: its aspect-ratio and .pfimg's inset are set inline so the photo
+   sits inside a perimeter band; the speaker ring (.spkring) covers the frame and puts its
+   dots in that band. A missing image keeps the frame and says so. */
+.pfig { position:relative; width:100%; border-radius:5px; background:var(--s2); }
+.pfimg { position:absolute; }
+.pfimg img { width:100%; height:100%; display:block; object-fit:fill; border-radius:3px;
+             background:var(--mbg); }           /* shows only behind the mask view's PNG */
+.pfig.missing .pfimg img, .pfig.missing .comov { visibility:hidden; }
+.pfig.missing .pfimg::after { content:attr(data-missing); position:absolute; inset:0;
+  display:grid; place-items:center; border:1px dashed var(--ink3); border-radius:3px;
+  font:700 12px var(--mono); letter-spacing:.1em; text-transform:uppercase; color:var(--ink2); }
+.spkring, .comov { position:absolute; inset:0; width:100%; height:100%; overflow:visible;
+                   pointer-events:none; }
+.spkdot circle { fill:var(--s1); stroke:var(--firm); stroke-width:1.4; }
+/* font-size comes from each dot's own SVG attribute (CSS would override it) */
+.spkdot text { font-family:var(--mono); font-weight:700; fill:var(--ink2);
+               text-anchor:middle; dominant-baseline:central; }
+.spkdot.on circle { fill:var(--accent); stroke:var(--accent); }
+.spkdot.on text { fill:#fff; }
+/* a slot this box doesn't use: kept so the full layout reads, just dimmed */
+.spkdot.unused circle { fill:var(--s2); stroke:var(--line); opacity:.55; }
+.spkdot.unused text { fill:var(--ink3); opacity:.75; }
+
+/* centre-of-mass X's: the segmentation colour (render.SEG), with a dark halo so they read
+   over their own same-coloured fill */
+.comov path { fill:none; stroke:var(--seg); stroke-width:2.5; vector-effect:non-scaling-stroke;
+              stroke-linecap:round; filter:drop-shadow(0 0 1.5px #000); }
 
 /* two compact media blocks pinned to the foot; the slack sits above them so the viewer
    fills the height of filter+search without any element being blown up to do it */
@@ -204,7 +192,13 @@ h2 em { font-style:normal; color:var(--accent); font-family:var(--mono);
 .svmh em { display:block; font-style:normal; opacity:.7; }
 /* Always-visible play/seek, but BELOW the video rather than the native overlay -- so the
    controls never sit on top of (and hide part of) the spectrogram itself. */
-.vidwrap { display:flex; flex-direction:column; gap:4px; }
+/* position:relative so anything a browser extension anchors to the video (e.g. a
+   playback-speed overlay, absolutely positioned beside it) scrolls with it -- without a
+   positioned ancestor inside the scrolling #flow, it is pinned to the window instead. */
+.vidwrap { display:flex; flex-direction:column; gap:4px; position:relative; }
+/* the previous video's last frame, held over the video while the next one loads (setVideo) */
+.vidhold { position:absolute; object-fit:contain; background:#000; border-radius:3px;
+           pointer-events:none; }
 .vidctl { display:flex; align-items:center; gap:6px; }
 .vidplay { flex:none; width:20px; height:20px; padding:0; display:flex; align-items:center;
            justify-content:center; border:1px solid var(--firm); border-radius:4px;
@@ -222,18 +216,30 @@ h2 em { font-style:normal; color:var(--accent); font-family:var(--mono);
    for these 2:1 videos instead of square mode canvases -- 220px so 3 of .fgrid-rest's
    pinned-probe tiles fit in a row beside .fgrid-cur (the current sample's own tile). */
 #recgrid .fgrid-rest { grid-template-columns:repeat(auto-fill, 220px); }
-#recgrid video { width:100%; max-width:220px; aspect-ratio:2/1; object-fit:contain;
-                  display:block; border-radius:3px; background:#000; }
+#recgrid .spbox { max-width:220px; }
+/* Recovered spectrogram player (setSpec): a still PNG of the recovered audio's
+   spectrogram, with the playback line drawn over it by the browser in place of an mp4's
+   baked-in one. Same 2:1 box as the videos (the PNG is 6x3 in, like the mp4). */
+.spbox { position:relative; width:100%; max-width:280px; aspect-ratio:2/1; border-radius:3px;
+         background:#fff; overflow:hidden; cursor:pointer; }
+.spbox img { width:100%; height:100%; display:block; }
+.spbox img:not([src]) { visibility:hidden; }
+.phead { position:absolute; width:2px; margin-left:-1px; background:red; pointer-events:none; }
+.specplay.loading .spbox { opacity:.55; transition:opacity .15s .1s; }
 /* The ground-truth video is the one big reference (step 4's answer to the overlaid mode
-   plot), so it gets real size instead of the 280px side-by-side cap. */
-#svm-gt { width:680px; }
+   plot), so it gets real size -- up to 680px, shrinking with the window. */
 #svm-gt video { max-width:none; }
 
-/* the whole step-1 grid stacks once the content column gets tight */
-@media (max-width:1180px) {
-  .s1cols { grid-template-columns:1fr; }
-  .s1viewer { border-left:0; border-top:1px solid var(--line);
-              margin-left:0; padding-left:0; margin-top:14px; padding-top:15px; }
+/* narrow window: the viewer drops under filter + gallery */
+@media (max-width:1400px) {
+  .s1grid { grid-template-columns:220px minmax(0,1fr); }
+  /* the viewer wraps under filter + gallery, so step 1 can't be one screen tall any more:
+     natural height, the gallery a fixed share of the window */
+  .step1 { height:auto; }
+  .s1grid { grid-template-rows:auto; }
+  .s1gallery .sgrid { flex:none; height:60vh; }
+  .s1viewer { grid-column:1 / -1; border-left:0; margin-left:0; padding-left:0; overflow:visible;
+              border-top:1px solid var(--line); margin-top:14px; padding-top:14px; }
 }
 
 .pk { display:flex; flex-direction:column; gap:4px; align-items:flex-start;
@@ -243,16 +249,13 @@ h2 em { font-style:normal; color:var(--accent); font-family:var(--mono);
 .pk > span { font-size:9px; letter-spacing:.06em; text-transform:uppercase; color:var(--ink3);
              display:flex; gap:6px; align-items:center; }
 /* How many distinct values this facet has in total -- unfiltered, so it always reads as
-   "how big is this picker", not "how many currently pass" (that's .ffacets, down by the
-   filter chips). Normal case + mono, so it doesn't read as part of the uppercase label. */
+   "how big is this picker", not "how many currently pass" (that's the header count). Normal case + mono, so it doesn't read as part of the uppercase label. */
 .pk-n { font:9px var(--mono); font-style:normal; text-transform:none; letter-spacing:0;
         color:var(--ink3); opacity:.75; }
 /* Every step-1 picker: a search box over a scrollable list. Same control for the dataset,
    the sample id, and the multi-select layout / object-count filters -- so a long list
    scrolls in place instead of growing the panel. Typed text matches anywhere and is
    highlighted. */
-.pk.pb { width:150px; }
-.pk.pb.ds { width:230px; }                    /* dataset: room for the long box names */
 .pk > span { align-self:stretch; }           /* full-width header so all / none sit hard right */
 .pickbox { display:flex; flex-direction:column; gap:3px; width:100%; }
 .pbq { width:100%; font:12px var(--mono); padding:4px 7px; border:1px solid var(--firm);
@@ -279,52 +282,32 @@ h2 em { font-style:normal; color:var(--accent); font-family:var(--mono);
 .pbrow mark { background:none; color:var(--accent); }
 .pbrow.on mark { color:inherit; }
 .pbmore { font:9px var(--mono); color:var(--ink3); padding:4px 6px; }
-/* Multi-select: each filter's own active values, as removable chips in a lane ABOVE its
-   search box. Fixed height, one line, horizontal scroll -- so no matter how many chips a
-   filter holds, nothing below it moves. Each chip carries the same colour dot as the
-   value's list row, tying it to where it came from. */
-.pbsel { display:flex; flex-wrap:nowrap; gap:4px; height:22px; margin-bottom:4px;
-         align-items:center; overflow-x:auto; overflow-y:hidden; overscroll-behavior:contain;
-         scrollbar-width:none; }
-.pbsel::-webkit-scrollbar { display:none; }
-.pbsel:empty::before { content:'—'; font:9px var(--mono); color:var(--ink3); opacity:.45; }
-.pbchip { flex:none; display:inline-flex; align-items:center; gap:4px; cursor:pointer;
+/* Multi-select: each filter's active values, as removable chips in a lane above its label.
+   Wraps onto as many rows as it needs, bottom-aligned so the chips sit on the label. Each
+   chip carries the same colour dot as the value's list row. */
+.pbsel { display:flex; flex-wrap:wrap; gap:4px; align-content:flex-end; align-self:end; }
+.pbchip { flex:none; display:inline-flex; align-items:center; gap:4px;
           border:1px solid var(--line); background:var(--s1); color:var(--ink2);
           font:9px var(--mono); line-height:1.5; padding:1px 4px 1px 6px; border-radius:3px; }
 .pbchip .pbdot { width:7px; height:7px; }
-.pbchip b { font:11px/1 var(--sans); font-weight:400; opacity:.5; }
-.pbchip:hover { border-color:var(--firm); color:var(--ink); }
-.pbchip:hover b { opacity:1; }
+/* a filter chip is a plain label; only its × is a control (#spkat's chips are buttons) */
+.pbx { border:0; background:none; padding:0 1px; color:inherit; cursor:pointer;
+       font:11px/1 var(--sans); opacity:.5; }
+.pbx:hover { opacity:1; color:var(--ink); }
+button.pbchip:hover { border-color:var(--firm); color:var(--ink); }
 /* Row icons: a thumbnail of the box / scene for dataset and sample, a colour dot for
    layout and object count. The dataset and sample rows are taller so the photo is big
    enough to read at a glance. */
 .pbimg { width:58px; height:44px; object-fit:cover; border-radius:3px; flex:none;
          background:var(--s2); }
-#datasetbox .pbrow { padding:5px 7px; gap:9px; }
-/* Dataset rows: a small thumbnail so the (often long) name has room to sit on one line. */
-#datasetbox .pbimg { width:44px; height:34px; }
+/* Dataset rows: a small thumbnail, so the name keeps most of the narrow filter column */
+#datasetbox .pbrow { padding:4px; gap:6px; }
+#datasetbox .pbimg { width:32px; height:24px; }
 #datasetbox .pbrow i { min-width:2.5ch; padding-left:6px; }
 #datasetbox .pblist { max-height:200px; }
-/* The sample list: a scrollable photo grid, 5 per row -- caption above thumbnail so the
-   pos/spk/id reads before the picture. */
-/* minmax(0,1fr), not bare 1fr: a plain fr track won't shrink below its content's
-   min-content size, and nowrap caption text's min-content IS its full untruncated width
-   regardless of text-overflow:ellipsis (that's paint-time only, it doesn't affect layout's
-   min-content calculation) -- so without the 0 floor here, this grid (and everything
-   containing it, all the way up to the search column) got forced wider than its box and
-   visually overflowed into the sample viewer next to it. */
-/* Height, not flex:1: flex:1 only bounds a child if the flex container ITSELF has a
-   bounded cross size to hand out, and .pk.gallerycol's "align-self:stretch to match the
-   sample viewer" has nothing to stretch to -- .s1cols (the grid that holds the search
-   column and the viewer column) uses align-items:start, not stretch, so neither column
-   matches the other's height. flex:1 in an unbounded flex column just grows to fit ALL of
-   its content, which is exactly "the gallery has no cap and bleeds down the page."
-   min-height is a floor for before wireViewerHeightSync's ResizeObserver (app.js) has run
-   or found anything to measure yet; once it has, the inline height it sets is what actually
-   governs -- self-contained, and it doesn't depend on any OTHER element's own layout
-   working out, unlike the flex chain it replaced. */
-.sgrid { display:grid; grid-template-columns:repeat(5, minmax(0, 1fr)); gap:10px;
-         min-height:220px; overflow-y:auto;
+/* The sample gallery: a scrollable photo grid, caption above thumbnail. It fills step 1's
+   height (.s1gallery .sgrid); min-height is only a floor. */
+.sgrid { min-height:220px; overflow-y:auto;
          border:1px solid var(--line); border-radius:var(--r); background:var(--s1); padding:6px; }
 /* No overscroll-behavior:contain here (unlike the other scrollable pickers): `contain`
    blocks wheel scroll from chaining to the page the moment this element is "at its
@@ -336,97 +319,46 @@ h2 em { font-style:normal; color:var(--accent); font-family:var(--mono);
    it has room to, and chain to the page exactly when there's nothing left to scroll here
    (whether that's because you hit its edge or because it was never scrollable to begin
    with). */
+/* the rendered window of cards (buildSampleGrid virtualizes the gallery) */
+/* column count is set inline by buildSampleGrid (it fits ~130px cards to the width) */
+.sgin { display:grid; gap:10px; }
 .scard { display:flex; flex-direction:column; gap:3px; border:1px solid transparent;
          background:none; border-radius:4px; padding:3px; cursor:pointer; text-align:center; }
 .scard:hover { background:var(--s2); }
-.scard.on { border-color:var(--accent); background:var(--accent-sf); }
+/* pinned to the workbench: a ring in that probe's colour (box-shadow, so no reflow) */
+.scard.pin { box-shadow:0 0 0 3px var(--pc); }
+.scard.pin .sclab::before { content:'● '; color:var(--pc); }
+/* current sample: ink (black), the colour it has everywhere else (the live curve, mode
+   plot, sidebar row) -- a solid card + thick ring, so it pops out of a wall of near-
+   identical thumbnails at a glance. outline (not border) so the grid doesn't reflow. */
+.scard.on, .scard.on:hover { background:var(--ink); border-color:var(--ink);
+  outline:3px solid var(--ink); outline-offset:2px; }
 .sclab { font:9px var(--mono); color:var(--ink2); overflow:hidden; text-overflow:ellipsis;
          white-space:nowrap; }
-.scard.on .sclab { color:var(--ink); font-weight:600; }
-.scimg { width:100%; aspect-ratio:4/3; object-fit:cover; border-radius:3px; background:var(--s2); }
-.scimgwrap { position:relative; }
-/* The compact speaker ring (spkRingDots): dots only, no box like #scenering has -- no
-   numbers there either, once upon a time, but at gallery-thumbnail size that read as
-   meaningless confetti; both size and stroke are bumped up (per-call in app.js, and here)
-   until the numbers are actually legible, not just present. */
-.spkring { position:absolute; inset:0; width:100%; height:100%; pointer-events:none; }
-.spkring .spkdot circle { fill:var(--s1); stroke:var(--firm); stroke-width:1.4; opacity:.95; }
-/* No font-size here -- each dot sets its own via the SVG font-size attribute (CSS would
-   win over that and flatten every dot to one size, big and small rings alike). */
-.spkring .spkdot text { font-family:var(--mono); font-weight:700; fill:var(--ink2);
-                         text-anchor:middle; dominant-baseline:central; pointer-events:none; }
-.spkring .spkdot.on circle { fill:var(--accent); stroke:var(--accent); opacity:1; }
-.spkring .spkdot.on text { fill:#fff; }
-/* A slot this box doesn't actually use -- kept in the ring (not filtered out) so the full
-   physical layout still reads, just dimmed enough to stay out of the way of the ones that
-   matter. Still its own full size and stroke, so the number itself stays readable. */
-.spkring .spkdot.unused circle { fill:var(--s2); stroke:var(--line); opacity:.55; }
-.spkring .spkdot.unused text { fill:var(--ink3); opacity:.75; }
+.scard.on .sclab { color:var(--s0); font-weight:700; }
 .pbdot { width:8px; height:8px; border-radius:50%; flex:none;
          background:hsl(var(--h) 58% 52%); }
-/* Dataset names are long -- let the row wrap to two lines instead of a very wide column. */
-#datasetbox .pbl { white-space:normal; overflow:visible; line-height:1.2;
-                   overflow-wrap:anywhere; }
-/* Box/title + scatter on the LEFT (fixed width, the scatter's own natural size); the
-   search pair + 5-col photo gallery (buildSampleGrid) fill the rest of the row to its
-   RIGHT, growing with whatever space is left. */
-/* Locked in place while the gallery beside it scrolls: position:sticky relative to #flow
-   (the page's own scroll container -- nothing between here and there sets overflow or a
-   transform, so it can see past every intermediate ancestor). This also settles the
-   "hovering the box picker scrolls the gallery instead of the page" mixup for free: a
-   sticky element has no scroll container of its own, so a wheel event over it has nowhere
-   to go but up to #flow, same as hovering any other static bit of the page. background is
-   set so the gallery's grid doesn't show through the gaps between this column's own pieces
-   (the title, the scatter, the repeats list) as it scrolls past underneath. */
-.pk.boxcol { flex:0 0 340px; position:sticky; top:0; align-self:flex-start; z-index:1;
-             background:var(--s0); padding-bottom:8px; }
-/* align-self:stretch: take the full height .s1srow's own stretch (from .s1cols) gives
-   this row, instead of .s1srow's default flex-start sizing everything to its own content
-   -- .boxcol/.spkat don't need the extra height so they're left at flex-start.
-   align-items:stretch (overriding the base .pk rule's align-items:flex-start): WIDTH, not
-   height. .searchrow and #samplegrid neither one sets its own width, so under flex-start
-   they were sizing to their OWN content instead of stretching to fill whatever width this
-   column actually has -- the real cause of the dead space to the gallery's right. Every
-   sibling .pk (e.g. .boxcol) never showed this because its children set width:100%
-   themselves, which is a definite size and ignores align-items either way. */
-.pk.gallerycol { display:flex; flex-direction:column; gap:8px; flex:1 1 600px; min-width:0;
-                 align-self:stretch; align-items:stretch; }
-/* "{box} box, spk {spk}" as two native <select>s standing in for plain text -- styled to
-   read as a label, not an obvious form control, but still a real dropdown. Long dataset
-   names get clipped rather than blowing out the row (see .s1frow .pk.pb.ds for the same
-   problem solved with real width instead, which this row doesn't have to spare). */
+/* SEARCH, in the sidebar under the current sample */
+#navsearch { flex:none; display:flex; flex-direction:column; gap:6px;
+             padding:10px 0; border-bottom:1px solid var(--line); }
+/* "{box} box, spk {spk}": two native <select>s styled to read as a title, not a form */
 .boxspktitle { display:flex; align-items:baseline; gap:5px; font:13px var(--mono);
-               color:var(--ink3); margin-bottom:8px; }
-.boxspktitle #poscount { margin-left:auto; font-size:11px; color:var(--ink3); }
-/* The dropdowns are the actual content of this "title" -- bigger and bold, like the
-   pos/spk/id headline in the sample viewer (.svk b) -- while "box," and "spk" stay small,
-   plain connective text around them. */
+               color:var(--ink3); min-width:0; white-space:nowrap; }
 .boxspksel { font:700 16px var(--mono); color:var(--ink); background:none; border:0;
-             border-bottom:1px dashed var(--firm); padding:0 1px; cursor:pointer; max-width:160px; }
-#boxsel.boxspksel { max-width:180px; }
-/* Position jump beside the gallery's own "search by sample id" input, EACH exactly half
-   of .gallerycol's own width (the gap between them doesn't count against that split).
-   #samplegrid (the 5-col grid, buildSampleGrid) is a separate sibling below -- NOT nested
-   inside #samplebox, which would cap it to #samplebox's own half-width instead of the
-   full row under both search bars. */
-/* The gallery's view toggles (.galctl) sit on the same line, right-aligned -- .searchpair
-   grows to fill what's left, .galctl stays its natural width at the far end. */
-.searchrow { display:flex; gap:14px; align-items:center; }
-.searchpair { display:flex; gap:8px; align-items:flex-start; flex:1; min-width:0; }
-#posjump { flex:1 1 0; width:auto; min-width:0; -moz-appearance:textfield; }
+             border-bottom:1px dashed var(--firm); padding:0 1px; cursor:pointer;
+             min-width:0; max-width:140px; }
+#posjump, #galposjump { -moz-appearance:textfield; }
 #posjump[hidden] { display:none; }
-.searchpair .pickbox { flex:1; min-width:0; }
-.galctl { display:flex; gap:12px; flex:none; white-space:nowrap; }
-/* Speaker-at-this-position: only appears with 2+ speakers selected in the filter above
-   (see renderSpkAt) -- a direct pick, not a step, among whichever of them have a sample
-   here. Lives in SEARCH, since it picks a specific sample, not a filter value. */
-.pk.spkat { width:300px; }
 #spkat { display:flex; flex-wrap:wrap; gap:5px; }
+#spkat .pbchip { cursor:pointer; }
 #spkat .pbchip.on { background:var(--accent-sf); border-color:var(--accent); color:var(--ink);
                     font-weight:600; }
 /* The scatter is the primary spatial picker now, so it is bigger than the old top-bar
    strip -- clicking a dot and arrow-stepping both want the room. */
-#scatter { width:100%; height:140px; background:var(--s2);
+/* --ar is the position cloud's own shape (app.js buildScatter): full width when wide,
+   capped at ~254px tall (SH_MAX at the full-width scale) and centred when tall. */
+#scatter { display:block; margin:0 auto; width:min(100%, 254px * var(--ar, 1.87));
+           aspect-ratio:var(--ar, 1.87); background:var(--s2);
            border:1px solid var(--firm); border-radius:4px; }
 #spk { width:132px; height:84px; border:1px solid var(--line); border-radius:6px;
        background:var(--s1); padding:2px; overflow:visible; }
@@ -434,14 +366,22 @@ h2 em { font-style:normal; color:var(--accent); font-family:var(--mono);
         align-self:center; }
 /* Empty-box drift repeats: always shown, in their own labelled strip under the scatter --
    they have no spatial COM so they can't be scatter points. */
-.repeatslab { width:100%; margin-top:10px; font-size:9px; letter-spacing:.06em;
+.repeatslab { display:flex; align-items:baseline; width:100%; margin-top:4px; font-size:9px; letter-spacing:.06em;
               text-transform:uppercase; color:var(--ink3); }
-#repeats { display:flex; flex-wrap:wrap; gap:4px; width:100%; align-content:start;
-           margin-top:5px; }
+#repeats { display:flex; flex-direction:column; gap:5px; width:100%; }
+/* the timeline strip: one mark per run of empty boxes, the current sample as a thin line */
+.repbar { width:100%; height:18px; display:block; cursor:pointer; background:var(--s2);
+          border:1px solid var(--line); border-radius:3px; }
+.reprun { fill:var(--ink3); }
+.reprun.on { fill:var(--ink); }
+.repnow { fill:var(--accent); }
+.repchips { display:flex; flex-wrap:wrap; gap:4px; align-items:center; }
+/* "N groups · M empty", right-aligned on the "empty box" label line */
+.repnote { margin-left:auto; font:9px var(--mono); color:var(--ink3); text-transform:none; letter-spacing:0; }
 .rep { font:10px var(--mono); padding:3px 8px; border:1px solid var(--line); border-radius:4px;
        background:var(--s1); color:var(--ink2); cursor:pointer; line-height:1.2; }
 .rep:hover { border-color:var(--firm); color:var(--ink); }
-.rep.on { background:var(--accent); border-color:var(--accent); color:#fff; }
+.rep.on { background:var(--ink); border-color:var(--ink); color:var(--s0); }
 .repnone { font:10px var(--mono); color:var(--ink3); opacity:.6; }
 
 /* ***** controls ***** */
@@ -463,9 +403,9 @@ button { font:inherit; cursor:pointer; }
 /* ***** layout ***** */
 /* The left flow scrolls; the right column is pinned to the viewport so the current
    sample is always in view. main itself does not scroll -- each column owns its scroll. */
-main { flex:1; display:grid; grid-template-columns:minmax(0,1fr) 280px; gap:12px;
+main { flex:1; display:grid; grid-template-columns:minmax(0,1fr) 340px; gap:12px;
         padding:12px; overflow:hidden; align-items:stretch; }
-#flow { display:flex; flex-direction:column; gap:12px; min-width:0; min-height:0;
+#flow { position:relative; display:flex; flex-direction:column; gap:12px; min-width:0; min-height:0;
         overflow-y:auto; overscroll-behavior:contain; padding-right:2px; }
 .step h2 b { display:inline-flex; width:16px; height:16px; border-radius:50%;
              background:var(--accent); color:#fff; align-items:center;
@@ -478,15 +418,20 @@ main { flex:1; display:grid; grid-template-columns:minmax(0,1fr) 280px; gap:12px
 .chsel button { flex:1; padding:4px 0; font-size:12px; }
 .lf { flex:1; min-width:0; position:relative; }
 
-/* Hover tooltip on the signal plots: wandb-style dark box, one row per visible series. */
+/* Hover tooltip on the signal plots: one row per visible series, each in its curve's colour
+   with a bar at its left -- the same look as that probe's workbench card. Light, like those
+   cards, so the probe colours and the current sample's ink both read. */
 .ptt { position:absolute; z-index:4; display:none; pointer-events:none;
-       background:var(--ink); color:var(--s1); border-radius:5px; padding:6px 8px;
-       font:10px var(--mono); line-height:1.6; white-space:nowrap; box-shadow:0 2px 8px rgba(0,0,0,.25); }
-.ptt b { display:block; font-weight:600; margin-bottom:2px; color:var(--s1); }
-.ptt span { display:flex; align-items:center; gap:6px; }
-.ptt span i { width:8px; height:8px; border-radius:50%; flex:none; display:inline-block; }
-.ptt span em { font-style:normal; margin-left:auto; padding-left:10px;
-               font-variant-numeric:tabular-nums; opacity:.9; }
+       background:var(--s1); color:var(--ink); border:1px solid var(--firm); border-radius:5px;
+       padding:6px 8px; font:10px var(--mono); line-height:1.6; white-space:nowrap;
+       box-shadow:0 2px 8px rgba(0,0,0,.18); }
+.ptt b { display:block; font-weight:600; margin-bottom:2px; }
+.ptt span { display:flex; align-items:center; color:var(--c); border-left:3px solid var(--c);
+            padding-left:6px; margin:1px 0; }
+/* value first, then the curve's name: a fixed right-aligned column so the numbers line up
+   on their decimal ends and every name starts at the same x */
+.ptt span em { font-style:normal; min-width:7ch; text-align:right; margin-right:10px;
+               font-variant-numeric:tabular-nums; }
 
 /* Box zoom: the rubber-band rectangle, and the reset affordance that only appears
    once a plot is actually zoomed. */
@@ -569,7 +514,7 @@ main { flex:1; display:grid; grid-template-columns:minmax(0,1fr) 280px; gap:12px
    so you can see what is stacked underneath the current position. */
 #scatter .pt.on { fill:var(--accent); fill-opacity:.72;
                   stroke:var(--accent); stroke-width:1.2; }
-#scatter .hot { fill:none; stroke:var(--accent); stroke-width:1.5; }
+#scatter .hot { fill:none; stroke:var(--accent); stroke-width:2.4; }
 #spk circle { fill:var(--s1); stroke:var(--firm); }
 #spk .on circle { fill:var(--accent); stroke:var(--accent); }
 #spk .cur circle { stroke:var(--ink); stroke-width:2; }
@@ -606,37 +551,29 @@ svg:focus, .plot:focus { outline:1px solid var(--accent); outline-offset:2px; }
 .plot:focus { border-radius:3px; }
 
 /* ***** the pinned right column: current sample, then workbench *****
-   Full viewport height, its own scroll. Everything above the pinned-probe list is fixed;
-   only #plist scrolls when the workbench outgrows the column. */
-#probes { background:var(--s1); border:1px solid var(--line); border-radius:var(--r);
-          padding:10px; display:flex; flex-direction:column; min-height:0; overflow:hidden; }
+   Full viewport height. #plist scrolls when the workbench outgrows the column; if even
+   that isn't enough (short window) the whole column scrolls. */
+#probes { position:relative; background:var(--s1); border:1px solid var(--line); border-radius:var(--r);
+          padding:10px; display:flex; flex-direction:column; min-height:0; overflow-y:auto; }
 
-/* current-sample panel: overhead + speaker ring, then the metadata list */
-#cursample { flex:none; padding:8px 0 10px; margin-bottom:2px;
+/* current-sample panel: title, the sample/laser lines + dataset, then overhead + speaker ring */
+#cursample { flex:none; padding:0 0 10px; margin-bottom:2px;
              border-bottom:1px solid var(--line); }
-#cursample .scenefig { position:relative; width:94%; margin:0 auto; aspect-ratio:1; }
-#cursample #scene { position:absolute; inset:11%; width:78%; height:78%; object-fit:contain;
-                    border-radius:4px; background:var(--s2); }
-#cursample #scenering { position:absolute; inset:0; width:100%; height:100%; overflow:visible; }
-.ring-box { fill:none; stroke:var(--line); stroke-width:1.1; }
-.rs circle { fill:var(--s1); stroke:var(--firm); stroke-width:1.1; }
-.rs text { font:8px var(--mono); fill:var(--ink3); text-anchor:middle; dominant-baseline:central; }
-.rs.on circle { fill:var(--accent); stroke:var(--accent); }
-.rs.on text { fill:#fff; font-weight:600; }
-#curmeta { display:grid; grid-template-columns:auto 1fr; gap:2px 10px; margin:8px 0 0;
-           font:10px/1.35 var(--mono); }
+#curmeta { margin:0 0 8px; font:10px/1.35 var(--mono); }
 #curmeta.muted { opacity:.42; }
-/* laser · channel · frequency: pinned to the top, spanning both columns, since it is the
-   part that changes as you hover and the rest must not jump under it. */
-#curmeta .top { grid-column:1/-1; margin-bottom:5px; padding:4px 7px; border-radius:4px;
-                background:var(--s2); font:600 12px/1.3 var(--mono); color:var(--ink); }
+/* the sample line as a title, then laser · channel · frequency + dataset as its subtitle */
+#curmeta .top { padding:5px 7px; border-radius:4px; background:var(--s2);
+                font-family:var(--mono); color:var(--ink); overflow-wrap:anywhere; }
+#curmeta .top b { display:block; font:700 14px/1.3 var(--mono); }
+#curmeta .top span { display:block; margin-top:2px; font-size:10px; color:var(--ink2); }
+#curmeta .top i { font-style:normal; margin-left:1.4em; color:var(--ink3); }
 #curmeta .top u { text-decoration:none; color:var(--accent); font-weight:400; font-size:9px; }
-#curmeta dt { color:var(--ink3); text-transform:uppercase; letter-spacing:.05em;
-              font-size:8px; align-self:center; }
-#curmeta dd { margin:0; color:var(--ink); overflow-wrap:anywhere; }
 
 .probe { display:flex; gap:6px; align-items:flex-start; padding:4px 3px; border-radius:4px; cursor:pointer; }
 .probe:hover { background:var(--s2); }
+/* the curve highlighted in section 2 (app.js markHot): its card lit, the others faded */
+.probe.hot, .probe.live.hot { background:var(--s2); box-shadow:inset 0 0 0 1.5px var(--ink3); }
+#plist.dim .probe:not(.hot), #nowrow.faded { opacity:.35; }
 .probe .sw { width:9px; height:9px; border-radius:50%; flex:none; margin-top:3px; }
 /* Same overflow-wrap as #curmeta dd -- this line embeds the dataset name verbatim
    (sampleMeta's line1), and those run long with no spaces to break on, so without it a
@@ -773,21 +710,22 @@ h2 em.soft { color:var(--ink3); font-weight:400; margin-left:auto; }
 /* The overlay plot on the left, the per-probe tiles on the right half.
    .modeleft is pinned to the canvas width (320 + 34 label gutter): otherwise the legend,
    which grows with every probe, widened this column and walked the grid rightwards. */
-.modesplit { display:flex; gap:20px; align-items:flex-start; }
+.modesplit { display:flex; flex-wrap:wrap; gap:20px; align-items:flex-start; }
 .modeleft { flex:none; width:calc(var(--mw) + 64px); }
 /* One legend spanning the whole step, so it labels the overlay plot and the per-probe
    tiles at once. Vertical, so a long probe list reads down a single narrow column rather
    than wrapping into rows that push the plots around. */
 .modelegend { display:flex; flex-flow:row wrap; justify-content:flex-start;
               align-items:baseline; gap:3px 14px; margin:0 0 8px 64px; }
-.moderight { flex:1; min-width:0; }
+.moderight { flex:1 1 240px; min-width:0; }
 .modeleft .modewrap { display:inline-block; }
 .modeleft .mhint { display:block; margin:2px 0 0 64px; }
 /* Step 4's version of .modesplit: the ground-truth video fixed on the left (its own
    natural width, not the mode canvas's), the recovered-video tiles filling the rest. */
-.vidsplit { display:flex; gap:20px; align-items:flex-start; }
-.vidsplit-gt { flex:none; }
-.vidsplit-rest { flex:1; min-width:0; }
+/* Wraps (tiles under the video) rather than scrolling sideways when the window is narrow. */
+.vidsplit { display:flex; flex-wrap:wrap; gap:20px; align-items:flex-start; }
+.vidsplit-gt { flex:1 1 360px; max-width:680px; min-width:0; }
+.vidsplit-rest { flex:1 1 240px; min-width:0; }
 .ghint { display:block; margin:0 0 6px; }
 .fgrid { margin-top:0; }
 /* ***** workbench probe cards *****
@@ -797,18 +735,15 @@ h2 em.soft { color:var(--ink3); font-weight:400; margin-left:auto; }
          border:1px solid var(--line); border-left:3px solid var(--c);
          border-radius:4px; margin-bottom:3px; background:var(--s0); cursor:pointer; }
 .card2:hover { background:var(--s2); }
-.card2 .thumb { width:44px; height:36px; object-fit:contain; border-radius:3px;
+.card2 .thumb { width:84px; height:68px; object-fit:contain; border-radius:3px;
                 flex:none; display:block; background:var(--s2); }
 .card2 .meta { min-width:0; flex:1; font-family:var(--mono); line-height:1.25; }
 .card2 .ln1 { display:flex; align-items:baseline; gap:4px; }
-.card2 .ln1 b { font-size:11px; color:var(--ink); font-weight:600; flex:none; }
-/* Without min-width:0 a flex item won't shrink below its text's natural width -- it wraps
-   onto extra lines instead, which is what made these cards look cramped and uneven. */
-.card2 .sub { font-size:9px; color:var(--ink3); flex:1; min-width:0;
-              overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-.card2 .sub.foreign { color:var(--accent); }   /* probe kept from another box */
+/* the sample line may wrap (layout names run long); min-width:0 lets it shrink */
+.card2 .ln1 b { font-size:11px; color:var(--ink); font-weight:600; flex:1; min-width:0;
+                overflow-wrap:anywhere; }
+.card2 .ln1 b.foreign { color:var(--accent); }   /* probe kept from another box */
 .card2 .ln3 { font-size:9.5px; color:var(--ink2); white-space:nowrap; }
-.card2 .ln3.objs { overflow:hidden; text-overflow:ellipsis; }
 .card2 .x { border:0; background:none; color:var(--ink3); font-size:13px;
             line-height:1; padding:0 1px; margin-left:2px; cursor:pointer; }
 .card2 .x:hover { color:var(--ink); }
@@ -838,7 +773,7 @@ h2 em.soft { color:var(--ink3); font-weight:400; margin-left:auto; }
    label each field, so the dot was decoration that cost width. HTML collapses runs of
    whitespace, so the gap has to be preserved explicitly. */
 .legend span, .probe .id, .card2 .ln3, .fgrid figcaption i,
-.summary, #poscount { white-space:pre-wrap; }
+.summary { white-space:pre-wrap; }
 /* NOT on flex containers (.meta, .ln1): there the whitespace between child elements
    becomes real text nodes and stacks the row vertically. */
 /* ***** all-lasers view *****

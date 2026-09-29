@@ -4,133 +4,101 @@
 <title>viz2</title>
 <link rel="stylesheet" href="/style.css">
 
-<header id="bar">
-  <div class="bhead"><div class="brand">viz2</div>
-    <div id="summary" class="summary"></div></div>
-</header>
 
 <main>
 <div id="flow">
 
-  <!-- 1 . which recording: filter -> search, with the current sample shown big alongside -->
+  <!-- 1 . which recording: filter (left column) -> gallery -> the current sample, large.
+       Search (box map, position #) lives in the sidebar so it is reachable from every step. -->
   <section class="card step step1">
-    <h2><b>1</b> sample</h2>
+    <h2><b>1</b> sample
+      <span class="s1count"><b id="nmatch">0</b><span id="nmatchsub">/0</span> samples</span>
+      <button id="fclear" class="fclear" hidden></button></h2>
     <div class="s1grid">
 
-      <!-- FILTER: narrow the set. one dataset, many object / n_objects / layout / speaker.
-           full-width so all five pickers -- including speaker -- share one row. -->
-      <div class="s1part s1filter">
-        <div class="s1phead">filter <span class="s1psub">narrow the set</span>
-          <span class="s1count"><b id="nmatch">0</b><span id="nmatchsub">/0</span> samples</span>
+      <!-- FILTER: one dataset, many box / object / n_objects / layout / speaker. Each filter
+           is its active-value chips, then its label + all/none, then its list. -->
+      <div class="s1filter">
+        <div class="pk pb ds"><span>dataset <i class="pk-n" id="dscount"></i></span>
+          <div class="pickbox" id="datasetbox"></div>
         </div>
-        <div class="s1frow">
-          <div class="pk pb ds"><span>dataset <i class="pk-n" id="dscount"></i></span>
-            <div class="pickbox" id="datasetbox"></div>
-          </div>
-          <div class="pk pb bx"><span>box <i class="pk-n" id="boxcount"></i> <span class="an"><button class="link" data-all="boxes">all</button><button class="link" data-none="boxes">none</button></span></span>
-            <div class="pickbox" id="boxbox"></div>
-          </div>
-          <div class="pk pb"><span>object <i class="pk-n" id="objcount"></i> <span class="an"><button class="link" data-all="objects">all</button><button class="link" data-none="objects">none</button></span></span>
-            <div class="pickbox" id="objectbox"></div>
-          </div>
-          <div class="pk pb nb"><span>n_objects <i class="pk-n" id="nobjcount"></i> <span class="an"><button class="link" data-all="nobj">all</button><button class="link" data-none="nobj">none</button></span></span>
-            <div class="pickbox" id="nobjbox"></div>
-          </div>
-          <div class="pk pb ly"><span>layout <i class="pk-n" id="lycount"></i> <span class="an"><button class="link" data-all="layouts">all</button><button class="link" data-none="layouts">none</button></span></span>
-            <div class="pickbox" id="layoutbox"></div>
-          </div>
-          <div class="pk sp"><span>speaker <span class="an"><button class="link" data-all="spk">all</button><button class="link" data-none="spk">none</button></span></span>
-            <div class="spkchips" id="spkchips"></div>
-            <svg id="spk" tabindex="0"></svg>
-          </div>
+        <div class="pk pb bx"><div class="pbsel"></div>
+          <span>box <i class="pk-n" id="boxcount"></i> <span class="an"><button class="link" data-all="boxes">all</button><button class="link" data-none="boxes">none</button></span></span>
+          <div class="pickbox" id="boxbox"></div>
         </div>
-        <div id="filterchips"></div>
+        <div class="pk pb"><div class="pbsel"></div>
+          <span>object <i class="pk-n" id="objcount"></i> <span class="an"><button class="link" data-all="objects">all</button><button class="link" data-none="objects">none</button></span></span>
+          <div class="pickbox" id="objectbox"></div>
+        </div>
+        <div class="pk pb nb"><div class="pbsel"></div>
+          <span>n_obj <i class="pk-n" id="nobjcount"></i> <span class="an"><button class="link" data-all="nobj">all</button><button class="link" data-none="nobj">none</button></span></span>
+          <div class="pickbox" id="nobjbox"></div>
+        </div>
+        <div class="pk pb ly"><div class="pbsel"></div>
+          <span>layout <i class="pk-n" id="lycount"></i> <span class="an"><button class="link" data-all="layouts">all</button><button class="link" data-none="layouts">none</button></span></span>
+          <div class="pickbox" id="layoutbox"></div>
+        </div>
+        <div class="pk sp"><div class="pbsel" id="spkchips"></div>
+          <span>speaker <span class="an"><button class="link" data-all="spk">all</button><button class="link" data-none="spk">none</button></span></span>
+          <svg id="spk" tabindex="0"></svg>
+        </div>
       </div>
 
-      <!-- SEARCH (left) and the SAMPLE VIEWER (right) start on the same row, below filter -->
-      <div class="s1cols">
-
-        <!-- SEARCH: pick one sample out of what the filter left -->
-        <div class="s1part s1search">
-          <div class="s1phead">search <span class="s1psub">pick one sample</span></div>
-          <div class="s1srow">
-            <div class="pk boxcol">
-              <div class="boxspktitle">
-                <select id="boxsel" class="boxspksel"></select> box, spk
-                <select id="spksel" class="boxspksel"></select>
-                <em id="poscount"></em>
-              </div>
-              <svg id="scatter" tabindex="0"></svg>
-              <div class="repeatslab">empty box</div>
-              <div id="repeats"></div>
-            </div>
-            <!-- Position jump sits beside the gallery's own search input, each half width;
-                 the 5-col photo gallery (#samplegrid, buildSampleGrid) is a separate
-                 sibling below so it spans the FULL row, under both search bars. -->
-            <div class="pk gallerycol">
-              <div class="searchrow">
-                <div class="searchpair">
-                  <input id="posjump" class="pbq" type="number" min="1" placeholder="search by position #">
-                  <div class="pickbox" id="samplebox"></div>
-                </div>
-                <!-- Independent: background off with no segmentation mask to show instead
-                     just falls back to the photo (see galThumbUrl / render.thumb). -->
-                <div class="galctl">
-                  <label class="chk"><input type="checkbox" id="galbg" checked> background</label>
-                  <label class="chk"><input type="checkbox" id="galmask"> segmentation mask</label>
-                </div>
-              </div>
-              <div class="sgrid" id="samplegrid"></div>
-            </div>
-            <!-- Only shown with 2+ speakers selected in the filter above: pick which of
-                 them to view AT the current position, directly -- no stepping. -->
-            <div class="pk spkat" id="spkatwrap" hidden><span>speaker here</span>
-              <div id="spkat"></div>
-            </div>
-          </div>
+      <!-- GALLERY: every sample that passes the filter; fills step 1's height -->
+      <div class="s1gallery">
+        <div class="galrow">
+          <input id="galposjump" class="pbq" type="number" min="1" placeholder="search by position #">
+          <!-- gallery order (app.js gallerySort); the arrow flips it -->
+          <label class="galsort">sort
+            <select id="galsort">
+              <option value="pos">position</option><option value="spk">speaker</option>
+              <option value="n">n objects</option><option value="object">object</option>
+              <option value="layout">layout</option><option value="id">sample id</option>
+              <option value="cx">com x</option><option value="cy">com y</option>
+              <option value="area">mask area</option><option value="box">box</option>
+            </select><button type="button" id="galdir" title="flip order">↑</button></label>
+          <!-- switches every sample photo: gallery, viewer and sidebar -->
+          <div class="seg" id="view"><button data-v="photo" class="on">photo</button><button data-v="overlay">overlay</button><button data-v="mask">mask</button></div>
         </div>
-
-        <!-- SAMPLE VIEWER: the current sample, large -->
-        <div class="s1part s1viewer">
-          <div class="s1phead">sample viewer <span class="s1psub">the current sample</span></div>
-          <div class="svbody">
-            <div class="svtop" id="svtop"></div>
-            <div class="svimgs">
-              <figure>
-                <div class="svimgwrap"><img id="svphoto" alt="">
-                  <svg class="comov" id="svphotocom" aria-hidden="true"></svg>
-                  <svg class="comov spkring" id="svphotospk" aria-hidden="true"></svg></div>
-                <figcaption>overhead <em class="comnote" id="comnote"></em></figcaption>
-              </figure>
-              <figure id="svmaskfig">
-                <div class="svimgwrap"><img id="svmask" alt=""><svg class="comov" id="svmaskcom" aria-hidden="true"></svg></div>
-                <figcaption>segmentation</figcaption>
-              </figure>
-            </div>
-            <div class="svmedia">
-              <div class="svm" id="svm-src">
-                <div class="svmh">original <em id="svstim">played stimulus</em></div>
-                <div class="vidwrap">
-                  <video id="svvidsrc" preload="metadata" playsinline></video>
-                  <div class="vidctl"><button class="vidplay" type="button">▶</button>
-                    <input class="vidseek" type="range" min="0" max="0" step="0.01" value="0">
-                    <span class="vidtime">0.00s / 0.00s</span></div>
-                </div>
-              </div>
-              <div class="svm" id="svm-rec">
-                <div class="svmh">recovered <em>laser 55 · x · fixed render</em></div>
-                <div class="vidwrap">
-                  <video id="svvidrec" preload="metadata" playsinline></video>
-                  <div class="vidctl"><button class="vidplay" type="button">▶</button>
-                    <input class="vidseek" type="range" min="0" max="0" step="0.01" value="0">
-                    <span class="vidtime">0.00s / 0.00s</span></div>
-                </div>
-              </div>
-            </div>
-          </div>
-        </div>
-
+        <div class="sgrid" id="samplegrid"></div>
       </div>
+
+      <!-- SAMPLE VIEWER: the current sample, large -->
+      <div class="s1viewer">
+        <div class="svbody">
+          <div class="svtop" id="svtop"></div>
+          <figure class="svphoto"><div id="svphotobox"></div>
+          </figure>
+          <!-- one row per object + "all" (app.js drawMasks) -->
+          <table id="smtable"></table>
+          <details id="svaudio" open><summary>audio</summary>
+          <div class="svmedia">
+            <div class="svm" id="svm-src">
+              <div class="svmh">original <em id="svstim">played stimulus</em></div>
+              <div class="vidwrap">
+                <video id="svvidsrc" preload="metadata" playsinline></video>
+                <div class="vidctl"><button class="vidplay" type="button">▶</button>
+                  <input class="vidseek" type="range" min="0" max="0" step="0.01" value="0">
+                  <span class="vidtime">0.00s / 0.00s</span></div>
+              </div>
+            </div>
+            <div class="svm" id="svm-rec">
+              <div class="svmh">recovered <em id="svrecwho">laser 55 · x</em></div>
+              <div class="vidwrap specplay" id="svrec">
+                <div class="spbox"><img alt=""><div class="phead"></div></div>
+                <audio preload="auto"></audio>
+                <div class="vidctl"><button class="vidplay" type="button">▶</button>
+                  <input class="vidseek" type="range" min="0" max="0" step="0.01" value="0">
+                  <span class="vidtime">0.00s / 0.00s</span></div>
+              </div>
+            </div>
+          </div></details>
+          <!-- the raw metadata.jsonl, under the spectrograms; open by default,
+               ~14 lines tall (drag the corner for more), fetched only while open -->
+          <details id="svmeta" open><summary>metadata</summary><pre></pre></details>
+        </div>
+      </div>
+
     </div>
   </section>
 
@@ -227,7 +195,7 @@
        multiples on the right (there, one mode tile per probe; here, one recovered-video
        tile per probe). -->
   <section class="card step">
-    <h2><b>4</b> recovered audio <em class="soft">laser 55 · x · fixed render, per pinned sample</em></h2>
+    <h2><b>4</b> recovered audio <em class="soft">per pinned sample, at its laser · channel</em></h2>
     <div class="stepbody">
       <!-- no controls here yet -- an empty rail, kept the same width as steps 2 and 3, so
            this section's content starts at the same x as their plots. -->
@@ -259,13 +227,30 @@
 <aside id="probes">
 
   <section id="cursample">
-    <div class="scenefig"><img id="scene" alt=""><svg id="scenering" aria-hidden="true"></svg></div>
+    <h2 class="asidetitle">current sample</h2>
     <dl id="curmeta"></dl>
+    <div id="scenebox"></div>
+  </section>
+
+  <!-- SEARCH: here, not in step 1, so a position is one click away from every step -->
+  <section id="navsearch">
+    <div class="boxspktitle">
+      <select id="boxsel" class="boxspksel"></select> box, spk
+      <select id="spksel" class="boxspksel"></select>
+    </div>
+    <input id="posjump" class="pbq" type="number" min="1" placeholder="search by position #">
+    <svg id="scatter" tabindex="0"></svg>
+    <div class="repeatslab">empty box <span class="repnote" id="repnote"></span></div>
+    <div id="repeats"></div>
+    <!-- only with 2+ speakers selected: which of them to view at this position -->
+    <div class="pk spkat" id="spkatwrap" hidden><span>speaker here</span>
+      <div id="spkat"></div>
+    </div>
   </section>
 
   <h2 class="asidetitle">workbench</h2>
 
-  <h3 class="asidesub">masks <em>current + pinned</em></h3>
+  <h3 class="asidesub">masks <em>black = current · colour = pinned sample</em></h3>
   <figure id="maskfig"><img id="allmasks" alt=""></figure>
 
   <h3 class="asidesub" id="heldh">probes <em class="addhint">press <kbd>Enter</kbd> to add</em><button id="clear" class="link">clear</button></h3>

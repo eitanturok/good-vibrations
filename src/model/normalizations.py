@@ -300,6 +300,14 @@ def torch_raw_phase(fft, weighted: bool = False):
     'the gauge fix helps' -- without it, a relative-laser win is unattributable."""
     return _phasor_cos_sin(fft)
 
+def torch_referenced_phase(fft, weighted: bool = False, ref=None):
+    """[cos, sin] of angle(Z) - angle(ref). `ref` is a complex phasor broadcastable to fft, built
+    by dataset.compute_phase_ref: the played stimulus's own spectrum ('src'), or that times the
+    speaker's empty-box phase ('src_eb'). Unlike rel_laser, the reference is FIXED across samples,
+    so per-sample trigger jitter (a linear-in-f ramp) is not cancelled."""
+    if ref is None: raise ValueError("referenced phase arms need a phase ref (see dataset.compute_phase_ref)")
+    return _phasor_cos_sin(fft * ref.conj())
+
 def _both(fft, weighted: bool):
     import torch
     return torch.cat([torch_relative_laser(fft, weighted), torch_group_delay(fft, weighted)], dim=-1)
@@ -316,9 +324,12 @@ PHASE_ARMS = {
     'both':               (_both,                False),
     'both_w':             (_both,                True),
     'raw_phase':          (torch_raw_phase,      False),
+    'src':                (torch_referenced_phase, False),  # minus the source audio's phase
+    'src_eb':             (torch_referenced_phase, False),  # minus source phase and the speaker's empty-box phase
 }
+PHASE_REF_ARMS = ("src", "src_eb")  # arms that need a precomputed reference, see dataset.compute_phase_ref
 
-def apply_phase_arm(fft, arm: str, top_frac: float | None = 0.10):
+def apply_phase_arm(fft, arm: str, top_frac: float | None = 0.10, ref=None):
     """Complex (B,L,F,C) -> real (B,L,F,K) phase channels.
 
     Bins outside the top `top_frac` by laser-mean magnitude are zeroed rather than
@@ -328,7 +339,7 @@ def apply_phase_arm(fft, arm: str, top_frac: float | None = 0.10):
     """
     if arm not in PHASE_ARMS: raise ValueError(f"unknown {arm=}; expected one of {sorted(PHASE_ARMS)}")
     fn, weighted = PHASE_ARMS[arm]
-    p = fn(fft, weighted)
+    p = fn(fft, weighted, ref=ref) if arm in PHASE_REF_ARMS else fn(fft, weighted)
     if top_frac is not None:
         mag = fft.abs().mean(dim=(1, 3))                      # (B,F)
         keep = mag >= mag.quantile(1.0 - top_frac, dim=-1, keepdim=True)

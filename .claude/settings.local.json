@@ -39,7 +39,13 @@
       "Bash(python -c ' *)",
       "Bash(export PYTHONPATH=.)",
       "Bash(PYTHONPATH=src python *)",
-      "Bash(git fetch *)"
+      "Bash(git fetch *)",
+      "Bash(sed *)",
+      "Bash(tmux send-keys *)",
+      "Bash(.venv/bin/python *)",
+      "Bash(ls *)",
+      "Bash(grep -E 'python3 -$|python3 - ')",
+      "Bash(grep -n \"pickbox\\(\\\\$\\\\|multi: true\\\\|chips: false\" viz2/static/app.js)"
     ]
   }
 }

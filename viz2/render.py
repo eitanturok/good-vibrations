@@ -92,43 +92,65 @@ def masks_overlay(masks, colors, w=300):
     return b.getvalue()
 
 
+OBJ_COLORS = ["#0072B2", "#E69F00", "#009E73", "#CC79A7", "#D55E00", "#56B4E9", "#F0E442"]  # Okabe-Ito
+
+
+def objmasks_png(masks, sel=-1, w=640):
+    """Each object filled in its own colour on a transparent field (the page sets the
+    background). sel >= 0 fades every other object."""
+    h, wd = masks[0].shape
+    ow = min(w, wd)
+    oh = round(h * ow / wd)
+    img = np.zeros((oh, ow, 4), np.uint8)
+    for i, m in enumerate(masks):
+        # INTER_AREA + a low threshold, not NEAREST, so a small object never drops out
+        hit = cv2.resize(m.astype(np.float32), (ow, oh), interpolation=cv2.INTER_AREA) > 0.2
+        c = OBJ_COLORS[i % len(OBJ_COLORS)]
+        img[hit] = [int(c[k:k + 2], 16) for k in (1, 3, 5)] + [255 if sel < 0 or i == sel else 50]
+    b = io.BytesIO()
+    Image.fromarray(img).save(b, "PNG")
+    return b.getvalue()
+
+
 def _jpeg(im, quality=78):
     b = io.BytesIO()
     im.save(b, "JPEG", quality=quality)
     return b.getvalue()
 
 
-def thumb(path, mask=None, fill=False, bg=True, box=(160, 120)):
-    """A tiny JPEG for the step-1 pickers and the sample gallery.
+SEG = (40, 220, 100)   # the segmentation colour; app.js/style.css --seg must match
 
-    No mask: the bare cropped photo, as always. With a mask and bg=True: the photo, with the
-    object's ground-truth outline traced in green -- ALWAYS, independent of `fill`, so you
-    can always see where the object is without covering the photo itself. `fill` additionally
-    washes the segmented area in a translucent green tint (the old "segmentation mask"
-    checkbox behavior), under the outline. bg=False drops the photo and shows the
-    segmentation alone, on a flat field; bg=False with no mask (nothing to show instead)
-    falls back to the bare photo rather than an empty thumbnail.
+
+def thumb(path, masks=(), seg=False, box=(160, 120), sel=-1):
+    """A small JPEG for the step-1 pickers and THE sample photo (gallery, viewer, sidebar).
+
+    Each mask's outline is traced in SEG. seg=True is the segmentation view: the photo goes
+    gray so the objects stand out, and their region is also filled with SEG (the
+    centre-of-mass X's are drawn over it client-side). masks is the combined smask, or one
+    per object; sel >= 0 fades every object's outline/fill but that one's (the viewer's
+    selected table row), the photo itself untouched.
     """
     im = Image.open(path).convert("RGB")
     im.thumbnail(box)
-    if mask is None:
-        return _jpeg(im)
-    # Resize the mask to the THUMBNAIL's own resolution (NEAREST, not a smooth resample --
-    # a small object is only a handful of pixels here, and blurring shrinks it toward
-    # nothing) and do everything below -- fill, contour -- at that scale, not full-res: a
-    # contour traced at full res and then shrunk gets just as lost as an unscaled fill did.
-    m = np.asarray(Image.fromarray((np.asarray(mask) > 0.5).astype(np.uint8) * 255)
-                    .resize(im.size, Image.NEAREST)) > 127
-    if not bg:
-        img = np.full((*m.shape, 3), (238, 238, 235), np.uint8)
-        img[m] = (24, 160, 100)
-        return _jpeg(Image.fromarray(img))
     arr = np.array(im)
-    if fill and m.any():
-        arr[m] = (0.43 * np.array((24, 160, 100)) + 0.57 * arr[m]).astype(np.uint8)
-    if m.any():
+    if seg:                    # gray, and flattened toward mid-gray
+        g = arr @ np.array([0.299, 0.587, 0.114])
+        arr = np.repeat((0.55 * g + 0.45 * 150)[..., None], 3, axis=2).astype(np.uint8)
+    for i, mask in enumerate(masks):
+        # Resize the mask to the THUMBNAIL's resolution (NEAREST: a small object is only a
+        # handful of pixels here, and a smooth resample shrinks it toward nothing) and
+        # draw at that scale -- a contour traced at full res and then shrunk gets lost.
+        m = np.asarray(Image.fromarray((np.asarray(mask) > 0.5).astype(np.uint8) * 255)
+                       .resize(im.size, Image.NEAREST)) > 127
+        if not m.any():
+            continue
+        top = arr.copy()
+        if seg:
+            top[m] = (0.35 * np.array(SEG) + 0.65 * top[m]).astype(np.uint8)
         contours, _ = cv2.findContours(m.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        cv2.drawContours(arr, contours, -1, (24, 160, 100), 2)
+        cv2.drawContours(top, contours, -1, SEG, 2)
+        a = 1.0 if sel < 0 or i == sel else 0.2
+        arr = top if a == 1 else (a * top + (1 - a) * arr).astype(np.uint8)
     return _jpeg(Image.fromarray(arr))
 
 

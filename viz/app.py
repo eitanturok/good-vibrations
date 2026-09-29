@@ -90,7 +90,20 @@ def api_runs():
              "datasets": sorted(e.datasets),
              "shape": list(e.shape) if e.shape else None} for e in registry.entries]
     return {"runs": runs, "default_selected": registry.defaults(),
-            "n_samples": registry.n_samples, "render_version": config.RENDER_VERSION}
+            "n_samples": registry.n_samples, "render_version": _render_version()}
+
+
+def _render_version() -> str:
+    """The `v=` every immutable (year-cached) URL carries. Global sample ids are
+    gi * ID_STRIDE + local id, and gi is the experiment's position in LOAD ORDER, so adding
+    an experiment renumbers every one after it: /api/backdrop/3000005.jpg was
+    31_07_2026_gastronorm_exp1's sample 5 until 2026_09_27_gastronorm_four_objs sorted in
+    ahead of it. Hashing the loaded experiment names into the version changes every URL
+    when that happens, so a browser can never serve one experiment's cached image for
+    another's row. config.RENDER_VERSION still covers changes to the rendering itself."""
+    import hashlib
+    names = "|".join(gt.experiment_dir.name for gt in registry.gts)
+    return f"{config.RENDER_VERSION}-{hashlib.sha1(names.encode()).hexdigest()[:8]}"
 
 
 @app.get("/api/samples")

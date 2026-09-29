@@ -94,9 +94,11 @@ multi-experiment analog of `_sid()`. With exactly one experiment loaded, `gi == 
 
 A run's predictions are NOT assumed to belong to one experiment: `load_run` now takes the
 whole `Registry` and routes every predicted row to its own experiment via
-`Registry.route(local_id, box)`, using the `box` field each `.pt`'s `info` carries per
-sample (falling back to id-overlap against every loaded experiment for runs saved before
-`box` existed). This matters because a "combined" training run can predict samples from
+`Registry.resolve(ids, boxes, positions)`, using the `box` and `position_id` fields each
+`.pt`'s `info` carries per sample (every loaded experiment is a candidate for runs saved
+before `box` existed). Several captures share a box name and all number samples from
+000001, so the experiment is chosen per run and per box: the one holding the most of the
+run's (sample_id, position_id) pairs. This matters because a "combined" training run can predict samples from
 more than one box in the same eval, with per-box-local ids that are NOT unique across
 experiments -- two boxes can both have a `000010`. `RunData.row_of` still ends up keyed
 by `Row` exactly as section 2/5 describe, and `RunData.global_ids` (parallel to

@@ -6,7 +6,9 @@ there is no row space and no id->row conversion to get wrong.
 
 import json
 import math
+import os
 import random
+import threading
 from functools import lru_cache
 from pathlib import Path
 
@@ -29,6 +31,13 @@ MAX_OVERHEAD = [1, 1]               # largest cropped-overhead [w, h] over ALL d
 
 DIRS: dict[str, Path] = {}   # sample id -> dir; the only id->path map
 META: dict[str, dict] = {}
+# sample id -> (mtime_ns, size) of its metadata.jsonl when META was last built from it.
+# rescan() runs on every client poll (0.5s, per open tab); re-parsing every sample's
+# metadata each time cost ~0.75s of GIL-holding Python at 6.3k samples, so overlapping
+# polls kept the server pegged and starved the gallery's thumbnail requests. A stat is
+# ~50x cheaper, and a reprocessed-in-place sample still rewrites metadata.jsonl.
+STAMP: dict[str, tuple[int, int]] = {}
+_RESCAN = threading.Lock()   # polls from several tabs must not rescan concurrently
 INFO: dict = {}
 # Bumped whenever rescan/rescan_datasets/_load actually change a sample -- folded into the
 # client's cache-busting `rv` (see app.py::_payload) so a sample deleted and recaptured
@@ -62,15 +71,20 @@ def com(v) -> list[float]:
 def coms(v) -> list[list[float]]:
     """Per-object [row, col] centres, in the same overhead-pixel space as the smask.
 
-    metadata's `coms` is nested one level deep ([[ [r,c], ... ]]); an empty box is the
-    single sentinel [-1, -1], which is dropped."""
-    try:
-        flat = v[0] if (v and isinstance(v[0], list)
-                        and v[0] and isinstance(v[0][0], list)) else v
-        out = [[float(p[0]), float(p[1])] for p in flat]
-        return [p for p in out if p != [-1.0, -1.0]]
-    except Exception:
-        return []
+    metadata's `coms` nests differently by dataset -- [[ [r,c], [r,c] ]] or one wrapped
+    list per object, [ [[r,c]], [[r,c]] ] -- so every [r, c] pair is collected at any depth.
+    An empty box is the sentinel [-1, -1], which is dropped."""
+    out = []
+
+    def walk(x):
+        if isinstance(x, list) and len(x) == 2 and all(isinstance(e, (int, float)) for e in x):
+            if [float(x[0]), float(x[1])] != [-1.0, -1.0]:
+                out.append([float(x[0]), float(x[1])])
+        elif isinstance(x, list):
+            for e in x:
+                walk(e)
+    walk(v)
+    return out
 
 
 def _first(d: Path, names):
@@ -86,6 +100,42 @@ def sample_photo(sid: str) -> Path | None:
     p = _first(d(sid), PHOTOS)
     return d(sid) / p if p else None
 
+
+def sample_mask(sid: str) -> Path | None:
+    """Resolved per sample, like sample_photo: a dataset's first sample can be missing its
+    image/ dir (four_objs_part_1's 000001-4), so one dataset-wide filename taken from it
+    would be None and blank out every other sample's photo and mask too."""
+    p = _first(d(sid), MASKS)
+    return d(sid) / p if p else None
+
+
+@lru_cache(maxsize=4)
+def mask_areas(name: str, epoch: int) -> dict[str, int]:
+    """Every loaded sample's segmented area in px, for the gallery's "mask area" sort.
+    Read from the smask's tiny PNG twin (~1.6 s for 6k samples on 8 threads), so it is only
+    computed when asked for; name/epoch key the cache to the loaded dataset."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    def area(sid):          # -1: no image / no mask, so it sorts ahead of every real area
+        mp = sample_mask(sid)
+        if not mp or not sample_photo(sid):
+            return -1
+        png = mp.with_suffix(".png")
+        m = np.asarray(Image.open(png)) if png.exists() else np.load(mp) > 0.5
+        return int(np.count_nonzero(m))
+    sids = list(DIRS)
+    with ThreadPoolExecutor(8) as ex:
+        return dict(zip(sids, ex.map(area, sids)))
+
+
+@lru_cache(maxsize=32)
+def object_masks(sid: str) -> list[tuple[str, np.ndarray]]:
+    """One boolean mask per object from image/smasks/<type><i>.npy (experiment-25's
+    all.npy / empty_box*.npy there are not objects)."""
+    sd = d(sid) / "image" / "smasks"
+    fs = [f for f in sorted(sd.glob("*.npy")) if f.stem != "all" and not f.stem.startswith("empty")]
+    ms = [(f.stem, np.load(f) > 0.5) for f in fs]
+    return [(n, m) for n, m in ms if m.any()]
 
 def _glob1(base: Path | None, *globs: str) -> Path | None:
     """First file under `base` matching any of the glob patterns, in order."""
@@ -109,24 +159,60 @@ def recovered_video(sid: str) -> Path | None:
     return _glob1(DIRS.get(sid), "vibration/*spectrogram*.mp4")
 
 
-def _stim_dir(sid: str) -> Path | None:
-    """Local data/audio/<name>/ for the stimulus this sample played. metadata records only
-    the capture machine's absolute path, so we match on its basename and walk up from a few
-    roots to find the copy that lives beside the repo."""
-    raw = (META.get(sid) or {}).get("audio_dir") or ""
-    name = raw.replace("\\", "/").rstrip("/").split("/")[-1]
-    if not name:
-        return None
-    seen: set[Path] = set()
+def _audio_roots():
+    """Every data/audio/ dir found walking up from the cwd and the loaded dataset."""
+    seen: list[Path] = []
     for start in (Path.cwd(), DATASETS.get(CURRENT, Path.cwd())):
         for up in (start, *start.parents):
-            cand = up / "data" / "audio" / name
-            if cand in seen:
-                continue
-            seen.add(cand)
-            if cand.is_dir():
-                return cand
-    return None
+            cand = up / "data" / "audio"
+            if cand not in seen and cand.is_dir():
+                seen.append(cand)
+    return seen
+
+
+def _chirp_key(f_start, f_end, T_sec, T_start, T_end, fs):
+    try:
+        return tuple(round(float(v), 6) for v in (f_start, f_end, T_sec, T_start, T_end, fs))
+    except (TypeError, ValueError):
+        return None
+
+
+@lru_cache(maxsize=8)
+def _chirp_index(root: Path) -> dict:
+    """chirp params -> stimulus dir, from each data/audio/<name>/metadata.jsonl. Several
+    dirs can hold the same chirp (chirp_100_1000_1sec vs _1.0sec); the first sorted wins."""
+    out = {}
+    for sd in sorted(root.iterdir()):
+        try:
+            m = _meta(sd)
+        except OSError:
+            continue
+        k = _chirp_key(m.get("f_start"), m.get("f_end"), m.get("T_sec"),
+                       m.get("T_start"), m.get("T_end"), m.get("fs"))
+        if k and (sd / "audio.wav").exists():
+            out.setdefault(k, sd)
+    return out
+
+
+def _stim_dir(sid: str) -> Path | None:
+    """Local data/audio/<name>/ for the stimulus this sample played. Older samples record
+    only the capture machine's absolute audio_dir, so we match on its basename; newer ones
+    (e.g. four_objs) drop audio_dir and record the chirp's params inline (chirp_f_start,
+    chirp_t_sec, audio_fs, ...), so we match those against each stimulus's metadata."""
+    raw = (META.get(sid) or {}).get("audio_dir") or ""
+    name = raw.replace("\\", "/").rstrip("/").split("/")[-1]
+    roots = _audio_roots()
+    if name:
+        for r in roots:
+            if (r / name).is_dir():
+                return r / name
+        return None
+    m = _meta(d(sid)) if sid in DIRS else {}
+    k = _chirp_key(m.get("chirp_f_start"), m.get("chirp_f_end"), m.get("chirp_t_sec"),
+                   m.get("chirp_t_start"), m.get("chirp_t_end"), m.get("audio_fs"))
+    if not k:
+        return None
+    return next((_chirp_index(r)[k] for r in roots if k in _chirp_index(r)), None)
 
 
 def source_wav(sid: str) -> Path | None:
@@ -137,6 +223,25 @@ def source_wav(sid: str) -> Path | None:
 def source_video(sid: str) -> Path | None:
     """Spectrogram video of the played stimulus."""
     return _glob1(_stim_dir(sid), "spectrogram.mp4", "*.mp4")
+
+
+def stim_name(sid: str) -> str | None:
+    """Which stimulus this sample played (its data/audio/<name>/). Shared by every sample
+    that played the same chirp, so the client can key the original video on it and not
+    reload an identical video on every gallery step."""
+    sd = _stim_dir(sid)
+    return sd.name if sd else None
+
+
+def stim_video(name: str) -> Path | None:
+    """source_video() by stimulus name rather than sample id. Only names that are real
+    stimulus dirs resolve -- never a path the request made up."""
+    if not name or "/" in name or "\\" in name or name.startswith("."):
+        return None
+    for r in _audio_roots():
+        if (r / name).is_dir():
+            return _glob1(r / name, "spectrogram.mp4", "*.mp4")
+    return None
 
 
 def stim_params(sid: str) -> dict:
@@ -219,7 +324,8 @@ def switch(name: str) -> int:
     """Load a different dataset. Returns its sample count."""
     if name not in DATASETS:
         raise KeyError(name)
-    _load(name)
+    with _RESCAN:                 # not mid-way through a poll's rescan of the old dataset
+        _load(name)
     return len(DIRS)
 
 
@@ -253,7 +359,7 @@ def rescan_datasets() -> int:
         if DATASETS:
             _load(next(iter(DATASETS)))
         else:
-            DIRS.clear(); META.clear(); INFO.clear()
+            DIRS.clear(); META.clear(); INFO.clear(); STAMP.clear()
         changed += 1
     if changed:
         global EPOCH
@@ -264,24 +370,44 @@ def rescan_datasets() -> int:
 
 def rescan() -> int:
     """Reconcile DIRS/META for the current dataset against what's on disk: pick up samples
-    the watcher finished writing, drop ones whose directory (or FFT) is gone -- e.g. a bad
-    capture deleted mid-collection -- and refresh META for samples reprocessed in place
-    (same id, new metadata.jsonl) so a stale label doesn't survive a resample. Returns how
-    many samples changed either way."""
-    if CURRENT not in DATASETS:
+    the watcher finished writing, drop ones whose directory is gone -- e.g. a bad capture
+    deleted mid-collection -- and refresh META for samples reprocessed in place (same id,
+    new metadata.jsonl, detected via STAMP) so a stale label doesn't survive a resample.
+    Returns how many samples changed either way. A poll that arrives while another is
+    already rescanning just skips -- the next one picks up whatever it would have."""
+    if CURRENT not in DATASETS or not _RESCAN.acquire(blocking=False):
         return 0
     try:
-        on_disk = {d.name: d for d in (DATASETS[CURRENT] / "samples").iterdir()}
+        return _rescan()
+    finally:
+        _RESCAN.release()
+
+
+def _stamp(d: Path):
+    try:
+        st = (d / "metadata.jsonl").stat()
+        return (st.st_mtime_ns, st.st_size)
+    except OSError:
+        return None
+
+
+def _rescan() -> int:
+    try:
+        on_disk = {e.name: Path(e.path) for e in os.scandir(DATASETS[CURRENT] / "samples")}
     except OSError:
         on_disk = {}
     changed = 0
     for sid in [s for s in DIRS if s not in on_disk]:
-        del DIRS[sid]; del META[sid]
+        del DIRS[sid]; del META[sid]; STAMP.pop(sid, None)
         changed += 1
     for name, d in on_disk.items():
-        if not _fft(d):
+        st = _stamp(d)
+        if name in DIRS and st == STAMP.get(name):
+            continue
+        if st is None or not _fft(d):
             continue
         m = _meta_row(name, d, CURRENT)
+        STAMP[name] = st
         if name not in DIRS or META[name] != m:
             DIRS[name] = d
             META[name] = m
@@ -338,7 +464,9 @@ def _load(name: str) -> None:
     if not DIRS:
         raise SystemExit(f"no samples with an FFT under {ds}/samples")
 
+    STAMP.clear()
     for sid, d in DIRS.items():
+        STAMP[sid] = _stamp(d)
         META[sid] = _meta_row(sid, d, name)
 
     d0 = DIRS[next(iter(DIRS))]
@@ -353,7 +481,9 @@ def _load(name: str) -> None:
         rows=int(rows), cols=int(n_lasers // int(rows)), n_lasers=int(n_lasers),
         fps=float(m0.get("fps") or 2500), n_samples=int(z["n_samples"]),
         min_freq=float(m0.get("min_freq") or 50), max_freq=float(m0.get("max_freq") or 1000),
-        photo=_first(d0, PHOTOS), mask=_first(d0, MASKS),
+        # first sample that HAS one -- informational only; endpoints resolve per sample
+        photo=next((p for p in map(lambda x: _first(x, PHOTOS), DIRS.values()) if p), None),
+        mask=next((p for p in map(lambda x: _first(x, MASKS), DIRS.values()) if p), None),
         overhead=[ow, oh], max_overhead=list(MAX_OVERHEAD),
     )
     INFO["scale"] = _scales()
@@ -528,16 +658,51 @@ def audio(sid, ch, laser):
 
     Reimplemented from src/data/vibrate.py:get_recovered_audio -- that module does
     `import modal` at top level, so it cannot be imported here.
+
+    Each saved bin goes back to the rfft slot its OWN saved frequency names, not to a band
+    rebuilt from INFO's min/max_freq: some datasets (many_objects, cardboard, shoebox)
+    record a 100 Hz chirp start but saved the FFT from 50 Hz, and the rebuilt band then
+    has fewer slots than there are bins.
     """
-    f, _ = fft(sid)
+    f, freqs = fft(sid)
     n, fs = INFO["n_samples"], INFO["fps"]
-    full = np.fft.rfftfreq(n, d=1.0 / fs)
-    band = (full >= INFO["min_freq"]) & (full <= INFO["max_freq"])
-    spec = np.zeros(len(full), dtype=np.complex64)
-    spec[band] = pick(chan(f, ch if ch != "avg" else "x"), laser)
+    spec = np.zeros(n // 2 + 1, dtype=np.complex64)
+    spec[np.rint(freqs * n / fs).astype(int)] = pick(chan(f, ch), laser)
     sig = np.fft.irfft(spec, n=n)
     out = resample(sig, int(22050 * len(sig) / fs))
     return (out / (np.abs(out).max() + 1e-8) * 32767).astype(np.int16), 22050
+
+
+def rec_channel(ch, laser):
+    """The (ch, laser) that audio() recovers from a viewer selection: "both" (x and y drawn
+    in one axes) is heard as their average, and "all" is a rendering of every laser, whose
+    curves are the average. An average is taken on the complex spectra, i.e. of the
+    displacement signals themselves, as chan()/pick() do for every other curve."""
+    return (ch if ch in ("x", "y") else "avg"), ("avg" if laser in ("avg", "all") else str(int(laser)))
+
+
+def recspec(sid, ch, laser):
+    """Spectrogram PNG of audio(sid, ch, laser), styled exactly like the post-process
+    06_spectrogram mp4 (same utils.viz renderer), plus where the playback line goes:
+    {"axes": [left, right, top, bottom] as fractions of the image, "t": [t0, t1] the times
+    at the left/right axes edges}. The browser draws the moving line itself over the audio
+    from /api/audio, so switching laser/channel costs one ~60ms render, not an mp4 mux."""
+    import io
+    from scipy.signal import spectrogram
+    from utils.viz import render_spectrogram_frame
+    pcm, sr = audio(sid, ch, laser)
+    # src/data/audio.py:get_spectrogram's parameters
+    freqs, times, Sxx = spectrogram(pcm.astype(np.float32), fs=sr, nperseg=4096,
+                                    noverlap=4096 // 3, nfft=4096 * 4)
+    who = "avg of all lasers" if laser == "avg" else f"Laser {laser}"
+    rgb, (x0, x1, top, bottom), (t0, t1) = render_spectrogram_frame(
+        freqs, times, Sxx, label=f"Recovered: {{duration}}s, {who}, {'avg of x,y' if ch == 'avg' else ch + '-axis'}",
+        max_freq=INFO["max_freq"])
+    h, w = rgb.shape[:2]
+    b = io.BytesIO()
+    Image.fromarray(rgb).save(b, "PNG", compress_level=1)
+    return b.getvalue(), {"axes": [float(x0 / w), float(x1 / w), float(top / h), float(bottom / h)],
+                        "t": [float(t0), float(t1)]}
 
 
 def surface(U, V):
