@@ -254,7 +254,13 @@ def objmasks_png(sid: str, sel: int = -1):
     _d(sid)
     ms = [m for _, m in data.object_masks(sid)]
     if not ms:
-        raise HTTPException(404, "no masks")
+        # nothing segmented (an empty box) is a blank field, not "no image" -- that's only
+        # for a sample with no photo at all
+        p = data.sample_photo(sid)
+        if not p:
+            raise HTTPException(404, "no image")
+        with Image.open(p) as im:
+            ms = [np.zeros(im.size[::-1], bool)]
     return Response(render.objmasks_png(ms, sel), media_type="image/png", headers=CACHE)
 
 
