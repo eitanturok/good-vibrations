@@ -70,22 +70,29 @@ def readout_columns(x_start: int, x_end: int, sensor_w: int = 1920, align: int =
     return offset, min(width, sensor_w - offset)
 
 
-def compute_roi_grid(row_clicks: list[tuple[float, float]], col_clicks: list[tuple[float, float]],
-                      roi_width: int, roi_height: int, sensor_w: int = 1920, sensor_h: int = 1080):
-    """ROI grid from N_rows horizontal-line clicks (only y used) and N_cols vertical-line
-    clicks (only x used), in any click order: rows sort top-to-bottom, columns left-to-right,
-    each ROI centered on its click and clamped inside the sensor.
+def compute_roi_grid(rows: list[int], cols: list[int], roi_width: int, roi_height: int,
+                     crop: tuple[int, int] = (0, 1920), sensor_w: int = 1920, sensor_h: int = 1080):
+    """src/record.ipynb's ROI math: one roi_width x roi_height ROI centered on every crossing of a
+    horizontal line (y in `rows`) and a vertical line (x in `cols`), all in sensor px:
+    - a row band starts at y - roi_height // 2, rounded up to even (the camera reads rows in pairs)
+    - the camera reads the columns between the crop edges, on its 16 px grid, from offset_x
+    - an ROI starts at x - roi_width // 2, i.e. x - roi_width // 2 - offset_x in the output frame
+    An ROI that doesn't fit (off the sensor, or outside the crop) is an error, never moved.
 
-    Returns (rois, row_positions, offset_x) -- the camera reads only the selected row bands,
-    stacked edge-to-edge, over the column window starting at offset_x:
-    - rois: (x, y, w, h) per ROI, row-major, in the camera's OUTPUT frame (what the saved raw
-      frames and post-processing index): x = sensor x - offset_x, y = band * roi_height
-    - row_positions: the (even) sensor row each band starts at -- the camera addresses rows in pairs
+    Returns (rois, row_positions, offset_x) -- the camera sends only the row bands, stacked:
+    - rois: (x, y, w, h) per ROI, row-major (rows top-to-bottom, cols left-to-right), in the
+      camera's OUTPUT frame: y = band * roi_height
+    - row_positions: the (even) sensor row each band starts at
     - offset_x: the sensor column the output frame starts at"""
-    xs = sorted(int(round(min(max(x - roi_width / 2, 0), sensor_w - roi_width))) for x, _ in col_clicks)
-    row_positions = sorted(2 * int(round(min(max(y - roi_height / 2, 0), sensor_h - roi_height) / 2)) for _, y in row_clicks)
-    offset_x, _ = readout_columns(xs[0], xs[-1] + roi_width, sensor_w)
-    rois = [(x - offset_x, band * roi_height, roi_width, roi_height) for band in range(len(row_positions)) for x in xs]
+    row_positions = [y - roi_height // 2 + (y - roi_height // 2) % 2 for y in sorted(rows)]
+    offset_x, width = readout_columns(*crop, sensor_w)
+    xs = [x - roi_width // 2 - offset_x for x in sorted(cols)]
+    if any(y0 < 0 or y0 + roi_height > sensor_h for y0 in row_positions):
+        raise ValueError(f"a {roi_height} px tall ROI on rows {sorted(rows)} falls off the {sensor_h} px sensor")
+    if any(x < 0 or x + roi_width > width for x in xs):
+        raise ValueError(f"a {roi_width} px wide ROI on cols {sorted(cols)} falls outside the columns the camera reads "
+                         f"[{offset_x}, {offset_x + width}) -- widen the crop")
+    rois = [(x, band * roi_height, roi_width, roi_height) for band in range(len(row_positions)) for x in xs]
     return rois, row_positions, offset_x
 
 
@@ -111,14 +118,6 @@ def crop_rois(sensor_frame, rois, row_positions, offset_x: int, roi_height: int)
     import numpy as np
     width = max(x + w for x, y, w, h in rois)
     return np.concatenate([sensor_frame[y0:y0 + roi_height, offset_x:offset_x + width] for y0 in row_positions])
-
-
-def resize_roi_grid(rois, row_positions, offset_x: int, roi_size: int, new_size: int, sensor_w: int = 1920, sensor_h: int = 1080):
-    """The same grid at a new ROI size: every ROI stays centered where it was (i.e. on the
-    lines you clicked). Returns (rois, row_positions, offset_x) like compute_roi_grid."""
-    col_centers = sorted({x + offset_x + roi_size / 2 for x, y, w, h in rois})
-    row_clicks = [(0, y0 + roi_size / 2) for y0 in row_positions]
-    return compute_roi_grid(row_clicks, [(x, 0) for x in col_centers], new_size, new_size, sensor_w, sensor_h)
 
 
 def roi_mosaic(frame, rois, n_cols: int):

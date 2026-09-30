@@ -41,12 +41,12 @@ def draw_smask(ax, seg_results: list[dict], crop_overhead: np.ndarray, object_na
 N_RECENT_POSITIONS = 5  # the last 5 positions fade from dark to light; older ones all share the lightest color
 
 
-def add_coverage(coverage: dict, layout: str, smask: np.ndarray, position_id: int | None):
+def add_coverage(coverage: dict, layout: str, smask: np.ndarray, position_id: int | None, object_masks=None):
     """Accumulate one sample's smask into coverage[layout], in place and O(pixels): `last_seen` is
     the per-pixel index of the latest position covering it (0 = never), so recency needs no
-    history replay; `last_mask` is the latest sample's smask. Every speaker of a position shares
-    one smask, so a position is one step however many speakers it has. An empty box (all-False
-    smask) only bumps n_samples."""
+    history replay; `last_mask` is the latest sample's smask and `last_masks` its per-object masks
+    (default: the smask as one object). Every speaker of a position shares one smask, so a position
+    is one step however many speakers it has. An empty box (all-False smask) only bumps n_samples."""
     entry = coverage.get(layout)
     if entry is not None and entry["last_seen"].shape != smask.shape:
         entry = None  # shape guard -- crop is GUI-editable
@@ -55,6 +55,7 @@ def add_coverage(coverage: dict, layout: str, smask: np.ndarray, position_id: in
                  "last_seen": np.zeros(smask.shape, dtype=np.int32), "last_mask": smask}
     entry["n_samples"] += 1
     entry["last_mask"] = smask
+    entry["last_masks"] = [smask] if object_masks is None else list(object_masks)
     if smask.any():
         if position_id is None or entry["position_id"] != position_id:
             entry["position_id"], entry["n_positions"] = position_id, entry["n_positions"] + 1
@@ -73,18 +74,16 @@ def coverage_age(entry: dict) -> np.ndarray:
 def draw_coverage(ax, entry: dict, layout: str):
     """Where objects have been on the box floor, for one layout, colored only by recency: the
     latest position darkest, lighter over the last N_RECENT_POSITIONS, older ones all the same
-    light blue; a red border around the latest sample."""
-    from matplotlib.cm import ScalarMappable
+    light blue; a black contour around each of the latest sample's objects."""
     from matplotlib.colors import ListedColormap, Normalize
     import matplotlib
     cmap = ListedColormap(matplotlib.colormaps["Blues"](np.linspace(1.0, 0.25, 256)))  # dark (new) -> light, never white
-    norm = Normalize(vmin=0, vmax=N_RECENT_POSITIONS)
-    ax.imshow(coverage_age(entry), cmap=cmap, norm=norm, interpolation="nearest")  # NaN (never covered) is left blank
-    if entry["last_mask"].any():
-        ax.contour(entry["last_mask"], levels=[0.5], colors="red", linewidths=1.5)
-    cbar = ax.figure.colorbar(ScalarMappable(norm, cmap), ax=ax, label="positions ago")
-    cbar.set_ticks(range(N_RECENT_POSITIONS + 1), labels=[*map(str, range(N_RECENT_POSITIONS)), f"{N_RECENT_POSITIONS}+"])
+    ax.imshow(coverage_age(entry), cmap=cmap, norm=Normalize(vmin=0, vmax=N_RECENT_POSITIONS), interpolation="nearest")  # NaN (never covered) is left blank
+    ax.set_xticks([]), ax.set_yticks([])
     ax.set_title(f"Box Coverage {layout} ({entry['n_positions']} positions)")
+    for mask in entry["last_masks"]:  # last and on top: overlapping objects keep their own outline
+        if mask.any():
+            ax.contour(mask, levels=[0.5], colors="black", linewidths=1.5, zorder=3)
 
 
 def draw_shifts(ax, shifts: np.ndarray, fps: float, laser_idx: int, title: str | None = None):

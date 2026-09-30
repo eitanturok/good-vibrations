@@ -107,8 +107,14 @@ def make_grabber_cls(cam):
     return FakeEGrabber
 
 
+class TimeoutException(Exception):
+    pass
+
+
 class FakeBuffer:
     def __init__(self, grabber, timeout):
+        if not grabber.started:  # a stopped camera fills no buffers: the pop waits out its timeout
+            raise TimeoutException("EuresysEventsGetData: Timeout expired before the operation could be completed")
         self.g = grabber
         w, h = grabber.stream.get("Width"), grabber.stream.get("Height")
         self.parts = grabber.stream.get("BufferPartCount")
@@ -149,7 +155,7 @@ def load_notebook(cam):
               BUFFER_INFO_CUSTOM_NUM_DELIVERED_PARTS="delivered", INFO_DATATYPE_PTR=None, INFO_DATATYPE_SIZET=None)
     for marker in ("class ROIConfig", "class LaserCameraConfig", "class MikrotronCamera"):
         exec(next(src for src in cells if marker in src), ns)
-    roi_cell = next((src for src in cells if "def rois_from_clicks" in src), None)
+    roi_cell = next((src for src in cells if "def click_lines" in src), None)
     if roi_cell is not None:  # the ROI section's functions (shared by the notebook and the GUI)
         exec(roi_cell, ns)
     return ns
@@ -157,7 +163,7 @@ def load_notebook(cam):
 
 def grid_config(ns, **kwargs):
     """The laser camera config with the default ROI grid (Section 4's roi_config)."""
-    return ns["LaserCameraConfig"](roi=ns["ROIConfig"].spread(1920, 1080), **kwargs)
+    return ns["LaserCameraConfig"](roi=ns["ROIConfig"](), **kwargs)
 
 
 @pytest.mark.parametrize("left_acquiring", [False, True], ids=["fresh", "left-acquiring-by-previous-session"])
@@ -172,13 +178,12 @@ def test_construct_wide_open():
     ns["MikrotronCamera"](ns["LaserCameraConfig"]())  # roi=None: wide-open
 
 
-def test_default_grid_spans_sensor():
+def test_default_grid_is_inside_the_sensor():
     ns = load_notebook(Camera())
-    roi = ns["ROIConfig"].spread(1920, 1080)
-    xs = [x for x, y, w, h in roi.rois]
-    assert (roi.roi_width, roi.roi_height) == (32, 32)
-    assert min(xs) == 0 and max(xs) + roi.roi_width == 1920
-    assert roi.row_positions[0] == 0 and roi.row_positions[-1] + roi.roi_height == 1080
+    roi = ns["ROIConfig"]()
+    assert (roi.n_rows, roi.n_cols) == (10, 10) and len(roi.rois) == 100
+    for x, y, w, h in geometry.sensor_rois(roi.rois, roi.row_positions, roi.offset_x, roi.roi_height):
+        assert 0 <= x and x + w <= 1920 and 0 <= y and y + h <= 1080
 
 
 def test_full_buffer_fills_before_capture_timeout():
@@ -231,8 +236,9 @@ def test_any_row_count_is_valid(n_rows):
     """Real rule: selected rows x 2 must be a multiple of 4 -- with 30px ROIs an odd row count
     crashed set_rows. ROI heights are kept to multiples of 4, so every row count works."""
     ns = load_notebook(Camera())
-    roi = ns["ROIConfig"].spread(1920, 1080, n_rows=n_rows, roi_width=30, roi_height=30)
-    assert roi.roi_height % 4 == 0
+    with pytest.raises(ValueError):
+        ns["ROIConfig"](roi_height=30)
+    roi = ns["ROIConfig"](rows=list(range(60, 60 + 100 * n_rows, 100)), roi_width=30, roi_height=28)
     ns["MikrotronCamera"](ns["LaserCameraConfig"](roi=roi))
 
 
@@ -308,9 +314,8 @@ def test_calibrated_rois_land_on_the_clicked_speckle():
 
     cam = Camera()
     ns = load_notebook(cam)
-    rois, row_positions, offset_x = geometry.compute_roi_grid(row_clicks, col_clicks, size, size)
-    roi = ns["ROIConfig"](n_rows=2, n_cols=3, roi_width=size, roi_height=size, rois=rois,
-                          row_positions=row_positions, offset_x=offset_x)
+    roi = ns["ROIConfig"](rows=[y for _, y in row_clicks], cols=[x for x, _ in col_clicks], roi_width=size, roi_height=size)
+    row_positions, offset_x = roi.row_positions, roi.offset_x
     ns["MikrotronCamera"](ns["LaserCameraConfig"](roi=roi, buffer_part_count=2))
 
     frame = camera_readout(cam, sensor)
@@ -382,24 +387,6 @@ def test_buffer_size_options_divide_the_capture():
     assert 250 in sizes and all(2750 % b == 0 and b >= 25 for b in sizes)
 
 
-def test_roi_section_functions_calibrate_then_crop():
-    """The ROI section's functions -- the notebook's select_rois and the GUI's Reset ROIs both
-    use them: wide-open camera to click on, clicks -> ROI grid, camera cropped to that grid."""
-    cam = Camera()
-    ns = load_notebook(cam)
-    config = ns["LaserCameraConfig"](exposure_us=123.0)
-    calibration = ns["open_calibration_camera"](config)
-    assert calibration.config.roi is None and calibration.grabber.stream.get("BufferPartCount") == 1
-    assert cam.features["Width"] == 1920 and cam.features["Height"] == 1080  # full sensor to click on
-
-    roi = ns["rois_from_clicks"](config, [(0, 700), (0, 300)], [(900, 0), (500, 0)], roi_size=32)
-    assert (roi.n_rows, roi.n_cols, roi.roi_width) == (2, 2, 32) and roi.row_positions == [284, 684]
-
-    laser = ns["camera_with_rois"](config, roi)
-    assert laser.config.roi is roi and laser.config.exposure_us == 123.0
-    assert laser.grabber.stream.get("BufferPartCount") == config.buffer_part_count  # back to recording buffers
-
-
 def test_laser_camera_starts_without_rois():
     """Section 3 builds the laser camera before any ROIs exist: wide-open, full sensor from its
     config, streaming; Section 4 then rebuilds it cropped to the ROI grid."""
@@ -411,44 +398,60 @@ def test_laser_camera_starts_without_rois():
     assert laser.capture_latest_frame().shape == (1080, 1920)
 
 
-def test_roi_section_runs_twice():
-    """Real bug: re-running Section 4 crashed in plot_roi_steps ("could not broadcast (32,960)
-    into (0,960)") -- the second time, laser_cam was already cropped, so the "wide-open" frame
-    was a 320-row ROI frame, not the full sensor."""
+class FakeCv2:
+    """An OpenCV window that clicks `points` (window x, y), one per frame shown."""
+    EVENT_LBUTTONDOWN = 1
+
+    def __init__(self):
+        self.points, self.shown = [], []
+
+    def setMouseCallback(self, window, on_mouse): self.on_mouse = on_mouse
+    def cvtColor(self, frame, code): return np.dstack([frame] * 3)
+    def waitKey(self, ms): return -1
+
+    def imshow(self, window, frame):
+        self.shown.append(frame.shape[:2])
+        if self.points:
+            self.on_mouse(self.EVENT_LBUTTONDOWN, *self.points.pop(0), 0, None)
+
+    def __getattr__(self, name): return lambda *args, **kwargs: None  # namedWindow, line, putText, ...
+
+
+def test_roi_steps_rows_crop_cols_size():
+    """The ROI section's four cells, in order, twice (re-running must work too), clicking in the
+    OpenCV window: every step updates roi_config. Real bug: the crop step stopped the camera
+    (reset_global_roi) and its next frame read timed out -- TimeoutException: EuresysEventsGetData."""
     from matplotlib.figure import Figure
     from matplotlib.patches import Rectangle
     from PIL import Image
     from record.utils import viz
-    ns = load_notebook(Camera())
-    ns.update(Figure=Figure, Rectangle=Rectangle, Image=Image, viz=viz)
+    cam, cv2 = Camera(), FakeCv2()
+    ns = load_notebook(cam)
+    ns.update(cv2=cv2, Figure=Figure, Rectangle=Rectangle, Image=Image, viz=viz, display=lambda image: None)
     cells = ["".join(c["source"]) for c in json.loads(NB.read_text(encoding="utf-8"))["cells"] if c["cell_type"] == "code"]
-    params = next(src for src in cells if "roi_config = ROIConfig.spread(" in src)
-    run = next(src for src in cells if "plot_roi_steps(wide_open_frame" in src and "def " not in src)
+    step = lambda marker: exec(next(src for src in cells if marker in src and "def " not in src), ns)
     ns["laser_cam"] = ns["MikrotronCamera"](ns["laser_camera_config"])  # Section 3
-    ns["select_rois"] = lambda laser_cam, roi_config: roi_config  # no clicking in a test
+    step("roi_config = ROIConfig(")
+    rows, cols = list(range(100, 1100, 100)), list(range(450, 1550, 110))
     for _ in range(2):
-        exec(params, ns)
-        exec(run, ns)
-        assert ns["wide_open_frame"].shape == (1080, 1920)
+        cv2.points = [(5, y) for y in rows]
+        step("horizontal=True")
+        assert ns["roi_config"].rows == rows and ns["wide_open_frame"].shape == (1080, 1920)
 
+        cv2.points = [(1500, 5), (400, 5)]  # RIGHT then LEFT edge
+        step("crop=")
+        assert ns["roi_config"].crop == (400, 1500)
 
-def test_roi_plots_without_cropping_the_camera():
-    """Real bug: with select_rois and the camera rebuild commented out, plot_roi_steps crashed
-    ('NoneType' has no attribute 'row_positions') -- it read the ROIs off the still-wide-open
-    camera. The plots come from roi_config and the wide-open frame alone."""
-    from matplotlib.figure import Figure
-    from matplotlib.patches import Rectangle
-    from PIL import Image
-    from record.utils import viz
-    ns = load_notebook(Camera())
-    ns.update(Figure=Figure, Rectangle=Rectangle, Image=Image, viz=viz)
-    cells = ["".join(c["source"]) for c in json.loads(NB.read_text(encoding="utf-8"))["cells"] if c["cell_type"] == "code"]
-    exec(next(src for src in cells if "roi_config = ROIConfig.spread(" in src), ns)
-    run = next(src for src in cells if "plot_roi_steps(wide_open_frame" in src and "def " not in src)
-    skip = ("select_rois(", "dataclasses.replace(laser_camera_config", "laser_cam = MikrotronCamera(")
-    run = "\n".join("# " + l if any(s in l for s in skip) else l for l in run.splitlines())
-    exec(run, ns)
-    assert ns["laser_cam"].config.roi is None  # never cropped
+        cv2.shown.clear()
+        cv2.points = [(x - 400, 5) for x in cols]  # clicked in the cropped view
+        step("cols=cols")
+        assert cv2.shown[0] == (1080, 1100)  # only the cropped columns shown
+        assert ns["roi_config"].cols == cols
+
+        step("roi_width=")
+        roi = ns["roi_config"]
+        assert (roi.n_rows, roi.n_cols) == (10, 10) and ns["laser_cam"].config.roi is roi
+        assert cam.features["Height"] == 10 * roi.roi_height  # the camera reads only the ROI rows
 
 
 def test_roi_views_full_sensor_and_zoomed():
@@ -468,3 +471,37 @@ def test_roi_views_full_sensor_and_zoomed():
     assert zoomed.min() == 200  # tiles touch: no gaps between them
     for x, y, w, h in full_boxes:  # every grid box sits on live pixels pasted back at its sensor position
         assert full[y:y + h, x:x + w].min() == 200
+
+
+def test_gui_roi_calibration_is_the_notebook_steps():
+    """The GUI's Reset ROIs: click the rows, the 2 crop edges, then the cols on the shown (cropped)
+    frame -> the same ROIConfig the notebook's steps build, and the camera cropped to it."""
+    import tkinter as tk
+    from tkinter import ttk
+    from types import SimpleNamespace
+    ns = load_notebook(Camera())
+    ns.update(tk=tk, ttk=ttk)
+    cells = ["".join(c["source"]) for c in json.loads(NB.read_text(encoding="utf-8"))["cells"] if c["cell_type"] == "code"]
+    exec(next(src for src in cells if "class App:" in src), ns)
+    Var = lambda value: SimpleNamespace(get=lambda: value)
+    after = []
+    app = ns["App"].__new__(ns["App"])
+    app.root, app.ec = SimpleNamespace(after=lambda ms, fn: after.append(fn)), SimpleNamespace()
+    app.laser_canvas, app.laser_pause = SimpleNamespace(delete=lambda *a: None), threading.Event()
+    app.laser_view = {"transform": (0, 0, 1.0), "zoom": 1.0}  # canvas px = shown frame px
+    app.n_rows_var, app.n_cols_var, app.roi_width_var, app.roi_height_var = Var(2), Var(3), Var(80), Var(32)
+    app._redraw_laser = lambda: None
+    app._roi_base_config = ns["laser_camera_config"]
+    app._calibration_cam = ns["open_calibration_camera"](app._roi_base_config)
+    app._clicks = {"rows": [], "crop": [], "cols": []}
+
+    shown_widths = []
+    for x, y in [(5, 300), (5, 700), (1500, 5), (400, 5), (100, 5), (500, 5), (900, 5)]:
+        app._poll_calibration_frame()  # the live frame, cropped once both edges are in
+        shown_widths.append(app._last_laser_frame.shape[1])
+        app._on_laser_canvas_click(SimpleNamespace(x=x, y=y))
+    assert shown_widths == [1920] * 4 + [1100] * 3
+    after[-1]()  # _finish_calibration, scheduled after the last click
+    roi = app.ec.laser_cam.config.roi
+    assert (roi.rows, roi.crop, roi.cols) == ([300, 700], (400, 1500), [500, 900, 1300])
+    assert (roi.roi_width, roi.roi_height, len(roi.rois)) == (80, 32, 6)

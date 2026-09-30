@@ -1,6 +1,6 @@
-"""Coverage heatmap: color = how many positions ago each pixel was last covered (the last 10 fade
-from dark to light, older ones all the same), a red border around the latest sample, and an
-empty box adds nothing."""
+"""Coverage heatmap: color = how many positions ago each pixel was last covered (the last 5 fade
+from dark to light, older ones all the same), a black contour around each of the latest sample's
+objects, and an empty box adds nothing."""
 import time
 
 import numpy as np
@@ -25,7 +25,7 @@ def test_coverage_colors_by_recency_not_count():
     assert age[0, 4] == 0 and age[0, 48] == 1 and age[0, 44] == 2  # positions ago, one step per position
     assert age[0, 8] == age[0, 12] == viz.N_RECENT_POSITIONS == 5  # past the last 5: all the same
     assert np.isnan(age[30, 30])  # never covered: nothing drawn
-    assert coverage["a"]["last_mask"][0, 4]  # red border goes around the latest sample
+    assert coverage["a"]["last_mask"][0, 4]  # the latest sample
 
 
 def test_empty_box_plots_nothing():
@@ -35,8 +35,22 @@ def test_empty_box_plots_nothing():
     assert entry["n_samples"] == 1 and np.isnan(viz.coverage_age(entry)).all()
     fig = Figure()
     viz.draw_coverage(fig.subplots(), entry, "empty")
-    assert fig.axes[-1].get_ylim()[0] == 0  # colorbar starts at 0
-    assert not fig.axes[0].collections  # no red border
+    assert not fig.axes[0].collections  # no object contours
+
+
+def test_each_latest_object_gets_a_black_contour_on_top():
+    # two overlapping objects: each keeps its own outline, over the blue (not one merged blob)
+    a, b = square(10, 10), square(12, 12)
+    coverage = {}
+    viz.add_coverage(coverage, "a", a | b, position_id=1, object_masks=[a, b])
+    fig = Figure()
+    ax = fig.subplots()
+    viz.draw_coverage(ax, coverage["a"], "a")
+    assert len(fig.axes) == 1  # no colorbar: the plot gets the whole panel
+    assert not ax.get_xticks().size and not ax.get_yticks().size
+    [image] = ax.images
+    assert len(ax.collections) == 2 and all(c.zorder > image.get_zorder() for c in ax.collections)
+    assert all((c.get_edgecolor()[:, :3] == 0).all() for c in ax.collections)  # black
 
 
 def test_draw_coverage_is_fast():

@@ -1,7 +1,9 @@
 """The shifts/FFT preview is computed and plotted only for the preview speaker (not every
 speaker in the position)."""
+import copy
 import json
 import math
+import shutil
 import threading
 import time
 from pathlib import Path
@@ -20,15 +22,53 @@ class Lock:
     def __exit__(self, *a): pass
 
 
+def test_unsaved_position_shows_on_coverage_but_is_not_kept():
+    # save=False: the coverage plot shows this position's smask, but the session's coverage is untouched
+    from record.utils import viz
+    cells = ["".join(c["source"]) for c in json.loads(NB.read_text(encoding="utf-8"))["cells"] if c["cell_type"] == "code"]
+    old, new = np.zeros((4, 4), bool), np.zeros((4, 4), bool)
+    old[0, 0] = new[3, 3] = True
+    ns = dict(np=np, copy=copy, Path=Path, viz=viz, segment_mod=SimpleNamespace(combined_smask=lambda results, shape: new))
+    exec(next(src for src in cells if "def save_sample" in src), ns)
+    ec = SimpleNamespace(coverage={})
+    viz.add_coverage(ec.coverage, "a", old, 1)
+    seg_task = Task(lambda: [])
+
+    shown = ns["unsaved_coverage"](ec, seg_task, np.zeros((4, 4, 3)), "a", 2)["a"]
+    assert shown["n_positions"] == 2 and shown["last_mask"][3, 3] and shown["last_seen"][0, 0] == 1
+    kept = ec.coverage["a"]
+    assert kept["n_positions"] == 1 and not kept["last_mask"][3, 3] and kept["last_seen"][3, 3] == 0
+
+
+def test_a_failed_raw_save_leaves_no_truncated_raw(tmp_path):
+    # D: filled mid-write: a truncated 01_raw_vibrations.npy was left for post_process to choke on, silently
+    from datetime import datetime, timezone
+    cells = ["".join(c["source"]) for c in json.loads(NB.read_text(encoding="utf-8"))["cells"] if c["cell_type"] == "code"]
+    def disk_full(x, path):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"partial")
+        raise OSError(28, "No space left on device")
+    logs, submitted = [], []
+    ns = dict(np=np, json=json, Path=Path, status=status, datetime=datetime, timezone=timezone, save=disk_full,
+              append=lambda row, path: None, log=lambda ec, msg: logs.append(msg), full_post_process=SimpleNamespace(submit=submitted.append))
+    exec(next(src for src in cells if "def save_raw_vibration" in src), ns)
+    sample_dir = tmp_path / "000001"
+    with pytest.raises(OSError):
+        ns["save_raw_vibration"](SimpleNamespace(status={}), sample_dir, np.zeros(4, np.uint8), {"fps": 1.0})
+    assert not (sample_dir / "vibration/01_raw_vibrations.npy").exists() and submitted == []
+    assert len(logs) == 1 and "000001" in logs[0]  # said out loud, even with save=False (nothing else waits on it)
+
+
 def test_preview_only_for_the_preview_speaker(tmp_path):
     cells = ["".join(c["source"]) for c in json.loads(NB.read_text(encoding="utf-8"))["cells"] if c["cell_type"] == "code"]
     previewed, loading, coverage_plots = [], [], []
-    ns = dict(Task=Task, Timing=Timing, status=status, math=math, time=time, dataclasses=SimpleNamespace(asdict=lambda x: {}), np=np,
+    ns = dict(Task=Task, Timing=Timing, status=status, math=math, time=time, shutil=shutil, dataclasses=SimpleNamespace(asdict=lambda x: {}), np=np,
               log=lambda ec, msg: None, append=lambda row, path: None,
               crop=lambda image, **kw: image, segment_mod=SimpleNamespace(segment=lambda *a: None),
               capture_metadata=lambda *a: {}, sample_metadata=lambda *a: {},
               plot_loading=lambda ec, name: loading.append(name), plot_smask=lambda *a: None,
-              save_raw_vibration=lambda *a: None, save_sample=lambda *a: None, plot_coverage=lambda ec, task, sample_dir: coverage_plots.append(sample_dir.name),
+              save_raw_vibration=lambda *a: None, save_sample=lambda *a: None, unsaved_coverage=lambda *a: None,
+              plot_coverage=lambda ec, task, layout: coverage_plots.append(layout),
               preview_vibrations=lambda raw, roi, fps, laser_idx, min_freq, max_freq, use_PC: previewed.append(int(raw[0])) or
                   {"recovered_audio": np.full(100, int(raw[0]), dtype=np.int16), "audio_sample_rate": 22050},
               plot_shifts=lambda *a: None, plot_freqs=lambda *a: None)
@@ -37,7 +77,7 @@ def test_preview_only_for_the_preview_speaker(tmp_path):
     class Pool:
         def submit(self, fn, *a): return None
     speaker_now, labels = [], []
-    laser_cam = SimpleNamespace(lock=Lock(), flush=lambda: None, get_frame_rate=lambda: 2500.0,
+    laser_cam = SimpleNamespace(lock=Lock(), flush=lambda: None, get_frame_rate=lambda: 2500.0, width=32, height=32,
                                 capture_vibrations=lambda n: labels.append(ec.recording_label) or np.array([speaker_now[-1]]),
                                 config=SimpleNamespace(capture_margin_s=0.1, roi=SimpleNamespace(rois=[(0, 0, 32, 32)] * 100)))
     audio = SimpleNamespace(sample_rate=48000, config=SimpleNamespace(speaker_delay=0, speaker_device_names={1: "a", 2: "a", 3: "a"}),
@@ -47,15 +87,15 @@ def test_preview_only_for_the_preview_speaker(tmp_path):
                          laser_cam=laser_cam, audio_engine=audio, chirp_samples=np.zeros(4800), done_whistle_samples=np.zeros(10),
                          prompts={}, segmenter=None, stop_event=threading.Event(), raw_save_pool=Pool(), tasks={}, status={},
                          preview_config=SimpleNamespace(speaker=2, laser=55, use_pc=True), active_speaker=None, recording_label=None,
-                         chirp_config=SimpleNamespace(f_start=100.0, f_end=1000.0), segment_scale=1.0)
-    position = SimpleNamespace(speakers=[1, 2, 3], objects={}, prompts={}, box=SimpleNamespace(crop_params=SimpleNamespace()))
+                         chirp_config=SimpleNamespace(f_start=100.0, f_end=1000.0), segment_scale=1.0, min_free_gb=0.0)
+    position = SimpleNamespace(speakers=[1, 2, 3], objects={}, prompts={}, layout="a", box=SimpleNamespace(crop_params=SimpleNamespace()))
 
     ns["run_experiment"](ec, position, save=True, vibrate=True, verbose=False)
     for t in ec.tasks.values(): t.join()
     assert previewed == [2]  # only speaker 2's vibrations
     assert labels == ["1-1", "1-2", "1-3"] and ec.recording_label is None  # the RECORDING badge: {position}-{speaker}
     assert loading.count("shifts") == 1
-    assert coverage_plots == ["000001"]  # coverage redrawn once per position, on its first speaker
+    assert coverage_plots == ["a"]  # coverage redrawn once per position, on its first speaker
     # the GUI's status list: one row per position-speaker, its record stage timed
     assert {k: r["label"] for k, r in ec.status.items()} == {"000001": "1-1", "000002": "1-2", "000003": "1-3"}
     assert all(status.states(r, time.perf_counter())[0][0] == "done" for r in ec.status.values())
@@ -68,8 +108,10 @@ def test_preview_only_for_the_preview_speaker(tmp_path):
     assert played == [(2, 22050)]
 
     previewed.clear(); loading.clear(); ec.tasks.clear()
-    ns["run_experiment"](ec, SimpleNamespace(speakers=[1, 3], objects={}, prompts={}, box=position.box), save=False, vibrate=True, verbose=False)
+    ns["run_experiment"](ec, SimpleNamespace(speakers=[1, 3], objects={}, prompts={}, layout="b", box=position.box), save=False, vibrate=True, verbose=False)
+    for t in ec.tasks.values(): t.join()
     assert previewed == [] and "shifts" not in loading  # preview speaker not in this position: no plot, no "Loading..."
+    assert coverage_plots == ["a", "b"]  # save=False still shows this position on the coverage (unsaved_coverage)
     assert [r["skipped"][2] for r in ec.status.values()] == [False] * 3 + [True] * 2  # save=False: no save-sample stage
 
     # verbose (the notebook): the images the GUI panels got, shown in the cell in two figures --
@@ -110,3 +152,11 @@ def test_preview_only_for_the_preview_speaker(tmp_path):
     with pytest.raises(FileExistsError):
         ns["run_experiment"](ec, SimpleNamespace(speakers=[1, 3], objects={}, prompts={}, box=position.box), save=True, vibrate=True, verbose=False)
     assert len(speaker_now) == n_captured and len(ec.status) == n_rows and list(taken.iterdir()) == []
+
+    # never starts a position the disk can't hold: its raw vibrations + min_free_gb must fit, or
+    # it fails before anything is captured (post-processing is slower than recording, so raws pile up)
+    ec.min_free_gb = 1e9
+    with pytest.raises(OSError, match="free"):
+        ns["run_experiment"](ec, SimpleNamespace(speakers=[1, 3], objects={}, prompts={}, box=position.box, layout="a"), save=True, vibrate=True, verbose=False)
+    assert len(speaker_now) == n_captured and len(ec.status) == n_rows
+    ns["run_experiment"](ec, SimpleNamespace(speakers=[1], objects={}, prompts={}, box=position.box, layout="a"), save=False, vibrate=False, verbose=False)  # no vibration: no raws, no check
