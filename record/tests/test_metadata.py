@@ -16,7 +16,7 @@ NB = Path(__file__).resolve().parents[1] / "record.ipynb"
 
 EXPECTED = {
     # ids
-    "sample_id", "position_id", "speaker", "experiment_dir", "timestamp", "git_commit", "hostname",
+    "position_id", "speaker", "experiment_dir", "timestamp", "git_commit", "hostname",
     # position
     "box", "crop_left", "crop_right", "crop_top", "crop_bottom", "objects", "n_objects", "layout", "description",
     "is_empty_box", "speakers", "save", "vibrate", "prompts",
@@ -82,8 +82,8 @@ def test_every_key_saved_one_per_line_before_the_raw_vibrations(tmp_path):
                                layout="grid", description="a red cube", speakers=[1, 4])
     metadata = ns["capture_metadata"](ec, position, np.zeros((1200, 1600, 3)), np.zeros((900, 1000, 3)),
                                       n_frames=3250, n_capture_seconds=1.3, save=True, vibrate=True)
-    metadata = ns["sample_metadata"](ec, metadata, sample_id="000007", position_id=3, speaker=4)
-    sample_dir = tmp_path / "000007"
+    metadata = ns["sample_metadata"](ec, metadata, position_id=3, speaker=4)
+    sample_dir = tmp_path / "000003-4"
     ns["save_raw_vibration"](ec, sample_dir, np.zeros((4, 64, 144), np.uint8), metadata)
 
     raw_path, seen_by_post_process = submitted[0]

@@ -13,6 +13,8 @@ import numpy as np
 import pytest
 
 from record.utils import Task, Timing, status
+from utils.ids import sample_name
+from record.utils.position_id import PositionIdCounter
 
 NB = Path(__file__).resolve().parents[1] / "record.ipynb"
 
@@ -52,11 +54,11 @@ def test_a_failed_raw_save_leaves_no_truncated_raw(tmp_path):
     ns = dict(np=np, json=json, Path=Path, status=status, datetime=datetime, timezone=timezone, save=disk_full,
               append=lambda row, path: None, log=lambda ec, msg: logs.append(msg), full_post_process=SimpleNamespace(submit=submitted.append))
     exec(next(src for src in cells if "def save_raw_vibration" in src), ns)
-    sample_dir = tmp_path / "000001"
+    sample_dir = tmp_path / "000001-1"
     with pytest.raises(OSError):
         ns["save_raw_vibration"](SimpleNamespace(status={}), sample_dir, np.zeros(4, np.uint8), {"fps": 1.0})
     assert not (sample_dir / "vibration/01_raw_vibrations.npy").exists() and submitted == []
-    assert len(logs) == 1 and "000001" in logs[0]  # said out loud, even with save=False (nothing else waits on it)
+    assert len(logs) == 1 and "000001-1" in logs[0]  # said out loud, even with save=False (nothing else waits on it)
 
 
 def test_preview_only_for_the_preview_speaker(tmp_path):
@@ -67,7 +69,7 @@ def test_preview_only_for_the_preview_speaker(tmp_path):
               crop=lambda image, **kw: image, segment_mod=SimpleNamespace(segment=lambda *a: None),
               capture_metadata=lambda *a: {}, sample_metadata=lambda *a: {},
               plot_loading=lambda ec, name: loading.append(name), plot_smask=lambda *a: None,
-              save_raw_vibration=lambda *a: None, save_sample=lambda *a: None, unsaved_coverage=lambda *a: None,
+              save_raw_vibration=lambda *a: None, save_sample=lambda *a: None, unsaved_coverage=lambda *a: None, sample_name=sample_name,
               plot_coverage=lambda ec, task, layout: coverage_plots.append(layout),
               preview_vibrations=lambda raw, roi, fps, laser_idx, min_freq, max_freq, use_PC: previewed.append(int(raw[0])) or
                   {"recovered_audio": np.full(100, int(raw[0]), dtype=np.int16), "audio_sample_rate": 22050},
@@ -82,7 +84,7 @@ def test_preview_only_for_the_preview_speaker(tmp_path):
                                 config=SimpleNamespace(capture_margin_s=0.1, roi=SimpleNamespace(rois=[(0, 0, 32, 32)] * 100)))
     audio = SimpleNamespace(sample_rate=48000, config=SimpleNamespace(speaker_delay=0, speaker_device_names={1: "a", 2: "a", 3: "a"}),
                             play=lambda samples, speakers: speaker_now.append(speakers[0]) or [], reset=lambda: None)
-    ec = SimpleNamespace(_id_lock=threading.Lock(), next_position_id=1, next_sample_id=1, experiment_dir=tmp_path,
+    ec = SimpleNamespace(position_ids=PositionIdCounter(tmp_path / "position_id.txt", create=True), experiment_dir=tmp_path,
                          overhead_cam=SimpleNamespace(config=SimpleNamespace(hand_delay=0), capture_overhead=lambda: np.zeros((4, 4))),
                          laser_cam=laser_cam, audio_engine=audio, chirp_samples=np.zeros(4800), done_whistle_samples=np.zeros(10),
                          prompts={}, segmenter=None, stop_event=threading.Event(), raw_save_pool=Pool(), tasks={}, status={},
@@ -93,11 +95,11 @@ def test_preview_only_for_the_preview_speaker(tmp_path):
     ns["run_experiment"](ec, position, save=True, vibrate=True, verbose=False)
     for t in ec.tasks.values(): t.join()
     assert previewed == [2]  # only speaker 2's vibrations
-    assert labels == ["1-1", "1-2", "1-3"] and ec.recording_label is None  # the RECORDING badge: {position}-{speaker}
+    assert labels == ["000001-1", "000001-2", "000001-3"] and ec.recording_label is None  # the RECORDING badge: the sample name
     assert loading.count("shifts") == 1
     assert coverage_plots == ["a"]  # coverage redrawn once per position, on its first speaker
-    # the GUI's status list: one row per position-speaker, its record stage timed
-    assert {k: r["label"] for k, r in ec.status.items()} == {"000001": "1-1", "000002": "1-2", "000003": "1-3"}
+    # the GUI's status list: one row per sample, {position}-{speaker}, its record stage timed
+    assert list(ec.status) == ["000001-1", "000001-2", "000001-3"]
     assert all(status.states(r, time.perf_counter())[0][0] == "done" for r in ec.status.values())
 
     # the GUI's play button: the preview speaker's recovered audio, on the PC's default output
@@ -112,7 +114,8 @@ def test_preview_only_for_the_preview_speaker(tmp_path):
     for t in ec.tasks.values(): t.join()
     assert previewed == [] and "shifts" not in loading  # preview speaker not in this position: no plot, no "Loading..."
     assert coverage_plots == ["a", "b"]  # save=False still shows this position on the coverage (unsaved_coverage)
-    assert [r["skipped"][2] for r in ec.status.values()] == [False] * 3 + [True] * 2  # save=False: no save-sample stage
+    assert {k: r["skipped"][2] for k, r in ec.status.items()} == {"000001-1": False, "000001-2": False, "000001-3": False,
+                                                                   "000002-1": True, "000002-3": True}  # save=False: no save-sample stage
 
     # verbose (the notebook): the images the GUI panels got, shown in the cell in two figures --
     # smask | coverage on one row, and shifts over fft as soon as the preview is ready
@@ -144,9 +147,9 @@ def test_preview_only_for_the_preview_speaker(tmp_path):
     ns["run_experiment"](ec, SimpleNamespace(speakers=[1], objects={}, prompts={}, box=position.box), save=True, vibrate=True, verbose=False)
     assert status.states(ec.status[list(ec.status)[-1]], time.perf_counter())[0][0] == "failed"
 
-    # never records over an existing sample: a reused id fails before anything is captured or written
+    # never records over an existing sample: fails before anything is captured or written
     ec.laser_cam.capture_vibrations = lambda n: np.array([speaker_now[-1]])
-    taken = tmp_path / "samples" / f"{ec.next_sample_id + 1:06d}"
+    taken = tmp_path / "samples" / sample_name(int((tmp_path / 'position_id.txt').read_text()), 3)  # the next id the counter hands out
     taken.mkdir(parents=True)
     n_captured, n_rows = len(speaker_now), len(ec.status)
     with pytest.raises(FileExistsError):

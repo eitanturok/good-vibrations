@@ -92,11 +92,11 @@ def test_submitted_and_scanned_sample_is_processed_once(tmp_path):
         raw_path.unlink()  # like post_process: the raw file is deleted once done
 
     handler.start(tmp_path)
-    raw = tmp_path / "samples/000063/vibration/01_raw_vibrations.npy"
+    raw = tmp_path / "samples/000063-1/vibration/01_raw_vibrations.npy"
     raw.parent.mkdir(parents=True)
     raw.write_bytes(b"x" * (2**20 + 1))
     with pytest.raises(ValueError):
-        handler.submit(tmp_path / "samples/000063")  # not the matched file: rejected, not silently double-queued
+        handler.submit(tmp_path / "samples/000063-1")  # not the matched file: rejected, not silently double-queued
     handler.submit(raw)
 
     assert _wait_until(lambda: not raw.exists(), timeout=5.0)

@@ -8,7 +8,7 @@ showing a correct IoU beside it.
 
 | | `SampleId` | `Row` |
 |---|---|---|
-| is | the sample directory name, as int (`"000010"` → `10`) | index into the ground-truth arrays |
+| is | the sample directory name, a string (`"000010"`, or `"000012-3"` = utils.ids.sample_name for newer data) | index into the ground-truth arrays |
 | domain | sparse, arbitrary, **need not start at 0** | dense, `0 .. len(gt)-1` |
 | authoritative for | the wire: URLs, JSON `s.i`, `.pt` `info["sample_id"]` | every numpy/torch array in the process |
 | from | the client, `gt.sample_ids[row]`, `.pt` files | `_sid()` / `registry.sample_index()` |
@@ -81,16 +81,18 @@ more ids sit on top:
 
 | | `GlobalId` | `Row` (as above) |
 |---|---|---|
-| is | `gi * ID_STRIDE + local SampleId` | a single index into a flat space spanning every loaded experiment |
-| domain | sparse, one disjoint 1,000,000-wide block per experiment | dense, `0 .. registry.n_samples-1` |
+| is | `f"{gi}:{local SampleId}"` | a single index into a flat space spanning every loaded experiment |
+| domain | sparse strings, prefixed per experiment | dense, `0 .. registry.n_samples-1` |
 | authoritative for | the wire, same as `SampleId` was (URLs, JSON `s.i`) | every numpy/torch array, same as `Row` was |
 | from | `registry.global_id(gi, local_id)` | `_sid()` / `registry.sample_index()`, same entry point as before |
 
 `Registry.locate(row) -> (gi, gt, local_row)` is the single place a flat row resolves back
 to which experiment's `GtIndex` it came from and that experiment's own local row — the
 multi-experiment analog of `_sid()`. With exactly one experiment loaded, `gi == 0`,
-`GlobalId == local SampleId` and `Row == local row`, so single-experiment behaviour
-(including `ensure_viz`'s per-training-job auto-launch) is bit-for-bit unchanged.
+`GlobalId == "0:" + local SampleId` and `Row == local row`.
+
+What the UI SHOWS as a sample's id is neither: it is utils.ids.sample_name built from the sample's
+metadata (`"000012-3"`), for old and new samples alike (`s.sample_id` in /api/samples).
 
 A run's predictions are NOT assumed to belong to one experiment: `load_run` now takes the
 whole `Registry` and routes every predicted row to its own experiment via

@@ -10,6 +10,7 @@ from composer.loggers import WandBLogger
 
 from model.attribution import capture_attention, ablate_lasers, ablate_freq_patches
 from utils.metrics import center_of_mass
+from utils.ids import sample_name
 
 
 def mses(pred, true):
@@ -89,7 +90,7 @@ class VisualizeSMask(Callback):
         is_rgb = mask_pred.ndim == 4  # center of mass is an occupancy notion, so skip it on rgb targets
         com_dists = None if is_rgb else com_distances(mask_pred, mask_true, epsilon=1e-6, normalize=True).numpy()
         mse_vals = mses(mask_pred, mask_true).numpy()
-        captions = [f"{info['box'][i]}  pos {info['position_id'][i]}  spk {info['speaker'][i]} (smp {info['sample_id'][i]})  objs={info['n_objects'][i]}  "
+        captions = [f"{info['box'][i]}  {sample_name(info['position_id'][i], info['speaker'][i])}  objs={info['n_objects'][i]}  "
                     f"mse={mse_vals[i]:.4f}"
                     + ("" if is_rgb else f"  com=({info['x_com'][i]:.1f},{info['y_com'][i]:.1f})  com_dist={com_dists[i]:.4f}")
                     + (f"  p(empty)={p_empty[i]:.3f}" if p_empty is not None else "")

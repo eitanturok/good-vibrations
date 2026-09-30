@@ -116,9 +116,13 @@ function statusChip(status) {
 /* The identity line both column types carry: where the capture happened, which speaker
    played, and the sample it belongs to. Shared so the two titles cannot drift apart. */
 function identity(s) {
-  const pos = s.output_id == null ? "–" : +s.output_id;
-  return `Pos ${pos}, Spk ${s.speaker} (${+s.sample_id}${s.dataset ? `, ${s.dataset}` : ""})`;
+  return `${s.sample_id}${s.dataset ? ` (${s.dataset})` : ""}`;
 }
+
+/* s.sample_id is the universal id, "{position:06d}-{speaker}" (utils/ids.py); s.i is the opaque
+   wire id. Searches may skip the padding: "12-3" -> "000012-3". */
+const padId = (t) => t.replace(/^(\d+)-/, (_, p) => `${p.padStart(6, "0")}-`);
+const byId = (a, b) => (a.i < b.i ? -1 : a.i > b.i ? 1 : 0);
 
 function shortLayout(s) {
   if (!s) return "–";
@@ -377,7 +381,7 @@ function failures(s) {
   // An explicit ID search overrides the browsing filters: when you ask for a sample by
   // number you want to see it, not have it hidden by a speaker chip you set earlier.
   if (f.findSamples.size || f.findPositions.size) {
-    const hit = f.findSamples.has(+s.sample_id) || f.findPositions.has(+s.output_id);
+    const hit = f.findSamples.has(s.sample_id) || f.findPositions.has(+s.output_id);
     return hit ? out : ["find"];
   }
   if (!f.speakers.has(s.speaker)) out.push("speakers");
@@ -496,7 +500,7 @@ function applyFilters() {
     // the end by sample id, rather than jumping into the middle of the frozen sequence.
     const rank = S.frozenOrder;
     const at = (s) => (rank.has(s.i) ? rank.get(s.i) : Number.MAX_SAFE_INTEGER);
-    rows.sort((a, b) => at(a) - at(b) || a.i - b.i);
+    rows.sort((a, b) => at(a) - at(b) || byId(a, b));
     S.order = rows;
     S.groups = S.view.rowMode === "dataset" ? computeGroups(rows) : null;
     return;
@@ -516,11 +520,11 @@ function applyFilters() {
       // empty box), sinks to the end in BOTH directions.
       const xv = x && x[metric] != null ? x[metric] : null;
       const yv = y && y[metric] != null ? y[metric] : null;
-      if (xv == null && yv == null) return a.i - b.i;
+      if (xv == null && yv == null) return byId(a, b);
       if (xv == null) return 1;
       if (yv == null) return -1;
       const d = (key(yv) - key(xv)) * (desc ? 1 : -1);
-      return d || a.i - b.i;
+      return d || byId(a, b);
     });
   }
   S.order = rows;
@@ -1106,7 +1110,7 @@ function paintRunCell(c, name, cs, mixed) {
   // THIS sample, also right-aligned. Both describe the prediction, which is why neither
   // lived below the image before: they are closer in kind to a title than to a metric.
   // identity(cs) is also where a grouped cell's OWN dataset becomes visible -- see
-  // identity()'s "(sample_id, dataset)" suffix -- since neighbouring columns in
+  // identity()'s "(dataset)" suffix -- since neighbouring columns in
   // different groups can be showing entirely different datasets at this same rank.
   head.innerHTML =
     `<span class="t1 run"><span class="txt" title="${name}">${name}</span>${epchip}</span>` +
@@ -1345,7 +1349,7 @@ function renderFindChips() {
     b.onclick = () => { set.delete(val); renderFindChips(); refresh(); };
     host.appendChild(b);
   };
-  [...f.findSamples].sort((a, b) => a - b).forEach((v) => add("sample", f.findSamples, v));
+  [...f.findSamples].sort((a, b) => a.localeCompare(b, undefined, { numeric: true })).forEach((v) => add("sample", f.findSamples, v));
   [...f.findPositions].sort((a, b) => a - b).forEach((v) => add("pos", f.findPositions, v));
 
   const n = f.findSamples.size + f.findPositions.size;
@@ -1356,18 +1360,18 @@ function renderFindChips() {
 }
 
 function bindFind() {
-  const commit = (input, set, valid) => {
-    // Accept a list, so pasting "871, 502 33" works as well as typing one at a time.
-    const ids = input.value.split(/[^0-9]+/).filter(Boolean).map(Number);
+  const commit = (input, set, valid, parse = Number) => {
+    // Accept a list, so pasting "871, 502 33" (or "12-3, 12-4") works as well as typing one at a time.
+    const ids = (input.value.match(/\d+(?:-\d+)?/g) || []).map(parse);
     let added = 0;
     for (const id of ids) if (valid(id)) { set.add(id); added++; }
     if (added) { input.value = ""; renderFindChips(); refresh(true); }
     else if (ids.length) { input.classList.add("bad"); setTimeout(() => input.classList.remove("bad"), 600); }
   };
-  const sampleIds = new Set(S.samples.map((s) => +s.sample_id));
+  const sampleIds = new Set(S.samples.map((s) => s.sample_id));
   const posIds = new Set(S.samples.map((s) => +s.output_id));
   $("#find-sample").onkeydown = (e) => {
-    if (e.key === "Enter") commit($("#find-sample"), S.filters.findSamples, (i) => sampleIds.has(i));
+    if (e.key === "Enter") commit($("#find-sample"), S.filters.findSamples, (i) => sampleIds.has(i), padId);
   };
   $("#find-pos").onkeydown = (e) => {
     if (e.key === "Enter") commit($("#find-pos"), S.filters.findPositions, (i) => posIds.has(i));
@@ -2382,7 +2386,7 @@ async function valuesFor(run, sid, mode) {
 const HIT_PX = 7;
 function hitConnector(el, ev, b) {
   if (!S.view.coms || !el.dataset.run) return null;
-  const coms = comsFor(el.dataset.run, +el.dataset.sid);
+  const coms = comsFor(el.dataset.run, el.dataset.sid);
   if (!coms || !coms.pairs || !coms.pairs.length) return null;
   const [mh, mw] = runShape(el.dataset.run);
   const px = ev.clientX - b.left, py = ev.clientY - b.top;
@@ -2596,7 +2600,7 @@ async function openNeighbors(run, sid) {
     <li class="nb ${cls}" data-i="${x.i}">
       <img src="/api/gt_mask.png?sid=${x.i}&bg=1&shape=${d.shape[0]}x${d.shape[1]}&v=${S.renderVersion}" loading="lazy" alt="">
       <div class="nbmeta">
-        <div class="nbtop"><b>${+x.sample_id}</b> <span class="tag">pos ${+x.output_id}</span></div>
+        <div class="nbtop"><b>${x.sample_id}</b></div>
         <div class="nbsub">d ${fmt(x.distance, 3)} · com ${dc(x.com[0], x.com[1])}</div>
         <div class="nbsub">${shortLayout(x.layout)} · ${x.n_objects} obj</div>
       </div>
@@ -2608,7 +2612,7 @@ async function openNeighbors(run, sid) {
 
   const rel = S.view.relative ? 1 : 0;
   S.modalComs = { coms: comsFor(run, sid) || (S.runs[run] && S.runs[run].samples[sid] || {}).coms || null };
-  $("#m-title").innerHTML = `Sample ${+d.sample_id} — <span class="mrun">${run}</span>`;
+  $("#m-title").innerHTML = `Sample ${d.sample_id} — <span class="mrun">${run}</span>`;
   $("#m-body").innerHTML = `
     <div class="msec">
       <h3>This prediction</h3>
@@ -2641,7 +2645,7 @@ async function openNeighbors(run, sid) {
   // The modal shows ONE sample, so its panels take that sample's own box aspect rather
   // than --mask-w, which is sized to the widest box loaded.
   {
-    const nb = $(".nbviews"), smp = S.samples.find((x) => x.i === +sid);
+    const nb = $(".nbviews"), smp = S.samples.find((x) => x.i === sid);
     if (nb && smp && smp.aspect > 0)
       nb.style.setProperty("--row-mask-w", `${Math.round(cssPx("--mask-h", 168) * smp.aspect)}px`);
   }
@@ -2651,7 +2655,7 @@ async function openNeighbors(run, sid) {
   // Each neighbour opens its own ground-truth detail, if it is on screen.
   $("#m-body").querySelectorAll(".nb").forEach((li) => {
     li.onclick = () => {
-      const rank = S.order.findIndex((s) => s.i === +li.dataset.i);
+      const rank = S.order.findIndex((s) => s.i === li.dataset.i);
       if (rank >= 0) openModal(rank);
     };
   });

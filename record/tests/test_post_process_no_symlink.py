@@ -14,7 +14,7 @@ def test_post_process_without_symlink_privilege(tmp_path, monkeypatch):
         raise OSError(22, "A required privilege is not held by the client", str(self), 1314)
     monkeypatch.setattr(Path, "symlink_to", refuse)
 
-    sample_dir = tmp_path / "000000"
+    sample_dir = tmp_path / "000001-1"
     (sample_dir / "vibration").mkdir(parents=True)
     rng = np.random.default_rng(0)
     np.save(sample_dir / "vibration/01_raw_vibrations.npy", rng.integers(0, 255, (2500, 80, 80), dtype=np.uint8))

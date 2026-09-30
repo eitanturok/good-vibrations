@@ -8,6 +8,7 @@ import math
 import threading
 import time
 import tracemalloc
+import weakref
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -27,8 +28,8 @@ class GenapiError(Exception):
 
 class Camera:
     """The physical camera: its state outlives any one grabber handle."""
-    def __init__(self, acquiring=False, offset_x=0, offset_y=0):
-        self.acquiring = acquiring
+    def __init__(self, acquiring=False, offset_x=0, offset_y=0, powered=True):
+        self.acquiring, self.powered = acquiring, powered
         self.lut = {}  # multi-ROI row registers: index -> value (value v reads sensor rows 2v, 2v+1)
         self.features = {"Width": 1920 - offset_x, "Height": 1080 - offset_y, "OffsetX": offset_x, "OffsetY": offset_y,
                          "AcquisitionFrameRate": 25, "AcquisitionFrameRateMax": 3987}  # 25 = what the real camera was left at
@@ -78,11 +79,32 @@ class ClientError(Exception):
     pass
 
 
+class InvalidAddressException(Exception):
+    pass
+
+
+class ResourceInUseException(Exception):
+    pass
+
+
+class FakeEGenTL:
+    """Real rule: one live EGenTL per process -- a second EGenTL() while an earlier one is
+    still referenced (e.g. by a failed cell's traceback) fails with ResourceInUseException."""
+    live = None
+
+    def __init__(self):
+        if FakeEGenTL.live is not None and FakeEGenTL.live() is not None:
+            raise ResourceInUseException("GCInitLib: Requested resource is already in use")
+        FakeEGenTL.live = weakref.ref(self)
+
+
 def make_grabber_cls(cam):
     class FakeEGrabber:
         """Second real rule: while one thread is inside a grabber call (e.g. waiting in a
         Buffer pop for the camera to fill a buffer), any call from another thread fails."""
         def __init__(self, gentl):
+            if not cam.powered:  # the grabber card has no camera on its CoaXPress link
+                raise InvalidAddressException("DevGetPort: A given address is out of range or invalid")
             self.remote, self.stream, self.started = Remote(cam), Stream(cam), False
             self.owner, self.popping = None, threading.Event()
             self.produced, self.queued = 0, 0  # buffers filled so far; filled but not yet popped (FIFO)
@@ -144,13 +166,14 @@ class FakeBuffer:
     def get_info(self, what, datatype): return self.info[what]
 
 
-def load_notebook(cam):
+def load_notebook(cam, gentl=lambda: None):
     """Exec the ROIConfig, LaserCameraConfig and MikrotronCamera cells, as-is, with the
     fake grabber standing in for egrabber."""
     cells = ["".join(c["source"]) for c in json.loads(NB.read_text(encoding="utf-8"))["cells"] if c["cell_type"] == "code"]
     ns = dict(np=np, dataclass=dataclass, field=field, geometry=geometry, dataclasses=__import__('dataclasses'),
               close_previous_instance=close_previous_instance, stop_then_close=stop_then_close,
-              EGenTL=lambda: None, EGrabber=make_grabber_cls(cam), ct=ct, threading=threading,
+              EGenTL=gentl, EGrabber=make_grabber_cls(cam), ct=ct,
+              InvalidAddressException=InvalidAddressException, threading=threading,
               Buffer=FakeBuffer, BUFFER_INFO_BASE="base", BUFFER_INFO_CUSTOM_PART_SIZE="part_size",
               BUFFER_INFO_CUSTOM_NUM_DELIVERED_PARTS="delivered", INFO_DATATYPE_PTR=None, INFO_DATATYPE_SIZET=None)
     for marker in ("class ROIConfig", "class LaserCameraConfig", "class MikrotronCamera"):
@@ -176,6 +199,19 @@ def test_construct_wide_open():
     """rois=None is what the GUI's Reset-ROIs calibration flow builds -- full sensor, no grid."""
     ns = load_notebook(Camera(acquiring=True))
     ns["MikrotronCamera"](ns["LaserCameraConfig"]())  # roi=None: wide-open
+
+
+def test_camera_turned_off_says_so_and_retry_works():
+    """Real bug: with the laser camera powered off, construction failed with the misleading
+    "InvalidAddressException: DevGetPort: A given address is out of range or invalid" -- and
+    re-running the cell after turning the camera on then failed "GCInitLib: already in use"
+    because the failed attempt's EGenTL was still alive."""
+    cam = Camera(powered=False)
+    ns = load_notebook(cam, gentl=FakeEGenTL)
+    with pytest.raises(RuntimeError, match="turned on"):
+        ns["MikrotronCamera"](grid_config(ns))
+    cam.powered = True  # the user turns the camera on and re-runs the cell
+    ns["MikrotronCamera"](grid_config(ns))
 
 
 def test_default_grid_is_inside_the_sensor():
