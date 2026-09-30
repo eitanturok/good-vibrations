@@ -212,6 +212,7 @@ body.nosidebar #sidebar {
   border: 0; background: var(--surface-2); color: var(--ink-3);
 }
 .seg button.on { background: var(--accent); color: #fff; }
+.seg button:disabled { opacity: .45; cursor: not-allowed; }
 
 /* Epoch scrubber: frames are held locally, so dragging and playback never hit the net. */
 .epochrow { display: flex; align-items: center; gap: 8px; }

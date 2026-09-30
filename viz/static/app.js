@@ -723,29 +723,64 @@ function makeDraggable(cell, name) {
    and the runs, so the handle to bring it back lives in the index header cell (and on "g") rather
    than in the column itself. Width lives in a CSS var, so the header, every pooled row, and the
    sticky offsets all follow from one class -- no re-render, and no row heights change. */
-function setGtCol(open) {
+function setGtCol(open, persist = true) {
   // There is no single shared ground truth to show outside "single sample" mode -- see
   // paintRow -- so opening it is a no-op there rather than fighting setRowMode over the
   // nogt class every time either one runs.
   if (open && S.view.rowMode !== "single") return;
   document.body.classList.toggle("nogt", !open);
-  try { localStorage.setItem("viz.gtcol", open ? "1" : "0"); } catch (_) {}
+  // The row-mode switch collapses it without persisting, so "single" can restore the
+  // user's own last choice rather than the forced collapse.
+  if (persist) { try { localStorage.setItem("viz.gtcol", open ? "1" : "0"); } catch (_) {} }
 }
 
 /* "By dataset" (default) vs "single sample" -- see S.view.rowMode's doc comment and
    paintRow. Switching away from "single" force-collapses the ground-truth column;
    switching back restores whatever the user last had it set to. */
 function setRowMode(mode) {
-  S.view.rowMode = mode;
+  S.view.rowPref = mode;
+  syncRowMode();
+  refresh(true);
+}
+
+/* The loaded runs' primary datasets (the same key computeGroups groups columns by). More
+   than one means the columns share no sample, so "single sample" mode -- one shared
+   sample per row -- would line every column up against whichever dataset sorts first and
+   show "not in run" for all the others, burying their datasets at the bottom. */
+function runDatasets() {
+  const ds = new Set();
+  for (const n of S.runOrder) {
+    const d = (S.runs[n].entry && S.runs[n].entry.datasets) || [];
+    if (d.length) ds.add(d[0]);
+  }
+  return ds;
+}
+
+/* Applies the effective row mode: the user's pick (S.view.rowPref), except that runs
+   trained on different datasets force "by dataset" -- keyed on the dataset (experiment
+   dir), not the box, since several captures share a box. Called on every refresh so
+   adding/removing a run flips it; returns whether the mode changed. */
+function syncRowMode() {
+  const mixed = runDatasets().size > 1;
+  const mode = mixed ? "dataset" : (S.view.rowPref || "dataset");
+  const single = $("#rowmode-seg").querySelector('[data-rowmode="single"]');
+  single.dataset.title ??= single.title;   // the static tooltip from index.html
+  single.disabled = mixed;
+  single.title = mixed
+    ? "Unavailable: the loaded runs were trained on different datasets, so no sample is shared across every column."
+    : single.dataset.title;
   $("#rowmode-seg").querySelectorAll("button").forEach((b) => b.classList.toggle("on", b.dataset.rowmode === mode));
+  if (mode === S.view.rowMode && S.view.rowModeApplied) return false;
+  S.view.rowMode = mode;
+  S.view.rowModeApplied = true;
   if (mode === "single") {
     let stored = "1";
     try { stored = localStorage.getItem("viz.gtcol") ?? "1"; } catch (_) {}
-    setGtCol(stored !== "0");
+    setGtCol(stored !== "0", false);
   } else {
-    setGtCol(false);
+    setGtCol(false, false);
   }
-  refresh(true);
+  return true;
 }
 
 function renderHeader() {
@@ -1229,6 +1264,9 @@ function refresh(toTop = false) {
   $("#focus").hidden = !S.focus;
   // toTop is passed exactly by the sort controls, which is also the signal that the user
   // asked for a new order -- so it releases any pin the epoch scrubber holds.
+  // A run just added/removed can flip the effective row mode (see syncRowMode); the rows
+  // then mean something different, so start from the top like a re-sort does.
+  if (syncRowMode()) toTop = true;
   if (toTop) thawOrder();
   applyFilters();
   // Re-sorting puts different samples at rank 1, so keeping the old scroll offset would
