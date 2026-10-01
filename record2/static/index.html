@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>record</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header class="top">
+  <span id="dir" class="dir"></span>
+  <span id="counts" class="counts"></span>
+  <span id="errors" class="errors" hidden></span>
+</header>
+
+<main class="grid">
+  <!-- two rows: each camera beside the plots made from it -->
+  <section class="views">
+    <figure class="feed" id="overhead">
+      <div class="view"><div class="stage"><img alt="overhead camera"><svg></svg></div><div class="speakers"></div></div>
+      <figcaption><h2>overhead</h2><span class="hint">wheel zoom · shift-drag pan · drag to crop · double-click crop ↔ whole</span></figcaption>
+    </figure>
+    <figure class="plot"><img id="p-smask" alt=""><div class="status" data-name="segmentation"></div></figure>
+    <figure class="plot"><img id="p-coverage" alt=""><div class="status" data-name="coverage"></div></figure>
+    <figure class="feed" id="laser">
+      <div class="view"><div class="stage"><img alt="laser camera"><canvas></canvas><svg></svg></div></div>
+      <figcaption><h2>laser</h2><span class="hint" id="laser-hint"></span></figcaption>
+    </figure>
+    <figure class="plot long"><img id="p-shifts" alt=""><div class="status" data-name="shifts"></div></figure>
+    <figure class="plot long"><button id="play" class="play" disabled>▶ recovered audio</button><audio id="audio"></audio><img id="p-freqs" alt=""><div class="status" data-name="fft"></div></figure>
+  </section>
+
+  <aside class="side">
+    <button id="run"><b id="run-label"></b><span id="run-id"></span><small id="run-sub"></small></button>
+    <div class="runrow">
+      <label class="switch"><input type="checkbox" id="save" checked><i></i>save</label>
+      <label class="switch"><input type="checkbox" id="vibrate" checked><i></i>vibrate</label>
+      <button id="delete" title="delete the last recorded position (its samples move to deleted/)" disabled>
+        <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M3 6h18M8 6V4a1 1 0 0 1 1-1h6a1 1 0 0 1 1 1v2m2 0v14a1 1 0 0 1-1 1H7a1 1 0 0 1-1-1V6M10 11v6M14 11v6"/></svg>
+        <span id="delete-id"></span>
+      </button>
+    </div>
+    <div id="msg"></div>
+
+    <section>
+      <h2>position</h2>
+      <label class="pk">box <select id="box"></select></label>
+      <div class="row">
+        <label>left<input type="number" step="0.001" id="crop-left"></label>
+        <label>right<input type="number" step="0.001" id="crop-right"></label>
+        <label>top<input type="number" step="0.001" id="crop-top"></label>
+        <label>bottom<input type="number" step="0.001" id="crop-bottom"></label>
+      </div>
+      <div class="pk">speakers <div id="speakers" class="chips"></div></div>
+      <label class="pk">layout <input id="layout" list="layouts"></label>
+      <div class="pk">objects <div id="objects"></div><button id="add-object" class="link">+ object</button></div>
+      <label class="pk">description <textarea id="description" rows="2"></textarea></label>
+      <datalist id="layouts"></datalist><datalist id="object-names"></datalist>
+    </section>
+
+    <section>
+      <h2>preview</h2>
+      <div class="row">
+        <label>speaker<select id="pv-speaker"></select></label>
+        <label>laser<input type="number" min="0" id="pv-laser"></label>
+        <label>channel<select id="pv-channel"><option value="0">x</option><option value="1">y</option></select></label>
+        <label class="switch"><input type="checkbox" id="pv-use-pc"><i></i>PC</label>
+      </div>
+    </section>
+
+    <section>
+      <h2>cameras</h2>
+      <div id="sliders"></div>
+    </section>
+
+    <section>
+      <h2>rois</h2>
+      <div class="row">
+        <label>rows<input type="number" min="1" id="roi-rows"></label>
+        <label>cols<input type="number" min="1" id="roi-cols"></label>
+        <button id="calibrate">calibrate</button>
+      </div>
+      <div class="row">
+        <label>width<input type="number" min="4" id="roi-width"></label>
+        <label>height<input type="number" min="4" step="4" id="roi-height"></label>
+        <button id="roi-apply">apply size</button>
+      </div>
+    </section>
+
+    <section>
+      <h2>timeline <span class="toggle"><button data-view="sample" class="on">by sample</button><button data-view="thread">by thread</button></span></h2>
+      <div id="timeline"></div>
+      <div id="legend" class="legend"></div>
+    </section>
+  </aside>
+</main>
+<script src="/static/app.js"></script>
+</body>
+</html>

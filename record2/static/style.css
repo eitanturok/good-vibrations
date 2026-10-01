@@ -1,0 +1,145 @@
+/* Tokens are viz2's, so the recorder and the dashboards read as one product. */
+:root {
+  --s0:#f5f5f3; --s1:#fcfcfb; --s2:#eeeeeb;
+  --line:#e0e0dc; --firm:#c9c9c3;
+  --ink:#1a1a19; --ink2:#55554f; --ink3:#86867e;
+  --accent:#256abf; --accent-sf:#e8f0fc;
+  --rec:#d64541; --ok:#2f8f5f;
+  --r:6px;
+  --mono: ui-monospace, SFMono-Regular, Menlo, monospace;
+  --sans: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --s0:#141413; --s1:#1a1a19; --s2:#242422;
+    --line:#33332f; --firm:#4a4a45;
+    --ink:#f0efec; --ink2:#b8b7b1; --ink3:#86867e;
+    --accent:#3987e5; --accent-sf:#12233a;
+    --rec:#e5605c; --ok:#43b17d;
+  }
+}
+* { box-sizing:border-box; }
+html,body { margin:0; height:100%; font:13px/1.45 var(--sans); color:var(--ink); background:var(--s0); }
+body { display:flex; flex-direction:column; overflow:hidden; }
+h2 { margin:0 0 6px; font-size:11px; font-weight:600; letter-spacing:.06em; text-transform:uppercase;
+     color:var(--ink3); display:flex; align-items:center; gap:8px; }
+.hint { color:var(--ink3); font-size:11px; font-weight:400; letter-spacing:0; text-transform:none; }
+button { font:600 12px var(--sans); cursor:pointer; padding:5px 12px; border:1px solid var(--firm);
+         border-radius:var(--r); background:var(--s1); color:var(--ink); }
+button:hover:not(:disabled) { border-color:var(--accent); color:var(--accent); }
+button:disabled { opacity:.4; cursor:default; }
+input, select, textarea { font:12px var(--mono); padding:3px 5px; border:1px solid var(--firm);
+                          border-radius:var(--r); background:var(--s1); color:var(--ink); min-width:0; }
+input[type=checkbox] { accent-color:var(--accent); }
+input[type=range] { padding:0; border:none; background:none; accent-color:var(--accent); }
+
+/* ***** top bar ***** */
+.top { flex:none; display:flex; align-items:center; gap:16px; padding:8px 16px; border-bottom:1px solid var(--line); }
+.dir { font:12px var(--mono); color:var(--ink2); margin-right:auto; }
+.counts { font:12px var(--mono); color:var(--ink2); }
+.counts b { color:var(--ink); }
+.errors { font:600 12px var(--mono); padding:3px 10px; border:1px solid var(--rec); border-radius:var(--r); color:var(--rec); cursor:help; }
+
+/* ***** layout: controls + timeline on the left; on the right, overhead + its plots (65%), laser + its plots (35%) ***** */
+.grid { flex:1; min-height:0; display:grid; gap:12px; padding:12px 16px; grid-template-columns:330px minmax(0,1fr); }
+.views { grid-area:1/2; display:grid; gap:12px; min-height:0;
+         grid-template-columns:minmax(0,1.25fr) minmax(0,1fr) minmax(0,1fr); grid-template-rows:auto minmax(0,1fr) minmax(0,1fr); }  /* row 1 is the overhead's height; the rest goes to the laser row */
+#laser { grid-area:2/1/4/2; }
+.plot.long { grid-column:2/4; }  /* shifts over fft, each as wide as both plots above */
+.side { grid-area:1/1; overflow-y:auto; overscroll-behavior:contain; padding-right:16px;
+        border-right:1px solid var(--line); display:flex; flex-direction:column; gap:10px; }
+
+/* ***** live feeds: a stage (img + svg, in sensor px) transformed inside a clipped view ***** */
+figure { margin:0; min-width:0; min-height:0; display:flex; flex-direction:column; }
+.feed .view { position:relative; flex:1; min-height:0; overflow:hidden; background:#000; border-radius:var(--r);
+              outline:3px solid transparent; outline-offset:-3px; touch-action:none; }
+.recording .feed .view { animation:recborder 1s steps(2) infinite; }
+@keyframes recborder { 0% { outline-color:var(--rec); } 50% { outline-color:transparent; } }
+.stage { position:absolute; left:0; top:0; transform-origin:0 0; }
+.stage img, .stage canvas, .stage svg { position:absolute; inset:0; width:100%; height:100%; display:block; }
+.stage img { image-rendering:pixelated; user-select:none; -webkit-user-drag:none; }
+.stage svg { overflow:visible; pointer-events:none; }  /* drawn only: it's redrawn every poll, and a click on a replaced node is lost */
+.stage canvas { image-rendering:pixelated; }
+#laser .stage img { visibility:hidden; }  /* the source: the canvas shows it, rearranged */
+#laser .view { flex:none; }  /* sized to its picture by shapeView */
+#overhead .view { flex:none; max-height:62vh; }  /* the frame's shape (set from its size): no black bars */
+.stage svg .crop { fill:none; stroke:var(--accent); stroke-width:15; vector-effect:non-scaling-stroke; }
+.stage svg .roi { fill:none; stroke:#1e90ff; stroke-width:1; vector-effect:non-scaling-stroke; }
+.stage svg .roi.pv { fill:rgba(30,144,255,.35); stroke-width:2; }
+.stage svg .line { stroke:#1e90ff; stroke-width:2; vector-effect:non-scaling-stroke; }
+.speakers { position:absolute; inset:0; pointer-events:none; }
+.spk { position:absolute; width:22px; height:22px; margin:-11px 0 0 -11px; border-radius:50%;
+       display:grid; place-items:center; font:700 11px var(--mono);
+       background:#2b2f33; color:#95a5a6; border:1px solid #5d6d7e; }
+.spk.on { width:38px; height:38px; margin:-19px 0 0 -19px; font-size:16px; background:var(--rec); color:#fff;
+          border:2px solid #fff; box-shadow:0 0 0 4px var(--rec); }
+figcaption { flex:none; display:flex; align-items:baseline; gap:10px; padding-top:5px; }
+figcaption h2 { margin:0; }
+
+/* ***** result panels ***** */
+/* the plot image is the whole panel (matplotlib draws its own title), white like the figure */
+.plot { position:relative; border:1px solid var(--line); border-radius:var(--r); background:#fff; overflow:hidden; }
+.plot img { position:absolute; inset:0; width:100%; height:100%; }
+.plot img:not([src]) { visibility:hidden; }
+.status { position:absolute; inset:0; display:grid; place-items:center; font:12px var(--mono); color:var(--ink3); }
+.status:empty { display:none; }
+
+/* ***** timeline: one row per sample (or thread), bars colored by stage (or sample) ***** */
+.toggle { margin-left:auto; display:inline-flex; }
+.toggle button { padding:2px 8px; border-radius:0; font-size:10px; }
+.toggle button:first-child { border-radius:var(--r) 0 0 var(--r); }
+.toggle button:last-child { border-radius:0 var(--r) var(--r) 0; border-left:none; }
+.toggle button.on { background:var(--accent-sf); border-color:var(--accent); color:var(--accent); }
+#timeline { display:flex; flex-direction:column; gap:2px; }
+.trow { display:flex; align-items:center; gap:8px; height:12px; }
+.tlab { flex:none; width:96px; font:10px var(--mono); color:var(--ink2); text-align:right; overflow:hidden; white-space:nowrap; }
+.tbar { position:relative; flex:1; height:100%; background:var(--s2); border-radius:2px; }
+.tbar i { position:absolute; top:1px; bottom:1px; min-width:2px; border-radius:2px; }
+.tbar i.outer { top:auto; bottom:0; height:2px; opacity:.6; }
+.tbar i.running { animation:pulse 1s ease-in-out infinite alternate; }
+.tbar i.failed { outline:2px solid var(--rec); }
+@keyframes pulse { to { opacity:.45; } }
+.legend { display:flex; flex-wrap:wrap; gap:2px 12px; font:10px var(--mono); color:var(--ink2); padding-top:4px; }
+.legend b { display:inline-block; width:14px; height:4px; border-radius:2px; margin-right:4px; vertical-align:middle; }
+
+/* ***** controls ***** */
+.runrow { display:flex; align-items:center; gap:14px; }
+/* three lines: Record / position 001264 / 3 positions recorded */
+#run { padding:12px 18px 10px; background:var(--rec); border-color:var(--rec); color:#fff;
+       display:flex; flex-direction:column; align-items:center; gap:2px; }
+#run b { font:700 22px/1.1 var(--sans); letter-spacing:.02em; }
+#run span { font:600 15px var(--mono); }
+#run small { font:400 11px var(--mono); opacity:.75; margin-top:2px; }
+#run.stop { background:var(--ink); border-color:var(--ink); }
+#run:hover:not(:disabled) { color:#fff; filter:brightness(1.1); }
+#msg { font:11px var(--mono); color:var(--rec); min-height:1em; }
+.side section { display:flex; flex-direction:column; gap:6px; padding-top:8px; border-top:1px solid var(--line); }
+.pk { display:flex; flex-direction:column; gap:3px; font-size:11px; color:var(--ink2); }
+.row { display:flex; gap:6px; align-items:end; flex-wrap:wrap; }
+.row > label { display:flex; flex-direction:column; gap:2px; font-size:10px; color:var(--ink3); flex:1; }
+.row > label input, .row > label select { width:100%; }
+.chips { display:flex; flex-wrap:wrap; gap:4px; }
+.chips label { font:11px var(--mono); padding:2px 6px; border:1px solid var(--firm); border-radius:var(--r); cursor:pointer; }
+.chips label:has(input:checked) { border-color:var(--accent); background:var(--accent-sf); color:var(--accent); }
+.chips input { display:none; }
+.obj { display:grid; grid-template-columns:1.3fr 44px 2fr 20px; gap:4px; }
+.obj button { padding:0; border:none; background:none; color:var(--ink3); }
+.link { border:none; background:none; padding:0; color:var(--accent); font-weight:600; font-size:11px; text-align:left; }
+/* one line: label, min, slider, max, value */
+.slider { display:grid; grid-template-columns:124px auto minmax(0,1fr) auto 34px; gap:5px; align-items:center;
+          font-size:11px; color:var(--ink2); white-space:nowrap; }
+.slider input { width:100%; margin:0; }
+.slider small { font:9px var(--mono); color:var(--ink3); }
+.slider output { font:600 11px var(--mono); color:var(--ink); text-align:right; }
+.play { position:absolute; top:4px; right:4px; z-index:1; padding:2px 10px; font-size:11px; }
+.row > label.switch { flex:none; flex-direction:row; gap:6px; font-size:11px; color:var(--ink2); padding-bottom:4px; }
+#delete { margin-left:auto; display:inline-flex; align-items:center; gap:5px; padding:4px 9px; font:600 11px var(--mono);
+          color:var(--rec); border-color:var(--rec); background:transparent; }
+#delete:hover:not(:disabled) { color:#fff; background:var(--rec); }
+.switch { display:inline-flex; align-items:center; gap:6px; cursor:pointer; font-size:12px; color:var(--ink2); user-select:none; }
+.switch input { display:none; }
+.switch i { position:relative; width:30px; height:17px; border-radius:9px; background:var(--firm); transition:background .15s; }
+.switch i::after { content:""; position:absolute; top:2px; left:2px; width:13px; height:13px; border-radius:50%;
+                   background:#fff; transition:transform .15s; }
+.switch input:checked + i { background:var(--accent); }
+.switch input:checked + i::after { transform:translateX(13px); }
