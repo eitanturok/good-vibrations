@@ -660,6 +660,22 @@ def precompute_vibration_samples(samples: list[tuple[Path, dict]], signal_mode: 
 
 #***** 5 define dataset *****
 
+# object-class probe labels, keyed by the sorted object names in metadata["objects"]. Anything else
+# (cylinder, coffee pot, ...) is OTHER: never trained on, it is the out-of-distribution bucket.
+OBJECTS = ("", "red-cube", "vase", "soap dispenser", "candle", "green-cube+red-cube", "red-cube+vase")
+OTHER = len(OBJECTS)
+def object_id(row: dict) -> int:
+    key = "+".join(sorted(row.get("objects") or {}))
+    return OBJECTS.index(key) if key in OBJECTS else OTHER
+
+def obj_coms(row: dict) -> torch.Tensor:
+    """(2,2) per-object (row,col) com as a fraction of the cropped overhead, zero-padded past n_objects.
+    NaN when the row has no crop_overhead_shape (pre-four_objs captures): no com target there."""
+    if "crop_overhead_shape" not in row: return torch.full((2, 2), float("nan"))
+    coms = torch.zeros(2, 2)
+    for k, c in enumerate((row.get("coms") or [])[:2]): coms[k] = torch.tensor(c[0]) / torch.tensor(row["crop_overhead_shape"][:2])
+    return coms
+
 class VibrationDataset(StreamingDataset):
     def __init__(self, local: str | Path, process_kwargs: dict, shuffle: bool = False, seed: int = 42, **kwargs):
         super().__init__(local=str(local), shuffle=shuffle, batch_size=kwargs.pop("batch_size", None), **kwargs)
@@ -683,6 +699,8 @@ class VibrationDataset(StreamingDataset):
         self.empty_box_ref = load_empty_box_ref(ref_path) if ref_path.exists() and raw else None
         phase_ref_path = Path(local) / PHASE_REF_FILE
         self.phase_ref = load_phase_ref(phase_ref_path) if phase_ref_path.exists() and raw else None
+        # metadata.jsonl rows are in MDS order, so idx indexes both
+        self.index = [json.loads(l) for l in (Path(local) / "metadata.jsonl").read_text().splitlines() if l.strip()]
 
     def __getitem__(self, idx):
         s = super().__getitem__(idx)
@@ -697,6 +715,9 @@ class VibrationDataset(StreamingDataset):
         # grid's own aspect rather than dividing by it.
         box_w, box_h = self.box_geom.get(str(s["box"]), (0, 0))
         info = dict(sample_id=s["sample_id"], position_id=s["position_id"], n_objects=n_objects, speaker=s["speaker"], box=s["box"], is_empty_box=s["is_empty_box"], experiment=self.experiment, x_com=s["downsampled_com_x"], y_com=s["downsampled_com_y"], box_w=box_w, box_h=box_h)
+        row = self.index[idx]
+        assert int(row.get("sample_id", -1)) == s["sample_id"], f"metadata.jsonl row {idx} is not MDS sample {s['sample_id']}"
+        info.update(object=object_id(row), coms=obj_coms(row))
         speaker_mean = self.speaker_means[int(s["speaker"])].to(self.pk["device"]) if self.speaker_means is not None else None
         ref = self.empty_box_ref[int(s["speaker"])].to(self.pk["device"]) if self.empty_box_ref is not None else None
         pref = self.phase_ref[int(s["speaker"])].to(self.pk["device"]) if self.phase_ref is not None else None
@@ -1676,6 +1697,7 @@ def build_dataset(data_dir: str | Path, split: str = "exp25", batch_size: int = 
 
     index = [json.loads(line) for line in (mds_dir / "metadata.jsonl").read_text().strip().splitlines() if line]
     train_pos = {f'{eval_dataset.experiment} {index[i]["position_id"]}' for i in splits["train"]}
+    class_counts = torch.bincount(torch.tensor([object_id(index[i]) for i in splits["train"]]), minlength=OTHER + 1)
     # every eval split must be disjoint from train, except these, which share its positions by design
     strict = [label for label in splits if label != "train" and not any(s in label for s in ("speaker", "spk", "seenpos"))]
     for label in strict:
@@ -1698,4 +1720,5 @@ def build_dataset(data_dir: str | Path, split: str = "exp25", batch_size: int = 
     eval_loaders = [Evaluator(label=label, dataloader=loader(eval_datasets[label], idxs, eval_batch_size, num_workers, generator,
            banned=train_pos if label in strict else (), log=log_dir and label in strict and f"{log_dir}/{label.replace('/', '_')}.txt"), device_eval_microbatch_size=device_eval_microbatch_size) for label, idxs in splits.items() if label != "train"]
 
+    train_loader.class_counts = class_counts  # for the class-weighted object-class loss
     return train_loader, eval_loaders, train_eval_loader

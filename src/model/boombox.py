@@ -17,7 +17,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 from composer import ComposerModel
 
-from model.arch import LOSSES, count_loss, create_metrics, CHEAP_SEG_KEYS, N_COUNT_CLASSES
+from torchmetrics import MeanMetric
+from model.arch import LOSSES, create_metrics, CHEAP_SEG_KEYS, N_COUNT_CLASSES, MaskMetric
+from model.dataset import OBJECTS, OTHER
 
 def _drop(x, p, dim, training):
     """Zero whole slices along `dim` of (B,C,L,F), rescaling survivors so the mean is
@@ -428,16 +430,25 @@ class MaskedConvDecoder(Decoder):
         self.last_aux_logits = aux_logits  # stashed for the auxiliary loss (see class docstring)
         return x
 
+def com_err(pred, true, n, scale=1):
+    """per-object distance from each predicted com slot to its true com, under whichever slot order
+    fits best when there are two objects. Padding slots (past n_objects) and NaN targets are dropped."""
+    valid = (torch.arange(2, device=n.device) < n[:, None]) & ~true.isnan().any(-1)
+    true = true.nan_to_num()  # NaN would leak into the gradient through the masked-out rows
+    d_id, d_sw = [((pred - t) * scale).norm(dim=-1) for t in (true, true.flip(1))]
+    swap = (n >= 2) & (d_sw.sum(1) < d_id.sum(1))
+    return torch.where(swap[:, None], d_sw, d_id)[valid]
+
 class BoomboxModel(ComposerModel):
     """Same ComposerModel contract as VibrationTransformer, so callbacks, metrics
     and run.py work on it unchanged."""
     def __init__(self, d_model=512, data_info=None, fuse_speakers=False,
-                 loss_fn='mse', loss_alpha=0.5, count_loss_weight=0.0,
+                 loss_fn='mse', loss_alpha=0.5,
                  freq_dropout=0.0, laser_dropout=0.0, encoder='single', fuse='concat',
                  trim_pad=False, learned_collapse=False, freq_mult=1, freq_depth=1,
                  resize='conv', decoder_arch='default', coordconv=False,
                  decoder_upsample='transposed', decoder_nonlocal_stage=None,
-                 masked_conv_aux_weight=0.5, decoder_grow=False):
+                 masked_conv_aux_weight=0.5, decoder_grow=False, head_weights=None, class_counts=None):
         super().__init__()
         # tokenize() zero-pads F up to a whole number of patches. That padding is justified for
         # the transformer (FreqEncoder.embed sees the zeros at FIXED positions and absorbs them),
@@ -465,14 +476,21 @@ class BoomboxModel(ComposerModel):
         self.masked_conv_aux_weight = masked_conv_aux_weight if decoder_arch == 'masked-conv' else 0.0
         self.fuse_speakers = fuse_speakers
         self.empty_head = nn.Linear(d_model, 1)
-        self.count_head = nn.Linear(d_model, N_COUNT_CLASSES)
-        self.count_loss_weight = count_loss_weight
+        # heads on the embedding: object class, count, per-object com (2 slots), log area, each with
+        # its own loss weight. A head's loss trains the encoder too, so a weight of 0 removes it entirely.
+        mlp = lambda k: nn.Sequential(nn.Linear(d_model, d_model), nn.ReLU(), nn.Linear(d_model, k))
+        self.cls_head, self.count_head, self.com_head, self.area_head = mlp(len(OBJECTS)), mlp(N_COUNT_CLASSES), mlp(4), mlp(1)
+        self.head_weights = head_weights or dict(cls=0.1, count=0.1, com=1.0, area=0.1)
+        n = class_counts[:OTHER].float().clamp(min=1) if class_counts is not None else torch.ones(len(OBJECTS))
+        self.register_buffer('cls_weight', n.sum() / (len(n) * n))  # inverse frequency over train
         self.loss_fn = LOSSES[loss_fn]
         self.is_spatial_loss = loss_fn.startswith('ce-spatial')
         self.is_asym_loss = loss_fn.endswith('-asym')
         self.loss_alpha = loss_alpha
         self.train_metrics = create_metrics(data_info, CHEAP_SEG_KEYS)  # cheap subset per step
         self.val_metrics = create_metrics(data_info)                   # full suite on eval loaders
+        for k in ('cls_acc', 'cls_conf', 'count_mae', 'com_px', 'area_rel_err'):
+            self.val_metrics[k] = MeanMetric(); self.val_metrics[k].key = k
 
     def forward(self, batch):
         # dataset gives patched tokens (B,L,P,PS,C); a conv wants the frequency axis
@@ -484,8 +502,8 @@ class BoomboxModel(ComposerModel):
         else:
             emb = self.encoder(self._to_conv(x))
         mask_logits = self.decoder(emb)
-        out = dict(mask_pred=mask_logits.sigmoid(), mask_logits=mask_logits,
-                   empty_logit=self.empty_head(emb), count_logits=self.count_head(emb))
+        out = dict(mask_pred=mask_logits.sigmoid(), mask_logits=mask_logits, empty_logit=self.empty_head(emb),
+                   cls_logits=self.cls_head(emb), count_logits=self.count_head(emb), com=self.com_head(emb).sigmoid().view(-1, 2, 2), log_area=self.area_head(emb).squeeze(-1))
         if self.masked_conv_aux_weight: out['aux_mask_logits'] = self.decoder.last_aux_logits
         return out
 
@@ -500,8 +518,8 @@ class BoomboxModel(ComposerModel):
         kw = dict(empty_logit=outputs['empty_logit']) if self.is_spatial_loss else {}
         if self.is_asym_loss: kw = dict(alpha=self.loss_alpha)
         total = self.loss_fn(outputs['mask_logits'], outputs['mask_pred'], batch['mask_true'], **kw)
-        if self.count_loss_weight:
-            total = total + self.count_loss_weight * count_loss(outputs['count_logits'], batch['info']['n_objects'])
+        heads = self.head_losses(outputs, batch)
+        total = total + sum(self.head_weights[k] * v for k, v in heads.items())
         if self.masked_conv_aux_weight and 'aux_mask_logits' in outputs:
             # supervise MaskedConvDecoder's intermediate gates (see its docstring for why: an
             # untrained gate is all-zero and kills gradient to every later stage) -- BCE against
@@ -512,12 +530,32 @@ class BoomboxModel(ComposerModel):
                 target = F.interpolate(gt, size=logits.shape[-2:], mode='bilinear', align_corners=False)
                 aux = aux + F.binary_cross_entropy_with_logits(logits, target)
             total = total + self.masked_conv_aux_weight * (aux / len(outputs['aux_mask_logits']))
-        return total
+        return dict(total=total, **heads)  # composer backprops 'total' and logs every key
+
+    def head_losses(self, out, batch):
+        info, y = batch['info'], batch['info']['object']
+        # weighted mean over known-class rows; 0 (not NaN) when a batch has none
+        known_w = self.cls_weight[y.clamp(max=OTHER - 1)] * (y != OTHER)
+        cls = F.cross_entropy(out['cls_logits'], y, weight=self.cls_weight, ignore_index=OTHER, reduction='sum') / known_w.sum().clamp(min=1e-8)
+        com = com_err(out['com'], info['coms'], info['n_objects'])
+        area = F.l1_loss(out['log_area'], batch['mask_true'].flatten(1).sum(1).log1p())
+        return dict(cls=cls, count=F.cross_entropy(out['count_logits'], info['n_objects']), com=com.sum() / max(len(com), 1), area=area)
 
     def get_metrics(self, is_train=False): return self.train_metrics if is_train else self.val_metrics
 
     def update_metric(self, batch, outputs, metric):
-        metric.update(outputs['mask_logits'], outputs['mask_pred'], batch['mask_true'], batch['info']['n_objects'])
+        if isinstance(metric, MaskMetric):
+            return metric.update(outputs['mask_logits'], outputs['mask_pred'], batch['mask_true'], batch['info']['n_objects'])
+        info, n, (h, w) = batch['info'], batch['info']['n_objects'], batch['mask_true'].shape[-2:]
+        y, p, count = info['object'], outputs['cls_logits'].softmax(-1), outputs['count_logits'].argmax(-1)
+        area = batch['mask_true'].flatten(1).sum(1)
+        metric.update({
+            'cls_acc': (p.argmax(-1) == y)[y != OTHER].float(),
+            'cls_conf': p.max(-1).values,  # max softmax prob; should drop on unseen (OTHER) objects
+            'count_mae': (count - n).abs().float(),
+            'com_px': com_err(outputs['com'], info['coms'], n, torch.tensor([h, w], device=n.device)),
+            'area_rel_err': ((outputs['log_area'].expm1() - area).abs() / area)[area > 0],
+        }[metric.key])
 
     def eval_forward(self, batch, outputs=None):
         return outputs if outputs is not None else self.forward(batch)

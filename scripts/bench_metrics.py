@@ -173,14 +173,14 @@ def step_bench(a):
 
     raw = next(iter(dl))
     batch = {"fft": raw["fft"].to(DEV), "mask_true": raw["mask_true"].to(DEV),
-             "info": {"n_objects": raw["info"]["n_objects"].to(DEV)}}
+             "info": {k: v.to(DEV) for k, v in raw["info"].items() if k in ("n_objects", "object", "coms")}}
     model = BoomboxModel(a.d_model, info, loss_fn="ce-pixel").to(DEV)
     opt = torch.optim.AdamW(model.parameters(), 1e-3, fused=(DEV == "cuda"))
 
     def step(tms):
         opt.zero_grad(set_to_none=True)
         out = model(batch)
-        model.loss(out, batch).backward()
+        model.loss(out, batch)["total"].backward()
         opt.step()
         arch._seg_cache.clear()
         for m in tms.values():
