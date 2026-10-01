@@ -333,7 +333,7 @@ class Decoder(nn.Module):
     SEED = (4, 4)
 
     def __init__(self, d_model, out_h, out_w, out_c=1, resize='bilinear', mult:float=1.0, num_res_blocks:int|None=None,
-                 coordconv:bool=False, upsample:str='transposed', nonlocal_stage:int|None=None):
+                 coordconv:bool=False, upsample:str='transposed', nonlocal_stage:int|None=None, grow:bool=False):
         super().__init__()
         self.out_hw, self.out_c = (out_h, out_w), out_c
         self.resize = resize  # accepted for backwards compat, no longer used (see docstring)
@@ -348,6 +348,10 @@ class Decoder(nn.Module):
         # its own nn.Sequential (not one flat stack) so a subclass (MaskedConvDecoder) can hook
         # in between stages; NonLocalBlock2d is inserted the same way via nonlocal_stage.
         widths = [base, base // 2, base // 4, base // 8]
+        # grow: keep doubling (32 -> 64 -> ...) with learned stages until the output size is reached,
+        # instead of bilinearly stretching the 32x32 map. Channels keep halving, floored at 16.
+        while grow and 4 * 2 ** (len(widths) - 1) < max(out_h, out_w): widths.append(max(widths[-1] // 2, 16))
+        self.widths = widths
         self.stages = nn.ModuleList()
         for i in range(len(widths) - 1):
             stage = [TwoBranchUp(widths[i], widths[i + 1], upsample=upsample, coordconv=coordconv)]
@@ -408,8 +412,7 @@ class MaskedConvDecoder(Decoder):
     """
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        widths = [self.base, self.base // 2, self.base // 4, self.base // 8]
-        self.mask_heads = nn.ModuleList([nn.Conv2d(widths[i + 1], 1, 1) for i in range(len(self.stages) - 1)])
+        self.mask_heads = nn.ModuleList([nn.Conv2d(self.widths[i + 1], 1, 1) for i in range(len(self.stages) - 1)])
 
     def run_stages(self, x):
         aux_logits = []
@@ -434,7 +437,7 @@ class BoomboxModel(ComposerModel):
                  trim_pad=False, learned_collapse=False, freq_mult=1, freq_depth=1,
                  resize='conv', decoder_arch='default', coordconv=False,
                  decoder_upsample='transposed', decoder_nonlocal_stage=None,
-                 masked_conv_aux_weight=0.5):
+                 masked_conv_aux_weight=0.5, decoder_grow=False):
         super().__init__()
         # tokenize() zero-pads F up to a whole number of patches. That padding is justified for
         # the transformer (FreqEncoder.embed sees the zeros at FIXED positions and absorbs them),
@@ -458,7 +461,7 @@ class BoomboxModel(ComposerModel):
         dec_cls = MaskedConvDecoder if decoder_arch == 'masked-conv' else Decoder
         self.decoder = dec_cls(d_model, data_info['out_h'], data_info['out_w'],
                                data_info.get('out_c', 1), resize=resize, coordconv=coordconv,
-                               upsample=decoder_upsample, nonlocal_stage=decoder_nonlocal_stage)
+                               upsample=decoder_upsample, nonlocal_stage=decoder_nonlocal_stage, grow=decoder_grow)
         self.masked_conv_aux_weight = masked_conv_aux_weight if decoder_arch == 'masked-conv' else 0.0
         self.fuse_speakers = fuse_speakers
         self.empty_head = nn.Linear(d_model, 1)

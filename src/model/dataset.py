@@ -1534,8 +1534,19 @@ class PairedSpeakerDataset(torch.utils.data.Dataset):
 
 def num_samples(batch): return batch["mask_true"].shape[0]
 
-def loader(dataset, idxs, bs, num_workers, generator, shuffle=False, drop_last=False):
-    dl = DataLoader(Subset(dataset, idxs), batch_size=bs, shuffle=shuffle, num_workers=num_workers, generator=generator, pin_memory=True,
+class CheckedSubset(Subset):
+    """asserts no item is at a train position, and appends every position served to the file `log`"""
+    def __init__(self, dataset, idxs, banned, log): super().__init__(dataset, idxs); self.banned, self.log = banned, log
+    def __getitems__(self, idxs): return [self[i] for i in idxs]
+    def __getitem__(self, i):
+        s = super().__getitem__(i)
+        pos = f'{s["info"]["experiment"]} {s["info"]["position_id"]}'
+        assert pos not in self.banned, f"eval loader served train position {pos}"
+        if self.log: open(self.log, "a").write(pos + "\n")
+        return s
+
+def loader(dataset, idxs, bs, num_workers, generator, shuffle=False, drop_last=False, banned=(), log=None):
+    dl = DataLoader(CheckedSubset(dataset, idxs, banned, log), batch_size=bs, shuffle=shuffle, num_workers=num_workers, generator=generator, pin_memory=True,
                     persistent_workers=num_workers > 0, prefetch_factor=4 if num_workers > 0 else None, drop_last=drop_last)
     return DataSpec(dataloader=dl, get_num_samples_in_batch=num_samples)
 
@@ -1558,7 +1569,7 @@ def build_dataset(data_dir: str | Path, split: str = "exp25", batch_size: int = 
                    subtract_speaker_mean: bool = False, subtract_empty_box: bool = False, n_classes: int = 4, verbose: int = 1,
                    mag_recipe: str | None = None, pair_speakers_mode: bool = False, rgb: bool = False,
                    phase_arm: str | None = None, phase_weight: float = 1.0,
-                   laser_cols=None, laser_rows=None, device_eval_microbatch_size: str | int = "auto", **split_kwargs):
+                   laser_cols=None, laser_rows=None, device_eval_microbatch_size: str | int = "auto", log_dir=None, **split_kwargs):
 
     # A recipe owns the domain and the operation, so it OVERRIDES signal_mode and both
     # subtract_* flags. Deriving signal_mode here is what guarantees the references are
@@ -1663,8 +1674,14 @@ def build_dataset(data_dir: str | Path, split: str = "exp25", batch_size: int = 
     train_dataset = VibrationDataset(local=mds_dir, seed=seed, process_kwargs=dict(process_kwargs, augment_fft=augment_fft, augment_mask=augment_mask))
     eval_dataset = VibrationDataset(local=mds_dir, seed=seed, process_kwargs=dict(process_kwargs, augment_fft=0.0, augment_mask=0.0))
 
+    index = [json.loads(line) for line in (mds_dir / "metadata.jsonl").read_text().strip().splitlines() if line]
+    train_pos = {f'{eval_dataset.experiment} {index[i]["position_id"]}' for i in splits["train"]}
+    # every eval split must be disjoint from train, except these, which share its positions by design
+    strict = [label for label in splits if label != "train" and not any(s in label for s in ("speaker", "spk", "seenpos"))]
+    for label in strict:
+        assert not train_pos & {f'{eval_dataset.experiment} {index[i]["position_id"]}' for i in splits[label]}, f"{label} shares positions with train"
+
     if pair_speakers_mode:
-        index = [json.loads(line) for line in (mds_dir / "metadata.jsonl").read_text().strip().splitlines() if line]
         train_dataset = PairedSpeakerDataset(train_dataset, splits["train"], index)
         eval_datasets = {label: PairedSpeakerDataset(eval_dataset, idxs, index) for label, idxs in splits.items()}
         if verbose:
@@ -1673,11 +1690,12 @@ def build_dataset(data_dir: str | Path, split: str = "exp25", batch_size: int = 
     else:
         eval_datasets = {label: eval_dataset for label in splits}
 
-    train_loader = loader(train_dataset, splits["train"], batch_size, num_workers, generator, shuffle=True, drop_last=True)
+    train_loader = loader(train_dataset, splits["train"], batch_size, num_workers, generator, shuffle=True, drop_last=True, log=log_dir and f"{log_dir}/train.txt")
     train_eval_loader = loader(eval_datasets["train"], splits["train"], eval_batch_size, num_workers, generator)
     # device_eval_microbatch_size="auto" -> composer shrinks the eval microbatch and retries on OOM
     # instead of crashing the run (the big decoders OOM'd on the eval pass otherwise). Must be a
     # constructor arg, not a post-hoc attr, or Evaluator.auto_microbatching stays False.
-    eval_loaders = [Evaluator(label=label, dataloader=loader(eval_datasets[label], idxs, eval_batch_size, num_workers, generator), device_eval_microbatch_size=device_eval_microbatch_size) for label, idxs in splits.items() if label != "train"]
+    eval_loaders = [Evaluator(label=label, dataloader=loader(eval_datasets[label], idxs, eval_batch_size, num_workers, generator,
+           banned=train_pos if label in strict else (), log=log_dir and label in strict and f"{log_dir}/{label.replace('/', '_')}.txt"), device_eval_microbatch_size=device_eval_microbatch_size) for label, idxs in splits.items() if label != "train"]
 
     return train_loader, eval_loaders, train_eval_loader

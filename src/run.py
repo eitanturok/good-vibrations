@@ -9,7 +9,7 @@ import warnings, logging
 warnings.filterwarnings("ignore", message=r"The pynvml package is deprecated.*", category=FutureWarning)
 logging.getLogger("torch.distributed.elastic.multiprocessing.redirects").setLevel(logging.ERROR)
 
-import sys, argparse
+import sys, argparse, shutil
 from pathlib import Path
 
 try:
@@ -95,6 +95,7 @@ def get_parser():
     parser.add_argument("--decoder-arch",                type=str,   default="default", choices=["default", "masked-conv"], help="boombox only. 'masked-conv' is a conv analogue of Mask2Former's masked attention (Cheng et al. 2022, arXiv:2112.01527): after each upsampling stage (except the last), a 1x1 conv predicts a coarse mask, thresholded at 0.5, that gates (zeroes out) the background before the next stage runs. Trained with an auxiliary BCE loss on the intermediate masks (see --masked-conv-aux-weight). See model/boombox.py MaskedConvDecoder docstring.")
     parser.add_argument("--masked-conv-aux-weight",     type=float, default=0.5, help="--decoder-arch masked-conv only. Weight on the auxiliary BCE loss over the intermediate gate masks (mean over stages), added to the main mask loss. Needed because an untrained (all-zero) gate kills gradient to every later decoder stage.")
     parser.add_argument("--decoder-upsample",           type=str,   default="transposed", choices=["transposed", "pixelshuffle"], help="boombox only. 'pixelshuffle' swaps TwoBranchUp's ConvTranspose2d for sub-pixel (PixelShuffle) upsampling (Shi et al. 2016, arXiv:1609.05158), avoiding the periodic checkerboard artifact strided transposed convs are known to introduce (Odena et al., Distill 2016).")
+    parser.add_argument("--decoder-grow",               type=int,   default=0, choices=(0, 1), nargs="?", const=1, help="boombox only. Add learned stride-2 upsampling stages past 32x32 until out_h/out_w is reached (64 -> +1 stage, 128 -> +2, 256 -> +3), instead of bilinearly stretching the 32x32 feature map. No-op at out <= 32.")
     parser.add_argument("--decoder-nonlocal-stage",     type=int,   default=None, help="boombox only. Insert a NonLocalBlock2d (Wang et al. 2018, arXiv:1711.07971 'Non-local Neural Networks', self-attention over the H*W feature map) after this many decoder upsampling stages have run, e.g. 1 = after the first TwoBranchUp at 8x8. Gives every spatial location a direct, one-layer path to every other location before later stages commit to fine pixel detail. None = disabled.")
     parser.add_argument("--signal-mode",                type=str,   default="magnitude", choices=["magnitude", "log_magnitude", "complex", "mag_phase", "mag_trig_phase", "none"], help="'none' drops the magnitude block entirely (phase-only); requires --phase-arm.")
     parser.add_argument("--normalize-mode",             type=str,   default="std", help="Per-sample: std, z, per_laser_z. Train-split statistics: per_bin_z. Append '+token-mean' for token-level normalization.")
@@ -265,13 +266,15 @@ def run(**kwargs):
     speaker_kwargs = {"speaker_sample_per_position": args.speaker_sample_per_position} if args.speaker_sample_per_position else {}
     if args.train_speakers: speaker_kwargs["train_speakers"] = [int(s) for s in args.train_speakers.split(",")]
     if args.eval_speakers: speaker_kwargs["eval_speakers"] = [int(s) for s in args.eval_speakers.split(",")]
+    log_dir = f"runs/{args.run_name}/positions"  # every position each loader served, one file per loader
+    shutil.rmtree(log_dir, ignore_errors=True); os.makedirs(log_dir)
     train_loader, eval_loaders, train_eval_loader = build_dataset(
         args.data_dir, batch_size=args.batch_size, eval_batch_size=args.eval_batch_size, num_workers=args.num_workers,
         split=args.split, test_size=args.test_size, speakers=speakers, n_objects=args.n_objects, box=args.box, n_samples=args.n_samples,
         out_h=args.out_h, out_w=args.out_w, rgb=bool(args.rgb), signal_mode=args.signal_mode, normalize_mode=args.normalize_mode, patch_size=args.patch_size, seed=args.seed,
         augment_fft=args.augment_fft, augment_mask=args.augment_mask, subtract_speaker_mean=bool(args.subtract_speaker_mean), subtract_empty_box=bool(args.subtract_empty_box), mag_recipe=args.mag_recipe, phase_arm=args.phase_arm, phase_weight=args.phase_weight,
         force_rebuild_data=bool(args.force_rebuild_data), n_classes=N_COUNT_CLASSES, pair_speakers_mode=bool(args.pair_speakers),
-        laser_cols=laser_cols, laser_rows=laser_rows, device_eval_microbatch_size=microbatch(args.device_eval_microbatch_size), **speaker_kwargs)
+        laser_cols=laser_cols, laser_rows=laser_rows, device_eval_microbatch_size=microbatch(args.device_eval_microbatch_size), log_dir=log_dir, **speaker_kwargs)
     boundary_loaders = eval_loaders + [Evaluator(label='train', dataloader=train_eval_loader,
                                                  device_eval_microbatch_size=microbatch(args.device_eval_microbatch_size))]
     ensure_viz(args.data_dir, port=args.viz_port, enabled=not args.no_viz)
@@ -290,7 +293,7 @@ def run(**kwargs):
     print(f"laser grid: {n_laser_rows} rows x {n_laser_cols} cols = {n_lasers} lasers")
     print(f"{n_freqs_real} freq bins -> {n_patches} patches of {patch_size} = {n_patches * patch_size} ({n_patches * patch_size - n_freqs_real} padded)")
     if args.model == "boombox":
-        model = BoomboxModel(args.d_model, data_info, loss_fn=args.loss_fn, loss_alpha=args.loss_alpha, count_loss_weight=args.count_loss_weight, freq_dropout=args.freq_dropout, laser_dropout=args.laser_dropout, encoder=args.encoder, fuse=args.fuse, trim_pad=args.trim_pad, learned_collapse=args.learned_collapse, freq_mult=args.freq_mult, freq_depth=args.freq_depth, resize=args.resize, decoder_arch=args.decoder_arch, coordconv=bool(args.coordconv), decoder_upsample=args.decoder_upsample, decoder_nonlocal_stage=args.decoder_nonlocal_stage, masked_conv_aux_weight=args.masked_conv_aux_weight)
+        model = BoomboxModel(args.d_model, data_info, loss_fn=args.loss_fn, loss_alpha=args.loss_alpha, count_loss_weight=args.count_loss_weight, freq_dropout=args.freq_dropout, laser_dropout=args.laser_dropout, encoder=args.encoder, fuse=args.fuse, trim_pad=args.trim_pad, learned_collapse=args.learned_collapse, freq_mult=args.freq_mult, freq_depth=args.freq_depth, resize=args.resize, decoder_arch=args.decoder_arch, coordconv=bool(args.coordconv), decoder_upsample=args.decoder_upsample, decoder_nonlocal_stage=args.decoder_nonlocal_stage, masked_conv_aux_weight=args.masked_conv_aux_weight, decoder_grow=bool(args.decoder_grow))
     else:
         enc_ffn_dim = args.enc_ffn_dim if args.enc_ffn_dim is not None else args.ffn_dim
         dec_ffn_dim = args.dec_ffn_dim if args.dec_ffn_dim is not None else args.ffn_dim
@@ -309,7 +312,7 @@ def run(**kwargs):
             out_h=args.out_h, out_w=args.out_w, rgb=bool(args.rgb), signal_mode=args.signal_mode, normalize_mode=args.normalize_mode, patch_size=args.patch_size, seed=args.seed,
             augment_fft=args.augment_fft, augment_mask=args.augment_mask, subtract_speaker_mean=bool(args.subtract_speaker_mean), subtract_empty_box=bool(args.subtract_empty_box), mag_recipe=args.mag_recipe, phase_arm=args.phase_arm, phase_weight=args.phase_weight,
             force_rebuild_data=bool(args.force_rebuild_data), n_classes=N_COUNT_CLASSES, pair_speakers_mode=bool(args.pair_speakers),
-            device_eval_microbatch_size=microbatch(args.device_eval_microbatch_size))
+            device_eval_microbatch_size=microbatch(args.device_eval_microbatch_size), log_dir=log_dir)
         n_lasers_2 = train_loader_2.dataloader.dataset[0]['fft'].shape[0]
         assert n_lasers_2 == n_lasers, f"--data-dir-2 has a {n_lasers_2}-laser grid, --data-dir has {n_lasers}; crop one to match (--laser-rows/--laser-cols) before combining"
         generator = torch.Generator().manual_seed(args.seed)
@@ -366,6 +369,8 @@ def run(**kwargs):
     if not args.eval_only:
         trainer.fit()
         if args.eval_after_train: eval_boundary(trainer, boundary_loaders)  # eval after training ends
+        train_pos = set(open(f"{log_dir}/train.txt").read().splitlines())
+        for p in Path(log_dir).glob("eval*"): assert not train_pos & set(p.read_text().splitlines()), f"{p.name} has train positions"
     cleanup(trainer, boundary_loaders, eval_loaders, train_loader)
 
 @app.local_entrypoint()
