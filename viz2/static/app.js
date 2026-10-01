@@ -1775,7 +1775,7 @@ function buildSampleGrid() {
   const card = (o) =>
     `<button class="scard${o.id === S.live.sid ? ' on' : ''}${pins[o.id] ? ' pin' : ''}" data-id="${o.id}"` +
     `${pins[o.id] ? ` style="--pc:${pins[o.id]}"` : ''}>` +
-    `<span class="sclab" title="sample ${o.id}">${sampleLine(o)}</span>` +
+    `<span class="sclab" title="sample ${o.name}">${sampleLine(o)}</span>` +
     `${photoFig(o.id)}</button>`;
 
   const render = () => {
@@ -2368,9 +2368,9 @@ function pin() {
    Only the fields that apply to what's shown -- pass null to leave one out: section 2
    plots every frequency (no F), section 3's mode uses every laser and both channels (F
    only). The workbench, viewer and sidebar name a probe/sample in full. */
-// position and frequency zero-padded to 4 digits, so stacked labels line up (mono font)
+// frequency zero-padded to 4 digits, so stacked labels line up (mono font)
 const pad4 = (n) => String(Math.round(n)).padStart(4, '0');
-const sampleLine = (s) => `${pad4(s.pos)}-${s.spk} ${s.layout || '—'} ${s.box}`;
+const sampleLine = (s) => `${s.name} ${s.layout || '—'} ${s.box}`;  // s.name: the universal id, e.g. 000012-3
 const curveLine = (laser, ch, hzv) =>
   [laser != null && `L${laser}`, ch != null && `C${ch}`, hzv != null && `F${pad4(hzv)}`]
     .filter(Boolean).join(' ');
@@ -2659,7 +2659,7 @@ function renderProbes() {
     const m = p.meta, [l1, l2] = probeLines(p);
     // Two lines: WHICH sample, WHICH curve of it (the coloured border identifies the probe)
     return `<div class="probe card2${p.hidden ? ' off' : ''}" data-id="${p.id}" style="--c:${col(p)}"
-      title="sample ${p.sid}${p.ds !== S.info.dataset ? ` (${p.ds})` : ''}  --  click to view, click the eye to ${p.hidden ? 'show in' : 'hide from'} plots">
+      title="sample ${p.meta.name}${p.ds !== S.info.dataset ? ` (${p.ds})` : ''}  --  click to view, click the eye to ${p.hidden ? 'show in' : 'hide from'} plots">
       <img class="thumb mask" src="/api/masks.png?ids=${p.sid}&colors=${probeHex(p)}&v=${S.rv}" alt="">
       <div class="meta">
         <div class="ln1"><b class="${m.box !== S.info.box ? 'foreign' : ''}">${l1}</b>
@@ -2900,10 +2900,13 @@ function wire() {
   // Two of these: the sidebar's (Enter hands the arrow keys to the map) and the gallery's
   // (Enter hands them to the gallery).
   const posJump = (pj, after) => (pj.onchange = () => {
-    const n = +pj.value;
+    // a position ("12") or a sample id ("12-3"), zero padding optional ("000012-3")
+    const [, p, k] = pj.value.trim().match(/^(\d+)(?:-(\d+))?$/) || [], n = +p;
+    const s = k != null && matches().find((x) => x.pos === n && x.spk === +k);
+    if (s) { select(s.id); pj.value = ''; after(); }
     // any filtered sample at n counts -- an empty-box position isn't on the scatter (it
     // has the empty-box strip) but is still a position you can jump to
-    if (matches().some((s) => s.pos === n)) { goPos(n); pj.value = ''; after(); }
+    else if (k == null && p && matches().some((x) => x.pos === n)) { goPos(n); pj.value = ''; after(); }
     else { pj.classList.add('miss'); setTimeout(() => pj.classList.remove('miss'), 600); }
   });
   posJump($('#posjump'), () => $('#scatter').focus());

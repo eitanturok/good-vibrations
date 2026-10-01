@@ -295,8 +295,10 @@ def compute_shifts_for_all_rois_batched_optimized(videos, batch_size, debug:bool
 
         # load left/right frames from CPU separately — never hold full clip on GPU at once
         # pairs are (start, start+1), (start+1, start+2), ..., (end-1, end)
-        image1 = cp.asarray(videos[:, start:end],   dtype=cp.float32) / 255  # (L, n_pairs, H, W)
-        image2 = cp.asarray(videos[:, start+1:end+1], dtype=cp.float32) / 255
+        # copy the frames as they are (uint8: 1/4 the bytes of float32) and cast on the GPU --
+        # cp.asarray(..., dtype=float32) casts on the CPU first (~2 s of ~7 s per sample)
+        image1 = cp.asarray(videos[:, start:end]).astype(cp.float32) / 255  # (L, n_pairs, H, W)
+        image2 = cp.asarray(videos[:, start+1:end+1]).astype(cp.float32) / 255
         mprint("after image1+image2")
 
         if use_PC:

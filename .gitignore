@@ -238,3 +238,7 @@ src4/cache
 .venv-ldmseg
 src4/ckpts
 src2/data
+
+# position-id counter (record/utils/position_id.py): its lock and temp files
+position_id.txt.lock
+position_id.txt.tmp

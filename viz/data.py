@@ -22,6 +22,7 @@ import numpy as np
 import torch
 
 from viz import config
+from utils.ids import sample_name
 from utils.metrics import center_of_mass, object_centroids, soft_iou, contour_f, localization
 
 METRIC_KEYS = ('localization_rel', 'localization_raw', 'iou', 'contour')
@@ -69,7 +70,7 @@ def parse_com(v) -> list[float]:
 
 @dataclass
 class GtIndex:
-    sample_ids: list[str]        # zero-padded "000000"..; ids need NOT start at 0
+    sample_ids: list[str]        # dir names: an old counter ("000009"..) or utils.ids.sample_name ("000012-3")
     masks: np.ndarray            # (N,20,40) float32, contiguous
     meta: list[dict]
     com_gt: np.ndarray           # (N,2) grid-space COM of the target mask
@@ -83,7 +84,7 @@ class GtIndex:
     # sample id -> row. Ids are NOT an identity map into the arrays: the gastronorm
     # dataset starts at 000009, and any dataset can be missing a sample whose mask was
     # never written. Every id->row lookup must go through this.
-    row_of: dict[int, int] = field(default_factory=dict)
+    row_of: dict[str, int] = field(default_factory=dict)
     # Ground truth at OTHER grid sizes, loaded on demand: {(h,w): (N,h,w)}. Runs are
     # trained at different resolutions and each must be scored against its own target,
     # so the table can hold a 16x16 column beside a 30x30 one. Same rows, same order as
@@ -194,7 +195,7 @@ def load_gt(experiment_dir: Path, mask_h: int, mask_w: int) -> GtIndex:
     masks = np.ascontiguousarray(np.stack(masks).astype(np.float32))
     com_gt = np.asarray(center_of_mass(masks), dtype=np.float64)
     avg_com = np.asarray([parse_com(m.get("avg_com")) for m in meta], dtype=np.float64)
-    row_of = {int(s): i for i, s in enumerate(ids)}
+    row_of = {s: i for i, s in enumerate(ids)}
     return GtIndex(ids, masks, meta, com_gt, object_centroids(masks), avg_com, layout,
                    row_of, experiment_dir=experiment_dir)
 
@@ -239,10 +240,19 @@ def _batch_of(p: Path) -> int:
 
 
 def _as_int_array(v) -> np.ndarray:
-    """info['sample_id'] is a tensor on most runs but a plain list on some."""
+    """info fields are a tensor on most runs but a plain list on some."""
     if torch.is_tensor(v):
         v = v.tolist()
     return np.asarray(v, dtype=np.int64)
+
+
+def _info_dirs(info: dict) -> np.ndarray:
+    """Each row's sample dir name: the old counter from info['sample_id'], or -- samples with no
+    sample_id (the dataset writes -1), named utils.ids.sample_name -- from position_id/speaker."""
+    sid = _as_int_array(info["sample_id"])
+    if (sid >= 0).all(): return np.array([f"{s:06d}" for s in sid])
+    pos, spk = _as_int_array(info["position_id"]), _as_int_array(info["speaker"])
+    return np.array([f"{s:06d}" if s >= 0 else sample_name(p, k) for s, p, k in zip(sid, pos, spk)])
 
 
 def _as_box_list(info: dict, n: int) -> list:
@@ -399,7 +409,7 @@ def _probe(files: list[Path]) -> tuple[dict | None, str | None]:
     # 10s rescans re-probe just the new runs -- and 433ms total against RESCAN_SECONDS
     # is worth a 5x stronger gate now that ids are the only dataset check.
     base = None
-    ids: list[int] = []
+    ids: list[str] = []
     boxes: list = []   # which physical box each id in `ids` came from, aligned index-wise
     exps: list = []    # and its experiment name (None on older runs), same alignment
     for p in files[:5]:
@@ -408,9 +418,8 @@ def _probe(files: list[Path]) -> tuple[dict | None, str | None]:
         except Exception:
             continue
         mask, info = obj.get("mask_pred"), obj.get("info") or {}
-        sid = info.get("sample_id")
-        if sid is not None:
-            batch_ids = _as_int_array(sid).tolist()
+        if info.get("sample_id") is not None:
+            batch_ids = _info_dirs(info).tolist()
             ids.extend(batch_ids)
             boxes.extend(_as_box_list(info, len(batch_ids)))
             exps.extend(_as_exp_list(info, len(batch_ids)))
@@ -704,7 +713,7 @@ def param_count(name: str, runs_dir: Path) -> int | None:
 class RunData:
     name: str
     epoch: int
-    sample_ids: np.ndarray       # (M,) int
+    sample_ids: np.ndarray       # (M,) sample dir names
     masks: np.ndarray            # (M,20,40) float32, sigmoid probabilities
     splits: list[str]            # per row: "train" or the eval split name
     metrics: dict               # {name: (M,) array} -- see METRIC_KEYS
@@ -732,7 +741,7 @@ class RunData:
     # parallel to sample_ids -- what /api/run keys its per-sample metrics dict by, to match
     # /api/samples' s.i. A combined run's rows can come from different experiments, each
     # with its own offset, so this can no longer be computed from one shared offset.
-    global_ids: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=np.int64))
+    global_ids: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=str))
 
 
 def _split_dirs(outputs: Path) -> list[tuple[str, Path]]:
@@ -762,14 +771,14 @@ def load_epoch_masks(name: str, runs_dir: Path, epoch: int,
                 obj = torch.load(p, map_location="cpu", weights_only=False)
             except Exception:
                 continue
-            sid = _as_int_array(obj["info"]["sample_id"])
-            hit = [i for i, s in enumerate(sid) if int(s) in want_ids]
+            sid = _info_dirs(obj["info"])
+            hit = [i for i, s in enumerate(sid) if s in want_ids]
             if not hit:
                 continue
             boxes = _as_box_list(obj["info"], len(sid))
             m = obj["mask_pred"]
             for i in hit:
-                s, box = int(sid[i]), boxes[i]
+                s, box = str(sid[i]), boxes[i]
                 if (s, box) in want:
                     out[(s, box)] = m[i].float().numpy()
     return out
@@ -880,7 +889,7 @@ def load_run(name: str, runs_dir: Path, registry: "Registry", family: str = "unk
                 except Exception:
                     skipped.append(str(p.relative_to(outputs)))
                     continue
-                sid = _as_int_array(obj["info"]["sample_id"])
+                sid = _info_dirs(obj["info"])
                 ids.append(sid)
                 masks.append(obj["mask_pred"].float().numpy())
                 splits += [split] * len(sid)
@@ -907,7 +916,7 @@ def load_run(name: str, runs_dir: Path, registry: "Registry", family: str = "unk
         # The classified shape, not the primary grid: this run predicts at its own size
         # even when nothing decoded, and the column has to be drawn at that size.
         out_shape = shape or (registry.gts[0].masks.shape[1], registry.gts[0].masks.shape[2])
-        return RunData(name, epoch, np.zeros(0, dtype=np.int64),
+        return RunData(name, epoch, np.zeros(0, dtype=str),
                        np.zeros((0, *out_shape), dtype=np.float32), [],
                        {k: empty_f for k in METRIC_KEYS}, np.zeros((0, 2)), {}, skipped, family,
                        out_shape, "no readable prediction files")
@@ -970,7 +979,7 @@ def load_run(name: str, runs_dir: Path, registry: "Registry", family: str = "unk
     for gi in np.unique(gi_arr).tolist():
         m = gi_arr == gi
         gt = registry.gts[gi]
-        local_rows = np.array([gt.row_of[int(s)] for s in sample_ids[m]], dtype=np.int64)
+        local_rows = np.array([gt.row_of[s] for s in sample_ids[m]], dtype=np.int64)
         global_rows[m] = registry.row_base(gi) + local_rows
         gt_masks = gt.masks_at(shape)
         if gt_masks is None:
@@ -987,7 +996,7 @@ def load_run(name: str, runs_dir: Path, registry: "Registry", family: str = "unk
 
     if len(sample_ids) == 0:
         empty_f = np.zeros(0, dtype=np.float64)
-        return RunData(name, epoch, np.zeros(0, dtype=np.int64),
+        return RunData(name, epoch, np.zeros(0, dtype=str),
                        np.zeros((0, *shape), dtype=np.float32), [],
                        {k: empty_f for k in METRIC_KEYS}, np.zeros((0, 2)), {}, skipped, family,
                        shape, f"no ground truth at {shape[0]}x{shape[1]}")
@@ -1024,15 +1033,6 @@ def load_run(name: str, runs_dir: Path, registry: "Registry", family: str = "unk
 
 
 # ***** registry *****
-
-
-# Global sample id = gi * ID_STRIDE + local sample id. Safe because sample ids are
-# zero-padded 6-digit strings ("000000".."999999"), so a local id is always < ID_STRIDE
-# -- the two halves of a global id never collide and the split (divmod) is exact. With
-# exactly one experiment loaded this reduces to gi=0, global id == local id, so a
-# single-experiment server (ensure_viz's per-training-job case) emits and accepts
-# identical ids to before this change.
-ID_STRIDE = 1_000_000
 
 
 class Registry:
@@ -1079,7 +1079,7 @@ class Registry:
         never by `box`: several captures share a box name (three gastronorm experiments
         today) and all number their samples from 000001, so box + id is ambiguous."""
         self._row_base: list[int] = []
-        self.row_of: dict[int, int] = {}
+        self.row_of: dict[str, int] = {}
         self._gi_by_exp: dict[str, int] = {}
         self._boxes_of: list[set] = []
         self._recorded_at: list[float] = []
@@ -1087,7 +1087,7 @@ class Registry:
         for gi, gt in enumerate(self.gts):
             self._row_base.append(base)
             for local, sid in enumerate(gt.sample_ids):
-                self.row_of[self.global_id(gi, int(sid))] = base + local
+                self.row_of[self.global_id(gi, sid)] = base + local
             base += len(gt)
             self._gi_by_exp[gt.experiment_dir.name] = gi
             self._boxes_of.append({m.get("box") for m in gt.meta} - {None})
@@ -1096,12 +1096,11 @@ class Registry:
             self._recorded_at.append(datetime.fromisoformat(min(ts)).timestamp() if ts else 0.0)
         self.n_samples = base
 
-    def global_id(self, gi, local_sample_id):
-        """gi * ID_STRIDE + local_sample_id -- the ONE place this formula is written.
-        Works elementwise on plain ints or on equal-length numpy arrays (load_run scores
-        every row of a run at once, so it needs the vectorized form of the same thing
-        Registry._index_experiments and app.py's scalar call sites use)."""
-        return gi * ID_STRIDE + local_sample_id
+    def global_id(self, gi, sample_dir):
+        """"{gi}:{sample dir name}" -- the ONE place this formula is written. Elementwise on
+        equal-length arrays too (load_run scores every row of a run at once)."""
+        if np.ndim(gi): return np.array([f"{g}:{s}" for g, s in zip(gi, sample_dir)])
+        return f"{gi}:{sample_dir}"
 
     def resolve(self, sample_ids, boxes, exps, run_exps=(), run_time: float | None = None) -> list[int | None]:
         """Which experiment (gi) each PREDICTED row belongs to, keyed by experiment NAME.
@@ -1120,7 +1119,7 @@ class Registry:
         """
         out: list[int | None] = []
         for sid, box, exp in zip(sample_ids, boxes, exps):
-            sid = int(sid)
+            sid = str(sid)
             names = [exp] if exp is not None else list(run_exps)
             if len(names) > 1 and box is not None:
                 names = [n for n in names if n in self._gi_by_exp
@@ -1227,7 +1226,7 @@ class Registry:
         at zero on every dataset, so treating the id as the row silently served the wrong
         sample's mask and images.
         """
-        i = self.row_of.get(int(sid))
+        i = self.row_of.get(str(sid))
         if i is None:
             raise KeyError(sid)
         return i

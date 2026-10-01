@@ -19,6 +19,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from viz import config, data, render
+from utils.ids import meta_sample_name
 from viz.data import Registry
 
 app = FastAPI(title="viz")
@@ -95,8 +96,8 @@ def api_runs():
 
 def _render_version() -> str:
     """The `v=` every immutable (year-cached) URL carries. Global sample ids are
-    gi * ID_STRIDE + local id, and gi is the experiment's position in LOAD ORDER, so adding
-    an experiment renumbers every one after it: /api/backdrop/3000005.jpg was
+    "{gi}:{sample dir}", and gi is the experiment's position in LOAD ORDER, so adding
+    an experiment renumbers every one after it: /api/backdrop/3:000005.jpg was
     31_07_2026_gastronorm_exp1's sample 5 until 2026_09_27_gastronorm_four_objs sorted in
     ahead of it. Hashing the loaded experiment names into the version changes every URL
     when that happens, so a browser can never serve one experiment's cached image for
@@ -123,8 +124,8 @@ def api_samples():
                 # column resolved row->row-9 while the prediction column matched the row
                 # against a raw sample_id, putting two DIFFERENT scenes side by side. With
                 # one experiment loaded this is just the raw sample id, unchanged.
-                "i": registry.global_id(gi, int(sid)),
-                "sample_id": sid,
+                "i": registry.global_id(gi, sid),
+                "sample_id": meta_sample_name(m) or sid,  # the universal id, e.g. 000012-3
                 # Which experiment dir this sample came from -- not needed by today's UI
                 # (box already disambiguates), but cheap to carry for whatever needs it
                 # next, e.g. two experiments someday sharing a box value.
@@ -193,7 +194,7 @@ def api_run(name: str, reload: int = 0, epoch: int | None = None):
     # this dict against s.i (app.js: `r.samples[s.i]`), which is that same global id.
     samples = {}
     for i, gid in enumerate(rd.global_ids):
-        samples[int(gid)] = {
+        samples[str(gid)] = {
             "split": rd.splits[i],
             "com": [_clean(rd.com_pred[i][0]), _clean(rd.com_pred[i][1])],
             # Crosshair geometry: matched prediction/target object centroids, plus the
@@ -225,7 +226,7 @@ def api_run(name: str, reload: int = 0, epoch: int | None = None):
 
 
 @app.get("/api/mask.png")
-def api_mask(run: str, sid: int, mode: str = "pred", bg: int = 1, rel: int = 0):
+def api_mask(run: str, sid: str, mode: str = "pred", bg: int = 1, rel: int = 0):
     i = _sid(sid)
     rd = _run(run)
     if i not in rd.row_of:
@@ -239,7 +240,7 @@ def api_mask(run: str, sid: int, mode: str = "pred", bg: int = 1, rel: int = 0):
 
 
 @app.get("/api/gt_mask.png")
-def api_gt_mask(sid: int, bg: int = 1, rel: int = 0, shape: str = ""):
+def api_gt_mask(sid: str, bg: int = 1, rel: int = 0, shape: str = ""):
     """The target mask. `shape` ("21x30") renders it at a grid other than the primary one,
     so the ground-truth column can match the runs it sits beside."""
     want = _parse_shape(shape) if shape else None
@@ -251,7 +252,7 @@ def api_gt_mask(sid: int, bg: int = 1, rel: int = 0, shape: str = ""):
 
 
 @app.get("/api/backdrop/{sid}.jpg")
-def api_backdrop(sid: int):
+def api_backdrop(sid: str):
     """The overhead frame at cell size, shown behind canvas-drawn masks. Fetched once per
     sample and reused across every epoch, so scrubbing never re-downloads it."""
     img = render.cached_backdrop(_sid(sid))
@@ -267,7 +268,7 @@ def api_colorbar(mode: str):
 
 
 @app.get("/api/values")
-def api_values(sid: int, run: str = "", mode: str = "pred", shape: str = ""):
+def api_values(sid: str, run: str = "", mode: str = "pred", shape: str = ""):
     """Grid values behind one cell, for the hover tooltip. Fetched on first hover and
     memoized client-side -- never prefetched.
 
@@ -311,7 +312,7 @@ def api_values(sid: int, run: str = "", mode: str = "pred", shape: str = ""):
 
 
 @app.get("/api/overhead/{sid}.png")
-def api_overhead(sid: int):
+def api_overhead(sid: str):
     i = _sid(sid)
     _, gt, r = registry.locate(i)
     p = registry.sample_dir(i) / gt.layout.overhead
@@ -321,7 +322,7 @@ def api_overhead(sid: int):
 
 
 @app.get("/api/vibration/{sid}/{which}.png")
-def api_vibration(sid: int, which: str):
+def api_vibration(sid: str, which: str):
     pat = config.VIBRATION_GLOB.get(which)
     if pat is None:
         raise HTTPException(404, "unknown image")
@@ -332,7 +333,7 @@ def api_vibration(sid: int, which: str):
 
 
 @app.get("/api/audio/{sid}/{which}")
-def api_audio(sid: int, which: str):
+def api_audio(sid: str, which: str):
     i = _sid(sid)
     _, gt, r = registry.locate(i)
     rel = gt.layout.audio.get(which)
@@ -391,7 +392,7 @@ def api_frames(run: str, sids: str, epochs: str = ""):
         if s.strip():
             row = registry.sample_index(s)   # validates + rejects an id no experiment has
             _, gt, local_row = registry.locate(row)
-            pairs.append((int(gt.sample_ids[local_row]), gt.meta[local_row].get("box")))
+            pairs.append((gt.sample_ids[local_row], gt.meta[local_row].get("box")))
     if not pairs:
         raise HTTPException(400, "no sids")
     eps = [int(e) for e in epochs.split(",") if e.strip()] or registry.epochs(run)
@@ -415,7 +416,7 @@ def api_frames(run: str, sids: str, epochs: str = ""):
 
 
 @app.get("/api/neighbors")
-def api_neighbors(run: str, sid: int, k: int = 5):
+def api_neighbors(run: str, sid: str, k: int = 5):
     """Ground-truth samples whose center of mass is closest to / furthest from what this
     run predicted for `sid`.
 
@@ -487,8 +488,8 @@ def api_neighbors(run: str, sid: int, k: int = 5):
         m = gt.meta[idx]
         # "i" is the GLOBAL sample id, matching /api/samples: the client both requests
         # /api/gt_mask.png?sid= with it and matches it against s.i to open the row.
-        return {"i": registry.global_id(gi, int(gt.sample_ids[idx])),
-                "sample_id": gt.sample_ids[idx],
+        return {"i": registry.global_id(gi, gt.sample_ids[idx]),
+                "sample_id": meta_sample_name(m) or gt.sample_ids[idx],
                 "output_id": m.get("output_id") or m.get("position_id"),
                 "speaker": m.get("speaker"),
                 "layout": m.get("layout"), "n_objects": m.get("n_objects"),
@@ -497,7 +498,7 @@ def api_neighbors(run: str, sid: int, k: int = 5):
 
     # Every coordinate in this payload is in the run's grid, so the modal can print
     # pred_com and gt_com side by side without them meaning different things.
-    return {"run": run, "sample_id": gt.sample_ids[r],
+    return {"run": run, "sample_id": meta_sample_name(gt.meta[r]) or gt.sample_ids[r],
             "shape": [rd.shape[0], rd.shape[1]],
             "pred_com": [_clean(pred[0]), _clean(pred[1])],
             "gt_com": [_clean(com_gt[r][0]), _clean(com_gt[r][1])],
@@ -507,7 +508,7 @@ def api_neighbors(run: str, sid: int, k: int = 5):
 
 
 @app.get("/api/detail/{sid}")
-def api_detail(sid: int, shape: str = ""):
+def api_detail(sid: str, shape: str = ""):
     i = _sid(sid)
     _, gt, r = registry.locate(i)
     m = gt.meta[r]
@@ -520,6 +521,7 @@ def api_detail(sid: int, shape: str = ""):
             "min_freq", "max_freq", "n_lasers", "n_rows", "n_cols", "laser_idx",
             "fps", "n_capture_seconds", "timestamp"]
     out = {k: m.get(k) for k in keys}
+    out["sample_id"] = meta_sample_name(m) or gt.sample_ids[r]  # the universal id, old samples too
     # coms/avg_com are numpy reprs on the gastronorm layout; normalise the one the UI
     # actually plots so the modal never prints a raw "[603.1 901.2]" string.
     out["avg_com"] = data.parse_com(m.get("avg_com"))

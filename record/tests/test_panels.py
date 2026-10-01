@@ -37,5 +37,5 @@ def test_plots_are_full_panel_size_even_before_the_gui_exists():
     exec(next(src for src in cells if "def plot_shifts" in src), ns)
     ec = SimpleNamespace(panel_queues={"shifts": queue.Queue()}, laser_cam=SimpleNamespace(get_frame_rate=lambda: 2500.0))
     pclk = DoneTask({"shifts": np.random.default_rng(0).normal(size=(1, 2500, 2)), "laser_idx": 55})
-    ns["plot_shifts"](ec, pclk, "Shifts Position 1 Speaker 1 (000001) Laser 55")  # the dry run: no GUI yet
+    ns["plot_shifts"](ec, pclk, "Shifts Position 1 Speaker 1 Laser 55")  # the dry run: no GUI yet
     assert ec.panel_queues["shifts"].get_nowait().shape[:2] == (334, 1480)  # full-screen shifts panel

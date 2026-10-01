@@ -1,5 +1,5 @@
-"""Per-sample stage status for the GUI's status list: every sample (one position-speaker) goes
-through STAGES in order, each marked from whichever thread runs it. A plain dict, sample id ->
+"""Per-sample stage status for the GUI's status list: every sample ("{position_id}-{speaker}") goes
+through STAGES in order, each marked from whichever thread runs it. A plain dict, sample ->
 row; each row is only ever written by its own sample's stages, and the GUI tick only reads.
 Every mark is also appended to the sample's times.jsonl, so its stage timings outlive the session."""
 
@@ -13,8 +13,8 @@ STAGES = ("record", "save vibration", "save sample", "post process")
 RECORD, SAVE_VIBRATION, SAVE_SAMPLE, POST_PROCESS = range(len(STAGES))
 
 
-def add(status: dict, sample: str, label: str, sample_dir=None, now=time.perf_counter):
-    status[sample] = {"label": label, "dir": None if sample_dir is None else Path(sample_dir),
+def add(status: dict, sample: str, sample_dir=None, now=time.perf_counter):
+    status[sample] = {"label": sample, "dir": None if sample_dir is None else Path(sample_dir),
                       "start": [None] * len(STAGES), "end": [None] * len(STAGES),
                       "skipped": [False] * len(STAGES), "failed": None, "unwritten": []}
 

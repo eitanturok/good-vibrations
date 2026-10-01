@@ -19,7 +19,7 @@ H, W = 4, 6
 # {7: 0, 10: 1, 11: 2}: not id-minus-a-constant, so an off-by-one fix cannot fake it.
 IDS = [7, 8, 10, 11]
 NO_MASK = 8
-ROW_OF = {7: 0, 10: 1, 11: 2}
+ROW_OF = {"000007": 0, "000010": 1, "000011": 2}  # keyed by sample dir name
 
 
 def fingerprint(row: int) -> np.ndarray:
@@ -55,7 +55,7 @@ def runs(tmp_path):
     d.mkdir(parents=True)
     ids = [s for s in IDS if s != NO_MASK]
     torch.save(
-        {"mask_pred": torch.stack([torch.from_numpy(fingerprint(ROW_OF[s]) * 0.9) for s in ids]),
+        {"mask_pred": torch.stack([torch.from_numpy(fingerprint(ROW_OF[f"{s:06d}"]) * 0.9) for s in ids]),
          "info": {"sample_id": torch.tensor(ids), "x_com": torch.zeros(len(ids))}},
         d / "ep0000-ba0.pt")
     return tmp_path / "runs"
@@ -78,8 +78,8 @@ def test_gt_rows_are_not_ids(registry):
 def test_run_row_of_is_keyed_by_row(registry):
     """RunData.row_of is keyed by ROW -- that is what every consumer passes it."""
     rd = registry.run("r")
-    for j, sid in enumerate(rd.sample_ids):
-        assert rd.row_of[registry.sample_index(int(sid))] == j
+    for j, gid in enumerate(rd.global_ids):
+        assert rd.row_of[registry.sample_index(gid)] == j
 
 
 def test_rendered_prediction_matches_its_metrics(registry):
@@ -90,7 +90,7 @@ def test_rendered_prediction_matches_its_metrics(registry):
     rd = registry.run("r")
     for sid, row in ROW_OF.items():
         j = rd.row_of[row]                       # exactly what app.py/render.py do
-        assert int(rd.sample_ids[j]) == sid
+        assert rd.sample_ids[j] == sid
         assert rd.masks[j].argmax() == fingerprint(row).argmax()
         assert rd.metrics['iou'][j] > 0.8        # mispaired fingerprints score ~0
 
