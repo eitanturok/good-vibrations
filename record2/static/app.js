@@ -2,20 +2,19 @@
 // All drawing, zoom and overlays happen here -- Python only sends frames and JSON.
 const $ = (s) => document.querySelector(s);
 const SVG = "http://www.w3.org/2000/svg";
-const STAGE_COLORS = { overhead: "#86867e", segment: "#2f8f5f", "segment wait": "#b8b7b1", vibrate: "#d64541",
-  "save vibration": "#256abf", preview: "#8e44ad", "save segmentation": "#b06a2c", "post process": "#e6a817" };
-const PALETTE = ["#256abf", "#2f8f5f", "#b06a2c", "#8e44ad", "#d64541", "#16a2b8", "#e6a817", "#55554f"];
+const STAGE_COLORS = {  // record/'s palette: a sample's stages blue -> orange -> green; the position's own steps after them
+  vibrate: "#2980b9", "save vibration": "#e67e22", "post process": "#27ae60", overhead: "#7f8c8d", speaker: "#1a5276" };
 
 const ui = {
   view: { overhead: { x: 0, y: 0, s: 1, fit: true }, laser: { x: 0, y: 0, s: 1, fit: true } },
   overheadCrop: false,  // double-click: the crop, or the whole frame
   drawingCrop: false,   // mid-drag of a new crop box: the view holds still, unclipped
   laserFull: false,     // double-click: the ROIs packed edge to edge, or where they sit on the full sensor
-  timeline: "sample",
+  tab: "timeline",       // the bottom-left pane: timeline, logs or fails
   calib: null,          // ROI calibration in progress: {step, clicks: {rows, crop, cols}}
 };
 let catalog, state, since = 0, lastPanels = {}, lastAudio = null, lastRoi;
-const records = [], spans = new Map();
+const records = [], spans = new Map(), deleted = new Set();  // deleted: position ids
 
 const post = async (url, body) => {
   const r = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body ?? {}) });
@@ -34,6 +33,7 @@ async function poll() {
   for (const r of state.records) {
       since = r.seq;
       records.push(r);
+      if (r.deleted) deleted.add(r.deleted);
       if (r.stage) spans.set(`${r.label}|${r.stage}|${r.start}`, { ...spans.get(`${r.label}|${r.stage}|${r.start}`), ...r,
         thread: spans.get(`${r.label}|${r.stage}|${r.start}`)?.thread ?? r.thread });
   }
@@ -46,8 +46,8 @@ const runningSpans = () => [...spans.values()].filter((s) => s.end === undefined
 const fmt = (t) => `${Math.floor(t / 60)}:${(t % 60).toFixed(1).padStart(4, "0")}`;
 
 function update() {
-  // each part on its own, the feeds first: one that fails (see the browser console) never blanks the others
-  for (const part of [drawFeeds, drawHeader, drawPanels, syncSliders, drawTimeline]) {
+  // each part on its own (the header first: its text sets the panels' height, which the feeds fit to): one that fails (see the browser console) never blanks the others
+  for (const part of [drawHeader, drawFeeds, drawPanels, syncSettings, drawTimeline, drawLogs]) {
     try { part(); } catch (e) { console.error(part.name, e); }
   }
 }
@@ -56,23 +56,26 @@ function drawHeader() {
   const rec = state.recording, now = Date.now() / 1000;
   document.body.classList.toggle("recording", rec);
   const pos = runningSpans().find((s) => s.stage === "position"), vib = runningSpans().find((s) => s.stage === "vibrate");
-  // top bar: the experiment dir; saved positions per layout
-  $("#dir").textContent = state.experiment_dir;
-  $("#counts").innerHTML = Object.entries(state.counts.layouts).sort().map(([l, n]) => `${l} <b>${n}</b>`).join(" · ");
+  // top bar: the experiment dir and its saved positions; per layout on the right
+  const n = state.counts.experiment;
+  // ‎ keeps the path reading left to right while the rtl box cuts a long one from the left: its end always shows
+  $("#dir").textContent = `‎${state.experiment_dir}`;
+  $("#dir").title = state.experiment_dir;
+  $("#total").textContent = `total ${n}`;
+  $("#counts").innerHTML = Object.entries(state.counts.layouts).sort().map(([l, k]) => `<span>${esc(l)}<b>${k}</b></span>`).join("");
   const errors = records.filter((r) => r.level === "ERROR");  // the full log is record.log (and the notebook)
   $("#errors").hidden = !errors.length;
-  $("#errors").textContent = `${errors.length} error${errors.length > 1 ? "s" : ""} · see record.log`;
+  $("#errors").textContent = `${errors.length} error${errors.length > 1 ? "s" : ""}`;
   $("#errors").title = errors.at(-1)?.msg ?? "";
   // buttons: polls only change text, never the elements -- a click whose element is replaced mid-press is lost
-  const n = state.counts.experiment;
   $("#run-label").textContent = rec ? "Stop" : "Record";
-  $("#run-id").textContent = rec ? `${vib?.label ?? pos?.label ?? ""}` : $("#save").checked ? `position ${String(state.next_position_id).padStart(6, "0")}` : "dry run";
-  $("#run-sub").textContent = rec ? `recording ${pos ? fmt(now - pos.start) : ""}` : `${n} position${n === 1 ? "" : "s"} recorded`;
+  $("#run-id").textContent = rec ? `${vib?.label ?? pos?.label ?? ""}` : `position ${String(state.next_position_id).padStart(6, "0")}`;
+  for (const el of document.querySelectorAll(".rec-time")) el.textContent = `REC ${vib?.label ?? pos?.label ?? ""}  ${pos ? fmt(now - pos.start) : ""}`;  // on both cameras
   $("#run").classList.toggle("stop", rec);
   const last = state.position_id;
-  $("#delete").disabled = rec || !last || last === "dry";
-  $("#delete-id").textContent = last && last !== "dry" ? last : "";
-  for (const el of document.querySelectorAll("#sliders input, #calibrate, #roi-apply")) el.disabled = rec;
+  $("#delete").disabled = rec || !last;
+  $("#delete-id").textContent = last ?? "";
+  for (const el of document.querySelectorAll(".cam input, #calibrate, #roi-width, #roi-height")) el.disabled = rec;
 }
 
 // panels: "not run yet" -> "loading…" -> the plot (fetched once per position) or "failed"
@@ -125,17 +128,13 @@ function place(name, w, h) {
   applyView(name);
 }
 
-// the zoom/pan transform; in the overhead's crop view, the panel is also clipped to the box's on-screen
-// rectangle -- nothing outside the box ever shows, however you zoom or pan
+// the zoom/pan transform; in the overhead's crop view, the picture is clipped to the box (in sensor px, so it
+// follows any zoom or pan) -- the panel itself stays, black around it
 function applyView(name) {
-  const v = ui.view[name], [w, h] = $(`#${name} .stage`).dataset.size.split("x").map(Number);
-  $(`#${name} .stage`).style.transform = `translate(${v.x}px, ${v.y}px) scale(${v.s})`;
-  let clip = "";
-  if (name === "overhead" && ui.overheadCrop && !ui.drawingCrop) {
-    const [l, r, t, b] = readCrop(), box = view(name).getBoundingClientRect(), px = (n) => `${Math.max(0, n)}px`;
-    clip = `inset(${px(v.y + t * h * v.s)} ${px(box.width - v.x - r * w * v.s)} ${px(box.height - v.y - b * h * v.s)} ${px(v.x + l * w * v.s)} round 6px)`;
-  }
-  view(name).style.clipPath = clip;
+  const v = ui.view[name], st = $(`#${name} .stage`), [w, h] = st.dataset.size.split("x").map(Number);
+  st.style.transform = `translate(${v.x}px, ${v.y}px) scale(${v.s})`;
+  const [l, r, t, b] = name === "overhead" && ui.overheadCrop && !ui.drawingCrop ? readCrop() : [0, 1, 0, 1];
+  st.style.clipPath = `inset(${t * h}px ${(1 - r) * w}px ${(1 - b) * h}px ${l * w}px)`;
 }
 
 function toSensor(name, e) {
@@ -148,7 +147,7 @@ function setSrc(img, src) { if (img.dataset.src !== src) { img.dataset.src = src
 function setAttrs(node, attrs) { for (const [k, v] of Object.entries(attrs)) node.setAttribute(k, v); return node; }
 
 function drawFeeds() {
-  // overhead: the live frame, the crop box, the speakers (pinned to the panel), lit while one plays
+  // overhead: the live frame, the crop box, the speakers (fixed on the panel), lit while one plays
   const [ow, oh] = state.overhead.size;
   setSrc($("#overhead img"), "/overhead.mjpg");
   view("overhead").style.aspectRatio = `${ow} / ${oh}`;
@@ -157,24 +156,19 @@ function drawFeeds() {
   $("#overhead svg").replaceChildren(setAttrs(document.createElementNS(SVG, "rect"),
     { class: "crop", x: l * ow, y: t * oh, width: (r - l) * ow, height: (b - t) * oh }));
   const playing = runningSpans().find((s) => s.stage === "vibrate")?.label.split("-")[1];
-  // speakers along the edges of what's visible: the panel, or (crop view) the box's on-screen rectangle
-  const v = ui.view.overhead, panel = view("overhead").getBoundingClientRect(), m = 26;
-  const [x0, y0, x1, y1] = ui.overheadCrop
-    ? [Math.max(0, v.x + l * ow * v.s), Math.max(0, v.y + t * oh * v.s), Math.min(panel.width, v.x + r * ow * v.s), Math.min(panel.height, v.y + b * oh * v.s)]
-    : [0, 0, panel.width, panel.height];
+  // speakers fixed along the panel's border (26px in), whatever the zoom or crop
   $("#overhead .speakers").replaceChildren(...Object.entries(catalog.speaker_position).map(([spk, [x, y]]) => {
     const d = document.createElement("div");
     d.className = spk === playing ? "spk on" : "spk";
     d.textContent = spk;
-    d.style.left = `${x0 + m + x * (x1 - x0 - 2 * m)}px`;
-    d.style.top = `${y0 + m + (1 - y) * (y1 - y0 - 2 * m)}px`;
+    d.style.left = `calc(26px + ${x} * (100% - 52px))`;
+    d.style.top = `calc(26px + ${1 - y} * (100% - 52px))`;
     return d;
   }));
 
-  // laser: the panel takes the shape of what it shows, so no black bars pass for camera
+  // laser: the panel fills its figure (black); what it shows is fitted + centered in it
   const { mode, size: [lw, lh] } = laserMode(), roi = state.laser.roi;
   setSrc($("#laser img"), "/laser.mjpg");
-  shapeView("laser", lw, lh);
   place("laser", lw, lh);
   const nodes = [];
   if (mode === "sensor") {
@@ -184,12 +178,11 @@ function drawFeeds() {
   } else {
     roi.rois.forEach((r, i) => {
       const [x, y, w, h] = laserRect(mode, roi, r, i);
-      nodes.push(setAttrs(document.createElementNS(SVG, "rect"), { class: i === +$("#pv-laser").value ? "roi pv" : "roi", x, y, width: w, height: h }));
+      nodes.push(setAttrs(document.createElementNS(SVG, "rect"), { class: "roi", x, y, width: w, height: h }));
     });
   }
   $("#laser svg").replaceChildren(...nodes);
-  $("#laser-hint").textContent = mode === "sensor" ? calibHint() :
-    `${mode === "full" ? "ROIs on the full sensor" : "ROIs"} · click an ROI to preview it · double-click ${mode === "full" ? "ROIs only" : "full sensor"}`;
+  $("#laser-hint").textContent = mode === "sensor" ? calibHint() : "";  // only calibrating needs instructions
 }
 
 // what the laser panel shows: the ROIs packed edge to edge (the default), the ROIs where they sit on the sensor
@@ -197,8 +190,25 @@ function drawFeeds() {
 function laserMode() {
   const { roi, sensor } = state.laser;
   if (ui.calib || !roi) return { mode: "sensor", size: sensor };
-  if (ui.laserFull) return { mode: "full", size: sensor };
-  return { mode: "rois", size: [roi.cols.length * roi.roi_width, roi.rows.length * roi.roi_height] };
+  return ui.laserFull ? { mode: "full", size: sensor } : { mode: "rois", size: packedSize(roi) };
+}
+const packedSize = (roi) => [roi.cols.length * roi.roi_width, roi.rows.length * roi.roi_height];
+// the camera reads one band (the crop's width, an ROI tall) per row of ROIs: each band in the camera's frame
+// (x, y, w, h) -> where it sits on the sensor
+const frameWidth = (roi) => $("#laser img").naturalWidth || roi.crop[1] - roi.offset_x;  // the crop, rounded out to the camera's 16 px grid
+const bands = (roi) => roi.row_positions.map((y, k) => [[0, k * roi.roi_height, frameWidth(roi), roi.roi_height],
+                                                         [roi.offset_x, y, frameWidth(roi), roi.roi_height]]);
+// the whole sensor's last wide-open picture (fetched again when the grid changes), or null if there's none
+const sensorShot = { key: null, img: null };
+function sensorImage(roi) {
+  const key = JSON.stringify([roi.rows, roi.cols, roi.crop, roi.roi_width, roi.roi_height]);
+  if (sensorShot.key !== key) {
+    const img = new Image();
+    [sensorShot.key, sensorShot.img] = [key, null];
+    img.onload = () => { if (sensorShot.key === key) sensorShot.img = img; };
+    img.src = `/laser_sensor.jpg?v=${encodeURIComponent(key)}`;
+  }
+  return sensorShot.img;
 }
 // ROI i (x, y, w, h in the camera's frame) -> where the panel draws it
 function laserRect(mode, roi, [x, y, w, h], i) {
@@ -214,31 +224,30 @@ function drawLaser() {
   const { mode, size: [w, h] } = laserMode(), roi = state.laser.roi, ctx = canvas.getContext("2d");
   if (canvas.width !== w || canvas.height !== h) [canvas.width, canvas.height] = [w, h];
   if (mode === "sensor") return ctx.drawImage(img, 0, 0);
-  ctx.fillStyle = "#000";
-  ctx.fillRect(0, 0, w, h);
+  ctx.clearRect(0, 0, w, h);
+  if (mode === "full") {  // the sensor's last still, darker; the live bands; the ROIs brightest
+    const shot = sensorImage(roi);
+    ctx.globalAlpha = 0.45;
+    if (shot) ctx.drawImage(shot, 0, 0);
+    ctx.globalAlpha = 0.7;
+    for (const [src, dst] of bands(roi)) ctx.drawImage(img, ...src, ...dst);
+    ctx.globalAlpha = 1;
+  }
   roi.rois.forEach((r, i) => ctx.drawImage(img, ...r, ...laserRect(mode, roi, r, i)));
 }
 
-// size a view to its picture's aspect, as big as its figure allows
-function shapeView(name, w, h) {
-  const fig = $(`#${name}`), v = view(name);
-  const s = Math.min(fig.clientWidth / w, (fig.clientHeight - fig.querySelector("figcaption").offsetHeight) / h);
-  const [vw, vh] = [`${Math.floor(w * s)}px`, `${Math.floor(h * s)}px`];
-  if (v.style.width !== vw || v.style.height !== vh) { [v.style.width, v.style.height] = [vw, vh]; ui.view[name].fit = true; }
-}
-
-// zoom/pan never shows past the frame: zoomed out at most until the whole frame fits, never panned off an edge
-// (an axis the frame doesn't fill stays centered)
-const frameSize = (name) => $(`#${name} .stage`).dataset.size.split("x").map(Number);
+// zoom/pan never shows past what the view shows (the whole frame, or the overhead's crop box): zoomed out at most
+// until it fits, never panned off its edge (an axis it doesn't fill stays centered)
+const shown = (name) => fitRect(name, ...$(`#${name} .stage`).dataset.size.split("x").map(Number));
 function fitScale(name) {
-  const [w, h] = frameSize(name), r = view(name).getBoundingClientRect();
+  const [, , w, h] = shown(name), r = view(name).getBoundingClientRect();
   return Math.min(r.width / w, r.height / h);
 }
 function keepInFrame(name) {
-  const v = ui.view[name], [w, h] = frameSize(name), r = view(name).getBoundingClientRect();
-  const axis = (pos, size, box) => (size <= box ? (box - size) / 2 : Math.min(0, Math.max(box - size, pos)));
-  v.x = axis(v.x, w * v.s, r.width);
-  v.y = axis(v.y, h * v.s, r.height);
+  const v = ui.view[name], [x, y, w, h] = shown(name), r = view(name).getBoundingClientRect();
+  const axis = (pos, start, size, box) => (size <= box ? (box - size) / 2 : Math.min(0, Math.max(box - size, pos + start))) - start;
+  v.x = axis(v.x, x * v.s, w * v.s, r.width);
+  v.y = axis(v.y, y * v.s, h * v.s, r.height);
 }
 
 function zoomPan(name) {
@@ -246,7 +255,7 @@ function zoomPan(name) {
   v.addEventListener("wheel", (e) => {
     e.preventDefault();
     const r = v.getBoundingClientRect(), mx = e.clientX - r.left, my = e.clientY - r.top;
-    const k = Math.max(vs.s * Math.exp(-e.deltaY * 0.0015), fitScale(name)) / vs.s;  // never smaller than the whole frame
+    const k = Math.max(vs.s * Math.exp(-e.deltaY * 0.0015), fitScale(name)) / vs.s;  // never smaller than what the view shows
     Object.assign(vs, { x: mx - (mx - vs.x) * k, y: my - (my - vs.y) * k, s: vs.s * k, fit: false });
     keepInFrame(name);
     applyView(name);
@@ -293,17 +302,13 @@ function overheadEvents() {
   v.addEventListener("dblclick", () => { ui.overheadCrop = !ui.overheadCrop; ui.view.overhead.fit = true; drawFeeds(); });
 }
 
-// laser: calibration clicks, or click an ROI to preview it; double-click toggles live rows <-> full sensor
+// laser: calibration clicks; double-click toggles packed ROIs <-> ROIs at their sensor positions
 function laserEvents() {
   const v = view("laser");
   v.addEventListener("click", (e) => {
-    if (e.shiftKey) return;
-    let [x, y] = toSensor("laser", e);
-    if (ui.calib) return calibClick(Math.round(x), Math.round(y));
-    const { mode } = laserMode(), roi = state.laser.roi;
-    if (mode === "sensor") return;
-    const i = roi.rois.findIndex((r, j) => { const [rx, ry, w, h] = laserRect(mode, roi, r, j); return x >= rx && x < rx + w && y >= ry && y < ry + h; });
-    if (i >= 0) { $("#pv-laser").value = i; drawFeeds(); }
+    if (e.shiftKey || !ui.calib) return;
+    const [x, y] = toSensor("laser", e);
+    calibClick(Math.round(x), Math.round(y));
   });
   v.addEventListener("dblclick", () => {
     if (ui.calib || !state.laser.roi) return;
@@ -317,17 +322,24 @@ function laserEvents() {
 const calibN = () => ({ rows: +$("#roi-rows").value, crop: 2, cols: +$("#roi-cols").value });
 function calibHint() {
   if (!ui.calib) return "no ROIs yet -- calibrate";
-  const { step, clicks } = ui.calib, what = { rows: "horizontal lines", crop: "crop edges (left + right)", cols: "vertical lines" }[step];
-  return `calibrating: click ${calibN()[step]} ${what} (${clicks[step].length}/${calibN()[step]}) · Esc cancels`;
+  const { step, clicks } = ui.calib, what = { rows: "HORIZONTAL lines", crop: "CROP edges (left + right)", cols: "VERTICAL lines" }[step];
+  return `${what}: ${clicks[step].length}/${calibN()[step]}
+Esc cancels`;  // as the notebook's click window
 }
 async function startCalibration() {
   const previous = state.laser.roi;  // the camera goes wide-open: remember the grid, for Esc
+  view("laser").requestFullscreen().catch(() => {});  // the whole sensor, full screen, to click on (during the click: browsers require it)
   if (await post("/calibrate")) {
     ui.calib = { step: "rows", clicks: { rows: [], crop: [], cols: [] }, previous };
     ui.laserFull = false;
     ui.view.laser.fit = true;
-  }
+  } else if (document.fullscreenElement) document.exitFullscreen();
 }
+// leaving full screen (Esc, the browser's own key for it) mid-calibration cancels it
+document.addEventListener("fullscreenchange", () => {
+  ui.view.laser.fit = true;
+  if (!document.fullscreenElement && ui.calib) cancelCalibration();
+});
 async function calibClick(x, y) {
   const c = ui.calib, n = calibN();
   c.clicks[c.step].push(c.step === "rows" ? y : x);
@@ -335,11 +347,13 @@ async function calibClick(x, y) {
   if (c.step !== "cols") { c.step = c.step === "rows" ? "crop" : "cols"; return drawFeeds(); }
   const crop = [Math.min(...c.clicks.crop), Math.max(...c.clicks.crop)];
   ui.calib = null;
+  if (document.fullscreenElement) document.exitFullscreen();
   await post("/rois", { rows: c.clicks.rows, crop, cols: c.clicks.cols, roi_width: +$("#roi-width").value, roi_height: +$("#roi-height").value });
 }
 async function cancelCalibration() {
   const roi = ui.calib.previous;  // put the grid from before calibrating back
   ui.calib = null;
+  if (document.fullscreenElement) document.exitFullscreen();
   if (roi) await post("/rois", { rows: roi.rows, crop: roi.crop, cols: roi.cols, roi_width: roi.roi_width, roi_height: roi.roi_height });
 }
 function applyRoiSize() {
@@ -347,48 +361,104 @@ function applyRoiSize() {
   if (roi) post("/rois", { rows: roi.rows, crop: roi.crop, cols: roi.cols, roi_width: +$("#roi-width").value, roi_height: +$("#roi-height").value });
 }
 
-// ---------- timeline: rows = samples (colored by stage) or threads (colored by sample) ----------
-function color(s) {
-  if (ui.timeline === "sample") return STAGE_COLORS[s.stage] ?? "#86867e";
-  let h = 0;
-  for (const ch of s.label) h = (h * 31 + ch.charCodeAt(0)) >>> 0;
-  return PALETTE[h % PALETTE.length];
+// ---------- timeline: newest position on top -- its row, then one row per sample ----------
+// A position: its main thread (the photo, then a box for every speaker it plays: delay + vibrate; total = the
+// position). A sample: its stages as equal boxes with their seconds, the idle time between them (how long the next
+// one waited), its total.
+const SAMPLE_COLUMNS = ["vibrate", "save vibration", "post process"];  // a sample row's stages, in order
+const TRASH = `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18M8 6V4a1 1 0 0 1 1-1h6a1 1 0 0 1 1 1v2m2 0v14a1 1 0 0 1-1 1H7a1 1 0 0 1-1-1V6"/></svg>`;
+const STATUS_ICON = { done: "✓", failed: "✗", deleted: TRASH, running: "…" };
+const KEEP_POSITIONS = 50;  // the timeline scrolls through this session's last 50 positions; older ones are in record.log
+const secs = (t) => (t < 60 ? `${t.toFixed(1)}s` : `${Math.floor(t / 60)}m${String(Math.round(t % 60)).padStart(2, "0")}s`);
+
+// position id -> its labels ("000012", "000012-3", ...) -> their stages; newest position first
+function positions() {
+  const byPos = new Map();
+  for (const s of spans.values()) {
+    const labels = byPos.get(s.label.split("-")[0]) ?? byPos.set(s.label.split("-")[0], new Map()).get(s.label.split("-")[0]);
+    (labels.get(s.label) ?? labels.set(s.label, []).get(s.label)).push(s);
+  }
+  const start = (labels) => Math.min(...[...labels.values()].flat().map((s) => s.start));
+  const sorted = [...byPos].sort(([, a], [, b]) => start(b) - start(a));
+  const dropped = new Set(sorted.slice(KEEP_POSITIONS).map(([p]) => p));
+  for (const [k, s] of spans) if (dropped.has(s.label.split("-")[0])) spans.delete(k);
+  return sorted.slice(0, KEEP_POSITIONS);
 }
+
 function drawTimeline() {
-  const now = Date.now() / 1000;
-  for (const [k, s] of spans) if (s.end !== undefined && now - s.end > 900) spans.delete(k);  // keep 15 min
-  const key = ui.timeline === "sample" ? (s) => s.label : (s) => s.thread;
-  const rows = new Map();
-  for (const s of spans.values()) (rows.get(key(s)) ?? rows.set(key(s), []).get(key(s))).push(s);
-  const latest = (list) => Math.max(...list.map((s) => s.end ?? now));
-  const keys = [...rows.keys()].sort((a, b) => latest(rows.get(b)) - latest(rows.get(a))).slice(0, 14);
-  const shown = keys.flatMap((k) => rows.get(k));
-  if (!shown.length) return $("#timeline").replaceChildren();
-  // by sample: every row starts at its own first stage, all on one scale (the longest row); by thread: the last minute
-  const first = (list) => Math.min(...list.map((s) => s.start));
-  const span = ui.timeline === "sample" ? Math.max(1, ...keys.map((k) => latest(rows.get(k)) - first(rows.get(k)))) : 60;
-  $("#timeline").replaceChildren(...keys.map((k) => {
-    const row = document.createElement("div"), lab = document.createElement("span"), bar = document.createElement("div");
-    row.className = "trow"; lab.className = "tlab"; bar.className = "tbar";
-    lab.textContent = k;
-    const t0 = ui.timeline === "sample" ? first(rows.get(k)) : now - 60;
-    for (const s of rows.get(k)) {
-      const i = document.createElement("i"), end = s.end ?? now;
-      if (end < t0) continue;
-      const speaker = s.label.includes("-") ? ` ${s.label.split("-")[1]}` : "";
-      i.className = [["position", "speaker"].includes(s.stage) && "outer", s.end === undefined && "running", s.failed && "failed"].filter(Boolean).join(" ");
-      i.style.left = `${Math.max(0, (s.start - t0) / span) * 100}%`;
-      i.style.width = `${((end - Math.max(s.start, t0)) / span) * 100}%`;
-      i.style.background = color(s);
-      i.title = `${s.stage}${speaker} · ${s.label} · ${s.thread} · ${(end - s.start).toFixed(2)}s${s.failed ? " · FAILED" : ""}`;
-      bar.append(i);
+  if (ui.tab !== "timeline") return;
+  const now = Date.now() / 1000, end = (s) => s.end ?? now, dur = (parts) => parts.reduce((t, s) => t + end(s) - s.start, 0);
+  const last = (list, stage) => list.filter((s) => s.stage === stage).at(-1);
+  // one box: its stages' seconds summed, running while any runs; a name (position rows) goes above the seconds
+  const cell = (color, name, parts) => {
+    parts = parts.filter(Boolean);
+    const label = name ? `<small>${name}</small>` : "", cls = name ? "tbox step" : "tbox";
+    if (!parts.length) return `<i class="${cls} wait">${label}</i>`;
+    const failed = parts.some((s) => s.failed), running = parts.some((s) => s.end === undefined);
+    return `<i class="${cls}${running ? " running" : ""}${failed ? " failed" : ""}" style="--c:${STAGE_COLORS[color]}" ` +
+           `title="${parts.map((s) => `${s.stage} ${(end(s) - s.start).toFixed(2)}s`).join(" + ")}">${label}${failed ? "FAIL" : secs(dur(parts))}</i>`;
+  };
+  const row = (cls, label, middle, total, status) => `<div class="trow ${cls} ${status}" title="${label} · ${status}"><span class="tlab">${label}</span>` +
+    `${middle}<span class="ttot">${secs(total)}</span><span class="tst">${STATUS_ICON[status]}</span></div>`;
+  // idle: from a column's end to the next one's start -- still counting while the next waits (unless the row stopped)
+  const idle = (a, b, status) => {
+    if (!a.length || a.some((s) => s.end === undefined) || (!b.length && status !== "running")) return `<span class="tidle"></span>`;
+    const next = b.length ? Math.min(...b.map((s) => s.start)) : now;
+    return `<span class="tidle" title="idle">${secs(Math.max(0, next - Math.max(...a.map((s) => s.end))))}</span>`;
+  };
+
+  $("#timeline").innerHTML = positions().map(([p, labels]) => {
+    const gone = deleted.has(p), own = labels.get(p) ?? [], pos = last(own, "position");
+    const status = (list, done) => (gone ? "deleted" : list.some((s) => s.failed) ? "failed" : done ? "done" : "running");
+    const main = [cell("overhead", "img", [last(own, "overhead")]),
+                  ...(pos?.speakers ?? []).map((spk) => cell("speaker", `spk ${spk}`, [last(labels.get(`${p}-${spk}`) ?? [], "speaker")]))];
+    let html = row("pos", p, `<div class="tsteps">${main.join("")}</div>`, pos ? end(pos) - pos.start : 0, status(own, pos?.end !== undefined));
+    const samples = [...labels].filter(([l]) => l !== p).sort(([a], [b]) => a.split("-")[1] - b.split("-")[1]);
+    const expected = pos?.save === false ? 1 : SAMPLE_COLUMNS.length;  // a dry run only vibrates: nothing saved or post-processed
+    for (const [label, list] of samples) {
+      const st = status(list, list.every((s) => s.end !== undefined) && last(list, SAMPLE_COLUMNS[expected - 1]));
+      const cols = SAMPLE_COLUMNS.map((stage) => [last(list, stage)].filter(Boolean));
+      const middle = SAMPLE_COLUMNS.map((stage, n) => n >= expected ? `<span class="tidle"></span><i></i>` :
+        (n ? idle(cols[n - 1], cols[n], st) : "") + cell(stage, "", cols[n])).join("");
+      html += row("", label, middle, Math.max(...list.map(end)) - Math.min(...list.map((s) => s.start)), st);
     }
-    row.append(lab, bar);
-    return row;
-  }));
-  $("#legend").innerHTML = ui.timeline === "sample"
-    ? Object.entries(STAGE_COLORS).map(([k, c]) => `<span><b style="background:${c}"></b>${k}</span>`).join("")
-    : "<span>bars colored by sample · hover for details</span>";
+    return html;
+  }).join("");
+}
+
+// ---------- logs: every record this session, or only the failures (with their tracebacks); newest first ----------
+const esc = (x) => String(x).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
+const clock = (t) => new Date(t * 1000).toTimeString().slice(0, 8);
+// light highlighting on escaped text: sample/position ids, durations, quoted strings; in tracebacks also files, lines, the error
+const hlMsg = (m) => esc(m)
+  .replace(/\b(\d{6}(?:-\d+)?)\b/g, '<span class="h-id">$1</span>')
+  .replace(/\b(\d+(?:\.\d+)?s)\b/g, '<span class="h-num">$1</span>')
+  .replace(/\b(FAILED|failed)\b/g, '<span class="h-err">$1</span>')
+  .replace(/'[^']*'/g, '<span class="h-str">$&</span>');
+const hlExc = (t) => esc(t)
+  .replace(/File &quot;([^&]+)&quot;, line (\d+), in (\S+)/g,
+           'File <span class="h-file">&quot;$1&quot;</span>, line <span class="h-num">$2</span>, in <span class="h-fn">$3</span>')
+  .replace(/^(\w+(?:\.\w+)*(?:Error|Exception|Interrupt|Exit|Warning)\b)(:?)/gm, '<span class="h-err">$1</span>$2');
+let logsDrawn;
+function drawLogs() {
+  const fails = records.filter((r) => r.level === "ERROR");
+  $("#n-fails").textContent = fails.length || "";
+  const key = `${ui.tab}|${since}`;
+  if (ui.tab === "timeline" || key === logsDrawn) return;  // redrawn only when there's something new: a text selection survives
+  logsDrawn = key;
+  const list = (ui.tab === "logs" ? records.slice(-400) : fails).toReversed();
+  $(`#${ui.tab}`).innerHTML = list.map((r) =>
+    `<div class="lrow ${r.level}"><span class="lt">${clock(r.t)}</span><span class="lth">${esc(r.thread)}</span><span class="lid">${esc(r.sample ?? "")}</span><span class="lm">${hlMsg(r.msg)}</span>` +
+    (ui.tab === "fails" && r.exc ? `<pre>${hlExc(r.exc)}</pre>` : "") + "</div>").join("") ||
+    `<div class="lrow"><span class="lm">${ui.tab === "logs" ? "nothing logged yet" : "no failures"}</span></div>`;
+}
+function showTab(tab) {
+  ui.tab = tab;
+  for (const b of document.querySelectorAll(".tabs button")) b.classList.toggle("on", b.dataset.tab === tab);
+  for (const p of document.querySelectorAll("[data-pane]")) p.hidden = p.dataset.pane !== tab;
+  logsDrawn = null;
+  drawTimeline();
+  drawLogs();
 }
 
 // ---------- form ----------
@@ -419,6 +489,7 @@ function fillForm() {
   $("#layouts").innerHTML = catalog.layouts.map((l) => `<option value="${l}">`).join("");
   $("#object-names").innerHTML = Object.keys(catalog.prompts).map((o) => `<option value="${o}">`).join("");
   for (const [name, count] of Object.entries(P.objects)) addObject(name, count, P.prompts[name]);
+  while ($("#objects").children.length < 2) addObject();  // room for two objects; a blank row is ignored
   $("#description").value = P.description;
   $("#pv-speaker").replaceChildren(...catalog.speakers.map((s) => new Option(s, s)));
   [$("#pv-speaker").value, $("#pv-laser").value, $("#pv-channel").value, $("#pv-use-pc").checked] = [V.speaker, V.laser, V.channel, V.use_pc];
@@ -438,25 +509,21 @@ function readForm() {
   };
 }
 
-// camera sliders: POST on release ('change'), never while dragging
-const SLIDERS = [["overhead", "exposure", "exposure (ms)"], ["overhead", "gain", "gain"], ["laser", "exposure", "exposure (µs)"], ["laser", "gain", "gain"]];
-function makeSliders() {
-  $("#sliders").replaceChildren(...SLIDERS.map(([cam, key, label]) => {
-    const row = document.createElement("label"), [lo, hi] = state[cam][`${key}_bounds`];
-    row.className = "slider";
-    row.innerHTML = `<span>${cam} ${label}</span><small>${lo}</small><input type="range" min="${lo}" max="${hi}" step="${(hi - lo) / 1000}"><small>${hi}</small><output></output>`;
-    const input = row.querySelector("input"), out = row.querySelector("output");
-    input.dataset.cam = cam; input.dataset.key = key;
-    input.addEventListener("input", () => (out.value = (+input.value).toFixed(1)));
-    input.addEventListener("change", () => post("/camera", { cam, [key]: +input.value }));
-    return row;
-  }));
+// camera settings: type a value, then enter (or leave the box) sets it -- clamped to the camera's range, and laser fps
+// snapped to its step (a capture stays whole buffers)
+function cameraInputs() {
+  for (const input of document.querySelectorAll(".cam input")) input.addEventListener("change", () => {
+    const cam = input.closest(".cam").dataset.cam, key = input.dataset.key, [lo, hi] = state[cam][`${key}_bounds`], step = state[cam][`${key}_step`];
+    let v = Math.min(hi, Math.max(lo, +input.value));
+    if (step) v = Math.min(hi, lo + Math.round((v - lo) / step) * step);
+    post("/camera", { cam, [key]: v });
+  });
 }
-function syncSliders() {
-  for (const input of document.querySelectorAll("#sliders input")) {
-    if (input === document.activeElement) continue;
-    input.value = state[input.dataset.cam][input.dataset.key];
-    input.closest(".slider").querySelector("output").value = (+input.value).toFixed(1);
+function syncSettings() {
+  for (const input of document.querySelectorAll(".cam input")) {
+    if (input === document.activeElement) continue;  // never overwrite what's being typed
+    const cam = input.closest(".cam").dataset.cam;
+    input.value = +(+state[cam][input.dataset.key]).toFixed(2);
   }
   // the ROI fields: the current grid, or ROIConfig's defaults before there is one -- refreshed when the grid changes
   const roi = state.laser.roi, d = catalog.roi_defaults, key = JSON.stringify(roi && [roi.rows, roi.cols, roi.roi_width, roi.roi_height]);
@@ -481,25 +548,27 @@ async function main() {
   state = await (await fetch("/state")).json();
   since = 0;
   fillForm();
-  makeSliders();
+  cameraInputs();
   zoomPan("overhead"); zoomPan("laser");
   overheadEvents(); laserEvents();
   drawLaser();
   $("#run").addEventListener("click", runOrStop);
   $("#play").addEventListener("click", () => ($("#audio").paused ? $("#audio").play() : $("#audio").pause()));
-  for (const e of ["play", "pause", "ended"]) $("#audio").addEventListener(e, () => ($("#play").textContent = $("#audio").paused ? "▶ recovered audio" : "❚❚ recovered audio"));
+  for (const e of ["play", "pause", "ended"]) $("#audio").addEventListener(e, () => {
+    $("#play").textContent = $("#audio").paused ? "▶ recovered audio" : "❚❚ recovered audio";
+    post("/log", { msg: `recovered audio ${e} (${$("#audio").currentSrc.split("/").pop()}) on the default output` });  // in record.log: it shares the MOTU
+  });
   $("#add-object").addEventListener("click", () => addObject());
   $("#delete").addEventListener("click", () => {
     if (confirm(`Delete position ${state.position_id}? Its samples move to deleted/.`)) post("/delete", { position_id: state.position_id });
   });
   $("#calibrate").addEventListener("click", startCalibration);
-  $("#roi-apply").addEventListener("click", applyRoiSize);
-  for (const b of document.querySelectorAll(".timeline .toggle button")) b.addEventListener("click", () => {
-    ui.timeline = b.dataset.view;
-    for (const o of document.querySelectorAll(".timeline .toggle button")) o.classList.toggle("on", o === b);
-  });
+  for (const b of document.querySelectorAll(".tabs button")) b.addEventListener("click", () => showTab(b.dataset.tab));
+  $("#errors").addEventListener("click", () => showTab("fails"));
+  // the stage colors, in column order, as in record/: each a colored chip naming its stage
+  $("#legend").innerHTML = Object.keys(STAGE_COLORS).map((k) => `<b style="background:${STAGE_COLORS[k]}">${k}</b>`).join("");
+  for (const id of ["#roi-width", "#roi-height"]) $(id).addEventListener("change", applyRoiSize);  // on enter, blur or a spinner step
   for (const id of CROP) $(`#crop-${id}`).addEventListener("input", () => drawFeeds());
-  $("#pv-laser").addEventListener("input", () => drawFeeds());
   let resized;
   window.addEventListener("resize", () => {
     ui.view.overhead.fit = ui.view.laser.fit = true;
@@ -509,6 +578,14 @@ async function main() {
   document.addEventListener("keydown", (e) => {
     if (e.key === "Escape" && ui.calib) return cancelCalibration();
     if (e.target.closest("input, textarea, select")) return;  // keys belong to the field being edited
+    const cam = e.target.closest(".feed")?.id, arrow = { ArrowLeft: [1, 0], ArrowRight: [-1, 0], ArrowUp: [0, 1], ArrowDown: [0, -1] }[e.key];
+    if (cam && arrow) {  // a clicked camera: the arrows pan it, a tenth of the panel a press
+      e.preventDefault();
+      const v = ui.view[cam], r = view(cam).getBoundingClientRect();
+      Object.assign(v, { x: v.x + arrow[0] * r.width / 10, y: v.y + arrow[1] * r.height / 10, fit: false });
+      keepInFrame(cam);
+      return applyView(cam);
+    }
     if (["PageUp", "PageDown", "ArrowLeft", "ArrowRight", "Enter"].includes(e.key)) { e.preventDefault(); runOrStop(); }  // the clicker
   });
   poll();

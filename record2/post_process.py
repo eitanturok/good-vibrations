@@ -20,9 +20,11 @@ AUDIO_SAMPLE_RATE = 22050
 
 
 # ---- 1 pclk: speckle video -> per-ROI (x, y) shift per frame ----
-def pclk(raw_vibrations, rois, batch_size=PCLK_BATCH_SIZE, use_PC=True, desc=None, progress=True):
+def pclk(raw_vibrations, rois, batch_size=PCLK_BATCH_SIZE, use_PC=True):
+    # no progress bar: it runs on background threads, whose prints land in whichever notebook cell ran last
+    # (its duration is in record.log, as "post process")
     crops = np.stack([raw_vibrations[:, y:y + h, x:x + w] for x, y, w, h in rois])  # (L, T, h, w)
-    return compute_shifts_for_all_rois_batched_optimized(crops, batch_size, desc=desc, progress=progress, use_PC=use_PC)  # (L, T, 2)
+    return compute_shifts_for_all_rois_batched_optimized(crops, batch_size, progress=False, use_PC=use_PC)  # (L, T, 2)
 
 
 # The band [min_freq, max_freq] is the chirp's own [f_start, f_end] -- saved in each sample's
@@ -65,7 +67,7 @@ def post_process(raw_path):
 
 
 def _post_process(raw_path, sample_dir):
-    vib, sid = sample_dir / "vibration", sample_dir.name
+    vib = sample_dir / "vibration"
 
     metadata = load_metadata(sample_dir / "metadata.jsonl")
     fps, rois = float(metadata["fps"]), metadata["rois"]
@@ -75,7 +77,7 @@ def _post_process(raw_path, sample_dir):
     laser, axis = min(int(metadata["recovery_laser"]), len(rois) - 1), metadata["recovery_axis"]
     channel, suffix = "xy".index(axis), f"_laser{laser}_{axis}"
 
-    shifts = pclk(np.load(raw_path), rois, desc=f"[sample {sid}]")
+    shifts = pclk(np.load(raw_path), rois)
     save(shifts, vib / "02_raw_shifts.npy")
 
     clean_shifts = clean(shifts, fps, min_freq, max_freq)
@@ -103,7 +105,7 @@ def _post_process(raw_path, sample_dir):
 
 def preview_vibrations(raw_vibrations, roi, fps, laser_idx, channel, min_freq, max_freq, pclk_batch_size=PCLK_BATCH_SIZE, use_PC=True) -> dict:
     """Live preview: the same steps on one ROI and one channel (0 = x, 1 = y), nothing written to disk."""
-    shifts = pclk(raw_vibrations, [roi], pclk_batch_size, use_PC=use_PC, progress=False)  # (1, T, 2)
+    shifts = pclk(raw_vibrations, [roi], pclk_batch_size, use_PC=use_PC)  # (1, T, 2)
     fft_shifts, freqs = fft(clean(shifts, fps, min_freq, max_freq), fps, min_freq, max_freq)
     n_samples = shifts.shape[1]
     audio = recover_audio(fft_shifts[0, :, channel], n_samples, fps, min_freq, max_freq)

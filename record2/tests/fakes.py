@@ -55,16 +55,16 @@ class FakeLaser:
 
 
 class FakeOverhead:
-    def __init__(self):
-        self.config = SimpleNamespace(device_id=0, exposure_ms=12.0, gain=1, exposure_bounds_ms=(0.1, 100), gain_bounds=(0, 100))
-        self.width, self.height, self.frame_rate = 100, 80, 30.0
+    def __init__(self, config):
+        self.config = config
+        self.width, self.height, self.frame_rate = 100, 80, config.frame_rate
 
     def capture(self): return np.zeros((80, 100, 3), np.uint8)
     def get_exposure(self): return self.config.exposure_ms
     def get_gain(self): return self.config.gain
     def get_pixel_clock(self): return 86
-    def set_exposure(self, x): self.config.exposure_ms = x
-    def set_gain(self, x): self.config.gain = x
+    def set_exposure(self, x): self.config = dataclasses.replace(self.config, exposure_ms=x)
+    def set_gain(self, x): self.config = dataclasses.replace(self.config, gain=x)
 
 
 class FakeAudio:
@@ -91,7 +91,7 @@ def fake_preview(raw, roi, fps, laser, channel, f_start, f_end, batch, use_pc):
 
 def load(tmp_path, fail_on=None):
     """The catalog, config, Experiment and recording cells, with fakes for the hardware and the segmenter."""
-    import collections, dataclasses, io, math, os, shutil, socket, subprocess, time
+    import collections, contextlib, dataclasses, io, math, os, shutil, socket, subprocess, time
     from concurrent.futures import ThreadPoolExecutor
     from dataclasses import dataclass, field
     from datetime import datetime, timezone
@@ -103,29 +103,31 @@ def load(tmp_path, fail_on=None):
     from record2.log import TAIL, Timing, logger, running, setup_logging
     from record2.segment import combined_smask, object_centers_of_mass
     setup_logging()
-    ns = dict(collections=collections, dataclasses=dataclasses, io=io, math=math, os=os, shutil=shutil, socket=socket,
+    ns = dict(collections=collections, contextlib=contextlib, dataclasses=dataclasses, io=io, math=math, os=os, shutil=shutil, socket=socket,
               subprocess=subprocess, time=time, threading=threading, json=json, np=np, Path=Path,
               ThreadPoolExecutor=ThreadPoolExecutor, dataclass=dataclass, field=field, datetime=datetime, timezone=timezone,
               Figure=Figure, Image=Image, append=append, load=io_load, load_metadata=load_metadata, save=save,
-              viz=viz, crop=crop, TAIL=TAIL, Timing=Timing, logger=logger, running=running,
+              viz=viz, crop=crop, TAIL=TAIL, Timing=Timing, logger=logger, running=running, setup_logging=setup_logging,
               combined_smask=combined_smask, object_centers_of_mass=object_centers_of_mass,
               segment=fake_segment, preview_vibrations=fake_preview, PositionIdCounter=Counter,
-              PCLK_BATCH_SIZE=256, AUDIO_SAMPLE_RATE=22050, display=lambda x: None)
+              PCLK_BATCH_SIZE=256, REPO_DIR=Path(__file__).resolve().parents[2], AUDIO_SAMPLE_RATE=22050, display=lambda x: None)
     import cv2
     from matplotlib.patches import Rectangle
     from record2 import geometry
-    ns.update(cv2=cv2, Rectangle=Rectangle, geometry=geometry, MikrotronCamera=FakeLaser)
-    for marker in ("class LaserCameraConfig", "class ROIConfig", "def open_calibration_camera", "BOXES = {", "class PositionConfig",
-                   "default_position = ", "class PreviewConfig", "default_preview = ", "class Experiment",
+    ns.update(cv2=cv2, Rectangle=Rectangle, geometry=geometry, MikrotronCamera=FakeLaser, PyueyeCamera=FakeOverhead)
+    for marker in ("class OverheadCameraConfig", "class LaserCameraConfig", "class ROIConfig", "def open_calibration_camera", "class PositionConfig",
+                   "class PreviewConfig", "default_preview = ", "class Experiment",
                    "SAVE_POOL = ", "def job(", "def record_position", "PANELS = "):
         exec(cell(marker), ns)
+    ns["ROIS_FILE"] = tmp_path / "rois.json"
     laser = FakeLaser(ns["LaserCameraConfig"](roi=ns["ROIConfig"]()))
     laser.fail_on = fail_on
     chirp = SimpleNamespace(t_sec=0.2, t_start=0.0, t_end=0.0, f_start=100.0, f_end=1000.0)
     ns["exp"] = ns["Experiment"](tmp_path / "experiment", chirp, np.zeros(10, np.float32), np.zeros(10, np.float32), hand_delay=0, min_free_gb=0)
-    ns["hw"] = SimpleNamespace(overhead_cam=FakeOverhead(), laser_cam=laser, audio_engine=FakeAudio(), laser_background=None)
+    exec(cell("default_position = "), ns)
+    ns["hw"] = SimpleNamespace(overhead_cam=FakeOverhead(ns["OverheadCameraConfig"]()), laser_cam=laser, audio_engine=FakeAudio(), laser_background=None)
     ns["segmenter"] = None
-    ns["position"] = ns["PositionConfig"](speakers=[1, 3, 5, 7], box="gastronorm", crop=ns["BOXES"]["gastronorm"], objects={"red-cube": 1},
+    ns["position"] = ns["PositionConfig"](speakers=[1, 3, 5, 7], box="gastronorm", crop=ns["exp"].crop_box["gastronorm"], objects={"red-cube": 1},
                                           prompts={"red-cube": "Red cube"}, layout="one-cube")
     ns["preview"] = ns["PreviewConfig"](speaker=3, laser=5, channel=1)
     return ns

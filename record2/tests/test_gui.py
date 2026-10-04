@@ -69,6 +69,15 @@ def test_no_hardware_changes_while_recording(gui):
     assert c.get("/state").json()["laser"]["exposure"] == 50
 
 
+def test_fps_reopens_the_camera_at_it(gui):
+    c, laser = gui["client"], gui["hw"].laser_cam
+    assert c.post("/camera", json={"cam": "laser", "fps": 3750}).status_code == 200
+    assert c.post("/camera", json={"cam": "overhead", "fps": 20}).status_code == 200
+    state = c.get("/state").json()
+    assert gui["hw"].laser_cam is not laser and gui["hw"].laser_cam.config.roi is laser.config.roi
+    assert (state["laser"]["fps"], state["laser"]["fps_step"], state["overhead"]["fps"]) == (3750, 1250, 20)
+
+
 def test_calibrate_then_set_rois(gui):
     c = gui["client"]
     assert c.post("/calibrate").status_code == 200
@@ -108,3 +117,25 @@ def test_coverage_follows_the_layout(gui):
     finish(gui)
     assert c.get("/panel/coverage.png?layout=one-cube").headers["content-type"] == "image/png"
     assert c.get("/panel/coverage.png?layout=two-cubes").status_code == 404
+
+
+def test_the_page_and_its_files_are_never_served_stale(gui):
+    """Real bug: after the GUI files changed, the browser ran a cached old app.js against the new index.html,
+    which crashed at startup -- no cameras, no plots. Every load must re-check them."""
+    c = gui["client"]
+    for url in ("/", "/static/app.js", "/static/style.css"):
+        assert c.get(url).headers["cache-control"] == "no-cache"
+
+
+def test_the_whole_sensor_picture_is_kept_when_the_grid_is_applied(gui):
+    """The unzoomed laser view shows the rows the camera doesn't read from the last wide-open frame: applying a
+    grid while calibrating (wide-open) keeps that frame; with none yet, there's nothing to show."""
+    c = gui["client"]
+    assert c.get("/laser_sensor.jpg").status_code == 404
+    assert c.post("/calibrate").status_code == 200
+    roi = gui["ROIConfig"]()
+    body = dict(rows=roi.rows, cols=roi.cols, crop=list(roi.crop), roi_width=roi.roi_width, roi_height=roi.roi_height)
+    assert c.post("/rois", json=body).status_code == 200
+    r = c.get("/laser_sensor.jpg")
+    assert r.status_code == 200 and r.headers["content-type"] == "image/jpeg"
+    assert gui["wide_open_frame"].shape == (1080, 1920)

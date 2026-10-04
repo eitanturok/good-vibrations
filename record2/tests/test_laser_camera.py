@@ -7,6 +7,7 @@ import json
 import math
 import threading
 import time
+import tempfile
 import tracemalloc
 import weakref
 from dataclasses import dataclass, field
@@ -171,7 +172,7 @@ def load_notebook(cam, gentl=lambda: None):
     """Exec the LaserCameraConfig, MikrotronCamera and ROI cells, as-is, with the
     fake grabber standing in for egrabber."""
     cells = ["".join(c["source"]) for c in json.loads(NB.read_text(encoding="utf-8"))["cells"] if c["cell_type"] == "code"]
-    ns = dict(np=np, dataclass=dataclass, field=field, geometry=geometry, dataclasses=__import__('dataclasses'),
+    ns = dict(np=np, json=json, REPO_DIR=Path("."), dataclass=dataclass, field=field, geometry=geometry, dataclasses=__import__('dataclasses'),
               close_previous_instance=close_previous_instance, stop_then_close=stop_then_close,
               EGenTL=gentl, EGrabber=make_grabber_cls(cam), ct=ct,
               InvalidAddressException=InvalidAddressException, threading=threading,
@@ -179,6 +180,7 @@ def load_notebook(cam, gentl=lambda: None):
               BUFFER_INFO_CUSTOM_NUM_DELIVERED_PARTS="delivered", INFO_DATATYPE_PTR=None, INFO_DATATYPE_SIZET=None)
     for marker in ("class LaserCameraConfig", "class MikrotronCamera", "class ROIConfig", "def open_calibration_camera"):
         exec(next(src for src in cells if marker in src), ns)
+    ns["ROIS_FILE"] = Path(tempfile.mkdtemp()) / "rois.json"  # never the real last-used ROIs
     return ns
 
 
@@ -391,6 +393,30 @@ class FakeCv2:
     def __getattr__(self, name): return lambda *args, **kwargs: None  # namedWindow, line, putText, ...
 
 
+def roi_steps(ns):
+    cells = ["".join(c["source"]) for c in json.loads(NB.read_text(encoding="utf-8"))["cells"] if c["cell_type"] == "code"]
+    return lambda marker: exec(next(src for src in cells if marker in src and "def " not in src), ns)
+
+
+def test_roi_steps_without_clicking_use_the_default_grid():
+    """SET_ROIS = False: no clicks, and the camera still ends up cropped to the default (even) grid.
+    Real bug: only the clicking path cropped it, so the first recording ran on the wide-open
+    calibration camera (AttributeError: 'NoneType' object has no attribute 'rois' at the preview)."""
+    from matplotlib.figure import Figure
+    from matplotlib.patches import Rectangle
+    from PIL import Image
+    from record2 import viz
+    ns = load_notebook(Camera())
+    ns.update(cv2=FakeCv2(), Figure=Figure, Rectangle=Rectangle, Image=Image, viz=viz, display=lambda image: None, SET_ROIS=False)
+    ns["laser_cam"] = ns["MikrotronCamera"](ns["LaserCameraConfig"](buffer_part_count=4))
+    step = roi_steps(ns)
+    for marker in ("else load_rois()", "horizontal=True", "edges = click_lines", "cols = click_lines", "roi_width="):
+        step(marker)
+    roi, laser = ns["roi_config"], ns["laser_cam"]
+    assert laser.grabber is not None and laser.config.roi is roi
+    assert (roi.n_rows, roi.n_cols, roi.roi_width, roi.roi_height) == (10, 10, 80, 32)  # ROIConfig's defaults
+
+
 def test_roi_steps_rows_crop_cols_size():
     """The ROI section's cells, in order, twice (re-running must work too), clicking in the OpenCV
     window: each step updates roi_config, and the last leaves `laser_cam` OPEN and cropped to the grid.
@@ -405,9 +431,9 @@ def test_roi_steps_rows_crop_cols_size():
     ns = load_notebook(cam)
     ns.update(cv2=cv2, Figure=Figure, Rectangle=Rectangle, Image=Image, viz=viz, display=lambda image: None)
     ns["laser_cam"] = ns["MikrotronCamera"](ns["LaserCameraConfig"](buffer_part_count=4))
-    cells = ["".join(c["source"]) for c in json.loads(NB.read_text(encoding="utf-8"))["cells"] if c["cell_type"] == "code"]
-    step = lambda marker: exec(next(src for src in cells if marker in src and "def " not in src), ns)
-    step("roi_config = ROIConfig(")
+    ns["SET_ROIS"] = True
+    step = roi_steps(ns)
+    step("else load_rois()")
     rows, cols = list(range(100, 1100, 100)), list(range(450, 1550, 110))
     for _ in range(2):
         cv2.points = [(5, y) for y in rows]
@@ -430,6 +456,11 @@ def test_roi_steps_rows_crop_cols_size():
         assert (roi.n_rows, roi.n_cols) == (10, 10) and laser.config.roi is roi
         assert laser.config.buffer_part_count == 4  # calibration doesn't lose frames-per-buffer
         assert cam.features["Height"] == 10 * roi.roi_height  # the camera reads only the ROI rows
+
+    ns["SET_ROIS"] = False  # the next session, without clicking: the last-used ROIs
+    for marker in ("else load_rois()", "horizontal=True", "edges = click_lines", "cols = click_lines", "roi_width="):
+        step(marker)
+    assert ns["roi_config"].rois == roi.rois and ns["laser_cam"].config.roi.rois == roi.rois
 
 
 def test_setters_keep_the_config_current():

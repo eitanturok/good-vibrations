@@ -30,12 +30,11 @@ def test_a_saved_position(tmp_path):
     assert ns["hw"].audio_engine.played[-1] == list(range(1, 9))  # the whistle, on every speaker
 
 
-def test_a_dry_run_writes_nothing_and_uses_no_position_id(tmp_path):
+def test_a_dry_run_writes_nothing(tmp_path):
     ns = load(tmp_path)
-    assert run(ns, save=False) == "dry"
+    assert run(ns, save=False) == "000001"  # its own id, like any run: one row on the timeline
     exp = ns["exp"]
     assert not any(exp.samples_dir.iterdir()) and not (exp.experiment_dir / "positions.jsonl").exists()
-    assert exp.position_ids.n == 0
     assert ns["LAST"]["seg"].result()["coverage"]["n_positions"] == 1  # shown...
     assert exp.coverage == {} and not exp.positions_per_layout  # ...but not kept
 
@@ -49,6 +48,8 @@ def test_a_failed_capture_fails_the_position(tmp_path):
     assert not (exp.experiment_dir / "positions.jsonl").exists() and not exp.positions_per_layout
     assert "vibrate failed" in (exp.samples_dir / "000001-3" / "times.jsonl").read_text()
     assert not (exp.samples_dir / "000001-5").exists()  # no further speaker
+    failed = [r for r in ns["TAIL"] if r.get("failed") and r["label"] == "000001-3"]
+    assert "Timeout" in failed[-1]["exc"]  # the traceback, for the GUI's errors tab
 
 
 def test_stop_finishes_the_current_speaker_and_skips_the_rest(tmp_path):
@@ -81,6 +82,7 @@ def test_delete_position(tmp_path):
     assert (exp.experiment_dir / "deleted" / "000001-1" / "metadata.jsonl").exists()
     assert [json.loads(ln) for ln in (exp.experiment_dir / "positions.jsonl").read_text().splitlines()] == [{"2": [1, 3, 5, 7]}]
     assert exp.positions_per_layout["one-cube"] == 1
+    assert any(r.get("deleted") == "000001" for r in ns["TAIL"])  # the GUI timeline marks it deleted
 
 
 def test_delete_is_refused_while_the_position_is_busy(tmp_path):
@@ -97,14 +99,14 @@ def test_a_restart_counts_the_saved_positions(tmp_path):
     run(ns)
     exp = ns["Experiment"](ns["exp"].experiment_dir, ns["exp"].chirp_config, ns["exp"].chirp_samples, ns["exp"].done_whistle_samples)
     assert exp.positions_per_layout["one-cube"] == 1 and exp.coverage["one-cube"]["n_positions"] == 1
-    assert len(exp.coverage["one-cube"]["last_masks"]) == len(ns["exp"].coverage["one-cube"]["last_masks"])  # each object, from disk
+    assert (exp.coverage["one-cube"]["outlines"] == ns["exp"].coverage["one-cube"]["outlines"]).all()  # each object, from disk
 
 
 def test_record_position_and_plot_draws_each_result_in_the_cell(tmp_path):
     ns = load(tmp_path)
     shown = []
     ns["display"] = shown.append
-    assert ns["record_position_and_plot"](ns["hw"], ns["exp"], ns["segmenter"], ns["position"], ns["preview"], save=False) == "dry"
+    assert ns["record_position_and_plot"](ns["hw"], ns["exp"], ns["segmenter"], ns["position"], ns["preview"], save=False) == "000001"
     assert len(shown) == 4  # smask, coverage, shifts, freqs
 
 
@@ -113,3 +115,13 @@ def test_experiment_repr(tmp_path):
     run(ns)
     text = repr(ns["exp"])
     assert "saved positions: 1 (one-cube 1)" in text and "next position id: 2" in text and "GB free" in text
+
+
+def test_no_roi_grid_is_refused_before_anything_is_recorded(tmp_path):
+    """A wide-open laser camera (no ROI grid) can't preview or be post-processed: refused up front, not
+    after every speaker was recorded -- and no position id is used up."""
+    ns = load(tmp_path)
+    ns["hw"].laser_cam = ns["MikrotronCamera"](ns["LaserCameraConfig"]())  # wide-open, as the calibration camera
+    with pytest.raises(ValueError, match="ROI"):
+        run(ns)
+    assert ns["exp"].position_ids.peek() == 1 and not any(ns["exp"].samples_dir.iterdir()) and ns["hw"].audio_engine.played == []
