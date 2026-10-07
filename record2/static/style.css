@@ -1,0 +1,214 @@
+/* Tokens are viz2's, so the recorder and the dashboards read as one product. */
+:root {
+  --s0:#f5f5f3; --s1:#fcfcfb; --s2:#eeeeeb;
+  --line:#e0e0dc; --firm:#c9c9c3;
+  --ink:#1a1a19; --ink2:#55554f; --ink3:#86867e;
+  --accent:#256abf; --accent-sf:#e8f0fc;
+  --rec:#d64541; --ok:#2f8f5f;
+  --r:6px;
+  --mono: ui-monospace, SFMono-Regular, Menlo, monospace;
+  --sans: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --s0:#141413; --s1:#1a1a19; --s2:#242422;
+    --line:#33332f; --firm:#4a4a45;
+    --ink:#f0efec; --ink2:#b8b7b1; --ink3:#86867e;
+    --accent:#3987e5; --accent-sf:#12233a;
+    --rec:#e5605c; --ok:#43b17d;
+  }
+}
+* { box-sizing:border-box; }
+html,body { margin:0; height:100%; font:13px/1.45 var(--sans); color:var(--ink); background:var(--s0); }
+body { display:flex; flex-direction:column; overflow:hidden; }
+h2 { margin:0 0 6px; font-size:11px; font-weight:600; letter-spacing:.06em; text-transform:uppercase;
+     color:var(--ink3); display:flex; align-items:center; gap:8px; }
+button { font:600 12px var(--sans); cursor:pointer; padding:5px 12px; border:1px solid var(--firm);
+         border-radius:var(--r); background:var(--s1); color:var(--ink); }
+button:hover:not(:disabled) { border-color:var(--accent); color:var(--accent); }
+button:disabled { opacity:.4; cursor:default; }
+input, select, textarea { font:12px var(--mono); padding:3px 5px; border:1px solid var(--firm);
+                          border-radius:var(--r); background:var(--s1); color:var(--ink); min-width:0; }
+input[type=checkbox] { accent-color:var(--accent); }
+#description { width:100%; box-sizing:border-box; min-height:52px; resize:vertical; padding:8px 10px; border:1px solid var(--line);
+               border-radius:8px; background:var(--s1); font:13px/1.45 var(--sans); color:var(--ink);
+               transition:border-color .15s, box-shadow .15s; }
+#description::placeholder { color:var(--ink3); }
+#description:focus { outline:none; border-color:var(--accent); box-shadow:0 0 0 3px var(--accent-sf); }
+input[type=range] { padding:0; border:none; background:none; accent-color:var(--accent); }
+
+/* ***** top bar ***** */
+/* banner: the experiment (its folder name big, the path before it dim), its positions, then per layout */
+.top { flex:none; display:flex; align-items:center; gap:14px; padding:10px 16px; border-bottom:1px solid var(--line); background:var(--s1); }
+.dir { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; direction:rtl; text-align:left; font:700 16px var(--mono); color:var(--ink); }
+.total { flex:none; padding:3px 12px; border-radius:999px; background:var(--accent); color:#fff; font:700 14px var(--sans); }
+.counts, .errors { flex:none; }
+.counts { display:flex; flex-wrap:wrap; gap:6px; margin-right:auto; }  /* left, after the total; errors stay right */
+.counts span { display:inline-flex; align-items:center; gap:6px; padding:2px 4px 2px 10px; border:1px solid var(--line); border-radius:999px;
+               background:var(--s0); font:12px var(--sans); color:var(--ink2); }
+.counts span b { min-width:20px; padding:1px 6px; border-radius:999px; background:var(--s2); color:var(--ink); font:700 12px var(--mono); text-align:center; }
+.errors { font:600 12px var(--mono); padding:3px 10px; border:1px solid var(--rec); border-radius:var(--r); color:var(--rec); cursor:pointer; }
+
+/* ***** layout: controls + timeline on the left; on the right, overhead + its plots (65%), laser + its plots (35%) ***** */
+.grid { flex:1; min-height:0; display:grid; gap:12px; padding:12px 16px; grid-template-columns:440px minmax(0,1fr); }
+.views { grid-area:1/2; display:grid; gap:12px; min-height:0;
+         grid-template-columns:minmax(0,1.25fr) minmax(0,1fr) minmax(0,1fr); grid-template-rows:auto minmax(0,1fr) minmax(0,1fr); }  /* row 1 is the overhead's height; the rest goes to the laser row */
+#laser { grid-area:2/1/4/2; }
+.plot.long { grid-column:2/4; }  /* shifts over fft, each as wide as both plots above */
+.side { grid-area:1/1; overflow:hidden; min-height:0; padding-right:16px;
+        border-right:1px solid var(--line); display:flex; flex-direction:column; gap:8px; }
+
+/* ***** live feeds: a stage (img + svg, in sensor px) transformed inside a clipped view ***** */
+figure { margin:0; min-width:0; min-height:0; display:flex; flex-direction:column; }
+.feed .view:focus { outline:2px solid var(--accent); outline-offset:-2px; }  /* clicked: the arrow keys pan it */
+.feed .view { position:relative; flex:1; min-height:0; overflow:hidden; background:#000; border-radius:var(--r);
+              touch-action:none; }
+/* recording: a blinking red border, on a layer above the picture (a plain outline is painted under it) */
+.feed .view::after { content:""; position:absolute; inset:0; border:4px solid var(--rec); border-radius:inherit;
+                     pointer-events:none; visibility:hidden; }
+.recording .feed .view::after { visibility:visible; animation:blink 1s step-end infinite; }
+/* recording: a blinking red light and the elapsed time, at the bottom of each camera */
+.rec { display:none; position:absolute; left:50%; bottom:10px; transform:translateX(-50%); z-index:2; pointer-events:none;
+       align-items:center; gap:10px; padding:6px 16px 6px 12px; border-radius:999px; background:rgba(0,0,0,.65);
+       color:#fff; font:700 20px var(--mono); letter-spacing:.04em; white-space:pre; }
+.rec i { width:16px; height:16px; border-radius:50%; background:#ff3b30; box-shadow:0 0 8px #ff3b30; animation:blink 1s step-end infinite; }
+.recording .rec { display:flex; }
+@keyframes blink { 50% { opacity:0; } }
+.stage { position:absolute; left:0; top:0; transform-origin:0 0; }
+.stage img, .stage canvas, .stage svg { position:absolute; inset:0; width:100%; height:100%; display:block; }
+.stage img { image-rendering:pixelated; user-select:none; -webkit-user-drag:none; }
+.stage svg { overflow:visible; pointer-events:none; }  /* drawn only: it's redrawn every poll, and a click on a replaced node is lost */
+.stage canvas { image-rendering:pixelated; }
+#laser .stage img { visibility:hidden; }  /* the source: the canvas shows it, rearranged */
+#overhead .view { flex:none; max-height:62vh; }  /* the frame's shape (set from its size): no black bars */
+.stage svg .crop { fill:none; stroke:var(--accent); stroke-width:15; vector-effect:non-scaling-stroke; }
+.stage svg .roi { fill:none; stroke:#1e90ff; stroke-width:1; vector-effect:non-scaling-stroke; }
+.stage svg .line { stroke:#1e90ff; stroke-width:2; vector-effect:non-scaling-stroke; }
+.speakers { position:absolute; inset:0; pointer-events:none; }
+.spk { position:absolute; width:22px; height:22px; margin:-11px 0 0 -11px; border-radius:50%;
+       display:grid; place-items:center; font:700 11px var(--mono);
+       background:#2b2f33; color:#95a5a6; border:1px solid #5d6d7e; }
+.spk.on { width:38px; height:38px; margin:-19px 0 0 -19px; font-size:16px; background:var(--rec); color:#fff;
+          border:2px solid #fff; box-shadow:0 0 0 4px var(--rec); }
+/* calibrating: the step's instructions on the image, as the notebook's click window draws them */
+.hint { position:absolute; left:14px; top:10px; z-index:2; pointer-events:none; white-space:pre-line; color:#1e90ff;
+        font:700 26px var(--sans); text-shadow:0 0 4px #000, 0 0 2px #000; }
+.hint:empty { display:none; }
+
+/* ***** result panels ***** */
+/* the plot image is the whole panel (matplotlib draws its own title), white like the figure */
+.plot { position:relative; border:1px solid var(--line); border-radius:var(--r); background:#fff; overflow:hidden; }
+.plot img { position:absolute; inset:0; width:100%; height:100%; }
+.plot img:not([src]) { visibility:hidden; }
+.status { position:absolute; inset:0; display:grid; place-items:center; font:12px var(--mono); color:var(--ink3); }
+.status:empty { display:none; }
+
+/* ***** timeline: one row per sample (or thread), bars colored by stage (or sample) ***** */
+/* as record/'s sample list: a white card, one 22px line per row -- label, the stages as equal boxes, total + status */
+#timeline { display:flex; flex-direction:column; background:#fff; border:1px solid var(--line); border-radius:var(--r); padding:2px 4px; }
+.legend { position:sticky; top:0; z-index:1; display:flex; flex-wrap:wrap; gap:3px; padding-bottom:6px; background:var(--s0); }
+.legend b { padding:1px 5px; border-radius:2px; color:#fff; font:400 11px "Segoe UI", var(--sans); }
+.trow { display:grid; grid-template-columns:62px minmax(0,1fr) 26px minmax(0,1fr) 26px minmax(0,1fr) 50px 18px; align-items:center;
+        column-gap:2px; height:22px; font:12px "Segoe UI", var(--sans); color:#000; }
+.trow.pos { margin-top:5px; border-top:1px solid #ecf0f1; padding-top:3px; height:34px; }  /* a position starts its group */
+.tsteps { grid-column:2 / 7; display:flex; gap:2px; height:28px; }  /* the position's main-thread steps, equal boxes */
+.tbox.step { flex:1 1 0; min-width:0; height:100%; display:flex; flex-direction:column; justify-content:center; line-height:1.1; }
+.tbox.step small { font:600 9px "Segoe UI", var(--sans); opacity:.85; }
+.tbox.step.wait { color:#95a5a6; }
+.trow.pos:first-child { margin-top:0; border-top:none; }
+.tlab { font-weight:700; white-space:nowrap; font-size:11px; }
+.trow:not(.pos) .tlab { font-weight:400; color:#555; }
+.tbox { height:16px; border-radius:2px; display:grid; place-items:center; overflow:hidden; white-space:nowrap;
+        background:var(--c); color:#fff; font:700 10.5px "Segoe UI", var(--sans); font-style:normal; }
+.tbox.wait { background:#ecf0f1; }
+.tbox.running { background:color-mix(in srgb, var(--c) 45%, #fff); color:#000; animation:pulse .5s step-end infinite alternate; }
+.tbox.failed { background:#e74c3c; }
+.tidle { text-align:center; font-size:9px; color:#95a5a6; white-space:nowrap; overflow:hidden; }
+.trow.failed { background:#fdecea; }
+.trow.failed .tlab { color:#c0392b; font-weight:700; }
+.trow.deleted { opacity:.4; }
+.trow.deleted .tlab { text-decoration:line-through; }
+.ttot { text-align:right; white-space:nowrap; font-size:11px; }
+.tst { display:grid; place-items:center; font:700 14px/1 "Segoe UI", var(--sans); color:#7f8c8d; }
+.trow.done .tst { color:#27ae60; }
+.trow.failed .tst { color:#e74c3c; font-size:17px; }
+.trow.deleted .tst { color:#e74c3c; }
+@keyframes pulse { to { background:color-mix(in srgb, var(--c) 75%, #fff); } }  /* record/: a running stage blinks lighter/darker */
+/* the last sidebar section fills what's left of it (at least 260px); each tab scrolls on its own */
+.side > * { flex:none; }
+.side section.panes { flex:1 1 0; min-height:0; }  /* the sidebar never scrolls: this takes what's left, and its tabs scroll */
+.panes [data-pane] { flex:1; min-height:0; overflow-y:auto; overscroll-behavior:contain; }
+.panes [data-pane][hidden] { display:none; }
+.panes [data-pane="timeline"] { display:flex; flex-direction:column; }
+#timeline { flex:1 0 auto; }  /* the white card always reaches the bottom; more rows than fit: the pane scrolls */
+.tabs { display:flex; margin-bottom:2px; }
+.tabs button { padding:4px 12px; border-radius:0; font:600 11px var(--mono); text-transform:uppercase; letter-spacing:.06em; }
+.tabs button:first-child { border-radius:var(--r) 0 0 var(--r); }
+.tabs button:last-child { border-radius:0 var(--r) var(--r) 0; }
+.tabs button + button { border-left:none; }
+.tabs button.on { background:var(--accent-sf); border-color:var(--accent); color:var(--accent); }
+.tabs b { color:var(--rec); }
+.logs { font:11.5px/1.5 var(--mono); }
+.lrow { display:flex; flex-wrap:wrap; gap:0 6px; padding:2px 0; border-bottom:1px solid var(--line); }
+.lrow .lt { flex:none; color:var(--ink2); }
+.lrow .lth { flex:none; color:var(--accent); opacity:.75; }
+.lrow .lid { flex:none; color:#256abf; font-weight:700; }
+.lrow .lm { flex-basis:100%; min-width:0; overflow-wrap:anywhere; color:var(--ink); }
+.lrow.WARNING { background:rgba(230,168,23,.10); }
+.lrow.ERROR { background:rgba(214,69,65,.08); }
+.lrow.ERROR .lm { color:var(--rec); font-weight:700; }
+.lrow pre { flex-basis:100%; margin:3px 0 4px; padding:6px 8px; background:#1e1f22; color:#d4d4d4; border-radius:var(--r);
+            white-space:pre-wrap; overflow-wrap:anywhere; font:10.5px/1.45 var(--mono); }
+.h-id { color:#256abf; font-weight:700; }
+.h-num { color:#b06a2c; }
+.h-str { color:#2f8f5f; }
+.h-err { color:var(--rec); font-weight:700; }
+pre .h-file { color:#9cdcfe; }
+pre .h-num { color:#b5cea8; }
+pre .h-fn { color:#dcdcaa; }
+pre .h-err { color:#f48771; }
+
+/* ***** controls ***** */
+.runrow { display:flex; align-items:center; gap:14px; }
+/* three lines: Record / position 001264 / 3 positions recorded */
+#run { padding:12px 18px 10px; background:var(--rec); border-color:var(--rec); color:#fff;
+       display:flex; flex-direction:column; align-items:center; gap:2px; }
+#run b { font:700 30px/1.1 var(--sans); letter-spacing:.02em; }
+#run-id { font:600 24px var(--mono); }
+.run-top { display:flex; align-items:center; gap:10px; }
+#run .ico-pause, #run.stop .ico-play { display:none; }  /* Record shows play, Stop shows pause */
+#run.stop .ico-pause { display:block; }
+#run.stop { background:var(--ink); border-color:var(--ink); }
+#run:hover:not(:disabled) { color:#fff; filter:brightness(1.1); }
+#msg { font:11px var(--mono); color:var(--rec); min-height:1em; }
+.side section { display:flex; flex-direction:column; gap:5px; padding-top:6px; border-top:1px solid var(--line); }
+.pk { display:flex; flex-direction:column; gap:3px; font-size:11px; color:var(--ink2); }
+.row { display:flex; gap:6px; align-items:end; flex-wrap:wrap; }
+.row > label { display:flex; flex-direction:column; gap:2px; font-size:10px; color:var(--ink3); flex:1; }
+.row > label input, .row > label select { width:100%; }
+.chips { display:flex; flex-wrap:wrap; gap:4px; }
+.chips label { font:11px var(--mono); padding:2px 6px; border:1px solid var(--firm); border-radius:var(--r); cursor:pointer; }
+.chips label:has(input:checked) { border-color:var(--accent); background:var(--accent-sf); color:var(--accent); }
+.chips input { display:none; }
+.obj { display:grid; grid-template-columns:1.3fr 44px 2fr 20px; gap:4px; }
+.obj button { padding:0; border:none; background:none; color:var(--ink3); }
+.link { border:none; background:none; padding:0; color:var(--accent); font-weight:600; font-size:11px; text-align:left; }
+/* a section title with its button on the same line */
+/* settings: a name column, then each line's fields side by side */
+.side .settings { display:grid; grid-template-columns:64px minmax(0,1fr); gap:6px 8px; align-items:end; }
+.settings .sh { font:600 10px/1.25 var(--sans); letter-spacing:.06em; text-transform:uppercase; color:var(--ink3); text-align:left; padding-bottom:4px; }
+.settings .row { flex-wrap:nowrap; }
+.settings .row > label { min-width:0; }
+.settings .row > button { flex:none; padding:3px 8px; font-size:11px; }
+.play { position:absolute; top:4px; right:4px; z-index:1; padding:2px 10px; font-size:11px; }
+.row > label.switch { flex:none; flex-direction:row; gap:6px; font-size:11px; color:var(--ink2); padding-bottom:4px; }
+#delete { margin-left:auto; display:inline-flex; align-items:center; gap:5px; padding:4px 9px; font:600 11px var(--mono);
+          color:var(--rec); border-color:var(--rec); background:transparent; }
+#delete:hover:not(:disabled) { color:#fff; background:var(--rec); }
+.switch { display:inline-flex; align-items:center; gap:6px; cursor:pointer; font-size:12px; color:var(--ink2); user-select:none; }
+.switch input { display:none; }
+.switch i { position:relative; width:30px; height:17px; border-radius:9px; background:var(--firm); transition:background .15s; }
+.switch i::after { content:""; position:absolute; top:2px; left:2px; width:13px; height:13px; border-radius:50%;
+                   background:#fff; transition:transform .15s; }
+.switch input:checked + i { background:var(--accent); }
+.switch input:checked + i::after { transform:translateX(13px); }
