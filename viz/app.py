@@ -226,6 +226,7 @@ def api_run(name: str, reload: int = 0, epoch: int | None = None):
             # Trainable parameter count from the newest checkpoint, for the column header.
             "n_params": rd.n_params,
             "skipped_files": rd.skipped_files, "n": len(rd.sample_ids),
+            "missing": rd.missing,
             "epochs": registry.epochs(name),   # drives the epoch slider
             # Every dataset this run ACTUALLY predicted, read off its loaded rows. The scan's
             # entry.datasets only probes a few files, so a combined run looked single-dataset.
@@ -380,47 +381,44 @@ def api_lut():
 
 
 @app.get("/api/frames")
-def api_frames(run: str, sids: str, epoch: int | None = None):
-    """Raw mask values for a set of samples at ONE epoch, as one fp16 blob.
+def api_frames(run: str, sids: str, epochs: str = "latest"):
+    """Raw mask values for samples x epochs, as one fp16 blob [n_epochs][n_sids][H*W].
 
-    A mask is a few KB -- usually smaller than a PNG of it -- so shipping values and
-    drawing them on the client is lighter than per-cell images.
-
-    Default (no `epoch`) is the run's latest, served from the loaded run in memory: no
-    file is read, and the masks are exactly the ones the metrics beside them scored. An
-    explicit epoch (the scrubber) reads only that epoch's files. Shipping every epoch on
-    every scroll read ~800 .pt files (~1.3GB) per request on a long run.
-
-    Layout: float16[n_sids][H*W], C-order. Samples with no prediction are NaN, so the
-    client can show its "no prediction" state.
+    `epochs` is a comma list of epoch numbers and/or "latest". "latest" is served from the
+    loaded run in memory (no file read; exactly the masks its metrics scored); a numbered
+    epoch reads that epoch's files. The client asks for the epoch on screen first, then all
+    the others for the same rows, so the epoch slider repaints from local data.
+    Samples with no prediction are NaN.
     """
     entry = registry.by_name.get(run)
     if entry is None or not entry.compatible:
         raise HTTPException(404, "unknown or incompatible run")
     rows = [_sid(s) for s in sids.split(",") if s.strip()]
-    if not rows:
-        raise HTTPException(400, "no sids")
+    eps = [e.strip() for e in epochs.split(",") if e.strip()]
+    if not rows or not eps:
+        raise HTTPException(400, "no sids or epochs")
     h, w = entry.shape
-    out = np.full((len(rows), h * w), np.nan, dtype=np.float16)
-    if epoch is None:
-        rd = _run(run)
-        for i, r in enumerate(rows):
-            if r in rd.row_of:
-                out[i] = rd.masks[rd.row_of[r]].reshape(-1)
-        # "latest" moves as a run trains, so this URL must not be cached as immutable.
-        return Response(out.tobytes(), media_type="application/octet-stream",
-                        headers={"Cache-Control": "no-store"})
-    # load_epoch_masks matches the raw LOCAL sample_id + box stored in each .pt -- box
-    # disambiguates ids that collide across experiments in a combined run.
+    out = np.full((len(eps), len(rows), h * w), np.nan, dtype=np.float16)
+    # .pt files key samples by LOCAL sample_id + box (box disambiguates ids that collide
+    # across the experiments of a combined run).
     pairs = []
     for r in rows:
         _, gt, local = registry.locate(r)
         pairs.append((gt.sample_ids[local], gt.meta[local].get("box")))
-    masks = data.load_epoch_masks(run, registry.runs_dir, epoch, set(pairs))
-    for i, pair in enumerate(pairs):
-        if pair in masks:
-            out[i] = masks[pair].reshape(-1)
-    return Response(out.tobytes(), media_type="application/octet-stream", headers=IMMUTABLE)
+    for ei, ep in enumerate(eps):
+        if ep == "latest":
+            rd = _run(run)
+            for i, r in enumerate(rows):
+                if r in rd.row_of:
+                    out[ei, i] = rd.masks[rd.row_of[r]].reshape(-1)
+            continue
+        masks = data.load_epoch_masks(run, registry.runs_dir, int(ep), set(pairs))
+        for i, pair in enumerate(pairs):
+            if pair in masks:
+                out[ei, i] = masks[pair].reshape(-1)
+    # "latest" moves as a run trains, so only all-numbered responses are immutable.
+    cache = {"Cache-Control": "no-store"} if "latest" in eps else IMMUTABLE
+    return Response(out.tobytes(), media_type="application/octet-stream", headers=cache)
 
 
 @app.get("/api/neighbors")

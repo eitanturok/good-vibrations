@@ -6,7 +6,7 @@ const S = {
   all: [], info: null, byId: {}, byPos: {},
   live: { sid: null, ch: 'avg', laser: 'avg', fi: null },
   d: null, probe: null, mode: null, rng: {},
-  probes: [], hues: {}, hot: null,
+  probes: [], slots: {}, hot: null,
   fi: null, hoverFi: null,
   log: { spec: 1 },
   specMode: 'magphase', phmode: 'cos', fieldbg: false, kind: 'clean',
@@ -103,78 +103,71 @@ function pruneFilters() {
 
 const hz = (i) => (S.d ? S.d.freqs[i] : 0);
 const fmt = (f) => (f >= 100 ? f.toFixed(0) : f.toFixed(1));
-/* Three encodings, each matched to what it carries:
-     sample    -> HUE        categorical; a scene is a thing, not a quantity. Keyed by the
-                             SAMPLE (dataset + id), not the position, so two pins at one spot
-                             (another speaker / dataset) still get clearly different colours
-                             -- in the masks overlay, colour answers "which sample is this?"
-     frequency -> LIGHTNESS  ordered data on an ordered channel: low = light, high = dark
+/* Colour means ONE thing everywhere in viz2: which saved probe.
+     sample    -> one of 10 BASE colours, by the order you saved it: the 1st saved sample
+                  gets PALETTE[0], the 2nd PALETTE[1], ... -- so walking an object across
+                  the box and saving as you go reads as an order (blue -> ... -> indigo).
+                  Every view of that sample uses it: its curves, mode tile, workbench card,
+                  map outline, gallery ring, and its objects' outlines in the photos.
+     frequency -> SHADE of that base (darker / lighter), for 2+ probes of one sample
      channel   -> DASH       only x / y / avg, so a dash pattern stays readable
-   Laser is left to the legend: too many values for any visual channel.
-   Hues come from a fixed set, 60 deg apart and ordered so the first few are the most
-   distinct (blue / orange first, the colour-blind-safe pair). A new sample takes the first
-   hue no pinned sample is using, so unpinning frees its colour; a 7th sample repeats. */
-const HUES = [210, 30, 165, 320, 270, 90];
+   Laser is left to the legend: too many values for any visual channel. Unsaved samples
+   stay the one segmentation green (--seg).
+   Slots: a new sample takes the slot after the newest one still saved (removing a probe
+   leaves the others' colours alone; clearing them all starts over at the first); the 11th
+   wraps to the first colour. */
+// hue-ordered around the wheel (blue -> cyan -> teal -> olive -> amber -> orange -> red ->
+// magenta -> purple -> indigo), each tuned to read on the light ground at a similar weight.
+// No pure green: that is --seg, the colour of an UNSAVED sample.
+const PALETTE = ['#2f6fd0', '#1a9bc2', '#13a08a', '#8a9a14', '#d19a00',
+                 '#e0701a', '#d43d3d', '#c4408e', '#8a4fc7', '#4646a6'];
 const sampleKey = (p) => `${p.ds}|${p.sid}`;
-function hueForSample(key) {
-  if (S.hues[key] != null) return S.hues[key];
-  const used = new Set(Object.values(S.hues));
-  return (S.hues[key] = HUES.find((h) => !used.has(h)) ?? HUES[Object.keys(S.hues).length % HUES.length]);
+function slotFor(key) {
+  if (S.slots[key] == null) {
+    const used = Object.values(S.slots);
+    S.slots[key] = used.length ? Math.max(...used) + 1 : 0;
+  }
+  return S.slots[key];
 }
-/* Frequency used to map to LIGHTNESS across the band, which failed twice over: peaks
-   crowd the low end (127/185/251/325 Hz spanned only 6 lightness points) and distinct
-   peaks collided outright -- 251 and 272 Hz both landed on 55%. Lightness is also the
-   weakest channel here, squeezed between a white ground and the black live trace.
-
-   Instead, fan the HUE around the position's base color. Measured in CIE Lab, the worst
-   pair separates 2.6-5x better than the lightness ramp at every count. Position still owns
-   a hue NEIGHBOURHOOD, so probes from one sample stay recognisably related.
-
-   The fan is indexed by the order a probe was pinned within its sample -- not by which
-   peak it is -- so a frequency that is not a peak at all gets an equally distinct color. */
-const FAN = 50;        // narrower than the 60 deg between sample hues, so fans never meet
-
-/* Hue AND lightness together. Neither alone is enough: a fan wide enough to separate 5
-   probes by hue would spill into the neighbouring position's hue (measured: two positions
-   x 3 probes collided at dE 1.2, below the just-noticeable threshold), while lightness
-   alone tops out around dE 14. A 70 deg fan plus a 62->32 lightness ramp keeps the worst
-   pair anywhere in the workbench at dE 22.6, and two probes of one sample at 33. */
-function shadeFor(hue, i, n) {
-  if (n <= 1) return { hue, lit: 46 };
-  const t = i / (n - 1);
-  return { hue: ((hue - FAN / 2 + t * FAN) % 360 + 360) % 360, lit: Math.round(62 - t * 30) };
+// #rrggbb mixed toward black (t < 0) or white (t > 0); render.py shades() is the same
+function mix(c, t) {
+  return '#' + [1, 3, 5].map((i) => {
+    const v = parseInt(c.slice(i, i + 2), 16);
+    return Math.round(t < 0 ? v * (1 + t) : v + (255 - v) * t).toString(16).padStart(2, '0');
+  }).join('');
 }
+// a sample's i-th saved frequency: the base first, then alternately darker / lighter, so
+// an existing probe never changes colour when another frequency is added
+const SHADE = [0, -0.3, 0.3, -0.45, 0.45, -0.15, 0.15];
 
-/* Every probe of one sample is recolored together, since each one's slot depends on
-   how many siblings it has. Called whenever the set changes; a sample with no pins left
-   gives its hue back first. */
+/* Called whenever the probe set changes: assigns every probe its base + shade, frees the
+   slots of samples with no probe left, and repaints the photos that show those colours. */
 function reshade() {
   const by = {};
   for (const p of S.probes) (by[sampleKey(p)] ??= []).push(p);
-  for (const k of Object.keys(S.hues)) if (!by[k]) delete S.hues[k];
+  for (const k of Object.keys(S.slots)) if (!by[k]) delete S.slots[k];
   for (const [key, list] of Object.entries(by)) {
-    const base = hueForSample(key);
-    list.forEach((p, i) => Object.assign(p, shadeFor(base, i, list.length)));
+    const base = PALETTE[slotFor(key) % PALETTE.length];
+    list.forEach((p, i) => Object.assign(p, { base, color: mix(base, SHADE[i % SHADE.length]) }));
   }
+  queueMicrotask(() => {
+    $('#samplegrid')._updateThumbs?.();
+    if (OM.sid) showMasks(OM.sid);
+  });
 }
+// the saved-probe colour of this dataset's sample sid (hex, no #), or '' if it isn't saved
+const sampleHex = (sid) =>
+  S.probes.find((p) => p.ds === S.info.dataset && p.sid === sid)?.base.slice(1) || '';
 
 const DASH = { avg: [], x: [], y: [7, 6], both: [] };
 // The heatmap paints one plane, and avg IS a plane, so only "both" needs replacing there.
 const planeCh = (c) => (c === 'both' ? 'x' : c);
-const col = (p, a = 1) => `hsl(${p.hue} 66% ${p.lit ?? 46}% / ${a})`;
+const col = (p, a = 1) => p.color + (a >= 1 ? '' : Math.round(a * 255).toString(16).padStart(2, '0'));
 
-/* The mask overlay is painted server-side, so the color has to travel as hex. */
-function hex(h, s, l) {
-  s /= 100; l /= 100;
-  const k = (n) => (n + h / 30) % 12;
-  const a = s * Math.min(l, 1 - l);
-  const f = (n) => Math.round(255 * (l - a * Math.max(-1, Math.min(k(n) - 3, 9 - k(n), 1))));
-  return [f(0), f(8), f(4)].map((v) => v.toString(16).padStart(2, '0')).join('');
-}
 /* One full oscillation of the mode, quantised into frames. The slider spans exactly one
    period, so scrubbing off either end wraps rather than dead-ending. */
 const NFRAME = 60;
-const probeHex = (p) => hex(p.hue, 68, p.lit ?? 47);
+const probeHex = (p) => p.color.slice(1);
 const css = (n) => getComputedStyle(document.body).getPropertyValue(n).trim();
 
 /* ***** boot ***** */
@@ -580,7 +573,7 @@ function yAxis(sel, id) {
   g.innerHTML = tv.map((v) => {
     const y = yMap(v, lo, hi, h) / h * 100;
     return `<line class="ygrid" x1="0" x2="100%" y1="${y}%" y2="${y}%"/>` +
-           `<text class="ynum" x="-5" y="${y}%" dy="3">${fmtTick(v)}</text>`;
+           `<text class="ynum" x="-5" y="${y}%" dy="4">${fmtTick(v)}</text>`;
   }).join('');
 }
 
@@ -593,7 +586,7 @@ function laserTicks(svg) {
   const L = S.info.n_lasers;
   let out = '';
   for (let i = 0; i < L; i += 20)
-    out += `<text class="ynum" x="-5" y="${((i + 0.5) / L) * 100}%" dy="3">${i}</text>`;
+    out += `<text class="ynum" x="-5" y="${((i + 0.5) / L) * 100}%" dy="4">${i}</text>`;
   g.innerHTML = out;
 }
 
@@ -617,9 +610,9 @@ function modeAxes() {
   const R = S.info.rows, C = S.info.cols;
   let out = '';
   for (let r = 0; r < R; r++)
-    out += `<text class="ml" x="-4" y="${((r + 0.5) / R) * 100}%" dy="3">${r}</text>`;
+    out += `<text class="ml" x="-4" y="${((r + 0.5) / R) * 100}%" dy="4">${r}</text>`;
   for (let c = 0; c < C; c++)
-    out += `<text class="ml col" x="${((c + 0.5) / C) * 100}%" y="100%" dy="12">${c}</text>`;
+    out += `<text class="ml col" x="${((c + 0.5) / C) * 100}%" y="100%" dy="14">${c}</text>`;
   svg.innerHTML = out;
 }
 
@@ -892,11 +885,10 @@ function surfaces(g, sets, w, h, R, C, max) {
 
 /* One quad's color: the base carried through Lambert shading AND height.
 
-   HUE IS LEFT ALONE, deliberately. Hue is already spoken for -- hueForSample gives each
-   sample a hue and shadeFor fans probes only +/-FAN/2 around it, narrower than the
-   60 deg between sample hues precisely so two probes never collide. Riding height on hue
-   too would spend that same budget twice: a crest could drift a probe into its
-   neighbour's slot, and the surface would stop saying which probe it is.
+   HUE IS LEFT ALONE, deliberately. Hue is already spoken for -- each saved sample owns
+   one PALETTE colour (reshade). Riding height on hue too would spend that same budget
+   twice: a crest could drift a probe into its neighbour's colour, and the surface would
+   stop saying which probe it is.
 
    So height moves LIGHTNESS and saturation instead, which nothing else here uses. Crests
    lighten and saturate, troughs darken and mute -- the ordering the eye already reads as
@@ -1197,8 +1189,8 @@ function xAxis(svg, lo, hi, label, showNums) {
   if (showNums) {
     out += t.map((v) => {
       const x = ((v - lo) / (hi - lo)) * 100;
-      return `<text class="tk" x="${x}%" y="100%" dy="10">${v}</text>`;
-    }).join('') + `<text class="unit" x="50%" y="100%" dy="21">${label}</text>`;
+      return `<text class="tk" x="${x}%" y="100%" dy="12">${v}</text>`;
+    }).join('') + `<text class="unit" x="50%" y="100%" dy="27">${label}</text>`;
   }
   g.innerHTML = out;
 }
@@ -1634,8 +1626,6 @@ const tally = (key) => {
   for (const s of S.all) c.set(s[key], (c.get(s[key]) || 0) + 1);
   return [...c].sort((a, b) => b[1] - a[1]);
 };
-// A distinct, stable hue per index/value -- the coloured dot beside a layout or count.
-const hueOf = (n) => (28 + n * 47) % 360;
 
 // "{box} box, spk {spk}" as two live dropdowns above the scatter -- both are single,
 // EXCLUSIVE picks WITHIN the current filtered set (like the box/speaker filters, but a
@@ -1696,7 +1686,7 @@ function buildFilters() {
     // same as layout/n_objects: a sample passes if it's in ANY of the picked boxes.
     opts: () => {
       const f = facetTally('box', 'boxes');
-      return tally('box').map(([b], i) => ({ v: b, label: b, count: f.get(b) || 0, hue: hueOf(i) }));
+      return tally('box').map(([b], i) => ({ v: b, label: b, count: f.get(b) || 0 }));
     },
     on: (v) => S.f.boxes.has(v),
     pick: (v) => { toggle(S.f.boxes, v); applyFilter(); },
@@ -1708,7 +1698,7 @@ function buildFilters() {
     opts: () => {
       const f = facetObjTally();
       return objectValues().map((o, i) =>
-        ({ v: o, label: o === NONE_OBJ ? 'no-object' : o, count: f.get(o) || 0, hue: hueOf(i * 2 + 1) }));
+        ({ v: o, label: o === NONE_OBJ ? 'no-object' : o, count: f.get(o) || 0 }));
     },
     on: (v) => S.f.objects.has(v),
     pick: (v) => { toggle(S.f.objects, v); applyFilter(); },
@@ -1720,7 +1710,7 @@ function buildFilters() {
     opts: () => {
       const f = facetTally('n', 'nobj');
       return tally('n').map(([n]) => n).sort((a, b) => a - b)
-        .map((n) => ({ v: n, label: String(n), count: f.get(n) || 0, hue: hueOf(n) }));
+        .map((n) => ({ v: n, label: String(n), count: f.get(n) || 0 }));
     },
     on: (v) => S.f.nobj.has(+v),
     pick: (v) => { toggle(S.f.nobj, +v); applyFilter(); },
@@ -1730,7 +1720,7 @@ function buildFilters() {
     opts: () => {
       const f = facetTally('layout', 'layouts');
       return tally('layout').map(([l], i) =>
-        ({ v: l, label: l, count: f.get(l) || 0, hue: hueOf(i) }));
+        ({ v: l, label: l, count: f.get(l) || 0 }));
     },
     on: (v) => S.f.layouts.has(v),
     pick: (v) => { toggle(S.f.layouts, v); applyFilter(); },
@@ -1813,7 +1803,7 @@ function buildSampleGrid() {
     const key = `${r0},${r1},${cols}`, me = ++latest;     // only the newest request lands
     if (key === shown) { if (top != null) grid.scrollTop = top; return; }
     pins = {};
-    S.probes.forEach((p) => { if (p.ds === S.info.dataset) pins[p.sid] ??= col(p); });
+    S.probes.forEach((p) => { if (p.ds === S.info.dataset) pins[p.sid] ??= p.base; });
     let inner = grid.querySelector('.sgin');
     if (!inner) { grid.innerHTML = '<div class="sgin"></div>'; inner = grid.firstChild; }
     const old = new Map([...inner.children].map((b) => [b._html, b]));
@@ -1911,7 +1901,7 @@ function applyFilter() {
   syncSpkSel();
   renderClear();
   $('#nmatch').textContent = m.length;
-  $('#nmatchsub').textContent = `/${S.all.length}`;
+  $('#nmatchsub').textContent = ` / ${S.all.length}`;
   $('#nmatch').title = `${m.length} of ${S.all.length} samples in this dataset pass the filter`;
   buildScatter();
   // Keep the current sample if it still passes; otherwise stay at the same position under
@@ -2166,16 +2156,18 @@ function frame() {
    colour, on a plain field (--mbg behind the transparent PNG). An X marks each object's
    centre of mass in overlay and mask (not photo). sel >= 0 (the viewer's selected table
    row) keeps only that object's X and fades the other objects' marks in every view. */
-const photoSrc = (sid, sel = -1) => S.view === 'mask'
-  ? `/api/objmasks/${sid}.png?sel=${sel}&v=${S.rv}`
-  : `/api/thumb/${sid}.jpg?seg=${+(S.view === 'overlay')}${sel >= 0 ? `&sel=${sel}` : ''}&v=${S.rv}`;
+// a saved probe's sample is drawn in its probe colour (?c=), every other sample in --seg
+const photoSrc = (sid, sel = -1, c = sampleHex(sid)) => S.view === 'mask'
+  ? `/api/objmasks/${sid}.png?sel=${sel}${c ? `&c=${c}` : ''}&v=${S.rv}`
+  : `/api/thumb/${sid}.jpg?seg=${+(S.view === 'overlay')}${sel >= 0 ? `&sel=${sel}` : ''}` +
+    `${c ? `&c=${c}` : ''}&v=${S.rv}`;
 function photoFig(sid, sel = -1) {
-  const s = S.byId[sid], F = frame();
+  const s = S.byId[sid], F = frame(), c = sampleHex(sid);
   const coms = S.view === 'photo' ? [] : sel >= 0 ? [OM.objs[sel].com] : s?.coms || [];
   return F.open + ' data-missing="no image">' +
-      `<img src="${photoSrc(sid, sel)}" alt=""` +
+      `<img src="${photoSrc(sid, sel, c)}" alt=""` +
       ` onerror="this.closest('.pfig').classList.add('missing')">` +
-      (coms.length ? `<svg class="comov" viewBox="0 0 ${F.ow} ${F.oh}"` +
+      (coms.length ? `<svg class="comov" viewBox="0 0 ${F.ow} ${F.oh}"${c ? ` style="--seg:#${c}"` : ''}` +
         ` preserveAspectRatio="none" aria-hidden="true">${comSvg(coms, F.ow, F.oh)}</svg>` : '') +
     `</div>` + (s ? F.ring[s.spk] || '' : '') + `</div>`;
 }
@@ -2411,9 +2403,9 @@ const curveLine = (laser, ch, hzv) =>
 const probeLines = (p) => [sampleLine(p.meta), curveLine(p.laser, p.ch, p.hzv)];
 
 /* The current sample's label shows in two places, both fed from here: the lines above the
-   photo at the top of the right panel (#curmeta), and the live row above the pinned probes (#nowrow). laser/channel/frequency is the
-   FIRST metadata row because it is the part that moves as you hover the grid or spectrum;
-   keeping it on top means the rest of the block never reflows under it. */
+   photo at the top of the right panel (#curmeta), and the live row above the pinned probes (#nowrow). Laser / channel / freq are
+   labeled fields on a fixed grid, so hovering the grid or spectrum changes their values
+   without reflowing the block. */
 function renderNow() {
   const s = S.byId[S.live.sid];
   if (!s) return;
@@ -2427,7 +2419,12 @@ function renderNow() {
   if (dl) {
     dl.classList.toggle('muted', !!S.muted);
     dl.innerHTML =
-      `<div class="top"><b>${l1}</b><span>${l2}<i>${ds}</i>${prev ? ' <u>preview</u>' : ''}</span></div>`;
+      `<div class="cmhead"><b>${sampleId(s)}</b><span>speaker ${s.spk}</span></div>` +
+      `<div class="cmsub">${s.layout || '—'} · ${s.box}</div>` +
+      `<dl class="cmf${prev ? ' prev' : ''}">` +
+      `<dt>laser</dt><dd>${laser ?? '—'}</dd><dt>channel</dt><dd>${S.live.ch ?? '—'}</dd>` +
+      `<dt>freq</dt><dd>${Math.round(hz(fi))} Hz${prev ? ' <u>preview</u>' : ''}</dd>` +
+      `<dt>dataset</dt><dd class="ds">${ds}</dd></dl>`;
   }
 
   const row = $('#nowrow');
@@ -2462,7 +2459,8 @@ function showMeta() {
 const OM = { sid: null, objs: [], sel: -1 };
 
 async function showMasks(sid) {
-  const objs = await api(`/api/objstats/${sid}?v=${S.rv}`);
+  const c = sampleHex(sid);
+  const objs = await api(`/api/objstats/${sid}?${c ? `c=${c}&` : ''}v=${S.rv}`);
   if (S.live.sid !== sid) return;           // superseded by a newer pick while in flight
   OM.sid = sid; OM.objs = objs;
   if (OM.sel >= objs.length) OM.sel = -1;
@@ -2478,8 +2476,11 @@ function drawMasks() {
   $('#smtable').innerHTML =
     '<tr><th>#</th><th>object</th><th>com (x, y)</th><th>area px</th></tr>' +
     objs.map((o, i) => row(i, `<b style="background:${o.color}"></b>${i + 1}`, o.name,
-      `${r0(o.com[1])}, ${r0(o.com[0])}`, o.vol)).join('') +
-    row(-1, 'all', '', '', objs.reduce((a, o) => a + o.vol, 0));
+      `(${Math.round(o.com[1])}, ${Math.round(o.com[0])})`, o.vol)).join('') +  // no
+      // thousands separator here: "1,055, 680" read as three numbers
+    row(-1, 'all', '', objs.length ? `(${['1', '0'].map((k) =>
+      Math.round(objs.reduce((a, o) => a + o.com[k], 0) / objs.length)).join(', ')})` : '',
+      objs.reduce((a, o) => a + o.vol, 0));   // com: the plain mean of the objects' coms
 }
 
 /* Point the viewer's images and players at the current sample. A missing artefact (some
@@ -2712,7 +2713,7 @@ function renderProbes() {
   list.querySelectorAll('.x').forEach((b) => (b.onclick = (e) => {
     e.stopPropagation();
     S.probes = S.probes.filter((q) => q.id !== +b.dataset.x);
-    reshade();                            // the fan re-spaces around what is left
+    reshade();                            // frees its slot if it was the sample's last
     paintAll();
   }));
 }
@@ -2728,7 +2729,7 @@ function mapPins() {
   let away = 0;
   for (const p of shownProbes()) {
     const m = p.ds === S.info.dataset && S.byId[p.sid];
-    if (m?.box === box) here.set(p.sid, hex(S.hues[sampleKey(p)], 68, 47));
+    if (m?.box === box) here.set(p.sid, p.base.slice(1));
     else away++;
   }
   const xy = ([r, c]) => `${s.x(c).toFixed(1)},${s.y(r).toFixed(1)}`;
@@ -2961,8 +2962,8 @@ function wire() {
   });
   posJump($('#posjump'), () => $('#scatter').focus());
 
-  // objects / audio / metadata: at most one open, clicking the open one closes it; the
-  // choice is kept per browser
+  // objects / audio / metadata: tabs, exactly one open (objects by default); the choice is
+  // kept per browser
   const detail = (id) => {
     $('#details').hidden = !id;
     document.querySelectorAll('.detail').forEach((d) => d.classList.toggle('on', d.id === id));
@@ -2972,15 +2973,16 @@ function wire() {
   };
   $('#detail').onclick = (e) => {
     const b = e.target.closest('button');
-    if (b) detail(b.classList.contains('on') ? '' : b.dataset.v);
+    if (b) detail(b.dataset.v);
   };
   let open = '';
   try { open = localStorage.getItem('viz2.detail') || ''; } catch {}
+  if (!['svobjs', 'svaudio', 'svmeta'].includes(open)) open = 'svobjs';
   detail(open);
   $('#shapes').onchange = mapPins;
   wireAsideResize();
   // filters are an accordion: click a label to open it (closing the open one) or close it;
-  // which one is open is kept per browser
+  // which one is open is kept per browser; with none kept, object starts open
   const filters = [...document.querySelectorAll('.s1filter .pk:not(.sp)')];
   const openFilter = (pk) => {
     filters.forEach((f) => f.classList.toggle('open', f === pk));
@@ -2991,7 +2993,7 @@ function wire() {
   }));
   let fo = '';
   try { fo = localStorage.getItem('viz2.filter') || ''; } catch {}
-  openFilter(fo && $('#' + fo)?.closest('.pk'));
+  openFilter($('#' + (fo || 'objectbox'))?.closest('.pk'));
   // one switch for every sample photo: the gallery and the right panel's photo
   seg('#view', (v) => { S.view = v; $('#samplegrid')._updateThumbs(); });
   // A new order starts at its top: _draw keeps the current sample's row in view, which after
@@ -3033,7 +3035,7 @@ function wire() {
     drawMode();
   };
 
-  $('#clear').onclick = () => { S.probes = []; paintAll(); };
+  $('#clear').onclick = () => { S.probes = []; reshade(); paintAll(); };
 
   // Both sliders read out their value beside the label, in the same `.cl em` slot the
   // laser and peak counts already use, so the rail keeps one style of readout.

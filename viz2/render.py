@@ -92,12 +92,27 @@ def masks_overlay(masks, colors, w=300):
     return b.getvalue()
 
 
-OBJ_COLORS = ["#0072B2", "#E69F00", "#009E73", "#CC79A7", "#D55E00", "#56B4E9", "#F0E442"]  # Okabe-Ito
+SEG_HEX = "28dc64"     # SEG below as hex: the colour of an UNSAVED sample's objects
 
 
-def objmasks_png(masks, sel=-1, w=640):
-    """Each object filled in its own colour on a transparent field (the page sets the
-    background). sel >= 0 fades every other object."""
+def shades(c, n):
+    """n colours for the n objects of one sample: all the sample's colour `c` (hex, no #),
+    spread darker -> lighter so objects stay apart while reading as one sample. Colour
+    means "which saved probe" everywhere in viz2; objects get shades of it, not hues."""
+    rgb = np.array([int(c[k:k + 2], 16) for k in (0, 2, 4)], float)
+    out = []
+    for i in range(n):
+        t = 0 if n == 1 else -0.35 + 0.7 * i / (n - 1)       # <0 toward black, >0 toward white
+        v = rgb * (1 + t) if t < 0 else rgb + (255 - rgb) * t
+        out.append("#" + "".join(f"{int(round(x)):02x}" for x in v))
+    return out
+
+
+def objmasks_png(masks, sel=-1, w=640, colors=None):
+    """Each object filled in its colour (`colors`, hex per object; default the one
+    segmentation green) on a transparent field (the page sets the background).
+    sel >= 0 fades every other object."""
+    colors = colors or ["#" + SEG_HEX]
     h, wd = masks[0].shape
     ow = min(w, wd)
     oh = round(h * ow / wd)
@@ -105,7 +120,7 @@ def objmasks_png(masks, sel=-1, w=640):
     for i, m in enumerate(masks):
         # INTER_AREA + a low threshold, not NEAREST, so a small object never drops out
         hit = cv2.resize(m.astype(np.float32), (ow, oh), interpolation=cv2.INTER_AREA) > 0.2
-        c = OBJ_COLORS[i % len(OBJ_COLORS)]
+        c = colors[i % len(colors)]
         img[hit] = [int(c[k:k + 2], 16) for k in (1, 3, 5)] + [255 if sel < 0 or i == sel else 50]
     b = io.BytesIO()
     Image.fromarray(img).save(b, "PNG")
@@ -121,10 +136,11 @@ def _jpeg(im, quality=78):
 SEG = (40, 220, 100)   # the segmentation colour; app.js/style.css --seg must match
 
 
-def thumb(path, masks=(), seg=False, box=(160, 120), sel=-1):
+def thumb(path, masks=(), seg=False, box=(160, 120), sel=-1, colors=None):
     """A small JPEG for the step-1 pickers and THE sample photo (gallery, viewer, sidebar).
 
-    Each mask's outline is traced in SEG. seg=True is the segmentation view: the photo goes
+    Each mask's outline is traced in SEG, or in colors[i] (hex) when given -- a saved
+    probe's sample is drawn in its probe colour. seg=True is the segmentation view: the photo goes
     gray so the objects stand out, and their region is also filled with SEG (the
     centre-of-mass X's are drawn over it client-side). masks is the combined smask, or one
     per object; sel >= 0 fades every object's outline/fill but that one's (the viewer's
@@ -145,10 +161,12 @@ def thumb(path, masks=(), seg=False, box=(160, 120), sel=-1):
         if not m.any():
             continue
         top = arr.copy()
+        col = SEG if not colors else tuple(int(colors[i % len(colors)].lstrip("#")[k:k + 2], 16)
+                                           for k in (0, 2, 4))
         if seg:
-            top[m] = (0.35 * np.array(SEG) + 0.65 * top[m]).astype(np.uint8)
+            top[m] = (0.35 * np.array(col) + 0.65 * top[m]).astype(np.uint8)
         contours, _ = cv2.findContours(m.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        cv2.drawContours(top, contours, -1, SEG, 2)
+        cv2.drawContours(top, contours, -1, col, 2)
         a = 1.0 if sel < 0 or i == sel else 0.2
         arr = top if a == 1 else (a * top + (1 - a) * arr).astype(np.uint8)
     return _jpeg(Image.fromarray(arr))

@@ -1,6 +1,7 @@
 """Routes. The server does numpy; the browser draws."""
 
 import hashlib
+import re
 import os
 import threading
 import time
@@ -115,16 +116,26 @@ def box_thumb(name: str):
     return Response(render.thumb(p), media_type="image/jpeg", headers=CACHE)
 
 
+def _hex(c: str) -> str:
+    """The ?c= colour param (a saved probe's colour, 6 hex digits), or '' for none."""
+    if c and not re.fullmatch(r"[0-9a-fA-F]{6}", c):
+        raise HTTPException(400, "c must be 6 hex digits")
+    return c.lower()
+
+
 @app.get("/api/thumb/{sid}.jpg")
-def sample_thumb(sid: str, seg: int = 0, sel: int = -1):
+def sample_thumb(sid: str, seg: int = 0, sel: int = -1, c: str = ""):
     """THE sample photo -- the gallery cards, the sample viewer and the sidebar's current
     sample all show this same URL (app.js photoFig), so the viewer is an instant browser-
     cache hit on whatever the gallery already loaded. seg=1: the segmentation view.
-    sel >= 0: the viewer's selected object, others faded -- drawn per object, not cached."""
+    sel >= 0: the viewer's selected object, others faded. c: a saved probe's colour, its
+    objects outlined in shades of it. Either is drawn per object, not disk-cached."""
     _d(sid)
-    objs = data.object_masks(sid) if sel >= 0 else []
-    if 0 <= sel < len(objs) and (p := data.sample_photo(sid)):
-        b = render.thumb(p, [m for _, m in objs], seg=bool(seg), box=(480, 360), sel=sel)
+    c = _hex(c)
+    objs = data.object_masks(sid) if sel >= 0 or c else []
+    if objs and sel < len(objs) and (p := data.sample_photo(sid)):
+        b = render.thumb(p, [m for _, m in objs], seg=bool(seg), box=(480, 360), sel=sel,
+                         colors=render.shades(c, len(objs)) if c else None)
     else:
         b = gallery_thumb(sid, seg)
     if b is None:
@@ -239,24 +250,30 @@ def areas():
 
 
 @app.get("/api/objstats/{sid}")
-def objstats(sid: str):
+def objstats(sid: str, c: str = ""):
     """Per-object colour, volume (px), centroid [row, col] and outline (a simplified polygon,
     [[col, row], ...] in overhead px) -- the viewer's mask table and the probe shapes on the map."""
     _d(sid)
+    objs = data.object_masks(sid)
+    # unsaved: every object the one segmentation green, exactly as the photo outlines them;
+    # a saved probe's sample: shades of its colour, matching its photo / mask (?c= there too)
+    c = _hex(c)
+    cols = render.shades(c, len(objs)) if c else ["#" + render.SEG_HEX] * len(objs)
     out = []
-    for i, (name, m) in enumerate(data.object_masks(sid)):
+    for i, (name, m) in enumerate(objs):
         r, c = np.nonzero(m)
         cs, _ = cv2.findContours(m.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         poly = cv2.approxPolyDP(max(cs, key=cv2.contourArea), 2, True)[:, 0]
-        out.append({"name": name, "color": render.OBJ_COLORS[i % len(render.OBJ_COLORS)],
+        out.append({"name": name, "color": cols[i],
                     "vol": int(m.sum()), "com": [float(r.mean()), float(c.mean())],
                     "outline": poly.tolist()})
     return out
 
 
 @app.get("/api/objmasks/{sid}.png")
-def objmasks_png(sid: str, sel: int = -1):
+def objmasks_png(sid: str, sel: int = -1, c: str = ""):
     _d(sid)
+    c = _hex(c)
     ms = [m for _, m in data.object_masks(sid)]
     if not ms:
         # nothing segmented (an empty box) is a blank field, not "no image" -- that's only
@@ -266,7 +283,8 @@ def objmasks_png(sid: str, sel: int = -1):
             raise HTTPException(404, "no image")
         with Image.open(p) as im:
             ms = [np.zeros(im.size[::-1], bool)]
-    return Response(render.objmasks_png(ms, sel), media_type="image/png", headers=CACHE)
+    return Response(render.objmasks_png(ms, sel, colors=render.shades(c, len(ms)) if c else None),
+                    media_type="image/png", headers=CACHE)
 
 
 @app.get("/api/masks.png")

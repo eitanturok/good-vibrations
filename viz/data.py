@@ -534,13 +534,19 @@ def _classify(name: str, outputs: Path, files: list[Path], obj: dict | None,
     probe_exps = obj.get("exps") or [None] * len(probe_ids)
     run_exps = _config_experiments(outputs.parent)
     routed = registry.resolve(probe_ids, probe_boxes, probe_exps, run_exps, files[0].stat().st_mtime)
+    # A few unroutable ids (samples since moved to bad_samples/) don't sink the run --
+    # load_run drops those rows anyway. Only reject when NOTHING probed routes.
+    if any(gi is not None for gi in routed):
+        keep = [k for k, gi in enumerate(routed) if gi is not None]
+        probe_ids, probe_boxes, probe_exps, routed = (
+            [v[k] for k in keep] for v in (probe_ids, probe_boxes, probe_exps, routed))
     for sid, box, exp, gi in zip(probe_ids, probe_boxes, probe_exps, routed):
         if gi is None:
             named = [exp] if exp is not None else run_exps
             if named:
                 missing = [n for n in named if n not in registry._gi_by_exp]
                 reason = (f"experiment {', '.join(missing)} not loaded" if missing
-                          else f"sample {sid} not in experiment {', '.join(named)}")
+                          else f"missing {sid} directory in {', '.join(named)}/samples")
             else:
                 reason = (f"no experiment recorded, and box {box!r} + sample id match "
                           f"no single loaded experiment" if box is not None
@@ -793,6 +799,9 @@ class RunData:
     # /api/samples' s.i. A combined run's rows can come from different experiments, each
     # with its own offset, so this can no longer be computed from one shared offset.
     global_ids: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=str))
+    # Predicted sample ids no longer in any experiment's samples/ (e.g. moved to
+    # bad_samples/ after the run started). Dropped from scoring; listed in the header.
+    missing: list = field(default_factory=list)
 
 
 def _split_dirs(outputs: Path) -> list[tuple[str, Path]]:
@@ -985,6 +994,7 @@ def load_run(name: str, runs_dir: Path, registry: "Registry", family: str = "unk
     routed = registry.resolve(sample_ids, boxes_arr, exps, _config_experiments(runs_dir / name), run_time)
     keep = np.array([r is not None for r in routed], dtype=bool)
     gi_arr = np.array([r for r in routed if r is not None], dtype=np.int64)
+    missing = sorted({str(x) for x in sample_ids[~keep]})
     if not keep.all():
         sample_ids, preds = sample_ids[keep], preds[keep]
         splits = [s for s, k in zip(splits, keep) if k]
@@ -1080,7 +1090,7 @@ def load_run(name: str, runs_dir: Path, registry: "Registry", family: str = "unk
           f"{time.perf_counter() - _t0:.2f}s", flush=True)
     return RunData(name, epoch, sample_ids, pred.numpy(), splits,
                    metrics, com_pred, row_of, skipped, family, shape,
-                   com_pairs=geom, global_ids=global_ids)
+                   com_pairs=geom, global_ids=global_ids, missing=missing)
 
 
 # ***** registry *****

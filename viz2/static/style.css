@@ -75,10 +75,9 @@ h2 em { font-style:normal; color:var(--accent); font-family:var(--mono);
 
 /* the filtered / total count and "clear all N filters", in the step's own header */
 .step1 h2 { display:flex; align-items:baseline; gap:10px; margin:0; }
-.s1count { font:11px/1 var(--mono); letter-spacing:.06em; text-transform:uppercase;
-           color:var(--ink3); font-weight:400; }
-.s1count b { font:600 22px/1 var(--mono); color:var(--ink); }
-.s1count #nmatchsub { font-size:14px; }
+/* "1435 / 5812": plain, one size and weight */
+.s1count { font:400 13px/1 var(--mono); color:var(--ink3); }
+.s1count b { font-weight:400; }
 .fclear { font:600 12px var(--sans); cursor:pointer; padding:5px 12px;
           border:1px solid var(--accent); border-radius:var(--r);
           background:var(--accent-sf); color:var(--accent); }
@@ -100,6 +99,11 @@ h2 em { font-style:normal; color:var(--accent); font-family:var(--mono);
 .s1filter .pk.open .pblist { max-height:none; }
 .s1filter .pk > span .an { margin-left:auto; display:inline-flex; gap:6px; }
 .s1filter .pk > span .an .link { margin-left:0; font-size:11px; font-weight:400; }
+/* bigger type inside the filter dropdowns (rows, counts, search, chips) */
+.s1filter .pbrow { font-size:13px; padding:4px 6px; }
+.s1filter .pbrow i, .s1filter .pbmore, .s1filter .pbchip { font-size:11px; }
+.s1filter .pbq { font-size:13px; }
+.s1filter .pbchip .pbdot { width:8px; height:8px; }
 .s1filter .pbrow { padding:3px 4px; gap:5px; }
 .s1filter .pbrow i { min-width:2.5ch; padding-left:4px; }
 .s1filter .pbsel { align-self:stretch; }      /* chips start at the left, above the title */
@@ -119,7 +123,6 @@ h2 em { font-style:normal; color:var(--accent); font-family:var(--mono);
 /* ***** the right panel, top to bottom: label, photo, one row of buttons, (one open
    detail), search row, map, workbench. Spacing alone separates them -- no rules, no boxes. */
 #probes > * { flex:none; }
-.ctlrow { display:flex; justify-content:flex-end; gap:8px; flex-wrap:wrap; margin:8px 0 2px; }
 /* objects / audio / metadata: one box, as tall as the audio pane -- audio always takes its
    space (invisible unless it is the open one); the other two fill the box and scroll */
 #details { position:relative; margin-top:6px; }
@@ -135,7 +138,7 @@ h2 em { font-style:normal; color:var(--accent); font-family:var(--mono);
 #svphotobox { aspect-ratio:var(--arp); margin-top:8px; }
 
 /* the viewer's objects table */
-#smtable { border-collapse:collapse; font:10.5px var(--mono); color:var(--ink2); }
+#smtable { width:100%; border-collapse:collapse; font:10.5px var(--mono); color:var(--ink2); }
 #smtable tr:last-child td { border-top:1px solid var(--line); }
 #smtable th { text-align:left; font:600 8.5px var(--sans); text-transform:uppercase;
               color:var(--ink3); padding:0 8px 4px 0; border-bottom:1px solid var(--line); }
@@ -315,20 +318,36 @@ button.pbchip:hover { border-color:var(--firm); color:var(--ink); }
    identical thumbnails at a glance. outline (not border) so the grid doesn't reflow. */
 .scard.on, .scard.on:hover { background:var(--ink); border-color:var(--ink);
   outline:3px solid var(--ink); outline-offset:2px; }
-.sclab { font:9px var(--mono); color:var(--ink2); overflow:hidden; text-overflow:ellipsis;
-         white-space:nowrap; }
+/* up to two lines, then an ellipsis. Every caption reserves both lines (min-height) so all
+   cards are the same height -- buildSampleGrid virtualizes on one measured row pitch. */
+.sclab { font:11px/1.3 var(--mono); color:var(--ink2); overflow:hidden; overflow-wrap:anywhere;
+         display:-webkit-box; -webkit-box-orient:vertical; -webkit-line-clamp:2; line-clamp:2;
+         min-height:2.6em; }
 .scard.on .sclab { color:var(--s0); font-weight:700; }
 .pbdot { width:8px; height:8px; border-radius:50%; flex:none;
          background:hsl(var(--h) 58% 52%); }
-/* search row: box, speaker (native <select>s styled as text), position # */
-.searchrow { display:flex; align-items:baseline; gap:6px; margin:18px 0 6px;
+/* search row: box, speaker (native <select>s styled as text), the shapes switch; the
+   position # search wraps onto its own line below */
+.searchrow { display:flex; flex-wrap:wrap; align-items:baseline; gap:6px; margin:18px 0 6px;
              font:11px var(--mono); color:var(--ink3); white-space:nowrap; }
+/* on/off switch (a styled checkbox): track + knob, accent when on */
+.switch { margin-left:auto; display:inline-flex; align-items:center; gap:6px; align-self:center;
+          font:11px var(--sans); color:var(--ink2); cursor:pointer; user-select:none; }
+.switch input { appearance:none; -webkit-appearance:none; margin:0; flex:none; cursor:pointer;
+                position:relative; width:26px; height:15px; border-radius:8px;
+                background:var(--firm); transition:background .15s; }
+.switch input::after { content:''; position:absolute; top:2px; left:2px; width:11px; height:11px;
+                       border-radius:50%; background:#fff; transition:transform .15s;
+                       box-shadow:0 1px 2px rgba(0,0,0,.25); }
+.switch input:checked { background:var(--accent); }
+.switch input:checked::after { transform:translateX(11px); }
+.switch input:focus-visible { outline:1px solid var(--accent); outline-offset:2px; }
 .boxspksel { font:700 14px var(--mono); color:var(--ink); background:none; border:0;
              border-bottom:1px dashed var(--firm); padding:0 1px; cursor:pointer;
              /* natural width; shrinks (ellipsis) only when the panel is too narrow */
              flex:0 1 auto; min-width:0; text-overflow:ellipsis; }
 #spksel { flex:none; }
-.searchrow #posjump { flex:1; min-width:70px; margin-left:8px; }
+.searchrow #posjump { flex:1 0 100%; margin-top:4px; }
 #posjump { -moz-appearance:textfield; }
 #posjump[hidden] { display:none; }
 #spkat { display:flex; flex-wrap:wrap; gap:5px; }
@@ -339,10 +358,9 @@ button.pbchip:hover { border-color:var(--firm); color:var(--ink); }
    strip -- clicking a dot and arrow-stepping both want the room. */
 /* --ar is the box's shape (the overhead photo's, app.js buildScatter): full width, capped
    at ~260px tall. */
-/* under the map: the shapes toggle, and how many probes are in other boxes */
+/* under the map: how many probes are in other boxes */
 .mapnote { display:flex; justify-content:space-between; margin-top:4px;
            font:9.5px var(--mono); color:var(--ink3); }
-.mapnote .chk { font-size:9.5px; color:var(--ink3); }
 #scatter { display:block; margin:0 auto; width:min(100%, 260px * var(--ar, 1.87));
            aspect-ratio:var(--ar, 1.87); background:var(--s2);
            border:1px solid var(--firm); border-radius:4px; }
@@ -392,10 +410,17 @@ button { font:inherit; cursor:pointer; }
 main { flex:1; display:grid; grid-template-columns:minmax(0,1fr) 6px var(--aside, 546px); gap:3px;
         padding:12px; overflow:hidden; align-items:stretch; }
 #flow { position:relative; display:flex; flex-direction:column; gap:12px; min-width:0; min-height:0;
-        overflow-y:auto; overscroll-behavior:contain; padding-right:2px; }
-.step h2 > b { display:inline-flex; width:16px; height:16px; border-radius:50%;
-             background:var(--accent); color:#fff; align-items:center;
-             justify-content:center; font-size:10px; margin-right:2px; }
+        overflow-y:auto; overscroll-behavior:contain;
+        scrollbar-width:none; }            /* scrolls by wheel / trackpad / keys; no bar */
+#flow::-webkit-scrollbar { display:none; }
+/* Section headers: a thin, large numeral and a sentence-case title; any readout (hover
+   value, note) sits at the right. Quiet type, not chrome -- ~22px tall, so the plots keep
+   their room. */
+.step h2 { font:600 15px/1 var(--sans); letter-spacing:-.01em; text-transform:none;
+           color:var(--ink); gap:10px; }
+.step h2 > b { font:200 22px/1 var(--sans); letter-spacing:-.02em; color:var(--accent);
+               font-variant-numeric:tabular-nums; }
+.step h2 em.soft { font-size:11px; }
 /* Steps 2 and 3 keep the rail + working-area split; step 1 has its own .s1 bands. */
 .stepbody { display:flex; flex-wrap:wrap; gap:16px 22px; align-items:flex-start; }
 .lasercol { flex:none; width:150px; }
@@ -431,17 +456,17 @@ main { flex:1; display:grid; grid-template-columns:minmax(0,1fr) 6px var(--aside
 /* --mw / --mh are the mode canvas size: set per box by sizeModePanel() so each box keeps
    its true aspect ratio, scaled so a physically bigger box draws bigger. */
 :root { --mw:460px; --mh:460px; }
-.modewrap { position:relative; padding:0 0 22px 64px; flex:none; }
+.modewrap { position:relative; padding:0 0 30px 64px; flex:none; }
 .modeleft canvas { width:var(--mw); height:var(--mh); display:block; flex:none;
                    border:1px solid var(--line); border-radius:4px; background:var(--s0); }
 .mode-ax { position:absolute; left:64px; top:0; width:var(--mw); height:var(--mh);
            overflow:visible; pointer-events:none; }
-.mode-ax .ml { font:9px var(--mono); fill:var(--ink3); text-anchor:end; }
+.mode-ax .ml { font:11px var(--mono); fill:var(--ink3); text-anchor:end; }
 .mode-ax .ml.col { text-anchor:middle; }
 /* .mlab and .chk both set display, which would otherwise beat the hidden attribute the
    mode view uses to swap the rail between quiver and surface controls. */
 [hidden] { display:none !important; }
-.mlab { position:absolute; font:9px var(--mono); font-style:normal; color:var(--ink3);
+.mlab { position:absolute; font:11px var(--mono); font-style:normal; color:var(--ink3);
         letter-spacing:.04em; }
 .mlab.my { left:-4px; top:50%; transform:rotate(-90deg) translateX(50%);
            transform-origin:left center; white-space:nowrap; }
@@ -461,13 +486,19 @@ main { flex:1; display:grid; grid-template-columns:minmax(0,1fr) 6px var(--aside
 .plot.gut, .plot.gut:last-child { margin-bottom:56px; }
 .plot.h150 { margin-bottom:56px; }
 .plot.h110 { margin-bottom:56px; }
-.yl { position:absolute; left:2px; top:0; height:100%; width:0; font:9px var(--mono);
+.yl { position:absolute; left:2px; top:0; height:100%; width:0; font:11px var(--mono);
       font-style:normal; color:var(--ink3); white-space:nowrap;
       display:flex; align-items:center; justify-content:center; }
 .yl::before { content:''; }
-.yl { writing-mode:vertical-rl; transform:rotate(180deg); width:12px; }
+.yl { writing-mode:vertical-rl; transform:rotate(180deg); width:14px; }
 
-.h160 { height:170px; } .h150 { height:230px; } .h110 { height:180px; }
+/* Section 2's three plots share the window height so the whole section fits on one screen
+   without scrolling: ~290px is the rest of the section (title, plot gutters, card
+   padding), split 30/40/30. Floors are the old fixed heights -- which also keep the plots
+   at least as tall as the control rail beside them. */
+.h160 { height:170px; }
+.h150 { height:max(230px, calc((100vh - 290px) * .4)); }
+.h110 { height:max(180px, calc((100vh - 290px) * .3)); }
 
 .plot canvas, .plot img { width:100%; height:100%; display:block; }
 
@@ -485,9 +516,9 @@ main { flex:1; display:grid; grid-template-columns:minmax(0,1fr) 6px var(--aside
 .ov rect.lr.hov { stroke:var(--ink); stroke-dasharray:3 2; opacity:.75; }
 .ov line.cur { stroke:var(--accent); stroke-width:1; }
 .ov .ax line.grid { stroke:var(--firm); stroke-width:1; opacity:.85; }
-.ov .ax text { font:600 9.5px var(--mono); fill:var(--ink2); text-anchor:middle; }
-.ov .ax text.unit { fill:var(--ink); font-size:10px; }
-.ov .lax text.ly { font:9px var(--mono); fill:var(--ink3); text-anchor:end; }
+.ov .ax text { font:600 11px var(--mono); fill:var(--ink2); text-anchor:middle; }
+.ov .ax text.unit { fill:var(--ink); font-size:12px; }
+.ov .lax text.ly { font:10.5px var(--mono); fill:var(--ink3); text-anchor:end; }
 .ov text { font:9px var(--mono); fill:var(--ink3); }
 .ov circle.pk { fill:var(--s1); stroke:var(--ink2); stroke-width:1.2; }
 .ov text.pklab { font:9px var(--mono); fill:var(--ink3); text-anchor:middle; }
@@ -556,13 +587,25 @@ svg:focus, .plot:focus { outline:1px solid var(--accent); outline-offset:2px; }
 
 #curmeta { margin:0; font:10px/1.35 var(--mono); }
 #curmeta.muted { opacity:.42; }
-/* the sample line as a title, then laser · channel · frequency + dataset as its subtitle */
-#curmeta .top { padding:5px 7px; border-radius:4px; background:var(--s2);
-                font-family:var(--mono); color:var(--ink); overflow-wrap:anywhere; }
-#curmeta .top b { display:block; font:700 19px/1.3 var(--mono); }
-#curmeta .top span { display:block; margin-top:2px; font-size:11px; color:var(--ink2); }
-#curmeta .top i { font-style:normal; margin-left:1.4em; color:var(--ink3); }
-#curmeta .top u { text-decoration:none; color:var(--accent); font-weight:400; font-size:9px; }
+/* id + speaker, then layout · box, then labeled fields -- nothing to decode */
+#curmeta .cmhead { display:flex; align-items:baseline; justify-content:space-between; gap:8px; }
+#curmeta .cmhead b { font:700 19px/1.2 var(--mono); color:var(--ink); }
+#curmeta .cmhead span { font:12.5px var(--sans); color:var(--ink3); }
+#curmeta .cmsub { font:500 14px/1.3 var(--sans); color:var(--ink2); margin-top:1px;
+                  overflow-wrap:anywhere; }
+#curmeta .cmf { display:grid; grid-template-columns:repeat(5, auto) 1fr; gap:2px 6px;
+                align-items:baseline; margin:6px 0 0; padding-top:6px; border-top:1px solid var(--line); }
+#curmeta .cmf dt { font:600 10.5px var(--sans); letter-spacing:.06em; text-transform:uppercase;
+                   color:var(--ink3); }
+#curmeta .cmf dd { margin:0 14px 0 0; font:12.5px var(--mono); color:var(--ink); white-space:nowrap; }
+#curmeta .cmf dd.ds { grid-column:2 / -1; color:var(--ink2); overflow-wrap:anywhere; }
+#curmeta .cmf u { text-decoration:none; color:var(--accent); font-size:10.5px; }
+/* objects / audio / metadata: underline tabs sitting on their content */
+#detail { display:flex; gap:16px; margin:8px 0 0; border-bottom:1px solid var(--line); }
+#detail button { border:0; background:none; padding:4px 0 5px; margin-bottom:-1px; cursor:pointer;
+                 font:500 13.5px var(--sans); color:var(--ink3); border-bottom:2px solid transparent; }
+#detail button:hover { color:var(--ink); }
+#detail button.on { color:var(--ink); border-bottom-color:var(--accent); }
 
 .probe { display:flex; gap:6px; align-items:flex-start; padding:4px 3px; border-radius:4px; cursor:pointer; }
 .probe:hover { background:var(--s2); }
@@ -672,12 +715,14 @@ h2 em.soft { color:var(--ink3); font-weight:400; margin-left:auto; }
 .fkey .kx { left:42px; bottom:0; }
 .fkey .ky { left:-2px; top:34px; transform:rotate(-90deg); transform-origin:left center; }
 /* y-axis ticks: numbers in the gutter beside the rotated label, grid lines behind data. */
-.ov .ynum { font:600 9.5px var(--mono); fill:var(--ink2); text-anchor:end;
+.ov .ynum { font:600 11px var(--mono); fill:var(--ink2); text-anchor:end;
             transform:translateX(-2px); }
 .ov .ygrid { stroke:var(--firm); stroke-width:1; opacity:.85; }
 /* The empty workbench states its one gesture, where the result will appear. */
 .addhint { font:9px var(--sans); font-style:normal; color:var(--ink3);
            text-transform:none; letter-spacing:0; }
+.asidesub .addhint { margin-left:auto; }        /* right-aligned, before the clear link */
+.asidesub .addhint ~ .link { margin-left:0; }
 .addhint kbd { font:9px var(--mono); border:1px solid var(--firm); border-radius:3px;
                padding:0 3px; background:var(--s0); color:var(--ink2); }
 /* Step 4 uses the same rail + key + plot skeleton as steps 2 and 3, so all three plots

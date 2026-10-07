@@ -347,7 +347,6 @@ function initFilters() {
     if (s.n_objects != null) f.nObjects.add(s.n_objects);
     if (s.box) f.boxes.add(s.box);
     if (s.dataset) f.datasets.add(s.dataset);
-    (s.objects && s.objects.length ? s.objects : ["(none)"]).forEach((o) => f.objects.add(o));
   });
   // Speaker 1 only. The 8 speakers at a position capture the same scene, so showing all
   // of them makes the table eight rows deep per position; starting on one keeps the
@@ -404,10 +403,10 @@ function failures(s) {
   if (!f.nObjects.has(s.n_objects)) out.push("nObjects");
   if (!f.boxes.has(s.box)) out.push("boxes");
   if (!f.datasets.has(s.dataset)) out.push("datasets");
-  // Contains-any: a scene passes if any object in it is selected. Empty boxes have no
-  // objects, so they ride on the "empty" pseudo-entry rather than never matching.
+  // Picked objects, like viz2: none picked = no filter; else a scene passes if it
+  // contains ANY picked object. Empty boxes match the "(none)" pseudo-object.
   const objs = s.objects && s.objects.length ? s.objects : ["(none)"];
-  if (!objs.some((o) => f.objects.has(o))) out.push("objects");
+  if (f.objects.size && !objs.some((o) => f.objects.has(o))) out.push("objects");
   if (f.positions && !(s.pos >= 0 && f.positions.has(s.pos))) out.push("positions");
 
   // With no runs loaded the table is a ground-truth browser, so every sample qualifies;
@@ -472,7 +471,7 @@ const FILTERS = {
   speakers:  { label: "speaker",  clear: (f) => S.samples.forEach((s) => f.speakers.add(s.speaker)) },
   splits:    { label: "split",    clear: (f) => S.runOrder.forEach((n) => S.runs[n].splits.forEach((sp) => f.splits.add(sp))) },
   nObjects:  { label: "objects",  clear: (f) => S.samples.forEach((s) => f.nObjects.add(s.n_objects)) },
-  objects:   { label: "contains", clear: (f) => S.samples.forEach((s) => (s.objects && s.objects.length ? s.objects : ["(none)"]).forEach((o) => f.objects.add(o))) },
+  objects:   { label: "object",   clear: (f) => f.objects.clear() },
   layouts:   { label: "layout",   clear: (f) => S.samples.forEach((s) => s.layout && f.layouts.add(s.layout)) },
   boxes:     { label: "box",      clear: (f) => S.samples.forEach((s) => s.box && f.boxes.add(s.box)) },
   datasets:  { label: "dataset",  clear: (f) => S.samples.forEach((s) => s.dataset && f.datasets.add(s.dataset)) },
@@ -554,9 +553,10 @@ function applyFilters() {
 const runDs = (n) => S.runs[n].datasets || (S.runs[n].entry && S.runs[n].entry.datasets) || [];
 
 /* "By dataset" row mode: runs predicting the same SET of datasets share a group, and a
-   group's rows are the filtered/sorted `rows` that one of its runs predicted, interleaved
-   round-robin across its datasets -- so a combined run (gastro + plastic) shows both from
-   the first row instead of one dataset starting thousands of rows down. */
+   group's rows are the filtered/sorted `rows` that one of its runs predicted. Sorted by a
+   run in the group, that is one ranking across all its datasets; otherwise they are
+   interleaved round-robin, so a combined run (gastro + plastic) shows both from the first
+   row instead of one dataset starting thousands of rows down. */
 function computeGroups(rows) {
   if (!S.runOrder.length) return null;
   const groups = new Map();
@@ -567,10 +567,11 @@ function computeGroups(rows) {
     groups.get(key).runs.push(name);
   }
   for (const g of groups.values()) {
-    const per = g.datasets.map((d) => rows.filter((s) =>
-      s.dataset === d && g.runs.some((n) => S.runs[n].splitOf[s.i])));
-    const n = per.reduce((t, l) => t + l.length, 0);
-    for (let k = 0; g.order.length < n; k++)
+    const mine = rows.filter((s) => g.runs.some((n) => S.runs[n].splitOf[s.i]));
+    // Sorted by one of THIS group's runs: keep that one ranking across all its datasets.
+    if (g.runs.includes(S.sort.run)) { g.order = mine; continue; }
+    const per = g.datasets.map((d) => mine.filter((s) => s.dataset === d));
+    for (let k = 0; g.order.length < mine.length; k++)
       for (const l of per) if (k < l.length) g.order.push(l[k]);
   }
   return [...groups.values()];
@@ -809,6 +810,9 @@ function runHeaderCell(name) {
     ? `<span class="warnbadge" title="No eval split directories; dataset identity unconfirmed">?</span>` : "";
   const skipped = r.skipped_files.length
     ? ` · <span title="${r.skipped_files.join(", ")}">${r.skipped_files.length} file(s) skipped</span>` : "";
+  const moved = r.missing && r.missing.length
+    ? ` · <span title="not in samples/ (moved to bad_samples/ or deleted): ${r.missing.join(", ")}">missing ${r.missing[0]} directory${
+      r.missing.length > 1 ? ` (+${r.missing.length - 1} more)` : ""}</span>` : "";
   // A run can pass the compatibility scan and still score nothing -- targets exist at
   // its grid but none decoded, or no predicted sample belongs to this dataset. Saying
   // which is the difference between "this run is broken" and "viz is broken".
@@ -835,7 +839,7 @@ function runHeaderCell(name) {
         r.n_params.toLocaleString()} trainable parameters">${fmtParams(r.n_params)}<span class="k">&nbsp;params</span></span>` : ""}
     </div>
     ${why}
-    ${skipped ? `<div class="hmeta">${skipped.replace(/^ · /, "")}</div>` : ""}
+    ${skipped + moved ? `<div class="hmeta">${(skipped + moved).replace(/^ · /, "")}</div>` : ""}
     <div class="hstats">${METRICS.map((m) => {
       const s = st[m.key];
       return `<span><span class="k">${m.short}</span> <b>${s ? fmt(s.mean, 3) : "–"}</b>${
@@ -1411,8 +1415,16 @@ function renderChips() {
       .forEach((o) => objCounts.set(o, (objCounts.get(o) || 0) + 1));
   });
   const objVals = [...objCounts.entries()].sort((a, b) => (a[0] > b[0] ? 1 : -1));
-  chipRow($("#obj-chips"), objVals, f.objects, (v) => (v === "(none)" ? "empty" : shortLayout(v)));
-  $("#obj-count").textContent = `${f.objects.size}/${objVals.length}`;
+  // Click picks (viz2 style); nothing picked = no filter, so every chip reads as on.
+  $("#obj-chips").innerHTML = "";
+  for (const [v, n] of objVals) {
+    const b = document.createElement("button");
+    b.className = "chip" + (f.objects.size && !f.objects.has(v) ? " off" : "");
+    b.innerHTML = `${v === "(none)" ? "empty" : v}<span class="n">${n}</span>`;
+    b.onclick = () => { f.objects.has(v) ? f.objects.delete(v) : f.objects.add(v); refresh(); };
+    $("#obj-chips").appendChild(b);
+  }
+  $("#obj-count").textContent = f.objects.size ? `${f.objects.size}/${objVals.length}` : "all";
   $("#split-count").textContent = `${f.splits.size}/${splits.size}`;
   $("#layout-count").textContent = `${f.layouts.size}/${uniq((s) => s.layout).length}`;
   $("#nobj-count").textContent = `${f.nObjects.size}/${uniq((s) => s.n_objects).length}`;
@@ -1704,15 +1716,18 @@ function syncSliders() {
    makes scrubbing the epoch slider and playing the animation pure local work: no network
    round-trip and no server render per frame. */
 
-async function fetchFrames(run, sids, epoch) {
-  // One epoch per request; null = the run's latest, which the server answers from memory.
-  const q = epoch == null ? "" : `&epoch=${epoch}`;
-  const r = await fetch(
-    `/api/frames?run=${encodeURIComponent(run)}&sids=${sids.join(",")}${q}&v=${S.renderVersion}`);
+/* Masks for `sids` at each of `eps` (epoch numbers and/or "latest"), as one Map
+   sid -> fp16 mask per epoch, in the order asked. */
+async function fetchFrames(run, sids, eps) {
+  const r = await fetch(`/api/frames?run=${encodeURIComponent(run)}&sids=${sids.join(",")}` +
+    `&epochs=${eps.join(",")}&v=${S.renderVersion}`);
   if (!r.ok) throw new Error("frames");
   const raw = new Uint16Array(await r.arrayBuffer());
-  const cells = raw.length / sids.length;
-  return new Map(sids.map((s, i) => [s, raw.subarray(i * cells, (i + 1) * cells)]));
+  const cells = raw.length / (eps.length * sids.length);
+  return eps.map((_, e) => new Map(sids.map((s, i) => {
+    const o = (e * sids.length + i) * cells;
+    return [s, raw.subarray(o, o + cells)];
+  })));
 }
 
 /* Minimal IEEE half -> float. Only needed because DataView has no float16 reader. */
@@ -1948,15 +1963,14 @@ function paintCanvas(cv, run, sid, epoch) {
   drawMask(cv, buf, mode, truth, [rh, rw], comsFor(run, sid));
 }
 
-/* Fetch masks for the rows on screen plus a screen ahead, at the epoch on screen, MERGED
-   into the run's per-epoch sid -> mask store: scrolling back never refetches and only
-   missing sids go over the wire. Rows come from visibleRange(), the same window
-   renderVisible paints -- a private window formula here once left the bottom rows of a
-   tall screen blank forever (each paint re-requested the window that excluded them).
-   A call while one is in flight queues one re-check, since scrolling moves the rows. */
+/* Fetch masks for the rows on screen plus a screen ahead into the run's store
+   {epoch | "latest": Map sid -> fp16 mask}: first the epoch on screen (paints the scroll),
+   then every other epoch for the same rows in the background, so moving the epoch slider
+   repaints from local data with no request. Merged, so scrolling back never refetches.
+   Rows come from visibleRange(), the same window renderVisible paints. A call while one
+   is in flight queues one re-check, since scrolling moves the rows. */
 const framesPending = new Set();
 const framesStale = new Set();
-const MAX_FRAMES = 3000;   // sids kept per (run, epoch); past this that store restarts
 async function ensureFrames(run) {
   if (framesPending.has(run)) { framesStale.add(run); return; }
   framesPending.add(run);
@@ -1965,16 +1979,20 @@ async function ensureFrames(run) {
       framesStale.delete(run);
       const f = S.focus === run;
       const { first, last } = f ? focusRange() : visibleRange();
-      const rows = (f ? S.focusList : orderFor(run)).slice(first, 2 * last - first).filter(Boolean);
-      const ep = epochFor(run), key = ep ?? "latest";
+      const sids = (f ? S.focusList : orderFor(run)).slice(first, 2 * last - first).filter(Boolean).map((s) => s.i);
       const store = S.frameData[run] || (S.frameData[run] = {});
-      if (!store[key] || store[key].size > MAX_FRAMES) store[key] = new Map();
-      const m = store[key];
-      const sids = rows.map((s) => s.i).filter((i) => !m.has(i));
-      if (!sids.length) continue;
-      const got = await fetchFrames(run, sids, ep);
-      for (const [k, v] of got) m.set(k, v);
-      renderVisible();
+      const now = epochFor(run) ?? "latest";
+      const rest = ["latest", ...(S.runs[run].epochs || [])].filter((e) => e !== now);
+      for (const eps of [[now], rest]) {
+        const need = sids.filter((i) => eps.some((e) => !store[e] || !store[e].has(i)));
+        if (!need.length) continue;
+        const got = await fetchFrames(run, need, eps);
+        eps.forEach((e, k) => {
+          store[e] = store[e] || new Map();
+          for (const [sid, v] of got[k]) store[e].set(sid, v);
+        });
+        renderVisible();
+      }
     } while (framesStale.has(run));
   } finally {
     framesPending.delete(run);
@@ -2753,11 +2771,6 @@ function bindUI() {
       if (k === "nObjects") S.filters.nObjects = new Set(uniq((s) => s.n_objects).map((x) => x[0]));
       if (k === "boxes") S.filters.boxes = new Set(uniq((s) => s.box).map((x) => x[0]));
       if (k === "datasets") S.filters.datasets = new Set(uniq((s) => s.dataset).map((x) => x[0]));
-      if (k === "objects") {
-        const all = new Set();
-        S.samples.forEach((s) => (s.objects && s.objects.length ? s.objects : ["(none)"]).forEach((o) => all.add(o)));
-        S.filters.objects = all;
-      }
       if (k === "splits") { const a = new Set(); S.runOrder.forEach((n) => S.runs[n].splits.forEach((x) => a.add(x))); S.filters.splits = a; }
       refresh();
     };

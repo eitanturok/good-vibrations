@@ -14,7 +14,7 @@
     <div class="s1grid">
       <div class="s1left">
       <!-- the step's title, how many samples pass, and "clear all", above the filters -->
-      <h2><b>1</b> sample
+      <h2><b>01</b> Samples
         <span class="s1count"><b id="nmatch">0</b><span id="nmatchsub">/0</span></span></h2>
       <button id="fclear" class="fclear" hidden></button>
 
@@ -71,7 +71,7 @@
 
   <!-- 2 . the signal -->
   <section class="card step">
-    <h2><b>2</b> signal <em id="heatread" class="soft"></em></h2>
+    <h2><b>02</b> Signals <em id="heatread" class="soft"></em></h2>
     <p class="ptitle" id="sigtitle"></p>
     <div class="legend" id="siglegend"></div>
     <div class="stepbody">
@@ -117,7 +117,7 @@
 
   <!-- 4 . the mode -->
   <section class="card step">
-    <h2><b>3</b> mode</h2>
+    <h2><b>03</b> Modes</h2>
     <p class="ptitle" id="modetitle"></p>
     <div class="stepbody">
       <div class="rail-l">
@@ -162,7 +162,7 @@
        multiples on the right (there, one mode tile per probe; here, one recovered-video
        tile per probe). -->
   <section class="card step">
-    <h2><b>4</b> recovered audio <em class="soft">per pinned sample, at its laser · channel</em></h2>
+    <h2><b>04</b> Recovered audio <em class="soft">per pinned sample, at its laser · channel</em></h2>
     <div class="stepbody">
       <!-- no controls here yet -- an empty rail, kept the same width as steps 2 and 3, so
            this section's content starts at the same x as their plots. -->
@@ -200,9 +200,7 @@
        which is open below -->
   <dl id="curmeta"></dl>
   <div id="svphotobox"></div>
-  <div class="ctlrow">
-    <div class="seg sm" id="detail"><button data-v="svobjs">objects</button><button data-v="svaudio">audio</button><button data-v="svmeta">metadata</button></div>
-  </div>
+  <div class="tabs" id="detail"><button data-v="svobjs">Objects</button><button data-v="svaudio">Audio</button><button data-v="svmeta">Metadata</button></div>
   <!-- the three panes share one box, as tall as the audio pane -->
   <div id="details" hidden>
   <div class="detail" id="svobjs"><table id="smtable"></table></div>
@@ -235,11 +233,12 @@
   <!-- THE MAP: every position in the box (click / arrow keys to go there), the saved probes
        on it in their colours. Box / speaker / position # above it, since they pick what it shows. -->
   <div class="searchrow">
-    <select id="boxsel" class="boxspksel"></select><span>spk</span><select id="spksel" class="boxspksel"></select>
-    <input id="posjump" class="pbq" type="search" placeholder="position # or id (12-3)">
+    <span>box</span><select id="boxsel" class="boxspksel"></select><span>spk</span><select id="spksel" class="boxspksel"></select>
+    <label class="switch"><input type="checkbox" id="shapes" checked> shapes</label>
+    <input id="posjump" class="pbq" type="search" placeholder="search by position #">
   </div>
   <svg id="scatter" tabindex="0"></svg>
-  <div class="mapnote"><label class="chk"><input type="checkbox" id="shapes"> probe shapes</label><span id="elsewhere"></span></div>
+  <div class="mapnote"><span id="elsewhere"></span></div>
   <div class="repeatslab">empty box <span class="repnote" id="repnote"></span></div>
   <div id="repeats"></div>
   <!-- only with 2+ speakers selected: which of them to view at this position -->
@@ -248,7 +247,7 @@
   </div>
 
   <!-- WORKBENCH -->
-  <h3 class="asidesub" id="heldh">probes <em class="addhint">press <kbd>Enter</kbd> to add</em><button id="clear" class="link">clear</button></h3>
+  <h3 class="asidesub" id="heldh">probes <em class="addhint">press <kbd>Enter</kbd> to save</em><button id="clear" class="link">clear</button></h3>
   <div id="nowrow" class="probe live"></div>
   <div id="plist"></div>
 </aside>
