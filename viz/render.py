@@ -320,7 +320,11 @@ def render_mask(values: np.ndarray, mode: str, background: bool,
     rgb, alpha = colorize(values, mode,
                           domain=domain_of(values, mode) if relative else None)
     if backdrop is None:
-        return _png(rgb, None if background else alpha, config.UPSCALE)
+        # Integer NEAREST upscale, capped so a 256x256 grid isn't a 3072px PNG; every grid
+        # still lands at >= ~768px, well above its on-screen size, so nothing blurs.
+        h, w = values.shape
+        up = min(config.UPSCALE, max(2, -(-768 // max(h, w))))
+        return _png(rgb, None if background else alpha, up)
 
     h, w = values.shape
     size = canvas_size(h, w, backdrop)

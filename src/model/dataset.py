@@ -717,7 +717,7 @@ class VibrationDataset(StreamingDataset):
         info = dict(sample_id=s["sample_id"], position_id=s["position_id"], n_objects=n_objects, speaker=s["speaker"], box=s["box"], is_empty_box=s["is_empty_box"], experiment=self.experiment, x_com=s["downsampled_com_x"], y_com=s["downsampled_com_y"], box_w=box_w, box_h=box_h)
         row = self.index[idx]
         assert int(row.get("sample_id", -1)) == s["sample_id"], f"metadata.jsonl row {idx} is not MDS sample {s['sample_id']}"
-        info.update(object=object_id(row), coms=obj_coms(row))
+        info.update(object=object_id(row), coms=obj_coms(row), experiment=row.get("experiment", self.experiment))
         speaker_mean = self.speaker_means[int(s["speaker"])].to(self.pk["device"]) if self.speaker_means is not None else None
         ref = self.empty_box_ref[int(s["speaker"])].to(self.pk["device"]) if self.empty_box_ref is not None else None
         pref = self.phase_ref[int(s["speaker"])].to(self.pk["device"]) if self.phase_ref is not None else None
@@ -1317,10 +1317,21 @@ def shoebox_ring(mds_path, test_size=0.15, seed=42, speakers=None, n_objects=Non
 
 # ***** 2026_09_27_gastronorm_four_objs *****
 #
-# Positions dropped from every split (no overhead image, candle mislabeled as empty, failed
-# segmentation, partial raw vibration, a deleted sample's leftover dir, ...).
-FOUR_OBJS_IGNORE_POSITIONS = {1, 184, 189, 259, 279, 293, 294, 295, 296, 297, 298, 409, 474, 534,
-                              536, 537, 539, 540, 541, 542, 543, 544, 581, 582, 583, 584, 1102}
+# Positions dropped from every split.
+FOUR_OBJS_IGNORE_POSITIONS = {
+    1247,                                # segments entire box instead of coffee pot
+    1243,                                # segments entire box instead of cylinder
+    184, 259,                            # hand blocks red-cube
+    295,                                 # segments entire box instead of vase, labeled red-cube
+    279,                                 # segments black knob on red-cube
+    409, 474,                            # hand blocks vase
+    581, 582,                            # candle mislabeled as vase
+    583, 584,                            # candle mislabeled as empty box
+    1, 293, 294, 1102,                   # no overhead image
+    107, 108, 109,                       # missing speaker recordings
+    189, 293, 294, 295, 296, 297, 298,   # on whiteboard
+    534, 536, 537, 539, 540, 541, 542, 543, 544,  # previously ignored (failed seg / partial vibration / leftovers)
+}
 
 # eval label -> the layouts pooled under it. Split groups hold out FOUR_OBJS_EVAL_FRAC of their
 # positions (whole position_id, so a position is never in both train and eval); eval-only groups
@@ -1370,8 +1381,7 @@ def gastronorm_four_objs_2(mds_path, test_size=0.2, seed=42, verbose=1, index=No
     speaker at a position lands on the same side -- no position is in both train and eval."""
     assert all(v is None for v in filters.values()), f"gastronorm_four_objs_2 has no filters: {filters}"
     if index is None: index = [json.loads(l) for l in open(Path(mds_path) / "metadata.jsonl") if l.strip()]
-    ignore = {1, 184, 189, 259, 279, 293, 294, 295, 296, 297, 298, 409, 474, 534,
-              536, 537, 539, 540, 541, 542, 543, 544, 581, 582, 583, 584, 1102}
+    ignore = FOUR_OBJS_IGNORE_POSITIONS
     groups = {  # label: (fraction of positions held out for eval, layouts)
         "train":                   (0.0, ["empty-box-1", "empty-box-2", "empty-box-3", "empty-box-4"]),
         "vase":                    (test_size, ["vase-grid-1"]),
@@ -1416,8 +1426,7 @@ def gastronorm_four_objs_speakers(mds_path, test_size=0.2, seed=42, verbose=1, i
                      same number of samples -- the only difference is whether speaker 4 was ever heard."""
     assert all(v is None for v in filters.values()), f"gastronorm_four_objs_speakers has no filters: {filters}"
     if index is None: index = [json.loads(l) for l in open(Path(mds_path) / "metadata.jsonl") if l.strip()]
-    ignore = {1, 184, 189, 259, 279, 293, 294, 295, 296, 297, 298, 409, 474, 534,
-              536, 537, 539, 540, 541, 542, 543, 544, 581, 582, 583, 584, 1102}
+    ignore = FOUR_OBJS_IGNORE_POSITIONS
     groups = {  # label: (fraction of positions held out for eval, trained on, layouts)
         "train":                   (0.0, True, ["empty-box-1", "empty-box-2", "empty-box-3", "empty-box-4"]),
         "vase":                    (test_size, True, ["vase-grid-1"]),
@@ -1471,8 +1480,7 @@ def gastronorm_four_objs_scale(mds_path, test_size=0.2, seed=42, verbose=1, inde
     n_positions=125 -> 60 + 4 x 125 x 5 = 2560 samples ~ the old gastronorm run's 2553."""
     assert all(v is None for v in filters.values()), f"gastronorm_four_objs_scale has no filters: {filters}"
     if index is None: index = [json.loads(l) for l in open(Path(mds_path) / "metadata.jsonl") if l.strip()]
-    ignore = {1, 184, 189, 259, 279, 293, 294, 295, 296, 297, 298, 409, 474, 534,
-              536, 537, 539, 540, 541, 542, 543, 544, 581, 582, 583, 584, 1102}
+    ignore = FOUR_OBJS_IGNORE_POSITIONS
     groups = {  # label: (fraction of positions held out for eval, train positions kept, layouts); 0 = not trained
         "train":                   (0.0, None, ["empty-box-1", "empty-box-2", "empty-box-3", "empty-box-4"]),
         "vase":                    (test_size, n_positions, ["vase-grid-1"]),
@@ -1509,6 +1517,165 @@ def gastronorm_four_objs_scale(mds_path, test_size=0.2, seed=42, verbose=1, inde
         for label, idxs in splits.items(): print(f"{label}: {len(idxs)} samples")
     return splits
 
+# ***** 2026_10_05_green_plastic_four_objs *****
+
+def print_split_table(groups, index, splits):
+    """Markdown table of a {split: (layouts, eval_frac, speakers[, keep(position_id)])} dict, sorted by split name.
+    total/train/eval count POSITIONS; headers are kept to one short word so the columns stay narrow."""
+    def nums(s): return ",".join(map(str, sorted(s)))
+    def rng(s): return str(min(s)) if min(s) == max(s) else f"{min(s)}–{max(s)}"
+    print("n_positions per split (total = train + eval); objs = objects per sample\n")
+    print("| split | total | train | eval | eval % | objs | speakers | layouts |")
+    print("|---|---|---|---|---|---|---|---|")
+    lines = []
+    for label, (layouts, frac, speakers, *keep) in groups.items():
+        rows = [r for r in index if r["layout"] in layouts and (not keep or keep[0](r["position_id"]))]
+        used = [r for r in rows if speakers is None or r["speaker"] in speakers]
+        n = len({r["position_id"] for r in used})
+        n_eval = len({index[i]["position_id"] for i in splits.get(f"eval/{label}", [])})
+        ignored = {r["speaker"] for r in rows} - {r["speaker"] for r in used}
+        spk = nums({r["speaker"] for r in used}) + (f" (ignore {nums(ignored)})" if ignored else "")
+        lines.append((label, f"| {label} | {n} | {n - n_eval} | {n_eval} | {round(100 * frac)} "
+                         f"| {rng({r['n_objects'] for r in used})} | {spk} | {', '.join(layouts)} |"))
+    for _, line in sorted(lines): print(line)
+    train = splits["train"]
+    evals = sorted({i for label, idxs in splits.items() if label != "train" for i in idxs})
+    n_train, n_eval = (len({index[i]["position_id"] for i in idxs}) for idxs in (train, evals))
+    print(f"| total | {n_train + n_eval} | {n_train} | {n_eval} | {round(100 * n_eval / (n_train + n_eval))} "
+          f"| {rng({index[i]['n_objects'] for i in train + evals})} | {nums({index[i]['speaker'] for i in train + evals})} | |")
+
+def green_plastic_four_objs(mds_path, test_size=0.2, seed=42, verbose=1, index=None, **filters):
+    """Each split holds out `eval_frac` of its POSITIONS (after keeping only `speakers`; None = all), so every
+    speaker at a position lands on the same side -- no position is in both train and eval."""
+    assert all(v is None for v in filters.values()), f"green_plastic_four_objs has no filters: {filters}"
+    if index is None: index = [json.loads(l) for l in open(Path(mds_path) / "metadata.jsonl") if l.strip()]
+    groups = {  # split: (layouts, fraction of positions held out for eval, speakers)
+        "soap-dispenser":                 ([f"soap-dispenser-grid-{i}" for i in range(1, 6)], test_size, None),
+        "vase":                           (["vase-grid-1", "vase-grid-2", "vase-grid-3"], test_size, None),
+        "candle":                         (["candle-grid-1", "candle-grid-2", "candle-grid-3"], test_size, None),
+        "cube":                           (["cube-box-grid-1", "cube-box-grid-2", "cube-box-grid-3"], test_size, None),
+        "coffee-pot":                     (["coffee-pot-grid-1", "coffee-pot-grid-2"], 1.0, None),
+        "two-cubes":                      (["two-cubes-grid-1", "two-cubes-grid-2"], test_size, None),
+        "cube-vase":                      (["cube-vase"], test_size, None),
+        "cube-unseen-speaker-baseline":   (["cube-5-speakers"], 1.0, [1, 3, 5, 7]),
+        "cube-unseen-speaker-unseen":     (["cube-5-speakers"], 1.0, [4]),
+        "cube-lid":                       (["red-cube-lid"], 1.0, None),
+        "empty-box":                      (["empty-box-grid-1", "empty-box-2", "empty-box-3", "empty-box-4", "empty-box-5"], 0.0, None),
+        "portable-charger":               (["portable-charger"], 1.0, [1, 3, 5, 7]),
+        "cylinder-200g":                  (["cylinder-200g"], 1.0, None),
+        "soap-dispenser-sideways":        (["soap-dispenser-sideways"], 1.0, None),
+        "cylinder-100g":                  (["cylinder-100g"], 1.0, None),
+        "cylinder-500g":                  (["cylinder-500g"], 1.0, None),
+        "cylinder-1000g":                 (["cylinder-1000g"], 1.0, None),
+        "cube-shifted-lasers-1":          (["cube-shifted-lasers-1"], 1.0, [1, 3, 5, 7]),
+        "cube-shifted-lasers-2":          (["cube-shifted-lasers-2"], 1.0, [1, 3, 5, 7]),
+        "cube-shifted-lasers-3-backside": (["cube-shifted-lasers-3-backside"], 1.0, [1, 3, 5, 7]),
+    }
+    splits = {"train": []}
+    for label, (layouts, frac, speakers) in groups.items():
+        rows = [i for i, r in enumerate(index) if r["layout"] in layouts and (speakers is None or r["speaker"] in speakers)]
+        positions = sorted({index[i]["position_id"] for i in rows})
+        random.Random(seed).shuffle(positions)
+        held = set(positions[:round(frac * len(positions))])
+        splits["train"] += [i for i in rows if index[i]["position_id"] not in held]
+        if frac > 0: splits[f"eval/{label}"] = [i for i in rows if index[i]["position_id"] in held]
+    splits["train"].sort()
+    # check for leakage
+    train_pos = {index[i]["position_id"] for i in splits["train"]}
+    for label, idxs in splits.items():
+        if label == "train": continue
+        leaked = train_pos & {index[i]["position_id"] for i in idxs}
+        assert not leaked, f"{label} shares positions with train: {sorted(leaked)[:10]}"
+    if verbose: print_split_table(groups, index, splits)
+    return splits
+
+# ***** gastronorm four_objs + green-plastic four_objs *****
+#
+# Two captures in one run: every entry names its own dataset dir, and build_dataset collects samples
+# from all of them (SPLIT_DATA_DIRS). Keys are the split names; frac > 0 -> eval/<key>.
+GASTRO = "experiments/2026_09_27_gastronorm_four_objs"
+PLASTIC = "experiments/2026_10_05_green_plastic_four_objs"
+# 35 gastro cube positions (random.Random(42).sample of the 281 usable ones) taken out of gastro/cube and
+# held out whole, to test an unseen speaker (4) against the trained ones at the same positions
+GASTRO_UNSEEN_SPK_POSITIONS = {8, 17, 18, 20, 21, 27, 49, 52, 54, 57, 62, 76, 84, 86, 106, 118, 119, 120, 122, 127,
+                               133, 143, 148, 150, 180, 182, 185, 193, 204, 224, 226, 239, 245, 269, 291}
+GASTRO_CUBE = ["red-cube-grid1", "red-cube-grid2", "red-cube-grid3_test"]
+# split: (layouts, fraction of positions held out for eval, speakers, dataset dir[, keep(position_id) -> bool])
+GASTRO_PLASTIC_FOUR_OBJS = {
+    "gastro/empty-box":               (["empty-box-1", "empty-box-2", "empty-box-3", "empty-box-4"], 0.0, [1, 3, 7], GASTRO),
+    "gastro/vase":                    (["vase-grid-1"], 0.2, [1, 3, 7], GASTRO),
+    "gastro/candle":                  (["candle"], 0.2, [1, 3, 7], GASTRO),
+    "gastro/cube":                    (GASTRO_CUBE, 0.2, [1, 3, 7], GASTRO, lambda p: p not in GASTRO_UNSEEN_SPK_POSITIONS),
+    "gastro/cube-unseen-speaker-baseline": (GASTRO_CUBE, 1.0, [1, 3, 7], GASTRO, lambda p: p in GASTRO_UNSEEN_SPK_POSITIONS),
+    "gastro/cube-unseen-speaker-unseen":   (GASTRO_CUBE, 1.0, [4], GASTRO, lambda p: p in GASTRO_UNSEEN_SPK_POSITIONS),
+    "gastro/soap-dispenser":          (["soap-dispenser-grid-1", "soap-dispenser-grid-2", "soap-dispenser-grid-3"], 0.2, [1, 3, 7], GASTRO),
+    "gastro/cube-vase":               (["cube-vase"], 0.2, [1, 3, 7], GASTRO),
+    "gastro/two-cubes":               (["two-cubes-grid-1", "two-cubes-grid-2"], 0.2, [1, 3, 7], GASTRO),
+    "gastro/cube-lid":                (["red-cube-lid"], 1.0, [1, 3, 7], GASTRO),
+    "gastro/cylinder-1000g":          (["cylinder-1000g"], 1.0, [1, 3, 7], GASTRO),
+    "gastro/cylinder-500g":           (["cylinder-500g"], 1.0, [1, 3, 7], GASTRO),
+    "gastro/cylinder-100g":           (["cylinder-100g"], 1.0, [1, 3, 7], GASTRO),
+    "gastro/coffee-pot":              (["coffee-pot"], 1.0, [1, 3, 7], GASTRO),
+    "gastro/soap-dispenser-sideways": (["soap-dispenser-sideways"], 1.0, [1, 3, 7], GASTRO),
+    "plastic/empty-box":                      (["empty-box-grid-1", "empty-box-2", "empty-box-3", "empty-box-4", "empty-box-5"], 0.0, [1, 3, 7], PLASTIC),
+    "plastic/soap-dispenser":                 ([f"soap-dispenser-grid-{i}" for i in range(1, 6)], 0.2, [1, 3, 7], PLASTIC),
+    "plastic/vase":                           (["vase-grid-1", "vase-grid-2", "vase-grid-3"], 0.2, [1, 3, 7], PLASTIC),
+    "plastic/candle":                         (["candle-grid-1", "candle-grid-2", "candle-grid-3"], 0.2, [1, 3, 7], PLASTIC),
+    "plastic/cube":                           (["cube-box-grid-1", "cube-box-grid-2", "cube-box-grid-3"], 0.2, [1, 3, 7], PLASTIC),
+    "plastic/coffee-pot":                     (["coffee-pot-grid-1", "coffee-pot-grid-2"], 1.0, [1, 3, 7], PLASTIC),
+    "plastic/two-cubes":                      (["two-cubes-grid-1", "two-cubes-grid-2"], 0.2, [1, 3, 7], PLASTIC),
+    "plastic/cube-vase":                      (["cube-vase"], 0.2, [1, 3, 7], PLASTIC),
+    "plastic/cube-unseen-speaker-baseline":   (["cube-5-speakers"], 1.0, [1, 3, 7], PLASTIC),
+    "plastic/cube-unseen-speaker-unseen":     (["cube-5-speakers"], 1.0, [4], PLASTIC),
+    "plastic/cube-lid":                       (["red-cube-lid"], 1.0, [1, 3, 7], PLASTIC),
+    "plastic/portable-charger":               (["portable-charger"], 1.0, [1, 3, 7], PLASTIC),
+    "plastic/cylinder-200g":                  (["cylinder-200g"], 1.0, [1, 3, 7], PLASTIC),
+    "plastic/soap-dispenser-sideways":        (["soap-dispenser-sideways"], 1.0, [1, 3, 7], PLASTIC),
+    "plastic/cylinder-100g":                  (["cylinder-100g"], 1.0, [1, 3, 7], PLASTIC),
+    "plastic/cylinder-500g":                  (["cylinder-500g"], 1.0, [1, 3, 7], PLASTIC),
+    "plastic/cylinder-1000g":                 (["cylinder-1000g"], 1.0, [1, 3, 7], PLASTIC),
+    "plastic/cube-shifted-lasers-1":          (["cube-shifted-lasers-1"], 1.0, [1, 3, 7], PLASTIC),
+    "plastic/cube-shifted-lasers-2":          (["cube-shifted-lasers-2"], 1.0, [1, 3, 7], PLASTIC),
+    "plastic/cube-shifted-lasers-3-backside": (["cube-shifted-lasers-3-backside"], 1.0, [1, 3, 7], PLASTIC),
+}
+
+def gastro_plastic_four_objs(mds_path, test_size=0.2, seed=42, verbose=1, index=None, **filters):
+    """Train on both captures; each split holds out its fraction of POSITIONS, so no (experiment, position)
+    is in both train and eval. Rows are matched to an entry by their `experiment` (dataset dir name).
+    Eval fractions live in GASTRO_PLASTIC_FOUR_OBJS; test_size is accepted (run.py always passes it) but unused."""
+    assert all(v is None for v in filters.values()), f"gastro_plastic_four_objs has no filters: {filters}"
+    if index is None: index = [json.loads(l) for l in open(Path(mds_path) / "metadata.jsonl") if l.strip()]
+    ignore = {Path(GASTRO).name: FOUR_OBJS_IGNORE_POSITIONS, Path(PLASTIC).name: set()}
+    splits = {"train": []}
+    for label, (layouts, frac, speakers, path, *keep) in GASTRO_PLASTIC_FOUR_OBJS.items():
+        exp, keep = Path(path).name, (keep[0] if keep else lambda p: True)
+        rows = [i for i, r in enumerate(index) if r["experiment"] == exp and r["layout"] in layouts and keep(r["position_id"])
+                and r["position_id"] not in ignore[exp] and (speakers is None or r["speaker"] in speakers)]
+        positions = sorted({index[i]["position_id"] for i in rows})
+        random.Random(seed).shuffle(positions)
+        held = set(positions[:round(frac * len(positions))])
+        splits["train"] += [i for i in rows if index[i]["position_id"] not in held]
+        if frac > 0: splits[f"eval/{label}"] = [i for i in rows if index[i]["position_id"] in held]
+    splits["train"].sort()
+    # check for leakage
+    train_pos = {(index[i]["experiment"], index[i]["position_id"]) for i in splits["train"]}
+    for label, idxs in splits.items():
+        if label == "train": continue
+        leaked = train_pos & {(index[i]["experiment"], index[i]["position_id"]) for i in idxs}
+        assert not leaked, f"{label} shares positions with train: {sorted(leaked)[:10]}"
+    if verbose:  # one table per capture: both reuse layout names (vase-grid-1, cube-vase, ...)
+        for path in SPLIT_DATA_DIRS["gastro_plastic_four_objs"]:
+            exp = Path(path).name
+            rows = [i for i, r in enumerate(index) if r["experiment"] == exp and r["position_id"] not in ignore[exp]]
+            local = {i: k for k, i in enumerate(rows)}
+            print(f"\n{exp}:")
+            print_split_table({k: (*v[:3], *v[4:]) for k, v in GASTRO_PLASTIC_FOUR_OBJS.items() if v[3] == path}, [index[i] for i in rows],
+                              {l: [local[i] for i in idxs if i in local] for l, idxs in splits.items()})
+    return splits
+
+# splits whose samples come from more than one dataset dir: build_dataset collects from all of them
+SPLIT_DATA_DIRS = {"gastro_plastic_four_objs": sorted({v[3] for v in GASTRO_PLASTIC_FOUR_OBJS.values()})}
+
 #***** 8 build dataloaders *****
 
 SPLIT_METHODS = {"exp25": exp25_split, "gastronorm": gastronorm, "gastronorm_speaker_gen": gastronorm_speaker_gen,
@@ -1523,6 +1690,8 @@ SPLIT_METHODS = {"exp25": exp25_split, "gastronorm": gastronorm, "gastronorm_spe
                  "shoebox_cube": shoebox_cube, "shoebox_cylinder": shoebox_cylinder,
                  "shoebox_mug": shoebox_mug, "shoebox_ring": shoebox_ring,
                  "gastronorm_four_objs": gastronorm_four_objs, "gastronorm_four_objs_2": gastronorm_four_objs_2,
+                 "green_plastic_four_objs": green_plastic_four_objs,
+                 "gastro_plastic_four_objs": gastro_plastic_four_objs,
                  # scripts/four_objs_ablation.sh
                  "gastronorm_four_objs_spk_holdout": gastronorm_four_objs_speakers,
                  "gastronorm_four_objs_spk_control": partial(gastronorm_four_objs_speakers, control=True),
@@ -1630,7 +1799,14 @@ def build_dataset(data_dir: str | Path, split: str = "exp25", batch_size: int = 
 
     # the fft gain augmentation needs the raw complex fft, so any nonzero probability means we store it raw
     raw_fft = augment_fft > 0
-    samples = collect_samples(data_dir / "samples", verbose)
+    # a split that spans several dataset dirs collects from all of them, each row tagged with its
+    # experiment so the split, the leak check and viz can tell the captures apart
+    extra = [Path(d) for d in SPLIT_DATA_DIRS.get(split, []) if Path(d).resolve() != data_dir.resolve()]
+    if extra:
+        samples = [(d, dict(m, experiment=exp.name)) for exp in [data_dir, *extra]
+                   for d, m in collect_samples(exp / "samples", verbose)]
+    else:
+        samples = collect_samples(data_dir / "samples", verbose)
 
     # the laser grid is the data's own geometry, so it is read from the data, never configured
     n_lasers = np.load(fft_path(samples[0][0]))["fft"].shape[-3]
@@ -1696,12 +1872,13 @@ def build_dataset(data_dir: str | Path, split: str = "exp25", batch_size: int = 
     eval_dataset = VibrationDataset(local=mds_dir, seed=seed, process_kwargs=dict(process_kwargs, augment_fft=0.0, augment_mask=0.0))
 
     index = [json.loads(line) for line in (mds_dir / "metadata.jsonl").read_text().strip().splitlines() if line]
-    train_pos = {f'{eval_dataset.experiment} {index[i]["position_id"]}' for i in splits["train"]}
+    exp_of = lambda i: index[i].get("experiment", eval_dataset.experiment)
+    train_pos = {f'{exp_of(i)} {index[i]["position_id"]}' for i in splits["train"]}
     class_counts = torch.bincount(torch.tensor([object_id(index[i]) for i in splits["train"]]), minlength=OTHER + 1)
     # every eval split must be disjoint from train, except these, which share its positions by design
     strict = [label for label in splits if label != "train" and not any(s in label for s in ("speaker", "spk", "seenpos"))]
     for label in strict:
-        assert not train_pos & {f'{eval_dataset.experiment} {index[i]["position_id"]}' for i in splits[label]}, f"{label} shares positions with train"
+        assert not train_pos & {f'{exp_of(i)} {index[i]["position_id"]}' for i in splits[label]}, f"{label} shares positions with train"
 
     if pair_speakers_mode:
         train_dataset = PairedSpeakerDataset(train_dataset, splits["train"], index)

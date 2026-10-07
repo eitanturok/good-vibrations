@@ -24,6 +24,18 @@ function readRowMetrics() {
   ROW_H_BASE = cssPx("--row-h", ROW_H_BASE);
   MASK_BOX = cssPx("--mask-h", 168) + 4;   // mask box plus the gap above it
 }
+// Cells grow with the finest loaded grid so a 256x256 prediction is shown at >= 1 screen
+// px per cell instead of being squeezed into the 160px default (never shrunk below it).
+const MASK_BASE = { w: 160, h: 168, row: 239 };
+function fitMaskBox() {
+  const dims = S.runOrder.map((n) => Math.max(...runShape(n)));
+  const f = Math.max(1, ...dims.map((d) => d / MASK_BASE.w));
+  const root = document.documentElement.style;
+  root.setProperty("--mask-w", `${Math.round(MASK_BASE.w * f)}px`);
+  root.setProperty("--mask-h", `${Math.round(MASK_BASE.h * f)}px`);
+  root.setProperty("--row-h", `${Math.round(MASK_BASE.row + MASK_BASE.h * (f - 1))}px`);
+  readRowMetrics();
+}
 const rowH = () => (S.view.mode === "stacked" ? ROW_H_BASE + MASK_BOX : ROW_H_BASE);
 // --mask-w/--mask-h (see style.css) are the MAX a mask cell is ever allowed to take, not
 // the size it renders at: stretching every box to fill that box regardless of its own
@@ -175,7 +187,10 @@ async function boot() {
   buildScatter();
   buildSliders();
   bindUI();
-  for (const name of runs.default_selected) await addRun(name);
+  let keep = null;
+  try { keep = JSON.parse(sessionStorage.getItem("viz.reloadRuns") || "null"); sessionStorage.removeItem("viz.reloadRuns"); } catch (_) {}
+  const names = new Set(runs.runs.filter((r) => r.compatible).map((r) => r.name));
+  for (const name of (keep || runs.default_selected).filter((n) => names.has(n))) await addRun(name);
   $("#subtitle").textContent =
     `${S.samples.length} samples · ${runs.runs.filter((r) => r.compatible).length} runs available`;
   refresh();
@@ -406,7 +421,7 @@ function failures(s) {
   // "nopred", because that new run obviously never predicted them either. A cardboard
   // sample's coverage should only ever be judged against cardboard-trained runs.
   const relevantRuns = S.view.rowMode === "dataset"
-    ? S.runOrder.filter((n) => ((S.runs[n].entry && S.runs[n].entry.datasets) || []).includes(s.dataset))
+    ? S.runOrder.filter((n) => runDs(n).includes(s.dataset))
     : S.runOrder;
   if (S.runOrder.length) {
     const sps = splitsOf(s.i, relevantRuns);
@@ -534,52 +549,36 @@ function applyFilters() {
   S.groups = S.view.rowMode === "dataset" ? computeGroups(rows) : null;
 }
 
-/* Partitions the filtered/sorted `rows` into one entry per dataset among the currently
-   loaded runs, for "by dataset" row mode (see paintRow's `sampleForGroup`).
+/* The datasets a run predicted: what /api/run read off its loaded rows, else the scan's
+   guess (which probes only a few files, so it can miss a combined run's second dataset). */
+const runDs = (n) => S.runs[n].datasets || (S.runs[n].entry && S.runs[n].entry.datasets) || [];
 
-   A run belongs to the group for the alphabetically-first of its own dataset(s) (plain
-   single-dataset runs only have the one). A COMBINED run (trained on two datasets at
-   once, see run.py's --data-dir-2) is a member of that same first-dataset group like any
-   other column -- its second dataset has no group to align with, so those samples are
-   appended as extra, unaligned rows at the END of the table instead: a synthetic trailing
-   group, padded with `undefined` for every rank before its samples start, so every column
-   outside that trailing run is simply blank there (see paintRow's `!cs` branch) rather
-   than claiming a correspondence that doesn't exist. */
+/* "By dataset" row mode: runs predicting the same SET of datasets share a group, and a
+   group's rows are the filtered/sorted `rows` that one of its runs predicted, interleaved
+   round-robin across its datasets -- so a combined run (gastro + plastic) shows both from
+   the first row instead of one dataset starting thousands of rows down. */
 function computeGroups(rows) {
   if (!S.runOrder.length) return null;
-  const byDataset = new Map();
-  for (const s of rows) {
-    if (!s.dataset) continue;
-    if (!byDataset.has(s.dataset)) byDataset.set(s.dataset, []);
-    byDataset.get(s.dataset).push(s);
-  }
-  const primaryOf = new Map(), secondaryOf = new Map();
+  const groups = new Map();
   for (const name of S.runOrder) {
-    const ds = (S.runs[name].entry && S.runs[name].entry.datasets) || [];
+    const ds = runDs(name), key = ds.join("|");
     if (!ds.length) continue;
-    primaryOf.set(name, ds[0]);
-    if (ds.length > 1) secondaryOf.set(name, ds[1]);
+    if (!groups.has(key)) groups.set(key, { datasets: ds, runs: [], order: [] });
+    groups.get(key).runs.push(name);
   }
-  const mainDatasets = [...new Set(primaryOf.values())].sort();
-  const groups = mainDatasets.map((d) => ({
-    dataset: d, tail: false,
-    runs: S.runOrder.filter((n) => primaryOf.get(n) === d),
-    order: byDataset.get(d) || [],
-  }));
-  const mainRowCount = groups.reduce((n, g) => Math.max(n, g.order.length), 0);
-
-  const tailDatasets = [...new Set(secondaryOf.values())].sort();
-  for (const d of tailDatasets) {
-    const runs = S.runOrder.filter((n) => secondaryOf.get(n) === d);
-    const items = byDataset.get(d) || [];
-    groups.push({ dataset: d, tail: true, runs, order: new Array(mainRowCount).fill(undefined).concat(items) });
+  for (const g of groups.values()) {
+    const per = g.datasets.map((d) => rows.filter((s) =>
+      s.dataset === d && g.runs.some((n) => S.runs[n].splitOf[s.i])));
+    const n = per.reduce((t, l) => t + l.length, 0);
+    for (let k = 0; g.order.length < n; k++)
+      for (const l of per) if (k < l.length) g.order.push(l[k]);
   }
-  return groups;
+  return [...groups.values()];
 }
 
 /* Total row count the virtualizer must cover: the flat filtered list in "single sample"
-   mode, or the longest active dataset group (including any trailing tail rows) in "by
-   dataset" mode -- shorter groups just paint blank past their own end (see paintRow). */
+   mode, or the longest group in "by dataset" mode -- shorter groups just paint blank past
+   their own end (see paintRow). */
 function rowCount() {
   if (S.view.rowMode === "dataset" && S.groups && S.groups.length)
     return S.groups.reduce((n, g) => Math.max(n, g.order.length), 0);
@@ -747,17 +746,11 @@ function setRowMode(mode) {
   refresh(true);
 }
 
-/* The loaded runs' primary datasets (the same key computeGroups groups columns by). More
-   than one means the columns share no sample, so "single sample" mode -- one shared
-   sample per row -- would line every column up against whichever dataset sorts first and
-   show "not in run" for all the others, burying their datasets at the bottom. */
+/* The loaded runs' dataset sets (the same key computeGroups groups columns by). More
+   than one means the columns don't share rows, so "single sample" mode -- one shared
+   sample per row -- would show "not in run" down most of every column. */
 function runDatasets() {
-  const ds = new Set();
-  for (const n of S.runOrder) {
-    const d = (S.runs[n].entry && S.runs[n].entry.datasets) || [];
-    if (d.length) ds.add(d[0]);
-  }
-  return ds;
+  return new Set(S.runOrder.map((n) => runDs(n).join("|")).filter(Boolean));
 }
 
 /* Applies the effective row mode: the user's pick (S.view.rowPref), except that runs
@@ -964,8 +957,7 @@ function buildRunCell() {
 // The row list a run's column is painted against. In "by dataset" row mode a row is no
 // longer one shared sample -- each run column resolves ITS OWN dataset group's Nth
 // (filtered/sorted) sample, so two columns only show the same scene when their runs share
-// a dataset. Entries are undefined past the end of a group (a shorter group, or the
-// padding before a combined run's trailing second-dataset rows -- see computeGroups).
+// a dataset. Entries are undefined past the end of a shorter group.
 function orderFor(name) {
   const g = S.groups && S.groups.find((g) => g.runs.includes(name));
   return g ? g.order : S.order;
@@ -1071,9 +1063,8 @@ function paintRunCell(c, name, cs, mixed) {
   c.style.setProperty("--row-mask-h", `${Math.round(rmh)}px`);
 
   if (!cs) {
-    // This rank is past the end of THIS column's own dataset group -- another group (or
-    // a combined run's trailing second-dataset tail) is longer. Nothing to show here at
-    // all, not even "not in run": there is no sample, not just no prediction.
+    // This rank is past the end of THIS column's own dataset group -- another group is
+    // longer. Nothing to show here at all, not even "not in run": there is no sample, not just no prediction.
     chips.innerHTML = "";
     head.innerHTML = `<span class="t1 run"><span class="txt" title="${name}">${name}</span></span>`;
     predBox.hidden = true;
@@ -1264,6 +1255,7 @@ function onScroll() {
 }
 
 function refresh(toTop = false) {
+  fitMaskBox();
   if (!S.runs[S.focus]) S.focus = null;   // its run was removed
   $("#focus").hidden = !S.focus;
   // toTop is passed exactly by the sort controls, which is also the signal that the user
@@ -1712,24 +1704,15 @@ function syncSliders() {
    makes scrubbing the epoch slider and playing the animation pure local work: no network
    round-trip and no server render per frame. */
 
-async function fetchFrames(run, sids) {
-  // Ask for an EXPLICIT epoch list rather than letting the server default to its own.
-  // The blob is indexed by epoch position, so the labels must describe the bytes that
-  // came back. Defaulting server-side meant a still-training run answered with more
-  // epochs than the client had cached at load time: the client then indexed an 11-epoch
-  // blob as if it held 5, so `epoch == null` read epoch 200 as "latest" and every newer
-  // epoch fell off the end as index -1 and painted blank.
-  const eps = (S.runs[run] && S.runs[run].epochs) || [];
-  const q = eps.length ? `&epochs=${eps.join(",")}` : "";
+async function fetchFrames(run, sids, epoch) {
+  // One epoch per request; null = the run's latest, which the server answers from memory.
+  const q = epoch == null ? "" : `&epoch=${epoch}`;
   const r = await fetch(
     `/api/frames?run=${encodeURIComponent(run)}&sids=${sids.join(",")}${q}&v=${S.renderVersion}`);
   if (!r.ok) throw new Error("frames");
   const raw = new Uint16Array(await r.arrayBuffer());
-  return {
-    epochs: eps.slice(),
-    sids: new Map(sids.map((s, i) => [s, i])),
-    raw,
-  };
+  const cells = raw.length / sids.length;
+  return new Map(sids.map((s, i) => [s, raw.subarray(i * cells, (i + 1) * cells)]));
 }
 
 /* Minimal IEEE half -> float. Only needed because DataView has no float16 reader. */
@@ -1940,7 +1923,7 @@ const scratchFor = (n) => (scratch.length >= n ? scratch : (scratch = new Float3
 
 function paintCanvas(cv, run, sid, epoch) {
   if (!S.lut) return;
-  const store = S.frameData[run];
+  const store = S.frameData[run];   // {epoch | "latest": Map sid -> fp16 mask}
   const [rh, rw] = runShape(run);
   const cells = rh * rw;
   // Every early return clears first. A canvas keeps its last drawing until something
@@ -1948,20 +1931,10 @@ function paintCanvas(cv, run, sid, epoch) {
   // occupant's prediction -- or, once a filter change brings in rows the current store
   // was not fetched for, a stale mask that never gets repainted.
   const blank = () => cv.getContext("2d").clearRect(0, 0, cv.width, cv.height);
-  if (!store || !store.sids.has(sid)) { blank(); ensureFrames(run); return; }
-  const eps = store.epochs;
-  // A store fetched before the run advanced does not contain the newer epochs, so asking
-  // for one has to trigger a refetch rather than paint blank. Without this a training
-  // run's current epoch stayed empty until some unrelated scroll happened to replace the
-  // store -- which is why scrolling appeared to "fix" it.
-  const live = (S.runs[run] && S.runs[run].epochs) || [];
-  if (eps.length && live.length > eps.length) { blank(); ensureFrames(run); return; }
-  const ei = epoch == null ? eps.length - 1 : eps.indexOf(epoch);
-  const si = store.sids.get(sid);
-  if (ei < 0) { blank(); return; }
-  const off = (ei * store.sids.size + si) * cells;
+  const raw = store && store[epoch ?? "latest"] && store[epoch ?? "latest"].get(sid);
+  if (!raw) { blank(); ensureFrames(run); return; }
   const buf = scratchFor(cells);
-  for (let i = 0; i < cells; i++) buf[i] = half(store.raw[off + i]);
+  for (let i = 0; i < cells; i++) buf[i] = half(raw[i]);
   if (Number.isNaN(buf[0])) { blank(); return; }   // run has no prediction here
   // In stacked mode this canvas is the prediction half only -- the target is drawn into
   // its own canvas below, so it needs no truth here.
@@ -1975,33 +1948,32 @@ function paintCanvas(cv, run, sid, epoch) {
   drawMask(cv, buf, mode, truth, [rh, rw], comsFor(run, sid));
 }
 
-/* Fetch frames for whatever rows are on screen, once per run.
-
-   The window is recomputed from the CURRENT scroll position each time, and a second call
-   is allowed to queue while one is in flight: scrolling fast, or jumping to an epoch whose
-   sample set differs, moves the visible rows out from under the request that is already
-   running. Without the re-check those rows would stay blank, because paintCanvas asks for
-   frames and the pending flag would swallow the request. */
+/* Fetch masks for the rows on screen plus a screen ahead, at the epoch on screen, MERGED
+   into the run's per-epoch sid -> mask store: scrolling back never refetches and only
+   missing sids go over the wire. Rows come from visibleRange(), the same window
+   renderVisible paints -- a private window formula here once left the bottom rows of a
+   tall screen blank forever (each paint re-requested the window that excluded them).
+   A call while one is in flight queues one re-check, since scrolling moves the rows. */
 const framesPending = new Set();
 const framesStale = new Set();
+const MAX_FRAMES = 3000;   // sids kept per (run, epoch); past this that store restarts
 async function ensureFrames(run) {
   if (framesPending.has(run)) { framesStale.add(run); return; }
   framesPending.add(run);
   try {
     do {
       framesStale.delete(run);
-      const first = Math.max(0, Math.floor(Math.max(0, $("#scroller").scrollTop) / rowH()) - 4);
-      // In "by dataset" row mode this run's cells are painted against ITS OWN group's row
-      // list (see orderFor), not the flat S.order -- fetching S.order's
-      // window here would almost never contain the sample actually on screen for this
-      // column, so paintCanvas kept finding a miss and re-triggering this fetch forever.
-      const f = S.focus === run, w = f ? focusRange() : { first, last: first + 24 };
-      const sids = (f ? S.focusList : orderFor(run)).slice(w.first, w.last).filter(Boolean).map((s) => s.i);
-      if (!sids.length) return;
-      const d = await fetchFrames(run, sids);
-      // Replace rather than merge: a store holds one contiguous window, and its raw blob
-      // is indexed by position, so windows cannot be concatenated without re-laying it out.
-      S.frameData[run] = d;
+      const f = S.focus === run;
+      const { first, last } = f ? focusRange() : visibleRange();
+      const rows = (f ? S.focusList : orderFor(run)).slice(first, 2 * last - first).filter(Boolean);
+      const ep = epochFor(run), key = ep ?? "latest";
+      const store = S.frameData[run] || (S.frameData[run] = {});
+      if (!store[key] || store[key].size > MAX_FRAMES) store[key] = new Map();
+      const m = store[key];
+      const sids = rows.map((s) => s.i).filter((i) => !m.has(i));
+      if (!sids.length) continue;
+      const got = await fetchFrames(run, sids, ep);
+      for (const [k, v] of got) m.set(k, v);
       renderVisible();
     } while (framesStale.has(run));
   } finally {
@@ -2247,6 +2219,13 @@ async function poll() {
     meta = await api("/api/runs");
   } catch {
     return;                            // server restarting; try again next tick
+  }
+  // A new dataset appeared server-side: the sample list, filters and row ids all change,
+  // so reload the page (keeping the loaded columns) rather than patch every structure.
+  if (meta.n_samples !== S.meta.n_samples) {
+    try { sessionStorage.setItem("viz.reloadRuns", JSON.stringify(S.runOrder)); } catch (_) {}
+    location.reload();
+    return;
   }
   const prevNames = new Set(S.meta.runs.map((r) => r.name));
   const prevStatus = new Map(S.meta.runs.map((r) => [r.name, r.status]));

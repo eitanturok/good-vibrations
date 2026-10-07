@@ -64,18 +64,17 @@ h2 em { font-style:normal; color:var(--accent); font-family:var(--mono);
    minmax(0,...) so a wide child can't force its column wider than its share. */
 .step1 { flex:none; height:100%; display:flex; flex-direction:column; }
 .s1grid { flex:1; min-height:0; display:grid;
-          grid-template-columns:220px minmax(0,1fr) minmax(0,540px);
-          grid-template-rows:minmax(0,1fr); align-items:stretch; margin-top:10px; }
-.s1filter { overflow-y:auto; overscroll-behavior:contain; padding-right:4px; }
+          grid-template-columns:220px minmax(0,1fr);
+          grid-template-rows:minmax(0,1fr); align-items:stretch; }
+/* left column: title + count, "clear all", then the filters (which scroll in place) */
+.s1left { display:flex; flex-direction:column; gap:10px; min-width:0; min-height:0; }
+.s1left .s1filter { flex:1; min-height:0; }
 .s1gallery { display:flex; flex-direction:column; gap:8px; min-width:0; min-height:0;
              border-left:1px solid var(--line); margin-left:16px; padding-left:16px; }
 .s1gallery .sgrid { flex:1; min-height:0; }
-.s1viewer { min-width:0; min-height:0; display:flex; flex-direction:column;
-            overflow-y:auto; overscroll-behavior:contain;
-            border-left:1px solid var(--line); margin-left:16px; padding-left:16px; }
 
 /* the filtered / total count and "clear all N filters", in the step's own header */
-.step1 h2 { display:flex; align-items:center; gap:10px; }
+.step1 h2 { display:flex; align-items:baseline; gap:10px; margin:0; }
 .s1count { font:11px/1 var(--mono); letter-spacing:.06em; text-transform:uppercase;
            color:var(--ink3); font-weight:400; }
 .s1count b { font:600 22px/1 var(--mono); color:var(--ink); }
@@ -85,20 +84,30 @@ h2 em { font-style:normal; color:var(--accent); font-family:var(--mono);
           background:var(--accent-sf); color:var(--accent); }
 .fclear:hover { background:var(--accent); color:#fff; }
 
-/* FILTER: one filter under the next -- chips, label + all/none, list (scrolls in place) */
-.s1filter { display:flex; flex-direction:column; gap:14px; min-width:0; }
-.s1filter .pk { align-items:stretch; min-width:0; }
+/* FILTER: an accordion -- each filter is its label (click to open) then its chips; only
+   the OPEN one shows its search + list, and that list gets the column's spare height (it
+   scrolls only if it still doesn't fit). The speaker ring is always shown. */
+.s1filter { display:flex; flex-direction:column; gap:10px; min-width:0; min-height:0; overflow:hidden; }
+.s1filter .pk { flex:none; align-items:stretch; min-width:0; }
+.s1filter .pk > span { cursor:pointer; font-size:12px; font-weight:600; color:var(--ink2);
+                        padding:3px 0; }
+.s1filter .pk > span:hover { color:var(--ink); }
+.s1filter .pk > span .pk-n { font-size:10.5px; font-weight:400; }
+.s1filter .pk:not(.sp) > span::before { content:'›'; width:.9em; font-size:15px; transition:transform .15s; }
+.s1filter .pk.open > span::before { transform:rotate(90deg); }
+.s1filter .pk:not(.open):not(.sp) .pickbox { display:none; }
+.s1filter .pk.open, .s1filter .pk.open .pickbox, .s1filter .pk.open .pblist { flex:0 1 auto; min-height:0; }
+.s1filter .pk.open .pblist { max-height:none; }
 .s1filter .pk > span .an { margin-left:auto; display:inline-flex; gap:6px; }
-.s1filter .pk > span .an .link { margin-left:0; font-size:10px; }
-.s1filter .pblist { max-height:150px; }
+.s1filter .pk > span .an .link { margin-left:0; font-size:11px; font-weight:400; }
 .s1filter .pbrow { padding:3px 4px; gap:5px; }
 .s1filter .pbrow i { min-width:2.5ch; padding-left:4px; }
+.s1filter .pbsel { align-self:stretch; }      /* chips start at the left, above the title */
 .s1filter .pbsel:empty { display:none; }
 .s1filter #spk { width:100%; height:auto; aspect-ratio:126 / 78; }   /* the ring's viewBox */
 
 /* GALLERY: sample-id search + the view toggles, then the grid */
 .galrow { display:flex; gap:12px; align-items:center; white-space:nowrap; }
-#galposjump { flex:0 1 185px; min-width:0; }
 .galsort { display:inline-flex; align-items:center; gap:5px; margin-right:auto;
            font:600 9px var(--sans); letter-spacing:.1em; text-transform:uppercase; color:var(--ink3); }
 .galsort select { font:11px var(--mono); padding:3px 4px; border:1px solid var(--firm);
@@ -107,41 +116,23 @@ h2 em { font-style:normal; color:var(--accent); font-family:var(--mono);
                   background:var(--s1); color:var(--ink); font-size:12px; cursor:pointer; }
 .galsort button:hover { border-color:var(--accent); color:var(--accent); }
 
-/* ***** step 1: the sample viewer *****
-   The overhead + segmentation images are the point of this panel -- stacked and large. The
-   spectrogram clips are a small reference at the foot. Everything but the photo and the
-   mask row is flex:none; those two are flex:0 1 auto with their natural (aspect-ratio)
-   height as the basis, so when space runs short they give it up in proportion. */
-.svbody { flex:1; min-height:0; display:flex; flex-direction:column; gap:12px; }
-.svbody > * { flex:none; }
-.svbody > .svphoto { flex:0 1 auto; min-height:0; }
-/* the viewer's info block: pos-spk layout box as the title, then laser/channel/frequency
-   and the dataset as its subtitle */
-.svtop { display:flex; flex-direction:column; gap:4px; padding-bottom:10px;
-         border-bottom:1px solid var(--line); font-family:var(--mono); }
-.svtop .svk { font-size:19px; font-weight:700; color:var(--ink); letter-spacing:.01em; }
-.svtop .svk2 { font-size:11px; color:var(--ink2); }
-.svtop .svk2 i { font-style:normal; margin-left:1.4em; color:var(--ink3); }
-.svtop s { text-decoration:none; color:var(--firm); margin:0 7px; }
-.svtop .svk2 s { margin:0 5px; }
-
-/* collapsible raw metadata: keys bold, values as JSON */
-.svbody > details > summary { font:600 9px var(--sans); letter-spacing:.12em;
-                              text-transform:uppercase; color:var(--ink3); cursor:pointer; }
-.svbody > details > :not(summary) { margin-top:6px; }
-#svmeta pre { margin:6px 0 0; padding:8px; height:calc(14 * 1.45em + 16px); overflow:auto; resize:vertical;
+/* ***** the right panel, top to bottom: label, photo, one row of buttons, (one open
+   detail), search row, map, workbench. Spacing alone separates them -- no rules, no boxes. */
+#probes > * { flex:none; }
+.ctlrow { display:flex; justify-content:flex-end; gap:8px; flex-wrap:wrap; margin:8px 0 2px; }
+/* objects / audio / metadata: one box, as tall as the audio pane -- audio always takes its
+   space (invisible unless it is the open one); the other two fill the box and scroll */
+#details { position:relative; margin-top:6px; }
+#details[hidden], #svobjs:not(.on), #svmeta:not(.on) { display:none; }
+#svaudio:not(.on) { visibility:hidden; }
+#svobjs, #svmeta { position:absolute; inset:0; overflow:auto; }
+#svmeta pre { margin:0; padding:8px; height:100%; box-sizing:border-box; overflow:auto;
               background:var(--s2); border-radius:var(--r); font:10.5px/1.45 var(--mono);
               color:var(--ink2); white-space:pre-wrap; overflow-wrap:anywhere; }
 #svmeta pre b { color:var(--accent); font-weight:600; }
 
-/* one photo, the viewer's full width, with its own background / mask toggles */
-.svphoto { margin:0; display:flex; flex-direction:column; gap:5px; }
-/* The photo is the viewer's one flexible part: natural height is its aspect ratio at full
-   width, and it shrinks (container-query units keep the figure inside its box) only when
-   step 1's fixed height runs short -- folding masks/audio/metadata gives it the room back. */
-#svphotobox { min-height:120px; aspect-ratio:var(--arp); container-type:size;
-              display:flex; justify-content:center; }
-#svphotobox .pfig { width:min(100cqw, 100cqh * var(--arp)); flex:none; }
+/* the photo at the panel's full width; --arp (app.js showPhotos) is its frame's shape */
+#svphotobox { aspect-ratio:var(--arp); margin-top:8px; }
 
 /* the viewer's objects table */
 #smtable { border-collapse:collapse; font:10.5px var(--mono); color:var(--ink2); }
@@ -230,17 +221,6 @@ h2 em { font-style:normal; color:var(--accent); font-family:var(--mono);
    plot), so it gets real size -- up to 680px, shrinking with the window. */
 #svm-gt video { max-width:none; }
 
-/* narrow window: the viewer drops under filter + gallery */
-@media (max-width:1400px) {
-  .s1grid { grid-template-columns:220px minmax(0,1fr); }
-  /* the viewer wraps under filter + gallery, so step 1 can't be one screen tall any more:
-     natural height, the gallery a fixed share of the window */
-  .step1 { height:auto; }
-  .s1grid { grid-template-rows:auto; }
-  .s1gallery .sgrid { flex:none; height:60vh; }
-  .s1viewer { grid-column:1 / -1; border-left:0; margin-left:0; padding-left:0; overflow:visible;
-              border-top:1px solid var(--line); margin-top:14px; padding-top:14px; }
-}
 
 .pk { display:flex; flex-direction:column; gap:4px; align-items:flex-start;
       flex:none; }
@@ -290,6 +270,9 @@ h2 em { font-style:normal; color:var(--accent); font-family:var(--mono);
           border:1px solid var(--line); background:var(--s1); color:var(--ink2);
           font:9px var(--mono); line-height:1.5; padding:1px 4px 1px 6px; border-radius:3px; }
 .pbchip .pbdot { width:7px; height:7px; }
+/* dataset names are long and the column is narrow: wrap them, never cut them short */
+#datasetbox .pbl, .ds .pbchip { white-space:normal; overflow-wrap:anywhere; }
+.ds .pbchip { flex:initial; max-width:100%; }
 /* a filter chip is a plain label; only its × is a control (#spkat's chips are buttons) */
 .pbx { border:0; background:none; padding:0 1px; color:inherit; cursor:pointer;
        font:11px/1 var(--sans); opacity:.5; }
@@ -304,7 +287,6 @@ button.pbchip:hover { border-color:var(--firm); color:var(--ink); }
 #datasetbox .pbrow { padding:4px; gap:6px; }
 #datasetbox .pbimg { width:32px; height:24px; }
 #datasetbox .pbrow i { min-width:2.5ch; padding-left:6px; }
-#datasetbox .pblist { max-height:200px; }
 /* The sample gallery: a scrollable photo grid, caption above thumbnail. It fills step 1's
    height (.s1gallery .sgrid); min-height is only a floor. */
 .sgrid { min-height:220px; overflow-y:auto;
@@ -324,7 +306,7 @@ button.pbchip:hover { border-color:var(--firm); color:var(--ink); }
 .sgin { display:grid; gap:10px; }
 .scard { display:flex; flex-direction:column; gap:3px; border:1px solid transparent;
          background:none; border-radius:4px; padding:3px; cursor:pointer; text-align:center; }
-.scard:hover { background:var(--s2); }
+.scard:hover, .scard.peek { background:var(--s2); }   /* .peek: its position hovered on the map */
 /* pinned to the workbench: a ring in that probe's colour (box-shadow, so no reflow) */
 .scard.pin { box-shadow:0 0 0 3px var(--pc); }
 .scard.pin .sclab::before { content:'● '; color:var(--pc); }
@@ -338,16 +320,16 @@ button.pbchip:hover { border-color:var(--firm); color:var(--ink); }
 .scard.on .sclab { color:var(--s0); font-weight:700; }
 .pbdot { width:8px; height:8px; border-radius:50%; flex:none;
          background:hsl(var(--h) 58% 52%); }
-/* SEARCH, in the sidebar under the current sample */
-#navsearch { flex:none; display:flex; flex-direction:column; gap:6px;
-             padding:10px 0; border-bottom:1px solid var(--line); }
-/* "{box} box, spk {spk}": two native <select>s styled to read as a title, not a form */
-.boxspktitle { display:flex; align-items:baseline; gap:5px; font:13px var(--mono);
-               color:var(--ink3); min-width:0; white-space:nowrap; }
-.boxspksel { font:700 16px var(--mono); color:var(--ink); background:none; border:0;
+/* search row: box, speaker (native <select>s styled as text), position # */
+.searchrow { display:flex; align-items:baseline; gap:6px; margin:18px 0 6px;
+             font:11px var(--mono); color:var(--ink3); white-space:nowrap; }
+.boxspksel { font:700 14px var(--mono); color:var(--ink); background:none; border:0;
              border-bottom:1px dashed var(--firm); padding:0 1px; cursor:pointer;
-             min-width:0; max-width:140px; }
-#posjump, #galposjump { -moz-appearance:textfield; }
+             /* natural width; shrinks (ellipsis) only when the panel is too narrow */
+             flex:0 1 auto; min-width:0; text-overflow:ellipsis; }
+#spksel { flex:none; }
+.searchrow #posjump { flex:1; min-width:70px; margin-left:8px; }
+#posjump { -moz-appearance:textfield; }
 #posjump[hidden] { display:none; }
 #spkat { display:flex; flex-wrap:wrap; gap:5px; }
 #spkat .pbchip { cursor:pointer; }
@@ -355,9 +337,13 @@ button.pbchip:hover { border-color:var(--firm); color:var(--ink); }
                     font-weight:600; }
 /* The scatter is the primary spatial picker now, so it is bigger than the old top-bar
    strip -- clicking a dot and arrow-stepping both want the room. */
-/* --ar is the position cloud's own shape (app.js buildScatter): full width when wide,
-   capped at ~254px tall (SH_MAX at the full-width scale) and centred when tall. */
-#scatter { display:block; margin:0 auto; width:min(100%, 254px * var(--ar, 1.87));
+/* --ar is the box's shape (the overhead photo's, app.js buildScatter): full width, capped
+   at ~260px tall. */
+/* under the map: the shapes toggle, and how many probes are in other boxes */
+.mapnote { display:flex; justify-content:space-between; margin-top:4px;
+           font:9.5px var(--mono); color:var(--ink3); }
+.mapnote .chk { font-size:9.5px; color:var(--ink3); }
+#scatter { display:block; margin:0 auto; width:min(100%, 260px * var(--ar, 1.87));
            aspect-ratio:var(--ar, 1.87); background:var(--s2);
            border:1px solid var(--firm); border-radius:4px; }
 #spk { width:132px; height:84px; border:1px solid var(--line); border-radius:6px;
@@ -403,11 +389,11 @@ button { font:inherit; cursor:pointer; }
 /* ***** layout ***** */
 /* The left flow scrolls; the right column is pinned to the viewport so the current
    sample is always in view. main itself does not scroll -- each column owns its scroll. */
-main { flex:1; display:grid; grid-template-columns:minmax(0,1fr) 340px; gap:12px;
+main { flex:1; display:grid; grid-template-columns:minmax(0,1fr) 6px var(--aside, 546px); gap:3px;
         padding:12px; overflow:hidden; align-items:stretch; }
 #flow { position:relative; display:flex; flex-direction:column; gap:12px; min-width:0; min-height:0;
         overflow-y:auto; overscroll-behavior:contain; padding-right:2px; }
-.step h2 b { display:inline-flex; width:16px; height:16px; border-radius:50%;
+.step h2 > b { display:inline-flex; width:16px; height:16px; border-radius:50%;
              background:var(--accent); color:#fff; align-items:center;
              justify-content:center; font-size:10px; margin-right:2px; }
 /* Steps 2 and 3 keep the rail + working-area split; step 1 has its own .s1 bands. */
@@ -510,11 +496,20 @@ main { flex:1; display:grid; grid-template-columns:minmax(0,1fr) 340px; gap:12px
 
 /* ***** pickers: svg ***** */
 #scatter .pt { fill:var(--firm); }
-/* Semi-transparent plus a ring: on top of the grey dots, but they still read through it
-   so you can see what is stacked underneath the current position. */
-#scatter .pt.on { fill:var(--accent); fill-opacity:.72;
-                  stroke:var(--accent); stroke-width:1.2; }
-#scatter .hot { fill:none; stroke:var(--accent); stroke-width:2.4; }
+/* The current position in ink, like the current sample everywhere else (gallery card,
+   live curve, "now" row) -- colour on the map means a saved probe. A light halo keeps it
+   readable on top of a probe's dot. */
+#scatter .pt.on { fill:var(--ink); stroke:var(--s1); stroke-width:1.2; r:3.4; }
+/* looked-at but not selected (a hovered card or dot): grey, like a hovered card; a hovered
+   probe (markHot) sets its own colour inline */
+#scatter .hot { fill:none; stroke:var(--ink3); stroke-width:2.4; }
+/* saved probes on the map: the other positions recede, each probe in its colour */
+#scatter.haspins .pt:not(.on) { opacity:.45; }
+#scatter .pin { fill:var(--c); stroke:var(--c); }
+#scatter .pin circle { stroke:var(--s1); stroke-width:1; }
+#scatter .pin polyline { fill:none; stroke-width:1; }
+#scatter .pin polygon { fill-opacity:.18; stroke-width:1.2; vector-effect:non-scaling-stroke; }
+#scatter .pins.dim .pin:not(.hot) { opacity:.25; }
 #spk circle { fill:var(--s1); stroke:var(--firm); }
 #spk .on circle { fill:var(--accent); stroke:var(--accent); }
 #spk .cur circle { stroke:var(--ink); stroke-width:2; }
@@ -550,22 +545,22 @@ main { flex:1; display:grid; grid-template-columns:minmax(0,1fr) 340px; gap:12px
 svg:focus, .plot:focus { outline:1px solid var(--accent); outline-offset:2px; }
 .plot:focus { border-radius:3px; }
 
-/* ***** the pinned right column: current sample, then workbench *****
-   Full viewport height. #plist scrolls when the workbench outgrows the column; if even
-   that isn't enough (short window) the whole column scrolls. */
+/* ***** the pinned right column: current sample, search, then workbench *****
+   Full viewport height; ONE scroll -- the whole column -- so the probes are always reached
+   by scrolling down, never squeezed into a box of their own. */
+/* left-edge drag handle: sets main's --aside (app.js wireAsideResize) */
+#asidegrip { cursor:col-resize; border-radius:3px; }
+#asidegrip:hover, #asidegrip.on { background:var(--accent-sf); }
 #probes { position:relative; background:var(--s1); border:1px solid var(--line); border-radius:var(--r);
           padding:10px; display:flex; flex-direction:column; min-height:0; overflow-y:auto; }
 
-/* current-sample panel: title, the sample/laser lines + dataset, then overhead + speaker ring */
-#cursample { flex:none; padding:0 0 10px; margin-bottom:2px;
-             border-bottom:1px solid var(--line); }
-#curmeta { margin:0 0 8px; font:10px/1.35 var(--mono); }
+#curmeta { margin:0; font:10px/1.35 var(--mono); }
 #curmeta.muted { opacity:.42; }
 /* the sample line as a title, then laser · channel · frequency + dataset as its subtitle */
 #curmeta .top { padding:5px 7px; border-radius:4px; background:var(--s2);
                 font-family:var(--mono); color:var(--ink); overflow-wrap:anywhere; }
-#curmeta .top b { display:block; font:700 14px/1.3 var(--mono); }
-#curmeta .top span { display:block; margin-top:2px; font-size:10px; color:var(--ink2); }
+#curmeta .top b { display:block; font:700 19px/1.3 var(--mono); }
+#curmeta .top span { display:block; margin-top:2px; font-size:11px; color:var(--ink2); }
 #curmeta .top i { font-style:normal; margin-left:1.4em; color:var(--ink3); }
 #curmeta .top u { text-decoration:none; color:var(--accent); font-weight:400; font-size:9px; }
 
@@ -587,17 +582,9 @@ svg:focus, .plot:focus { outline:1px solid var(--accent); outline-offset:2px; }
                            color:var(--ink3); margin-left:auto; }
 .probe.live:hover { background:var(--s0); }
 .probe .id u { text-decoration:none; color:var(--accent); font-weight:400; font-size:9px; }
-#maskfig { margin:0 0 4px; flex:none; }
-#maskfig[hidden] { display:none; }
-#maskfig img { width:100%; border-radius:4px; display:block; background:var(--s2);
-                max-height:120px; object-fit:contain; }
-#maskfig figcaption { font:9px var(--mono); color:var(--ink3); margin-top:3px;
-                      text-align:center; }
 #nowrow { flex:none; margin-bottom:4px; }
 #nowrow:empty { display:none; }
-.asidetitle { flex:none; margin:6px 0 8px; padding-bottom:6px;
-              border-bottom:1px solid var(--line); font-size:11px; }
-.asidesub { flex:none; margin:12px 0 5px; font-size:10px; font-weight:600; letter-spacing:.05em;
+.asidesub { flex:none; margin:18px 0 5px; font-size:10px; font-weight:600; letter-spacing:.05em;
             text-transform:uppercase; color:var(--ink3); display:flex; align-items:center; gap:6px; }
 .asidesub em { font-weight:400; text-transform:none; letter-spacing:0; color:var(--ink3); }
 .asidesub .link { margin-left:auto; text-transform:none; letter-spacing:0; }
@@ -761,10 +748,6 @@ h2 em.soft { color:var(--ink3); font-weight:400; margin-left:auto; }
 .probe.off .eyei .slash { display:block; }
 .probe.off .eyei .pupil { fill:none; stroke:currentColor; stroke-width:1.4; }
 
-/* The pinned-probe list is the only thing in the right column that scrolls: it takes
-   whatever height is left under the current-sample panel and the masks, and scrolls
-   inside that instead of growing the column. */
-#plist { flex:1 1 0; min-height:72px; overflow-y:auto; overscroll-behavior:contain; }
 
 /* Workbench thumbnails are the segmentation mask alone, tinted to the probe's color --
    the overhead photo carries no per-probe information at 52px. */

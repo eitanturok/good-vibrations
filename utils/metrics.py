@@ -154,11 +154,16 @@ def _label(x, iters=None):
     runs on the eval loaders."""
     _, h, w = x.shape
     if iters is None: iters = 2 * (h + w)
-    xl = x.long()
-    ids = torch.arange(1, h * w + 1, device=x.device).view(1, h, w) * xl
+    # float throughout (ids <= H*W are exact in fp32); a .long()/.float() round trip per
+    # round cost more than the pool itself. On CPU there is no sync to avoid, so stop at the
+    # fixed point: ~diameter rounds instead of 2*(H+W) -- 30x faster scoring a run in viz.
+    xf = x.float()
+    ids = torch.arange(1, h * w + 1, device=x.device, dtype=torch.float32).view(1, h, w) * xf
     for _ in range(iters):
-        ids = F.max_pool2d(ids[:, None].float(), 3, 1, 1)[:, 0].long() * xl
-    return ids
+        nxt = F.max_pool2d(ids[:, None], 3, 1, 1)[:, 0] * xf
+        if x.device.type == "cpu" and torch.equal(nxt, ids): break
+        ids = nxt
+    return ids.long()
 
 def _centroids_batch(ids):
     """(B,H,W) component ids (0 = background) -> [(K_b, 2)] centroids per sample, (row, col).
@@ -213,7 +218,7 @@ def object_centroids(mask) -> list:
     import numpy as np
     x = mask if torch.is_tensor(mask) else torch.as_tensor(mask)
     if x.ndim == 2: x = x[None]
-    return [_centroids(ids).numpy().astype(np.float64) for ids in _label(_bin(x.float())).cpu()]
+    return [c.numpy().astype(np.float64) for c in _centroids_batch(_label(_bin(x.float())).cpu())]
 
 
 def match_objects(pred_c, gt_c, scale=(1.0, 1.0)):

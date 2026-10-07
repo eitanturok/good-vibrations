@@ -34,8 +34,16 @@ def init(experiment_dir: Path = None, runs_dir: Path = None,
     global registry
     registry = Registry(experiment_dir or config.EXPERIMENT_DIR,
                         runs_dir or config.RUNS_DIR, mask_override)
-    for name in registry.defaults():  # warm so the first paint has data
-        registry.run(name)
+    # Warm the default runs in the BACKGROUND: each can take ~50s to load+score, and doing
+    # it inline kept the server from listening for minutes after launch.
+    import threading
+    def _warm():
+        for name in registry.defaults():
+            try:
+                registry.run(name)
+            except Exception as e:
+                print(f"[viz] warm {name!r} failed: {e}", flush=True)
+    threading.Thread(target=_warm, daemon=True).start()
     return registry
 
 
@@ -219,6 +227,9 @@ def api_run(name: str, reload: int = 0, epoch: int | None = None):
             "n_params": rd.n_params,
             "skipped_files": rd.skipped_files, "n": len(rd.sample_ids),
             "epochs": registry.epochs(name),   # drives the epoch slider
+            # Every dataset this run ACTUALLY predicted, read off its loaded rows. The scan's
+            # entry.datasets only probes a few files, so a combined run looked single-dataset.
+            "datasets": sorted({registry.locate(r)[1].experiment_dir.name for r in rd.row_of}),
             "samples": samples}
 
 
@@ -369,49 +380,46 @@ def api_lut():
 
 
 @app.get("/api/frames")
-def api_frames(run: str, sids: str, epochs: str = ""):
-    """Raw mask values for a set of samples across a set of epochs, as one fp16 blob.
+def api_frames(run: str, sids: str, epoch: int | None = None):
+    """Raw mask values for a set of samples at ONE epoch, as one fp16 blob.
 
-    A 20x40 mask is 1600 bytes -- usually smaller than a PNG of it -- so shipping values
-    and drawing them on the client is both lighter than per-frame images and fast enough
-    to scrub and animate without touching the network again.
+    A mask is a few KB -- usually smaller than a PNG of it -- so shipping values and
+    drawing them on the client is lighter than per-cell images.
 
-    Layout: float16[n_epochs][n_sids][H*W], C-order. Samples the run never predicted are
-    filled with NaN so the client can show its "no prediction" state.
+    Default (no `epoch`) is the run's latest, served from the loaded run in memory: no
+    file is read, and the masks are exactly the ones the metrics beside them scored. An
+    explicit epoch (the scrubber) reads only that epoch's files. Shipping every epoch on
+    every scroll read ~800 .pt files (~1.3GB) per request on a long run.
+
+    Layout: float16[n_sids][H*W], C-order. Samples with no prediction are NaN, so the
+    client can show its "no prediction" state.
     """
     entry = registry.by_name.get(run)
     if entry is None or not entry.compatible:
         raise HTTPException(404, "unknown or incompatible run")
-
-    # load_epoch_masks matches against the raw LOCAL sample_id + box stored in each .pt,
-    # not the GLOBAL id the client sends -- decode each one via locate() rather than a
-    # single per-run offset, since a combined run can predict more than one experiment and
-    # each sid can belong to a different one.
-    pairs = []   # (local_id, box) -- box disambiguates ids that collide across experiments
-    for s in sids.split(","):
-        if s.strip():
-            row = registry.sample_index(s)   # validates + rejects an id no experiment has
-            _, gt, local_row = registry.locate(row)
-            pairs.append((gt.sample_ids[local_row], gt.meta[local_row].get("box")))
-    if not pairs:
+    rows = [_sid(s) for s in sids.split(",") if s.strip()]
+    if not rows:
         raise HTTPException(400, "no sids")
-    eps = [int(e) for e in epochs.split(",") if e.strip()] or registry.epochs(run)
-    if not eps:
-        raise HTTPException(404, "run has no saved epochs")
-
-    # Sized from THIS run's grid, not the global default: the table mixes resolutions, so
-    # a fixed cell count would truncate a finer run's mask or pad a coarser one. A
-    # compatible entry always carries a shape (_classify sets it), and the guard above
-    # already rejected anything else.
     h, w = entry.shape
-    want = set(pairs)
-    out = np.full((len(eps), len(pairs), h * w), np.nan, dtype=np.float16)
-    for ei, ep in enumerate(eps):
-        masks = data.load_epoch_masks(run, registry.runs_dir, ep, want)
-        for si, pair in enumerate(pairs):
-            m = masks.get(pair)
-            if m is not None:
-                out[ei, si] = m.reshape(-1)
+    out = np.full((len(rows), h * w), np.nan, dtype=np.float16)
+    if epoch is None:
+        rd = _run(run)
+        for i, r in enumerate(rows):
+            if r in rd.row_of:
+                out[i] = rd.masks[rd.row_of[r]].reshape(-1)
+        # "latest" moves as a run trains, so this URL must not be cached as immutable.
+        return Response(out.tobytes(), media_type="application/octet-stream",
+                        headers={"Cache-Control": "no-store"})
+    # load_epoch_masks matches the raw LOCAL sample_id + box stored in each .pt -- box
+    # disambiguates ids that collide across experiments in a combined run.
+    pairs = []
+    for r in rows:
+        _, gt, local = registry.locate(r)
+        pairs.append((gt.sample_ids[local], gt.meta[local].get("box")))
+    masks = data.load_epoch_masks(run, registry.runs_dir, epoch, set(pairs))
+    for i, pair in enumerate(pairs):
+        if pair in masks:
+            out[i] = masks[pair].reshape(-1)
     return Response(out.tobytes(), media_type="application/octet-stream", headers=IMMUTABLE)
 
 

@@ -16,7 +16,6 @@ import numpy as np
 from PIL import Image
 from scipy.signal import find_peaks, resample, savgol_filter
 
-from utils.ids import meta_sample_name
 
 # Older experiments name the FFT file singular; everything else about the payload matches.
 FFTS = ["vibration/04_ffts.npz", "vibration/04_fft.npz"]
@@ -432,7 +431,6 @@ def _meta_row(sid: str, d: Path, name: str) -> dict:
     m = _meta(d)
     return {
         "id": sid,
-        "name": meta_sample_name(m) or sid,          # the universal id shown, e.g. 000012-3 (utils/ids.py)
         "pos": int(m.get("position_id") or m.get("output_id") or 0),  # int here, string on exp-25 (which calls it output_id)
         "spk": int(m.get("speaker") or 0),
         "layout": m.get("layout") or "",

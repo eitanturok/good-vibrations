@@ -13,6 +13,7 @@ import os
 import re
 from datetime import datetime
 import resource
+import threading
 import time
 from dataclasses import dataclass, field
 from functools import lru_cache
@@ -41,10 +42,10 @@ def _rss_mb() -> float:
 def merge_metadata(path: Path) -> dict:
     """metadata.jsonl stores ONE KEY PER LINE, so the lines must be merged into a
     single dict. Stale Windows paths are dropped here so they can never reach a route."""
+    # One json.loads per FILE, not per line: ~76 lines x 20k samples was 4s of startup.
     meta = {}
-    for line in path.read_text().splitlines():
-        if line.strip():
-            meta.update(json.loads(line))
+    for d in json.loads("[" + ",".join(l for l in path.read_text().splitlines() if l.strip()) + "]"):
+        meta.update(d)
     return {k: v for k, v in meta.items() if k not in config.STALE_METADATA_KEYS}
 
 
@@ -66,6 +67,27 @@ def parse_com(v) -> list[float]:
         if flat.size >= 2:
             return [float(flat[0]), float(flat[1])]
     return [-1.0, -1.0]
+
+
+def _fullres_smask(sample_dir: Path) -> Path | None:
+    """The full-resolution segmentation mask (e.g. image/03_smask.npy), or None."""
+    hits = sorted(p for p in (sample_dir / "image").glob("*smask.npy")
+                  if "downsampled" not in p.name)
+    return hits[0] if hits else None
+
+
+def _box_downsample(mask: np.ndarray, h: int, w: int) -> np.ndarray:
+    """Same as src/model/dataset.downsample_mask: BOX area-average in float, so partial
+    coverage survives. Accepts a [0,1] or [0,255] mask."""
+    from PIL import Image
+    m = np.asarray(mask, dtype=np.float32)
+    if m.ndim == 3:
+        m = m[..., 0]
+    if m.max() > 1.0:
+        m = m / 255.0
+    out = np.asarray(Image.fromarray(m, mode="F").resize((w, h), resample=Image.BOX),
+                     dtype=np.float32)
+    return np.clip(out, 0.0, 1.0)
 
 
 @dataclass
@@ -95,6 +117,7 @@ class GtIndex:
     experiment_dir: Path | None = None
     _shapes: list[tuple[int, int]] | None = None   # memo for disk_shapes()
     _com: dict[tuple[int, int], np.ndarray | None] = field(default_factory=dict)
+    _has_fullres: bool | None = None
 
     def __len__(self) -> int:
         return len(self.sample_ids)
@@ -119,12 +142,18 @@ class GtIndex:
             # Globbed, exactly as disk_shapes/has_shape discover sizes -- templating the
             # detected layout's prefix here is what let the two disagree, so a run could
             # pass compatibility and then find no targets at all.
-            p = self.layout.resolve_gt_mask(
-                self.experiment_dir / "samples" / sid, h, w)
-            if p is None:
-                continue
+            sdir = self.experiment_dir / "samples" / sid
+            p = self.layout.resolve_gt_mask(sdir, h, w)
             try:
-                m = np.asarray(np.load(p), dtype=np.float32)
+                if p is not None:
+                    m = np.asarray(np.load(p), dtype=np.float32)
+                else:
+                    # No file at this size: build it from the full-res mask exactly as the
+                    # dataset pipeline does, so a run at any resolution has a target.
+                    full = _fullres_smask(sdir)
+                    if full is None:
+                        continue
+                    m = _box_downsample(np.load(full), h, w)
             except Exception:
                 continue
             if m.shape == shape:
@@ -159,8 +188,20 @@ class GtIndex:
         return self._shapes
 
     def has_shape(self, shape) -> bool:
-        """Whether targets exist at `shape`, without decoding them."""
-        return tuple(shape) in {tuple(s) for s in self.disk_shapes()}
+        """Whether targets exist at `shape` -- on disk, or derivable from the full-res
+        mask (see masks_at) -- without decoding them."""
+        if tuple(shape) in {tuple(s) for s in self.disk_shapes()}:
+            return True
+        if self.experiment_dir is None:
+            return False
+        if self._has_fullres is None:
+            try:
+                dirs = sorted(p for p in (self.experiment_dir / "samples").iterdir()
+                              if p.is_dir())[:50]
+            except OSError:
+                dirs = []
+            self._has_fullres = any(_fullres_smask(d) is not None for d in dirs)
+        return self._has_fullres
 
 
 def load_gt(experiment_dir: Path, mask_h: int, mask_w: int) -> GtIndex:
@@ -369,8 +410,18 @@ def _eval_dirs(outputs: Path) -> list[tuple[str, Path]]:
         prefix = "" if group == "eval" else f"{group.removesuffix('-eval')}-"
         try:
             with os.scandir(outputs / group) as it:
-                out += sorted(((f"{prefix}{e.name}", Path(e.path)) for e in it if e.is_dir()),
-                              key=lambda t: t[0])
+                found = []
+                for e in it:
+                    if not e.is_dir():
+                        continue
+                    # A combined split names its evals eval/<box>/<split> (e.g. eval/gastro/cube),
+                    # so a dir of split dirs is expanded one level.
+                    subs = [c for c in os.scandir(e.path) if c.is_dir()]
+                    if subs and not any(c.name.endswith(".pt") for c in os.scandir(e.path)):
+                        found += [(f"{prefix}{e.name}/{c.name}", Path(c.path)) for c in subs]
+                    else:
+                        found.append((f"{prefix}{e.name}", Path(e.path)))
+                out += sorted(found, key=lambda t: t[0])
         except OSError:
             continue
     return out
@@ -1050,6 +1101,7 @@ class Registry:
                 mask_override: tuple[int, int] | None = None):
         t0 = time.perf_counter()
         self.experiment_dir, self.runs_dir = experiment_dir, runs_dir
+        self.mask_override = mask_override
         self.gts = load_experiments(experiment_dir, runs_dir, mask_override)
         # See PERF_NOTES.md: separates ground-truth mask decoding (every experiment's
         # full mask array, loaded eagerly and kept resident for the process lifetime --
@@ -1062,6 +1114,7 @@ class Registry:
         self._scanned_at = 0.0
         self.rescan()
         self._runs: dict[tuple[str, int | None], RunData] = {}
+        self._load_lock = threading.Lock()
         n_ok = sum(e.compatible for e in self.entries)
         self.startup_s = time.perf_counter() - t0
         for gt in self.gts:
@@ -1152,10 +1205,44 @@ class Registry:
     def row_base(self, gi: int) -> int:
         return self._row_base[gi]
 
+    def _load_new_experiments(self) -> None:
+        """Pick up experiment dirs created after startup. APPENDED, never re-sorted, so
+        every existing gi -- and with it every global id "{gi}:{sid}" and row -- stays put.
+        A dir with no usable masks yet (still recording) is simply retried next scan."""
+        if (self.experiment_dir / "samples").is_dir():
+            return   # launched on a single experiment
+        have = {gt.experiment_dir.name for gt in self.gts}
+        try:
+            new = sorted(p for p in self.experiment_dir.iterdir()
+                         if p.is_dir() and p.name not in have and (p / "samples").is_dir())
+        except OSError:
+            return
+        added = []
+        retry = getattr(self, "_exp_retry", {})
+        self._exp_retry = retry
+        now = time.monotonic()
+        for d in new:
+            if retry.get(d.name, 0.0) > now:
+                continue
+            try:
+                added += load_experiments(d, self.runs_dir, self.mask_override)
+            except (SystemExit, Exception) as e:
+                first = d.name not in retry
+                retry[d.name] = now + 120.0
+                if first: print(f"[viz] new experiment {d.name} not loadable yet ({e}); retrying in 120s",
+                      flush=True)
+        if added:
+            self.gts += added
+            self._index_experiments()
+            print(f"[viz] loaded new experiment(s): "
+                  f"{', '.join(g.experiment_dir.name for g in added)}", flush=True)
+
     def rescan(self) -> None:
         """Re-read the runs directory so runs that finish while viz is open show up
         without a restart. Costs ~0.15s per experiment, and only probes one file per
-        run regardless of how many experiments it's classified against."""
+        run regardless of how many experiments it's classified against. Also loads any
+        experiment dir that appeared since startup, so its runs classify as compatible."""
+        self._load_new_experiments()
         self.entries = scan_runs(self.runs_dir, self)
         self.by_name = {e.name: e for e in self.entries}
         self._scanned_at = time.monotonic()
@@ -1188,6 +1275,15 @@ class Registry:
             # every loaded run on each poll), so this stays O(1) amortized.
             self._runs[key] = self._runs.pop(key)
             return self._runs[key]
+        # One load at a time: the client re-requests a run on every poll, and each request
+        # that missed the cache used to start its OWN load of the same run -- five
+        # concurrent 38s loads fighting over the CPU took ~175s each. Waiters find it cached.
+        with self._load_lock:
+            if key in self._runs:
+                return self._runs[key]
+            return self._load(name, key, entry, epoch)
+
+    def _load(self, name, key, entry, epoch) -> RunData:
         t0 = time.perf_counter()
         rd = load_run(name, self.runs_dir, self, entry.family, epoch, entry.shape)
         rd.n_params = param_count(name, self.runs_dir)

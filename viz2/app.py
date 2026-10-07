@@ -7,6 +7,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+import cv2
 import numpy as np
 from fastapi import FastAPI, HTTPException, Response
 from fastapi.responses import FileResponse
@@ -239,13 +240,17 @@ def areas():
 
 @app.get("/api/objstats/{sid}")
 def objstats(sid: str):
-    """Per-object colour, volume (px) and centroid [row, col] for the viewer's mask table."""
+    """Per-object colour, volume (px), centroid [row, col] and outline (a simplified polygon,
+    [[col, row], ...] in overhead px) -- the viewer's mask table and the probe shapes on the map."""
     _d(sid)
     out = []
     for i, (name, m) in enumerate(data.object_masks(sid)):
         r, c = np.nonzero(m)
+        cs, _ = cv2.findContours(m.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        poly = cv2.approxPolyDP(max(cs, key=cv2.contourArea), 2, True)[:, 0]
         out.append({"name": name, "color": render.OBJ_COLORS[i % len(render.OBJ_COLORS)],
-                    "vol": int(m.sum()), "com": [float(r.mean()), float(c.mean())]})
+                    "vol": int(m.sum()), "com": [float(r.mean()), float(c.mean())],
+                    "outline": poly.tolist()})
     return out
 
 
