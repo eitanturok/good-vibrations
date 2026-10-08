@@ -513,7 +513,7 @@ def _classify(name: str, outputs: Path, files: list[Path], obj: dict | None,
     shape = obj["shape"]
     if shape is None:
         return RunEntry(name, False, "no mask_pred in payload")
-    if not {"sample_id", "x_com"} <= obj["info_keys"]:
+    if "sample_id" not in obj["info_keys"]:
         return RunEntry(name, False, "legacy info schema")
 
     splits = [label for label, _ in _eval_dirs(outputs)]

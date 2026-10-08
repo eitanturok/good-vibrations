@@ -440,7 +440,10 @@ function failures(s) {
   // Metric ranges read the sorted run when one is chosen, else any RELEVANT loaded run
   // may satisfy them (union) — the intuitive reading of "show me samples where MSE is
   // high", scoped the same way as the split check just above and for the same reason.
-  const names = S.sort.run && S.runs[S.sort.run] ? [S.sort.run] : relevantRuns;
+  // The sorted run only judges samples it covers: a plastic sample is not in a gastro
+  // run, so sorting the gastro column must leave the plastic column as it was.
+  const sorted = S.sort.run && S.runs[S.sort.run];
+  const names = sorted && sorted.splitOf && sorted.splitOf[s.i] ? [S.sort.run] : relevantRuns;
   if (!names.length) return out;
   let any = false;
   for (const n of names) {
