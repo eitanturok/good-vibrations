@@ -16,10 +16,17 @@ sys.path.insert(0, str(Path(__file__).parent.resolve()))
 import argparse, shutil
 
 import torch
+from torch.utils.data import DataLoader
+from composer import Trainer
+from composer.core import Evaluator
+from composer.callbacks import LRMonitor, SpeedMonitor, NaNMonitor, RuntimeEstimator, OptimizerMonitor, OOMObserver
+from composer.loggers import WandBLogger, FileLogger
 from composer.utils.reproducibility import seed_all
-from composer.optim import ConstantScheduler, CosineAnnealingScheduler, CosineAnnealingWithWarmupScheduler, LinearWithWarmupScheduler
 
-BASE_DATA_DIR = Path("/home/ethantu/workspace/good-vibrations/experiments")
+from dataset import DATASETS, build_dataset
+from arch import Boombox
+from callbacks import VisualizeSMask, OutputSaver, PositionLogger
+from composer.optim import ConstantScheduler, CosineAnnealingScheduler, CosineAnnealingWithWarmupScheduler, LinearWithWarmupScheduler
 
 
 SCHEDULERS = {
@@ -39,12 +46,16 @@ def get_parser():
     parser.add_argument("--verbose",                    type=int,   default=2, help="If >=2, show torch.compile (TorchDynamo) logs.")
 
     # build data
-    parser.add_argument("--data-dir",                   type=str,  default=BASE_DATA_DIR / "31_07_2026_gastronorm_exp1")
-    parser.add_argument("--split",                      type=str,   default="gastronorm", help="How to split the dataset into train/val/test.")
+    parser.add_argument("--dataset",                    type=str,   default="gastronorm_plastic", choices=tuple(DATASETS))
+    parser.add_argument("--test-size",                  type=float, default=0.2, help="Fraction of each split's positions held out for eval.")
+    parser.add_argument("--speakers",                   type=lambda s: s if s == "all" else int(s), default=[1, 3, 7], nargs="+", help="Speakers to train/eval on, e.g. --speakers 1 3 7; 'all' = every speaker, none held out.")
+    parser.add_argument("--signal",                     type=str,   default="magnitude", choices=("magnitude", "log_magnitude"))
+    parser.add_argument("--norm",                       type=str,   default="std", choices=("std", "z"))
+    parser.add_argument("--patch-size",                 type=lambda s: None if s.lower() == "none" else int(s), default=None, help="Freq bins per token; 'none' = no patching, x is (L,F,C).")
+    parser.add_argument("--out-h",                      type=int,   default=64)
+    parser.add_argument("--out-w",                      type=int,   default=64)
+    parser.add_argument("--rgb",                        type=int,   default=0, choices=(0, 1), help="Predict the overhead photo instead of the mask.")
     parser.add_argument("--num-workers",                type=int,   default=4)
-    parser.add_argument("--test-size",                  type=float, default=0.2)
-    parser.add_argument("--laser-cols",                 type=str,   default=None, help="Comma-separated laser column ids to train on, e.g. '0,1,2,3,4'. Whole columns across every row, so the kept lasers stay a rectangle. Default None = all. The selection is applied where the fft is read off disk, so every normalization and reference statistic is computed over exactly these lasers -- which means each selection gets its own MDS build.")
-    parser.add_argument("--laser-rows",                 type=str,   default=None, help="Comma-separated laser row ids to train on, e.g. '0,1,2,3,4,5,6,7'. Whole rows across every kept column, so the kept lasers stay a rectangle. Default None = all. Same single-point selection as --laser-cols (composes with it), each combination gets its own MDS build.")
 
     # train
     parser.add_argument("--batch-size",                 type=int,   default=128)
@@ -57,23 +68,18 @@ def get_parser():
     # eval
     parser.add_argument("--eval-only",                  type=int,   default=0, choices=(0, 1), help="Skip training, just eval a loaded checkpoint (requires --checkpoint-path).")
     parser.add_argument("--eval-batch-size",            type=int,   default=108) # wandb caps images logged in a single call to 108, so eval batch size should be <= 108 to log all images
-    parser.add_argument("--eval-interval",              type=str,   default="50ep")
-    parser.add_argument("--viz-interval",               type=str,   default="50ep", help="How often VisualizeSMask logs predicted-vs-true mask images to wandb.")
+    parser.add_argument("--eval-interval",              type=str,   default="50ep", help="How often to eval, log predicted-vs-true images to wandb, and save outputs for viz.")
     parser.add_argument("--eval-before-train",          type=int,   default=1, choices=(0, 1), help="Run the boundary eval pass before training starts.")
     parser.add_argument("--eval-after-train",           type=int,   default=1, choices=(0, 1), help="Run the boundary eval pass after training ends.")
 
     # run
     parser.add_argument("--run-name",                   type=str,   default=None)
+    parser.add_argument("--wandb",                      type=int,   default=1, choices=(0, 1), help="Log to wandb; 0 = file logger only (smoke tests).")
     parser.add_argument("--wandb-group",                type=str,   default="attn-lr-sweep", help="wandb group, for keeping sweep runs together.")
-
-    # viz
-    parser.add_argument("--viz-port",                   type=int,   default=8504, help="Port for the auto-launched viz dashboard.")
-    parser.add_argument("--no-viz",                     action="store_true", help="Don't auto-launch the viz dashboard.")
 
     # checkpointing
     parser.add_argument("--checkpoint-path",            type=str,   default=None, help="Checkpoint to load for eval. If not set, defaults to the run's latest checkpoint.")
     parser.add_argument("--checkpoint-interval",        type=str,   default="500ep")
-    parser.add_argument("--remote-checkpoint-folder",   type=str, default="eturok-weizmann/laser-vibrations-checkpoints")
 
     # torch compile faster
     parser.add_argument("--compile",                    type=int,   default=1, choices=(0, 1), help="torch.compile-ing the model before training/eval.")
@@ -82,8 +88,16 @@ def get_parser():
     # precision
     parser.add_argument("--precision",                  type=str,   default="amp_bf16", choices=["fp32", "amp_fp16", "amp_bf16"], help="bf16 matches fp16's tensor-core throughput on Blackwell but keeps fp32's exponent range, so no loss scaling and no underflow on wide-dynamic-range FFT magnitudes.")
 
+    # model
+    parser.add_argument("--d-model",                    type=int,   default=1024, help="Size of the embedding between encoder and decoder.")
+
     # loss
-    # parser.add_argument("--loss-fn",                    type=str,   default='mse', choices=list(LOSSES))
+    parser.add_argument("--loss-fn",                    type=str,   default="bce", choices=("bce", "mse", "dice", "bce-dice"), help="Mask loss.")
+    parser.add_argument("--alpha",                      type=float, default=0.5, help="bce-dice only: alpha * bce + (1 - alpha) * dice.")
+    parser.add_argument("--object-weight",              type=float, default=0.1, help="Loss weight of the object-class head; 0 = off.")
+    parser.add_argument("--n-objects-weight",           type=float, default=0.1, help="Loss weight of the object-count head; 0 = off.")
+    parser.add_argument("--com-weight",                 type=float, default=1.0, help="Loss weight of the per-object com head; 0 = off.")
+    parser.add_argument("--area-weight",                type=float, default=0.1, help="Loss weight of the mask-area head; 0 = off.")
 
     return parser
 
@@ -110,18 +124,54 @@ def run(**kwargs):
     if args.compile and args.verbose >= 2: torch._logging.set_logs(dynamo=logging.INFO)
 
     # build dataset
-    log_dir = f"runs/{args.run_name}/positions"
-    shutil.rmtree(log_dir, ignore_errors=True); os.makedirs(log_dir)
+    train_dl, eval_dl, data_info = build_dataset(args.dataset, test_size=args.test_size, speakers=None if "all" in args.speakers else args.speakers, signal=args.signal, norm=args.norm, patch_size=args.patch_size,
+        out_h=args.out_h, out_w=args.out_w, rgb=bool(args.rgb), batch_size=args.batch_size, eval_batch_size=args.eval_batch_size,
+        num_workers=args.num_workers)
+    train_eval = Evaluator(label="train", dataloader=DataLoader(train_dl.dataset, batch_size=args.eval_batch_size, num_workers=args.num_workers))
 
-    train_loader, eval_loaders, train_eval_loader = build_dataset(
-        args.data_dir,
-        batch_size=args.batch_size, eval_batch_size=args.eval_batch_size, num_workers=args.num_workers,
-        split=args.split, test_size=args.test_size,
-        speakers=args.speakers, n_objects=args.n_objects, box=args.box, n_samples=args.n_samples,
-        out_h=args.out_h, out_w=args.out_w,
-        signal_mode=args.signal_mode, normalize_mode=args.normalize_mode, patch_size=args.patch_size, seed=args.seed,
-        augment_fft=args.augment_fft, augment_mask=args.augment_mask,
-        force_rebuild_data=bool(args.force_rebuild_data), rgb=bool(args.rgb), log_dir=log_dir)
+    # build model
+    assert args.patch_size is None, "Boombox convolves the raw spectrum: use --patch-size none"
+    model = Boombox(args.d_model, data_info, args.out_h, args.out_w, rgb=bool(args.rgb), loss_fn=args.loss_fn, alpha=args.alpha,
+                    loss_weights=dict(object=args.object_weight, n_objects=args.n_objects_weight, com=args.com_weight, area=args.area_weight))
+    print(f"{sum(p.numel() for p in model.parameters()):,} parameters")
+
+    # loggers
+    loggers = [FileLogger("runs/{run_name}/logs-rank{rank}.txt")]
+    if args.wandb and not args.eval_only:
+        config = args.__dict__ | data_info | dict(gpu_name=torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu",
+                                                  num_parameters=sum(p.numel() for p in model.parameters()))
+        loggers.append(WandBLogger("better-tsa", group=args.wandb_group, name=args.run_name,
+                                   init_kwargs={"config": config, "id": args.run_name, "resume": "allow", "save_code": True}))
+
+    # callbacks
+    callbacks = [
+        LRMonitor(), SpeedMonitor(), RuntimeEstimator(skip_batches=64, time_unit="minutes"), NaNMonitor(),
+        OptimizerMonitor(log_optimizer_metrics=True, batch_log_interval=10),               # grad + weight norms
+        OOMObserver(folder="runs/{run_name}/torch_traces", remote_file_name=None, overwrite=True),  # memory traces if a run OOMs
+        VisualizeSMask(args.eval_interval), OutputSaver(args.eval_interval), PositionLogger(),
+    ]
+
+    # optimizer + lr schedule
+    optimizer = torch.optim.AdamW(model.parameters(), args.lr, weight_decay=args.weight_decay)
+    scheduler = build_scheduler(args.scheduler, args.t_warmup)
+
+    # trainer
+    trainer = Trainer(
+        run_name=args.run_name, model=model, optimizers=optimizer, schedulers=scheduler,
+        train_dataloader=train_dl, eval_dataloader=eval_dl, eval_interval=args.eval_interval,
+        max_duration=None if args.eval_only else args.max_duration, seed=args.seed,
+        device=device, precision=args.precision if device == "gpu" else "fp32",
+        loggers=loggers, callbacks=callbacks, progress_bar=False, log_to_console=True, save_metrics=True,
+        load_path=args.checkpoint_path, autoresume=bool(args.run_name) and not args.eval_only,
+        save_folder=None if args.eval_only else "runs/{run_name}/checkpoints", save_interval=args.checkpoint_interval,
+        compile_config={"mode": args.compile_mode} if args.compile else None,
+    )
+
+    # train the model
+    if args.eval_before_train: trainer.eval(eval_dl + [train_eval])
+    if not args.eval_only:
+        trainer.fit()
+        if args.eval_after_train: trainer.eval(eval_dl + [train_eval])
 
 if __name__ == "__main__":
     run()
