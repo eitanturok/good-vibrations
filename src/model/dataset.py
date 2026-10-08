@@ -1639,18 +1639,36 @@ GASTRO_PLASTIC_FOUR_OBJS = {
     "plastic/cube-shifted-lasers-3-backside": (["cube-shifted-lasers-3-backside"], 1.0, [1, 3, 7], PLASTIC),
 }
 
-def gastro_plastic_four_objs(mds_path, test_size=0.2, seed=42, verbose=1, index=None, **filters):
-    """Train on both captures; each split holds out its fraction of POSITIONS, so no (experiment, position)
+# One box at a time, same entries: compares gastro only / plastic only / both on identical eval sets.
+GASTRO_FOUR_OBJS_SPK137 = {k: v for k, v in GASTRO_PLASTIC_FOUR_OBJS.items() if v[3] == GASTRO}
+PLASTIC_FOUR_OBJS_SPK137 = {k: v for k, v in GASTRO_PLASTIC_FOUR_OBJS.items() if v[3] == PLASTIC}
+
+def all_speakers(table):
+    """Every speaker in train and eval, and no speaker held out: the unseen-speaker entries go, and their
+    positions become one more held-out-positions split. The other entries keep their positions, so their
+    eval sets are the spk137 ones plus the extra speakers."""
+    out = {k: (v[0], v[1], None, *v[3:]) for k, v in table.items() if "unseen-speaker" not in k}
+    if "gastro/cube" in table:
+        out["gastro/cube-35pos"] = (GASTRO_CUBE, 0.2, None, GASTRO, lambda p: p in GASTRO_UNSEEN_SPK_POSITIONS)
+    if "plastic/cube" in table:
+        out["plastic/cube-5-speakers"] = (["cube-5-speakers"], 0.2, None, PLASTIC)
+    return out
+
+GASTRO_FOUR_OBJS_ALLSPK = all_speakers(GASTRO_FOUR_OBJS_SPK137)
+PLASTIC_FOUR_OBJS_ALLSPK = all_speakers(PLASTIC_FOUR_OBJS_SPK137)
+GASTRO_PLASTIC_FOUR_OBJS_ALLSPK = all_speakers(GASTRO_PLASTIC_FOUR_OBJS)
+
+def box_four_objs(table, mds_path, test_size=0.2, seed=42, verbose=1, index=None, **filters):
+    """Train on the captures `table` names; each split holds out its fraction of POSITIONS, so no (experiment, position)
     is in both train and eval. Rows are matched to an entry by their `experiment` (dataset dir name).
-    Eval fractions live in GASTRO_PLASTIC_FOUR_OBJS; test_size is accepted (run.py always passes it) but unused."""
-    assert all(v is None for v in filters.values()), f"gastro_plastic_four_objs has no filters: {filters}"
+    Eval fractions live in `table`; test_size is accepted (run.py always passes it) but unused."""
+    assert all(v is None for v in filters.values()), f"box_four_objs has no filters: {filters}"
     if index is None: index = [json.loads(l) for l in open(Path(mds_path) / "metadata.jsonl") if l.strip()]
-    ignore = {Path(GASTRO).name: FOUR_OBJS_IGNORE_POSITIONS, Path(PLASTIC).name: set()}
     splits = {"train": []}
-    for label, (layouts, frac, speakers, path, *keep) in GASTRO_PLASTIC_FOUR_OBJS.items():
+    for label, (layouts, frac, speakers, path, *keep) in table.items():
         exp, keep = Path(path).name, (keep[0] if keep else lambda p: True)
         rows = [i for i, r in enumerate(index) if r["experiment"] == exp and r["layout"] in layouts and keep(r["position_id"])
-                and r["position_id"] not in ignore[exp] and (speakers is None or r["speaker"] in speakers)]
+                and (speakers is None or r["speaker"] in speakers)]
         positions = sorted({index[i]["position_id"] for i in rows})
         random.Random(seed).shuffle(positions)
         held = set(positions[:round(frac * len(positions))])
@@ -1664,17 +1682,23 @@ def gastro_plastic_four_objs(mds_path, test_size=0.2, seed=42, verbose=1, index=
         leaked = train_pos & {(index[i]["experiment"], index[i]["position_id"]) for i in idxs}
         assert not leaked, f"{label} shares positions with train: {sorted(leaked)[:10]}"
     if verbose:  # one table per capture: both reuse layout names (vase-grid-1, cube-vase, ...)
-        for path in SPLIT_DATA_DIRS["gastro_plastic_four_objs"]:
+        for path in sorted({v[3] for v in table.values()}):
             exp = Path(path).name
-            rows = [i for i, r in enumerate(index) if r["experiment"] == exp and r["position_id"] not in ignore[exp]]
+            rows = [i for i, r in enumerate(index) if r["experiment"] == exp]
             local = {i: k for k, i in enumerate(rows)}
             print(f"\n{exp}:")
-            print_split_table({k: (*v[:3], *v[4:]) for k, v in GASTRO_PLASTIC_FOUR_OBJS.items() if v[3] == path}, [index[i] for i in rows],
+            print_split_table({k: (*v[:3], *v[4:]) for k, v in table.items() if v[3] == path}, [index[i] for i in rows],
                               {l: [local[i] for i in idxs if i in local] for l, idxs in splits.items()})
     return splits
 
-# splits whose samples come from more than one dataset dir: build_dataset collects from all of them
-SPLIT_DATA_DIRS = {"gastro_plastic_four_objs": sorted({v[3] for v in GASTRO_PLASTIC_FOUR_OBJS.values()})}
+BOX_FOUR_OBJS = {"gastro_plastic_four_objs": GASTRO_PLASTIC_FOUR_OBJS,
+                 "gastro_four_objs_spk137": GASTRO_FOUR_OBJS_SPK137, "plastic_four_objs_spk137": PLASTIC_FOUR_OBJS_SPK137,
+                 "gastro_four_objs_allspk": GASTRO_FOUR_OBJS_ALLSPK, "plastic_four_objs_allspk": PLASTIC_FOUR_OBJS_ALLSPK,
+                 "gastro_plastic_four_objs_allspk": GASTRO_PLASTIC_FOUR_OBJS_ALLSPK}
+gastro_plastic_four_objs = partial(box_four_objs, GASTRO_PLASTIC_FOUR_OBJS)
+
+# splits whose rows are matched by experiment: build_dataset collects from every dir and tags each row with it
+SPLIT_DATA_DIRS = {name: sorted({v[3] for v in table.values()}) for name, table in BOX_FOUR_OBJS.items()}
 
 #***** 8 build dataloaders *****
 
@@ -1691,7 +1715,7 @@ SPLIT_METHODS = {"exp25": exp25_split, "gastronorm": gastronorm, "gastronorm_spe
                  "shoebox_mug": shoebox_mug, "shoebox_ring": shoebox_ring,
                  "gastronorm_four_objs": gastronorm_four_objs, "gastronorm_four_objs_2": gastronorm_four_objs_2,
                  "green_plastic_four_objs": green_plastic_four_objs,
-                 "gastro_plastic_four_objs": gastro_plastic_four_objs,
+                 **{name: partial(box_four_objs, table) for name, table in BOX_FOUR_OBJS.items()},
                  # scripts/four_objs_ablation.sh
                  "gastronorm_four_objs_spk_holdout": gastronorm_four_objs_speakers,
                  "gastronorm_four_objs_spk_control": partial(gastronorm_four_objs_speakers, control=True),
@@ -1802,7 +1826,7 @@ def build_dataset(data_dir: str | Path, split: str = "exp25", batch_size: int = 
     # a split that spans several dataset dirs collects from all of them, each row tagged with its
     # experiment so the split, the leak check and viz can tell the captures apart
     extra = [Path(d) for d in SPLIT_DATA_DIRS.get(split, []) if Path(d).resolve() != data_dir.resolve()]
-    if extra:
+    if split in SPLIT_DATA_DIRS:
         samples = [(d, dict(m, experiment=exp.name)) for exp in [data_dir, *extra]
                    for d, m in collect_samples(exp / "samples", verbose)]
     else:

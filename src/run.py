@@ -186,6 +186,7 @@ def get_parser():
     parser.add_argument("--run-name",                   type=str,   default=None)
     parser.add_argument("--wandb-group",                type=str,   default="attn-lr-sweep", help="wandb group, for keeping sweep runs together.")
     parser.add_argument("--viz-port",                   type=int,   default=8504, help="Port for the auto-launched viz dashboard.")
+    parser.add_argument("--no-wandb",                   action="store_true", help="File logger only, no wandb run (smoke tests).")
     parser.add_argument("--no-viz",                     action="store_true", help="Don't auto-launch the viz dashboard.")
 
     # checkpointing
@@ -329,9 +330,9 @@ def run(**kwargs):
     loggers = []
     if not args.eval_only:
         config = data_info | args.__dict__ | dict(gpu_name=torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu", num_parameters=sum([p_.numel() for p_ in model.parameters()]))
-        wandb_logger = WandBLogger("better-tsa", group=args.wandb_group, name=args.run_name, init_kwargs={"settings": wandb.Settings(x_disable_stats=False), "config": config, "save_code": True, "id": args.run_name, "resume": "allow"})
-        file_logger = FileLogger(f"runs/{{run_name}}/logs-rank{{rank}}.txt")
-        loggers = [wandb_logger, file_logger]
+        loggers = [FileLogger(f"runs/{{run_name}}/logs-rank{{rank}}.txt")]
+        if not args.no_wandb:
+            loggers.insert(0, WandBLogger("better-tsa", group=args.wandb_group, name=args.run_name, init_kwargs={"settings": wandb.Settings(x_disable_stats=False), "config": config, "save_code": True, "id": args.run_name, "resume": "allow"}))
 
     # profiler
     profiler = None
