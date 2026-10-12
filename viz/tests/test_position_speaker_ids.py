@@ -42,7 +42,7 @@ def check(app, shown):
     assert len(rd.sample_ids) == len(shown)
     for j, gid in enumerate(rd.global_ids):  # every prediction lands on its own sample's mask
         assert rd.masks[j].argmax() == app.registry.sample_index(gid) and rd.metrics["iou"][j] > 0.8
-    samples = app.api_samples()["samples"]
+    samples = app._build_samples()["samples"]
     assert [s["sample_id"] for s in samples] == shown
     assert app.api_detail(samples[-1]["i"])["sample_id"] == shown[-1]
 

@@ -5,6 +5,7 @@ sys.path, so `from utils.metrics import ...` resolves no matter what cwd viz is
 launched from. The repo is not pip-installed; imports resolve by path.
 """
 
+import os
 import sys
 from pathlib import Path
 
@@ -19,6 +20,8 @@ if str(REPO_ROOT) not in sys.path:
 # parent of several -- see data.load_experiments.
 EXPERIMENT_DIR = REPO_ROOT / "experiments"
 RUNS_DIR = REPO_ROOT / "runs"
+# Ground truth per experiment, pickled after the first load (see data.load_gt). Safe to delete.
+CACHE_DIR = Path.home() / ".cache" / "viz"
 PORT = 8503  # 8502 is taken by the other explorer
 
 # ***** dataset shape *****
@@ -41,13 +44,20 @@ N_SAMPLES = 1024
 GT_MASK_GLOB = "*_downsampled_smask_{h}h_{w}w.npy"
 
 
+def subdirs(path) -> list[Path]:
+    """Subdirectories of `path`, sorted by name. scandir + string sort: sorting ~20k Path
+    objects from iterdir() did ~1M Path comparisons, a large share of viz's startup."""
+    with os.scandir(path) as it:
+        return [Path(p) for p in sorted(e.path for e in it if e.is_dir())]
+
+
 def mask_shapes(samples_dir) -> list[tuple[int, int]]:
     """Downsampled-mask sizes actually present, newest-layout first, for error messages
     and for --mask's default. Reads one sample dir; sizes are uniform across a dataset."""
     import re
     out = set()
     try:
-        probes = sorted(p for p in samples_dir.iterdir() if p.is_dir())[:25]
+        probes = subdirs(samples_dir)[:25]
     except OSError:
         return []
     for d in probes:
@@ -72,7 +82,7 @@ def usable_mask_shapes(samples_dir) -> list[tuple[int, int]]:
     """
     import numpy as np
     try:
-        dirs = sorted(p for p in samples_dir.iterdir() if p.is_dir())
+        dirs = subdirs(samples_dir)
     except OSError:
         return []
     # Spread the probes over the WHOLE dataset rather than taking the first N. Empty-box
@@ -265,7 +275,7 @@ class Layout:
         incompatible" with nothing pointing back to here.
         """
         try:
-            probes = sorted(p for p in samples_dir.iterdir() if p.is_dir())[:25]
+            probes = subdirs(samples_dir)[:25]
         except OSError:
             probes = []
         layouts = [cls(name, LAYOUTS[name], mask_h, mask_w) for name in LAYOUT_ORDER]
@@ -316,12 +326,7 @@ N_DEFAULT_RUNS = 3
 # training while viz is open show up without a restart. A scan is ~0.15s.
 RESCAN_SECONDS = 10.0
 
-# How many scrubbed-epoch RunData objects to keep. Each is ~5MB, so this bounds the
-# epoch slider's memory; the latest-epoch entry per run is never evicted.
-MAX_EPOCH_CACHE = 24
-
-# How many RunData objects (any epoch, including the "latest" entries that used to be
-# kept forever) Registry.run() keeps decoded in memory at once, LRU. Loading N runs over
+# How many RunData objects Registry.run() keeps decoded in memory at once, LRU. Loading N runs over
 # the course of a session used to pin all N forever even after they were removed from the
 # table -- the single largest source of the process's memory growing unbounded over a long
 # session. 24 comfortably covers any table anyone actually keeps open at once (a handful

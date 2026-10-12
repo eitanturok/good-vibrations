@@ -814,15 +814,22 @@ body.nogt .cell.gt > *, body.nogt .hcell.gt > * { display: none; }
   font-size: 10.5px; color: var(--ink-3);
 }
 
-/* An epoch that saved nothing for this sample is a fact about the DATA, so it gets a
-   solid border -- there is nothing to wait for. Loading stays dashed and fades, so a
-   transient state never looks like a permanent one. */
-.nopred.unsaved { border-style: solid; }
-.nopred.loading { opacity: .55; animation: nopred-pulse 1.1s ease-in-out infinite; }
-@keyframes nopred-pulse { 50% { opacity: .28; } }
+/* An empty prediction box says why (set by paintCanvas). An epoch that saved nothing for
+   this sample is a fact about the DATA, so it is solid -- there is nothing to wait for.
+   Loading pulses, so a transient state never looks like a permanent one. */
+.maskbox[data-state="loading"]::after, .maskbox[data-state="unsaved"]::after {
+  position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+  font-size: 10.5px; color: var(--ink-3); border: 1px solid var(--line-firm); border-radius: 3px;
+  pointer-events: none;
+}
+.maskbox[data-state="unsaved"]::after { content: "not saved"; }
+.maskbox[data-state="loading"]::after {
+  content: "loading…"; border-style: dashed; animation: nopred-pulse 1.1s ease-in-out infinite;
+}
+@keyframes nopred-pulse { 50% { opacity: .4; } }
 
 @media (prefers-reduced-motion: reduce) {
-  .nopred.loading { animation: none; }
+  .maskbox[data-state="loading"]::after { animation: none; }
 }
 
 #empty { padding: 40px; text-align: center; color: var(--ink-3); }

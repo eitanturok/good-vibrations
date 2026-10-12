@@ -133,3 +133,53 @@ Startup: 921MB → 738MB RSS, 4.62s → 3.38s GT load. Run-cache growth is now b
 entries regardless of session length (was unbounded). Per-run add time (~1.2-1.8s server
 side) is dominated by `torch.load`-ing each `.pt` file — see "tried / considered" above for
 the path to cut that further if it's still the bottleneck after these land.
+
+## Epoch scrubbing (2026-10-08)
+
+Symptom: arrow-stepping the epoch slider took 22-51s per step to settle, and scrubbed masks
+never appeared for s6-* runs. Measured with playwright (keydown -> every visible mask redrawn)
+plus cProfile on load_run.
+
+- Each step fired `/api/run?epoch=N` per loaded run. That re-runs load_run and re-scores ALL
+  ~7.5k samples (~7s, ~90% in utils/metrics labeling/contour/matching; the .pt reads are
+  ~15ms), one at a time behind Registry._load_lock. 3 runs = up to 51s queued per step, and
+  cells hid their mask ("loading…") until it landed.
+- `/api/frames` for numbered epochs matched rows on (local id, box), but newer .pt files carry
+  `experiment` and no `box`, so every scrubbed epoch came back NaN ("not saved").
+
+Fix (simplification, not caching): the scrubber is masks-only. Rows, order, filters and
+metrics are the latest epoch's; cells show "metrics at latest epoch only" while scrubbed.
+Removed `/api/run?epoch`, the epoch-keyed run cache + MAX_EPOCH_CACHE, client
+fetchEpochMetrics/metricsPending/frozenOrder. load_epoch_masks routes rows through
+registry.resolve like load_run does. Polling no longer wipes all frames when a run advances
+(only "latest" changes). Result: 17-25ms per step, zero requests while stepping; prefetching
+all 21 epochs x 40 rows is ~0.9s per run, in the background.
+
+## Per-sample metrics saved by training (2026-10-08)
+
+src6 OutputSaver now writes `metrics` ({name: (B,) float32}, NaN where a metric does not
+apply) and `geometry` (localization's crosshair pairs) into every .pt -- see
+`src6/callbacks.py sample_metrics`: training's iou/object_acc/n_objects_err/com_err/
+area_rel_err per sample, the ConfidenceLogger scores (peak, peak_obj, peak_bg, fill, miss),
+and viz's localization_rel/_raw + contour. load_run reads them when EVERY file of the loaded
+epoch has the four METRIC_KEYS, else scores as before (old runs, or a run resumed across the
+change). Measured on s6-dice0-v1's 8015 rows rewritten in the new format: 14.4s -> 0.34s,
+metrics and geometry bit-identical. Training cost: ~43ms per 108-sample batch on GPU, only
+on save epochs.
+
+## Startup (2026-10-08)
+
+Launch -> masks visible went ~20s -> ~4.0s (server listening 2.8s, page 1.2s). Registry
+init 11.4s -> 2.1s, measured without the profiler, each step found with cProfile:
+
+| step | before | after | fix |
+|---|---|---|---|
+| GT object centroids | 6.3s | cached | `_label` CPU path: each mask stops at its own fixed point (one 64-wide blob held all 6155 masks for 64 rounds); 2.75s -> 0.66s uncached, bit-identical |
+| GT load (npy + metadata + centroids) | ~9s | 1.3s | pickled per experiment in ~/.cache/viz, validated by stat of every sample dir, image/ dir, metadata.jsonl and mask used (~80ms) |
+| run scan | 1.8s | 0.85s | `_pred_files` returns scandir strings; `_epoch_of`/`_batch_of` on os.path (Path re-parsed itself ~430k times); `config.subdirs` sorts names, not Path objects (~1M Path compares) |
+| /api/samples | 0.6-1.0s | 0.06s | encoded once per experiment count; json.dumps instead of jsonable_encoder |
+| /api/run json | 0.4s | 0.05s | json.dumps instead of jsonable_encoder |
+
+Old-format runs (scored in viz) load in 1.2-5s instead of 7-14s, from the same `_label` fix.
+Every startup payload (/api/samples, /api/runs, /api/lut, /api/run for old and new runs)
+checked JSON-equal against the previous code.

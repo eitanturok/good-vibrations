@@ -10,6 +10,7 @@ every field, argument and map is keyed by.
 
 import json
 import os
+import pickle
 import re
 from datetime import datetime
 import resource
@@ -196,19 +197,48 @@ class GtIndex:
             return False
         if self._has_fullres is None:
             try:
-                dirs = sorted(p for p in (self.experiment_dir / "samples").iterdir()
-                              if p.is_dir())[:50]
+                dirs = config.subdirs(self.experiment_dir / "samples")[:50]
             except OSError:
                 dirs = []
             self._has_fullres = any(_fullres_smask(d) is not None for d in dirs)
         return self._has_fullres
 
 
+def _stamp(paths) -> list:
+    """(mtime_ns, size) per path, None if missing -- what a cached load is checked against."""
+    out = []
+    for p in paths:
+        try:
+            st = os.stat(p)
+            out.append((st.st_mtime_ns, st.st_size))
+        except OSError:
+            out.append(None)
+    return out
+
+
 def load_gt(experiment_dir: Path, mask_h: int, mask_w: int) -> GtIndex:
+    """Every sample's target mask + metadata, and the per-object centroids derived from them.
+
+    Built once and pickled to config.CACHE_DIR; later loads reuse it if every input is
+    unchanged: the sample dir listing, and the stat of each sample dir, its image/ dir
+    (catches a mask written or deleted), its metadata.jsonl and the mask file it used
+    (catches an in-place rewrite). Checking costs ~80ms for all experiments; rebuilding cost
+    ~9s, mostly decoding 20k small files and labelling objects.
+    """
     samples_dir = experiment_dir / "samples"
     layout = config.Layout.detect(samples_dir, mask_h, mask_w)
-    sample_dirs = sorted(p for p in samples_dir.iterdir() if p.is_dir())
-    ids, masks, meta = [], [], []
+    sample_dirs = config.subdirs(samples_dir)
+    cache = config.CACHE_DIR / f"gt-{experiment_dir.name}-{mask_h}x{mask_w}.pkl"
+    inputs = [q for d in sample_dirs for q in (d, d / "image", d / "metadata.jsonl")]
+    try:
+        c = pickle.loads(cache.read_bytes())
+        if c["inputs"] == [str(q) for q in inputs] + c["masks_used"] and \
+                c["stamp"] == _stamp(inputs + [Path(q) for q in c["masks_used"]]):
+            return GtIndex(c["ids"], c["masks"], c["meta"], c["com_gt"], c["obj_com"], c["avg_com"],
+                           layout, {s: i for i, s in enumerate(c["ids"])}, experiment_dir=experiment_dir)
+    except Exception:
+        pass   # missing, stale or unreadable: rebuild
+    ids, masks, meta, used = [], [], [], []
     for d in sample_dirs:
         gt = layout.resolve_gt_mask(d, mask_h, mask_w)
         if gt is None:
@@ -221,6 +251,7 @@ def load_gt(experiment_dir: Path, mask_h: int, mask_w: int) -> GtIndex:
             continue
         ids.append(d.name)
         masks.append(m)
+        used.append(str(gt))
         meta.append(merge_metadata(d / "metadata.jsonl"))
     if not masks:
         # Only reachable via an explicit --mask, or a size neither requested nor usable
@@ -236,9 +267,20 @@ def load_gt(experiment_dir: Path, mask_h: int, mask_w: int) -> GtIndex:
     masks = np.ascontiguousarray(np.stack(masks).astype(np.float32))
     com_gt = np.asarray(center_of_mass(masks), dtype=np.float64)
     avg_com = np.asarray([parse_com(m.get("avg_com")) for m in meta], dtype=np.float64)
-    row_of = {s: i for i, s in enumerate(ids)}
-    return GtIndex(ids, masks, meta, com_gt, object_centroids(masks), avg_com, layout,
-                   row_of, experiment_dir=experiment_dir)
+    obj_com = object_centroids(masks)
+    try:
+        config.CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = cache.with_suffix(f".{os.getpid()}.tmp")
+        tmp.write_bytes(pickle.dumps(dict(
+            inputs=[str(q) for q in inputs] + used, masks_used=used,
+            stamp=_stamp(inputs + [Path(q) for q in used]),
+            ids=ids, masks=masks, meta=meta, com_gt=com_gt, obj_com=obj_com, avg_com=avg_com),
+            protocol=pickle.HIGHEST_PROTOCOL))
+        tmp.replace(cache)   # atomic: a concurrent reader sees the old file or the new one
+    except OSError as e:
+        print(f"[viz] could not cache ground truth for {experiment_dir.name}: {e}", flush=True)
+    return GtIndex(ids, masks, meta, com_gt, obj_com, avg_com, layout,
+                   {s: i for i, s in enumerate(ids)}, experiment_dir=experiment_dir)
 
 
 # ***** run scanning *****
@@ -270,14 +312,17 @@ class RunEntry:
     datasets: frozenset = field(default_factory=frozenset)
 
 
-def _epoch_of(p: Path) -> int:
-    return int(p.stem.split("-")[0].removeprefix("ep"))
+# Both run on every prediction file of every run each rescan (~240k calls): os.path on the
+# raw string, because Path.stem parses the whole path first and that was ~1.3s of startup.
+def _epoch_of(p) -> int:
+    """Epoch from `ep{E}-ba{B}.pt`."""
+    return int(os.path.basename(p)[2:].split("-", 1)[0])
 
 
-def _batch_of(p: Path) -> int:
+def _batch_of(p) -> int:
     """Batch index from `ep{E}-ba{B}.pt`. Filenames sort correctly as strings today, but
     only because B is zero-padded; parse it so that stays true if the width changes."""
-    return int(p.stem.split("-")[1].removeprefix("ba"))
+    return int(os.path.basename(p).split("-ba", 1)[1].removesuffix(".pt"))
 
 
 def _as_int_array(v) -> np.ndarray:
@@ -375,15 +420,15 @@ def run_status(run_dir: Path) -> str:
     return "stopped"
 
 
-def _pred_files(outputs: Path) -> list[Path]:
+def _pred_files(outputs: Path) -> list[str]:
     """Every ep*.pt under train/ and eval/<split>/ (or boxN-eval/<split>/), via scandir
-    (see _classify)."""
+    (see _classify). Plain strings: a rescan touches ~240k of these, and Path objects
+    re-parse themselves on every str()/name, which was over a second of each scan."""
     out = []
     for _, split_dir in [("train", outputs / "train")] + _eval_dirs(outputs):
         try:
             with os.scandir(split_dir) as it:
-                out += [Path(e.path) for e in it
-                        if e.name.startswith("ep") and e.name.endswith(".pt")]
+                out += [e.path for e in it if e.name.startswith("ep") and e.name.endswith(".pt")]
         except OSError:
             continue
     return out
@@ -533,7 +578,7 @@ def _classify(name: str, outputs: Path, files: list[Path], obj: dict | None,
     experiments = set()
     probe_exps = obj.get("exps") or [None] * len(probe_ids)
     run_exps = _config_experiments(outputs.parent)
-    routed = registry.resolve(probe_ids, probe_boxes, probe_exps, run_exps, files[0].stat().st_mtime)
+    routed = registry.resolve(probe_ids, probe_boxes, probe_exps, run_exps, os.stat(files[0]).st_mtime)
     # A few unroutable ids (samples since moved to bad_samples/) don't sink the run --
     # load_run drops those rows anyway. Only reject when NOTHING probed routes.
     if any(gi is not None for gi in routed):
@@ -581,7 +626,7 @@ def _classify(name: str, outputs: Path, files: list[Path], obj: dict | None,
     # captures can share -- see RunEntry.datasets' own docstring); reuses `experiments`
     # (already-collected gi's) rather than tracking a second parallel set in the loop above.
     datasets = frozenset(registry.gts[gi].experiment_dir.name for gi in experiments)
-    return RunEntry(name, True, None, newest.stat().st_mtime, _epoch_of(newest), splits,
+    return RunEntry(name, True, None, os.stat(newest).st_mtime, _epoch_of(newest), splits,
                     family, shape=shape, experiments=frozenset(experiments),
                     datasets=datasets)
 
@@ -629,9 +674,7 @@ def most_trained_shape(counts, allowed) -> tuple[int, int] | None:
 
 def scan_runs(runs_dir: Path, registry: "Registry") -> list[RunEntry]:
     entries = []
-    for d in sorted(runs_dir.iterdir()):
-        if not d.is_dir():
-            continue
+    for d in config.subdirs(runs_dir):
         outputs, files, obj, err = _probe_run(d)
         e = _classify(d.name, outputs, files, obj, err, registry)
         e.status = run_status(d)      # status is useful even for runs we can't compare
@@ -660,8 +703,7 @@ def load_experiments(path: Path, runs_dir: Path,
     if (path / "samples").is_dir():
         dirs = [path]
     else:
-        dirs = sorted(p for p in path.iterdir()
-                      if p.is_dir() and (p / "samples").is_dir())
+        dirs = [p for p in config.subdirs(path) if (p / "samples").is_dir()]
         if not dirs:
             raise SystemExit(f"[viz] no experiment directories (with samples/) under {path}")
     single = len(dirs) == 1
@@ -809,38 +851,38 @@ def _split_dirs(outputs: Path) -> list[tuple[str, Path]]:
     return out + _eval_dirs(outputs)
 
 
-def load_epoch_masks(name: str, runs_dir: Path, epoch: int,
-                     want: set[tuple[int, object]]) -> dict[tuple[int, object], np.ndarray]:
-    """Just the masks for `want` at one epoch, as {(local_sample_id, box): (H,W)}.
+def load_epoch_masks(name: str, runs_dir: Path, registry: "Registry", epoch: int,
+                     want: set[str]) -> dict[str, np.ndarray]:
+    """Just the masks for `want` (global ids) at one epoch, as {global_id: (H,W)}.
 
-    `want` pairs each local id with the box it must belong to (or None to match on id
-    alone, for runs predating the `box` info field) -- a combined run can predict two
-    different boxes' same-numbered local sample, so the id alone cannot key this safely.
-
-    load_run() would decode every sample of every split and score them all -- ~126MB of
-    tensors and a full metric pass -- to serve the couple of dozen cells on screen. The
-    epoch scrubber only needs pixels, so this skips the metrics entirely and keeps only
-    the requested rows.
+    Rows are routed with registry.resolve, exactly as load_run does, so a scrubbed frame
+    and the latest frame can never disagree about which sample a row is. (Matching on
+    (local id, box) instead returned nothing for runs whose files carry `experiment` but
+    no `box` -- every scrubbed epoch drew as "not saved".) No metrics: the scrubber only
+    needs pixels.
     """
     outputs = runs_dir / name / config.OUTPUTS_SUBDIR
-    want_ids = {lid for lid, _ in want}
-    out: dict[tuple[int, object], np.ndarray] = {}
+    want_local = {g.split(":", 1)[1] for g in want}
+    run_exps = _config_experiments(runs_dir / name)
+    out: dict[str, np.ndarray] = {}
     for _, d in _split_dirs(outputs):
-        for p in d.glob(f"ep{epoch:04d}-*.pt"):
+        for p in sorted(d.glob(f"ep{epoch:04d}-*.pt"), key=_batch_of):   # last write wins
             try:
                 obj = torch.load(p, map_location="cpu", weights_only=False)
             except Exception:
                 continue
             sid = _info_dirs(obj["info"])
-            hit = [i for i, s in enumerate(sid) if s in want_ids]
+            hit = [i for i, s in enumerate(sid) if s in want_local]   # cheap prefilter
             if not hit:
                 continue
-            boxes = _as_box_list(obj["info"], len(sid))
-            m = obj["mask_pred"]
-            for i in hit:
-                s, box = str(sid[i]), boxes[i]
-                if (s, box) in want:
-                    out[(s, box)] = m[i].float().numpy()
+            info = obj["info"]
+            boxes = np.array(_as_box_list(info, len(sid)), dtype=object)[hit]
+            exps = [_as_exp_list(info, len(sid))[i] for i in hit]
+            gis = registry.resolve(sid[hit], boxes, exps, run_exps, p.stat().st_mtime)
+            for i, gi in zip(hit, gis):
+                g = None if gi is None else registry.global_id(gi, sid[i])
+                if g in want:
+                    out[g] = obj["mask_pred"][i].float().numpy()
     return out
 
 
@@ -897,9 +939,9 @@ def _loadable_at(path: Path, mtime: float, size: int) -> bool:
         return False
 
 
-def _loadable(path: Path) -> bool:
+def _loadable(path) -> bool:
     try:
-        st = path.stat()
+        st = os.stat(path)
     except OSError:
         return False
     return _loadable_at(path, st.st_mtime, st.st_size)
@@ -925,6 +967,9 @@ def load_run(name: str, runs_dir: Path, registry: "Registry", family: str = "unk
     """
     outputs = runs_dir / name / config.OUTPUTS_SUBDIR
     ids, masks, splits, boxes, exps, skipped = [], [], [], [], [], []
+    # Per-sample metrics + crosshair geometry, written by training (src6 OutputSaver) since
+    # 2026-10-08. None for a file that predates it; then the run is scored here instead.
+    saved, geoms = [], []
     want, epoch = epoch, 0
     _t0 = time.perf_counter()
     _n_files = 0   # see the [viz] load_run print at the end of this function
@@ -955,6 +1000,8 @@ def load_run(name: str, runs_dir: Path, registry: "Registry", family: str = "unk
                 splits += [split] * len(sid)
                 boxes += _as_box_list(obj["info"], len(sid))
                 exps += _as_exp_list(obj["info"], len(sid))
+                saved.append(obj.get("metrics"))
+                geoms += obj.get("geometry") or [None] * len(sid)
                 got = True
                 _n_files += 1
             if got:
@@ -983,6 +1030,7 @@ def load_run(name: str, runs_dir: Path, registry: "Registry", family: str = "unk
 
     sample_ids = np.concatenate(ids)
     preds = np.concatenate(masks).astype(np.float32)
+    rows = np.arange(len(sample_ids))   # original row of each kept row, filtered in lockstep below
     boxes_arr = np.array(boxes, dtype=object)
 
     # Route every row to the experiment its OWN box belongs to -- sample ids are local to
@@ -996,7 +1044,7 @@ def load_run(name: str, runs_dir: Path, registry: "Registry", family: str = "unk
     gi_arr = np.array([r for r in routed if r is not None], dtype=np.int64)
     missing = sorted({str(x) for x in sample_ids[~keep]})
     if not keep.all():
-        sample_ids, preds = sample_ids[keep], preds[keep]
+        sample_ids, preds, rows = sample_ids[keep], preds[keep], rows[keep]
         splits = [s for s, k in zip(splits, keep) if k]
 
     if len(sample_ids) == 0:
@@ -1020,8 +1068,8 @@ def load_run(name: str, runs_dir: Path, registry: "Registry", family: str = "unk
         # Later rows come from later batches, so reversing makes "first seen" the newest.
         _, first = np.unique(scene_ids[::-1], return_index=True)
         keep[len(sample_ids) - 1 - first] = True
-        sample_ids, preds, gi_arr, scene_ids = (
-            sample_ids[keep], preds[keep], gi_arr[keep], scene_ids[keep])
+        sample_ids, preds, gi_arr, scene_ids, rows = (
+            sample_ids[keep], preds[keep], gi_arr[keep], scene_ids[keep], rows[keep])
         splits = [s for s, k in zip(splits, keep) if k]
 
     # Score against ground truth AT THIS RUN'S GRID. Runs trained at different
@@ -1051,8 +1099,8 @@ def load_run(name: str, runs_dir: Path, registry: "Registry", family: str = "unk
         truth[m] = gt_masks[local_rows]
 
     if not ok.all():
-        sample_ids, preds, gi_arr, global_rows, truth = (
-            sample_ids[ok], preds[ok], gi_arr[ok], global_rows[ok], truth[ok])
+        sample_ids, preds, gi_arr, global_rows, truth, rows = (
+            sample_ids[ok], preds[ok], gi_arr[ok], global_rows[ok], truth[ok], rows[ok])
         splits = [s for s, k in zip(splits, ok) if k]
 
     if len(sample_ids) == 0:
@@ -1065,16 +1113,23 @@ def load_run(name: str, runs_dir: Path, registry: "Registry", family: str = "unk
     pred = torch.from_numpy(preds)
     truth_t = torch.from_numpy(truth)
 
-    # One call, not two: geometry=True returns the crosshair geometry from the SAME
-    # labelling/matching pass that produces the numbers, which halves the scoring cost of a
-    # run and makes it impossible for a drawn line to disagree with its metric.
-    loc, geom = localization(pred, truth_t, geometry=True)
-    metrics = {
-        'localization_rel': loc['localization_rel'].numpy(),
-        'localization_raw': loc['localization_raw'].numpy(),
-        'iou': soft_iou(pred, truth_t).numpy(),
-        'contour': contour_f(pred, truth_t).numpy(),
-    }
+    if all(m is not None and all(k in m for k in METRIC_KEYS) for m in saved):
+        # Scored by training: read, don't recompute (scoring was ~90% of a load). Every key
+        # every file shares is kept, so the extra ones (fill, miss, com_err, ...) reach /api/run.
+        keys = set.intersection(*(set(m) for m in saved))
+        metrics = {k: np.concatenate([m[k].numpy() for m in saved])[rows] for k in keys}
+        geom = [geoms[i] for i in rows]
+    else:
+        # One call, not two: geometry=True returns the crosshair geometry from the SAME
+        # labelling/matching pass that produces the numbers, which halves the scoring cost of a
+        # run and makes it impossible for a drawn line to disagree with its metric.
+        loc, geom = localization(pred, truth_t, geometry=True)
+        metrics = {
+            'localization_rel': loc['localization_rel'].numpy(),
+            'localization_raw': loc['localization_raw'].numpy(),
+            'iou': soft_iou(pred, truth_t).numpy(),
+            'contour': contour_f(pred, truth_t).numpy(),
+        }
     com_pred = center_of_mass(pred, epsilon=config.EPSILON).numpy()
 
     # Keyed by GLOBAL ROW, not sample id: every consumer (render._cached, /api/mask.png,
@@ -1123,7 +1178,7 @@ class Registry:
         self._index_experiments()
         self._scanned_at = 0.0
         self.rescan()
-        self._runs: dict[tuple[str, int | None], RunData] = {}
+        self._runs: dict[str, RunData] = {}
         self._load_lock = threading.Lock()
         n_ok = sum(e.compatible for e in self.entries)
         self.startup_s = time.perf_counter() - t0
@@ -1223,8 +1278,8 @@ class Registry:
             return   # launched on a single experiment
         have = {gt.experiment_dir.name for gt in self.gts}
         try:
-            new = sorted(p for p in self.experiment_dir.iterdir()
-                         if p.is_dir() and p.name not in have and (p / "samples").is_dir())
+            new = [p for p in config.subdirs(self.experiment_dir)
+                   if p.name not in have and (p / "samples").is_dir()]
         except OSError:
             return
         added = []
@@ -1267,7 +1322,7 @@ class Registry:
         this is just its first slice."""
         return [e.name for e in self.entries if e.compatible][:config.N_DEFAULT_RUNS]
 
-    def run(self, name: str, reload: bool = False, epoch: int | None = None) -> RunData:
+    def run(self, name: str, reload: bool = False) -> RunData:
         entry = self.by_name.get(name)
         if entry is None:
             # A run requested but not in the cached scan may have just appeared.
@@ -1275,7 +1330,7 @@ class Registry:
             entry = self.by_name.get(name)
         if entry is None or not entry.compatible:
             raise KeyError(name)
-        key = (name, epoch)
+        key = name
         if reload:
             self._runs.pop(key, None)
         if key in self._runs:
@@ -1291,27 +1346,19 @@ class Registry:
         with self._load_lock:
             if key in self._runs:
                 return self._runs[key]
-            return self._load(name, key, entry, epoch)
+            return self._load(name, key, entry)
 
-    def _load(self, name, key, entry, epoch) -> RunData:
+    def _load(self, name, key, entry) -> RunData:
         t0 = time.perf_counter()
-        rd = load_run(name, self.runs_dir, self, entry.family, epoch, entry.shape)
+        rd = load_run(name, self.runs_dir, self, entry.family, shape=entry.shape)
         rd.n_params = param_count(name, self.runs_dir)
         self._runs[key] = rd
         # See PERF_NOTES.md: this print is how "10s to add a run" gets diagnosed -- it
         # separates decode time (this call) from whatever the browser spends afterward.
-        print(f"[viz] loaded run {name!r} epoch={epoch} in {time.perf_counter() - t0:.2f}s "
+        print(f"[viz] loaded run {name!r} epoch={rd.epoch} in {time.perf_counter() - t0:.2f}s "
               f"| {len(rd.sample_ids)} samples | rss={_rss_mb():.0f}MB "
               f"| cache={len(self._runs) + 1} runs", flush=True)
-        # Each RunData is ~5MB, and scrubbing a 200-epoch run would otherwise pin a
-        # gigabyte. Latest-epoch entries (epoch=None) are what the table always needs
-        # AT THE TIME they're loaded, so keep scrubbed ones tighter-capped than the
-        # general LRU below.
-        scrubbed = [k for k in self._runs if k[1] is not None]
-        for old in scrubbed[:-config.MAX_EPOCH_CACHE]:
-            self._runs.pop(old, None)
-        # MAX_RUN_CACHE, not "keep every epoch=None entry forever": a run removed from the
-        # table client-side leaves no trace server-side, so without this every run anyone
+        # MAX_RUN_CACHE: a run removed from the table client-side leaves no trace server-side, so without this every run anyone
         # ever added over a session stayed fully decoded in memory for the rest of the
         # process -- the single largest source of unbounded RSS growth (see PERF_NOTES.md).
         while len(self._runs) > config.MAX_RUN_CACHE:

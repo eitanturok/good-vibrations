@@ -115,8 +115,27 @@ def _render_version() -> str:
     return f"{config.RENDER_VERSION}-{hashlib.sha1(names.encode()).hexdigest()[:8]}"
 
 
+def _json(obj) -> Response:
+    """JSON straight from json.dumps. FastAPI's default path runs jsonable_encoder over every
+    value first, which cost 5-18x the encode itself on the two big payloads below."""
+    body = obj if isinstance(obj, bytes) else json.dumps(obj, separators=(",", ":")).encode()
+    return Response(body, media_type="application/json")
+
+
+# The sample list depends only on the loaded experiments, which are appended to but never
+# changed, so it is encoded once per experiment count rather than on every page load.
+_samples_json: tuple[int, bytes] | None = None
+
+
 @app.get("/api/samples")
 def api_samples():
+    global _samples_json
+    if _samples_json is None or _samples_json[0] != len(registry.gts):
+        _samples_json = (len(registry.gts), json.dumps(_build_samples(), separators=(",", ":")).encode())
+    return _json(_samples_json[1])
+
+
+def _build_samples() -> dict:
     out = []
     for gi, gt in enumerate(registry.gts):
         for local, sid in enumerate(gt.sample_ids):
@@ -184,16 +203,16 @@ def api_samples():
 
 
 @app.get("/api/run/{name}")
-def api_run(name: str, reload: int = 0, epoch: int | None = None):
-    """Per-sample metrics for one run. `epoch` scores that saved epoch instead of the
-    latest, so the numbers and sorting match the masks on screen while scrubbing."""
+def api_run(name: str, reload: int = 0):
+    """Per-sample metrics for one run, at its latest epoch. The epoch scrubber only swaps
+    masks (/api/frames); re-scoring every sample per scrubbed epoch cost ~7s per run."""
     _t0 = time.perf_counter()
     # reload=1 re-reads the run's prediction files, picking up epochs written since it
     # was first loaded (a run still training keeps producing them).
     if reload:
         registry.rescan()
     try:
-        rd = registry.run(name, reload=bool(reload), epoch=epoch)
+        rd = registry.run(name, reload=bool(reload))
     except KeyError:
         raise HTTPException(404, "unknown or incompatible run")
     _t_loaded = time.perf_counter()
@@ -216,7 +235,7 @@ def api_run(name: str, reload: int = 0, epoch: int | None = None):
     # /api/run request itself.
     print(f"[viz] /api/run/{name}: registry.run()={_t_loaded - _t0:.2f}s, "
           f"json-build={time.perf_counter() - _t_loaded:.2f}s", flush=True)
-    return {"name": rd.name, "epoch": rd.epoch, "family": rd.family,
+    return _json({"name": rd.name, "epoch": rd.epoch, "family": rd.family,
             # The grid this run predicts at. The client sizes the column's canvas from it,
             # so a 16x16 run and a 30x30 run render correctly in the same table.
             "h": rd.shape[0], "w": rd.shape[1],
@@ -231,7 +250,7 @@ def api_run(name: str, reload: int = 0, epoch: int | None = None):
             # Every dataset this run ACTUALLY predicted, read off its loaded rows. The scan's
             # entry.datasets only probes a few files, so a combined run looked single-dataset.
             "datasets": sorted({registry.locate(r)[1].experiment_dir.name for r in rd.row_of}),
-            "samples": samples}
+            "samples": samples})
 
 
 # ***** mask images *****
@@ -399,12 +418,7 @@ def api_frames(run: str, sids: str, epochs: str = "latest"):
         raise HTTPException(400, "no sids or epochs")
     h, w = entry.shape
     out = np.full((len(eps), len(rows), h * w), np.nan, dtype=np.float16)
-    # .pt files key samples by LOCAL sample_id + box (box disambiguates ids that collide
-    # across the experiments of a combined run).
-    pairs = []
-    for r in rows:
-        _, gt, local = registry.locate(r)
-        pairs.append((gt.sample_ids[local], gt.meta[local].get("box")))
+    gids = [s.strip() for s in sids.split(",") if s.strip()]
     for ei, ep in enumerate(eps):
         if ep == "latest":
             rd = _run(run)
@@ -412,10 +426,10 @@ def api_frames(run: str, sids: str, epochs: str = "latest"):
                 if r in rd.row_of:
                     out[ei, i] = rd.masks[rd.row_of[r]].reshape(-1)
             continue
-        masks = data.load_epoch_masks(run, registry.runs_dir, int(ep), set(pairs))
-        for i, pair in enumerate(pairs):
-            if pair in masks:
-                out[ei, i] = masks[pair].reshape(-1)
+        masks = data.load_epoch_masks(run, registry.runs_dir, registry, int(ep), set(gids))
+        for i, g in enumerate(gids):
+            if g in masks:
+                out[ei, i] = masks[g].reshape(-1)
     # "latest" moves as a run trains, so only all-numbered responses are immutable.
     cache = {"Cache-Control": "no-store"} if "latest" in eps else IMMUTABLE
     return Response(out.tobytes(), media_type="application/octet-stream", headers=cache)
