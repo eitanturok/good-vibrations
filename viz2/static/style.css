@@ -206,9 +206,8 @@ h2 em { font-style:normal; color:var(--accent); font-family:var(--mono);
 .svm video { width:100%; max-width:280px; aspect-ratio:2/1; object-fit:contain; display:block;
              border-radius:3px; background:#000; }
 .svm video.missing { display:none; }
-/* Recovered small-multiples: same .fgrid-cur/.fgrid-rest skeleton as the mode grid, sized
-   for these 2:1 videos instead of square mode canvases -- 220px so 3 of .fgrid-rest's
-   pinned-probe tiles fit in a row beside .fgrid-cur (the current sample's own tile). */
+/* Recovered small-multiples: same single .fgrid-rest grid as the mode tiles, sized for
+   these 2:1 videos instead of square mode canvases. */
 #recgrid .fgrid-rest { grid-template-columns:repeat(auto-fill, 220px); }
 #recgrid .spbox { max-width:220px; }
 /* Recovered spectrogram player (setSpec): a still PNG of the recovered audio's
@@ -491,6 +490,9 @@ main { flex:1; display:grid; grid-template-columns:minmax(0,1fr) 6px var(--aside
       display:flex; align-items:center; justify-content:center; }
 .yl::before { content:''; }
 .yl { writing-mode:vertical-rl; transform:rotate(180deg); width:14px; }
+/* All-lasers view: the colorbar takes the gutter's outer edge (.cb left:0) so the
+   "laser" label can sit right against the image instead of out past the colorbar. */
+.plot.all .yl { left:46px; }
 
 /* Section 2's three plots share the window height so the whole section fits on one screen
    without scrolling: ~290px is the rest of the section (title, plot gutters, card
@@ -690,22 +692,20 @@ h2 em.soft { color:var(--ink3); font-weight:400; margin-left:auto; }
 
 /* ***** mode: field small-multiples *****
    One field per probe at a SHARED brightness scale, so panels are comparable. The current
-   sample gets its own fixed leftmost column (.fgrid-cur); every pinned probe wraps in its
-   own grid to the right (.fgrid-rest) -- a plain single grid would drop row 2 back under
-   the current-sample tile instead of continuing past it. */
+   sample is just the first tile of the same grid (.fgrid-rest) as every pinned probe. */
 .fgrid { display:flex; gap:14px; align-items:flex-start; flex:1; min-width:0; }
-.fgrid-cur { flex:none; }
 .fgrid-rest { display:grid; grid-template-columns:repeat(auto-fill, 108px); gap:8px 10px;
               align-content:start; flex:1; min-width:0; }
 .fghead { grid-column:1/-1; display:flex; align-items:center; gap:8px;
           font:11px var(--mono); color:var(--ink3); letter-spacing:.04em; }
 .fgrid figure { margin:0; transition:opacity .12s; }
-.fgrid-cur canvas { width:108px; height:108px; display:block; border-radius:3px; }
 .fgrid-rest canvas { width:108px; height:108px; display:block; border-radius:3px; }
 .fgrid figcaption { font:9.5px/1.4 var(--mono); margin-top:5px;
                     padding-left:6px; border-left:2px solid var(--ink); }
 .fgrid figcaption b { color:var(--ink); font-weight:600; }
 .fgrid figcaption i { display:block; font-style:normal; color:var(--ink3); white-space:nowrap; }
+.fgrid figcaption .fc1 { display:flex; justify-content:space-between; gap:6px; }
+.fgrid figcaption i { overflow:hidden; text-overflow:ellipsis; }
 .fgrid-rest:has(figure.hot) figure:not(.hot) { opacity:.28; }
 /* The 2-D key: hue across x (direction), lightness down y (amplitude). */
 .fkey { margin:0; position:relative; padding:0 0 12px 42px; }
@@ -817,7 +817,7 @@ h2 em.soft { color:var(--ink3); font-weight:400; margin-left:auto; }
    never covers data. Max on top, matching the ramp's own direction. */
 /* Laser numbers sit just inside the image edge, clear of the colorbar. */
 .plot.all .ov .ynum { fill:var(--ink3); transform:translateX(2px); text-anchor:start; }
-.cb { position:absolute; left:30px; top:0; bottom:0; width:30px; display:none;
+.cb { position:absolute; left:0; top:0; bottom:0; width:30px; display:none;
       flex-direction:column; align-items:center; justify-content:center; gap:3px;
       font:8px var(--mono); font-style:normal; color:var(--ink3); }
 .plot.all .cb { display:flex; }

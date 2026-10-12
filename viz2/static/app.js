@@ -105,8 +105,8 @@ const hz = (i) => (S.d ? S.d.freqs[i] : 0);
 const fmt = (f) => (f >= 100 ? f.toFixed(0) : f.toFixed(1));
 /* Colour means ONE thing everywhere in viz2: which saved probe.
      sample    -> one of 10 BASE colours, by the order you saved it: the 1st saved sample
-                  gets PALETTE[0], the 2nd PALETTE[1], ... -- so walking an object across
-                  the box and saving as you go reads as an order (blue -> ... -> indigo).
+                  gets PALETTE[0], the 2nd PALETTE[1], ... -- consecutive slots jump
+                  across the wheel, so samples saved one after another never look alike.
                   Every view of that sample uses it: its curves, mode tile, workbench card,
                   map outline, gallery ring, and its objects' outlines in the photos.
      frequency -> SHADE of that base (darker / lighter), for 2+ probes of one sample
@@ -116,11 +116,11 @@ const fmt = (f) => (f >= 100 ? f.toFixed(0) : f.toFixed(1));
    Slots: a new sample takes the slot after the newest one still saved (removing a probe
    leaves the others' colours alone; clearing them all starts over at the first); the 11th
    wraps to the first colour. */
-// hue-ordered around the wheel (blue -> cyan -> teal -> olive -> amber -> orange -> red ->
-// magenta -> purple -> indigo), each tuned to read on the light ground at a similar weight.
+// NOT hue-ordered: each entry is far around the wheel from the one before it (blue,
+// orange, teal, magenta, ...), each tuned to read on the light ground at a similar weight.
 // No pure green: that is --seg, the colour of an UNSAVED sample.
-const PALETTE = ['#2f6fd0', '#1a9bc2', '#13a08a', '#8a9a14', '#d19a00',
-                 '#e0701a', '#d43d3d', '#c4408e', '#8a4fc7', '#4646a6'];
+const PALETTE = ['#2f6fd0', '#e0701a', '#13a08a', '#c4408e', '#8a9a14',
+                 '#4646a6', '#d19a00', '#1a9bc2', '#d43d3d', '#8a4fc7'];
 const sampleKey = (p) => `${p.ds}|${p.sid}`;
 function slotFor(key) {
   if (S.slots[key] == null) {
@@ -967,7 +967,9 @@ function fieldGrid() {
   const box = $('#fgrid');
   if (!box) return;
   const lm = S.byId[S.live.sid];
-  const cap = (m, hzv) => `<b>${sampleLine(m)}</b><i>${curveLine(null, null, hzv)}</i>`;
+  // id + freq on one line (freq flush right), then layout, then box -- each on its own line
+  const cap = (m, hzv) => `<span class="fc1"><b>${sampleId(m)}</b><i>${curveLine(null, null, hzv)}</i></span>` +
+    `<i>${m.layout || '—'}</i><i>${m.box}</i>`;
   const cur = S.mode && lm ? { m: S.mode, c: css('--ink'), id: 0, t: cap(lm, hz(S.fi)) } : null;
   const rest = shownProbes().filter(fitsGrid)
     .map((p) => ({ m: p.mode, c: col(p), id: p.id, t: cap(p.meta, p.hzv) }));
@@ -980,14 +982,11 @@ function fieldGrid() {
   const sig = sets.map((s) => s.id).join(',') + '|' + sets.map((s) => s.t).join('|');
   if (box.dataset.sig !== sig) {          // rebuild only when the SET changes, not per frame
     box.dataset.sig = sig;
-    // .fgrid-rest lists in DOM order right after .fgrid-cur, so `figure canvas` below still
-    // walks in the same order as `sets` (current first, then the rest) despite the nesting.
+    // one grid, current sample first, so `figure canvas` below walks in `sets` order.
     const tile = (s) => `<figure data-id="${s.id}">` +
       `<canvas width="124" height="124"></canvas>` +
       `<figcaption style="border-left-color:${s.c}">${s.t}</figcaption></figure>`;
-    box.innerHTML =
-      (cur ? `<div class="fgrid-cur">${tile(cur)}</div>` : '') +
-      `<div class="fgrid-rest">${rest.map(tile).join('')}</div>`;
+    box.innerHTML = `<div class="fgrid-rest">${sets.map(tile).join('')}</div>`;
   }
   box.querySelectorAll('figure').forEach((f) =>
     f.classList.toggle('hot', !!S.hot && +f.dataset.id === S.hot.id));
@@ -1011,7 +1010,7 @@ function fieldGrid() {
   });
 }
 
-/* Recovered-audio small-multiples: same current+rest layout as the mode grid above. Each
+/* Recovered-audio small-multiples: same single grid as the mode tiles above. Each
    tile is a live spectrogram player (setSpec) of that sample's recovered audio at the
    tile's own laser/channel -- the live selection for the current sample, each probe's
    p.laser/p.ch for pinned ones -- so switching laser or channel re-renders them (~60ms). */
@@ -1040,9 +1039,7 @@ function recoveredGrid() {
       `<input class="vidseek" type="range" min="0" max="0" step="0.01" value="0">` +
       `<span class="vidtime">0.00s / 0.00s</span></div></div>` +
       `<figcaption style="border-left-color:${s.c}"></figcaption></figure>`;
-    box.innerHTML =
-      (cur ? `<div class="fgrid-cur">${tile(cur)}</div>` : '') +
-      `<div class="fgrid-rest">${rest.map(tile).join('')}</div>`;
+    box.innerHTML = `<div class="fgrid-rest">${sets.map(tile).join('')}</div>`;
     box.querySelectorAll('.vidwrap').forEach(wireVideoControls);
   }
   box.querySelectorAll('figure').forEach((f, i) => {
