@@ -1,10 +1,16 @@
+import sys
 from pathlib import Path
 
 import numpy as np
 import torch
+import wandb
 from PIL import Image, ImageDraw, ImageFont
 from composer import Callback
 from composer.core import Time, TimeUnit
+
+from arch import iou, n_objects_err, box_acc, com_err, mask_area
+sys.path.append(str(Path(__file__).resolve().parents[1]))  # repo root, for viz's scoring in utils/metrics.py
+from utils.metrics import localization, contour_f
 
 MAX_WANDB_IMAGES = 108  # hard limit: wandb drops anything past 108 images in one log_images call
 
@@ -45,10 +51,35 @@ class VisualizeSMask(Callback):
     def eval_after_forward(self, state, logger):
         if due(state, self.interval, train=False): self.log(state, logger)
 
+def sample_metrics(out, batch):
+    """every metric per sample, each (B,) and NaN where it doesn't apply: training's (arch.METRICS, which average over objects or
+    drop rows before logging), the confidence scores below, and viz's localization + contour (utils.metrics). Also the crosshair
+    geometry viz draws, from the same object matching as localization. None for rgb runs (no mask to score)."""
+    pred, true = out["mask_pred"].detach().float(), batch["mask_true"].float()
+    if pred.ndim != 3: return None, None
+    obj, n, area = batch["object"], batch["n_objects"], mask_area(true)
+    nan = torch.full_like(area, torch.nan)
+    real = torch.arange(out["com"].shape[1], device=n.device) < n[:, None]   # (B,K) real object slots
+    com = torch.full(real.shape, torch.nan, device=pred.device)
+    com[real] = com_err(out["com"], batch["coms"], n)                          # (n_real,) -> (B,K), NaN padding
+    m = dict(iou=iou(out, batch),
+             object_acc=(out["object_logits"].argmax(-1) == obj).float().where(obj < out["object_logits"].shape[-1], nan),  # unseen: NaN
+             n_objects_err=n_objects_err(out, batch),
+             box_acc=box_acc(out, batch),
+             com_err=com.nanmean(1),                                           # mean over the sample's objects
+             area_rel_err=((out["log_area"].expm1() - area).abs() / area).where(area > 0, nan))
+    m.update({k: v for k, v in scores(pred, true).items() if k not in ("iou", "obj_px", "bg_px")})  # iou: same as above; px: not per sample
+    loc, geom = localization(pred, true, geometry=True)
+    m.update(localization_rel=loc["localization_rel"], localization_raw=loc["localization_raw"], contour=contour_f(pred, true))
+    return {k: v.detach().float().cpu() for k, v in m.items()}, geom
+
+HEADS = ("object_logits", "n_objects_logits", "com", "log_area", "box_logits")  # the aux heads' raw outputs, saved per sample
+
 class OutputSaver(Callback):
-    """save each batch's predicted masks + sample ids to runs/<run>/outputs_history/<loader label>/ep{epoch:04d}-ba{batch:06d}.pt,
-    the files the viz dashboard reads"""
-    def __init__(self, interval="50ep"): self.interval = Time.from_input(interval, TimeUnit.EPOCH).value
+    """save each batch's predicted masks + aux head outputs (HEADS) + sample ids + per-sample metrics (sample_metrics) to
+    runs/<run>/outputs_history/<loader label>/ep{epoch:04d}-ba{batch:06d}.pt, the files the viz dashboard reads.
+    objects names object_logits' classes, so the predicted class is objects[object_logits.argmax(-1)]"""
+    def __init__(self, interval="50ep", objects=None): self.interval, self.objects = Time.from_input(interval, TimeUnit.EPOCH).value, objects
 
     def save(self, state, batch):
         b = state.batch
@@ -56,7 +87,10 @@ class OutputSaver(Callback):
                     position_id=b["position_id"].cpu(), speaker=b["speaker"].cpu(), experiment=list(b["experiment"]))
         path = Path(f"runs/{state.run_name}/outputs_history/{state.dataloader_label}/ep{state.timestamp.epoch.value:04d}-ba{batch:06d}.pt")
         path.parent.mkdir(parents=True, exist_ok=True)
-        torch.save(dict(mask_pred=state.outputs["mask_pred"].detach().float().cpu(), info=info), path)
+        metrics, geometry = sample_metrics(state.outputs, b)
+        heads = {k: state.outputs[k].detach().float().cpu() for k in HEADS}
+        torch.save(dict(mask_pred=state.outputs["mask_pred"].detach().float().cpu(), **heads, objects=self.objects,
+                        info=info, metrics=metrics, geometry=geometry), path)
 
     def after_forward(self, state, logger):
         if due(state, self.interval, train=True): self.save(state, state.timestamp.batch_in_epoch.value)
@@ -82,3 +116,46 @@ class PositionLogger(Callback):
 
     def after_forward(self, state, logger): self.log(state)
     def eval_after_forward(self, state, logger): self.log(state)
+
+def scores(pred, true):
+    """Per-sample scores (B,): peak probability overall, inside the true object, and in the background; fill (mean probability inside
+    the object); soft iou; and miss (no pixel over 0.5 on the object). Object scores are NaN on an empty box.
+    Pixel scores (every pixel): obj_px, the predictions inside the object, and bg_px, the background predictions over 0.01 (most of
+    the background is ~0, which would bury everything else). The median of all pixels is useless here: it's background, ~0 throughout."""
+    pred, area = pred.detach().float(), true.flatten(1).sum(1)
+    obj, bg = true > 0.5, true == 0
+    nan = lambda v: v.where(area > 0, torch.nan)
+    peak = lambda m: pred.masked_fill(~m, 0).flatten(1).amax(1)
+    return dict(peak=peak(torch.ones_like(obj)), peak_obj=nan(peak(obj)), peak_bg=peak(bg),
+                fill=nan((pred * true).flatten(1).sum(1) / area),
+                iou=nan(torch.minimum(pred, true).flatten(1).sum(1) / torch.maximum(pred, true).flatten(1).sum(1)),
+                miss=nan((((pred > 0.5) & obj).flatten(1).sum(1) == 0).float()),
+                obj_px=pred[obj], bg_px=pred[bg & (pred > 0.01)])
+
+def log_scores(state, logger, group, pred, true):
+    """each score's mean, its median and +-2 std band (as the 2.5/50/97.5% quantiles: scores live in [0,1], where mean +- 2 std
+    overshoots), and a wandb histogram"""
+    for k, v in scores(pred, true).items():
+        v = v[~v.isnan()]
+        v = v[::len(v) // 2**24 + 1]  # torch.quantile takes at most 2^24 values; strided, so the training rng is untouched
+        if not len(v): continue
+        q = torch.quantile(v, torch.tensor([0.025, 0.5, 0.975], device=v.device)).tolist()
+        logger.log_metrics({f"conf/{group}/{k}_mean": v.mean().item(), f"conf/{group}/{k}_p2.5": q[0], f"conf/{group}/{k}_p50": q[1], f"conf/{group}/{k}_p97.5": q[2]})
+        if wandb.run: wandb.log({f"conf/{group}/{k}_hist": wandb.Histogram(v.cpu().numpy())}, step=state.timestamp.batch.value)
+
+class ConfidenceLogger(Callback):
+    """scores (see above) per eval split, and per object on every `interval`-th train batch: evals are too sparse to catch the jump
+    (at ~2000 steps train fill goes 0.5 -> 1 within ~400 steps while eval fill drops)"""
+    def __init__(self, objects, interval=10): self.objects, self.interval, self.evals = [o or "empty" for o in objects], interval, []
+
+    def after_forward(self, state, logger):
+        if state.timestamp.batch.value % self.interval: return
+        pred, true, obj = state.outputs["mask_pred"], state.batch["mask_true"], state.batch["object"]
+        for i in obj.unique().tolist(): log_scores(state, logger, f"train-batch/{self.objects[i]}", pred[obj == i], true[obj == i])
+
+    def eval_after_forward(self, state, logger): self.evals.append((state.outputs["mask_pred"].detach(), state.batch["mask_true"]))
+
+    def eval_end(self, state, logger):  # composer fires this once per eval split
+        pred, true = zip(*self.evals)
+        log_scores(state, logger, state.dataloader_label, torch.cat(pred), torch.cat(true))
+        self.evals = []

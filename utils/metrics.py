@@ -152,17 +152,26 @@ def _label(x, iters=None):
     rings is comfortably inside this (scripts/bench_metrics.py). It is cheap to be
     generous: a round is one tiny max_pool2d with no sync, and with change #2 this only
     runs on the eval loaders."""
-    _, h, w = x.shape
+    b, h, w = x.shape
     if iters is None: iters = 2 * (h + w)
     # float throughout (ids <= H*W are exact in fp32); a .long()/.float() round trip per
-    # round cost more than the pool itself. On CPU there is no sync to avoid, so stop at the
-    # fixed point: ~diameter rounds instead of 2*(H+W) -- 30x faster scoring a run in viz.
+    # round cost more than the pool itself.
     xf = x.float()
     ids = torch.arange(1, h * w + 1, device=x.device, dtype=torch.float32).view(1, h, w) * xf
+    if x.device.type == "cpu":
+        # No sync to avoid on CPU, so each mask stops at ITS OWN fixed point: converged masks
+        # drop out, and the work is the sum of each mask's rounds rather than batch x the
+        # slowest mask's (one blob spanning a 64-wide grid held 6155 GT masks for 64 rounds).
+        live = torch.arange(b)
+        for _ in range(iters):
+            if not len(live): break
+            cur = ids[live]
+            nxt = F.max_pool2d(cur[:, None], 3, 1, 1)[:, 0] * xf[live]
+            ids[live] = nxt
+            live = live[(nxt != cur).flatten(1).any(1)]
+        return ids.long()
     for _ in range(iters):
-        nxt = F.max_pool2d(ids[:, None], 3, 1, 1)[:, 0] * xf
-        if x.device.type == "cpu" and torch.equal(nxt, ids): break
-        ids = nxt
+        ids = F.max_pool2d(ids[:, None], 3, 1, 1)[:, 0] * xf
     return ids.long()
 
 def _centroids_batch(ids):

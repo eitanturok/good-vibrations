@@ -139,6 +139,7 @@ LOSS_FN = {"bce": bce_loss, "mse": mse_loss, "dice": dice_loss, "bce-dice": bce_
 # aux losses
 def object_loss(logits, obj, unseen): return F.cross_entropy(logits, obj, ignore_index=unseen)  # objects never seen in train are ignored
 def n_objects_loss(logits, n_objects): return F.cross_entropy(logits, n_objects)
+def box_loss(logits, box): return F.cross_entropy(logits, box)
 def com_loss(pred, true, n_objects): return com_err(pred, true, n_objects).sum() / n_objects.sum().clamp_min(1)  # mean over real objects
 def area_loss(log_area, true): return F.l1_loss(log_area, mask_area(true).log1p())
 
@@ -147,10 +148,11 @@ def area_loss(log_area, true): return F.l1_loss(log_area, mask_area(true).log1p(
 def iou(out, batch): return torch.minimum(out["mask_pred"], batch["mask_true"]).flatten(1).sum(1) / torch.maximum(out["mask_pred"], batch["mask_true"]).flatten(1).sum(1).clamp_min(1e-6)  # soft, sum(min) / sum(max)
 def object_acc(out, batch): return (out["object_logits"].argmax(-1) == batch["object"])[batch["object"] < out["object_logits"].shape[-1]].float()  # unseen objects (no logit) are left out
 def n_objects_err(out, batch): return (out["n_objects_logits"].argmax(-1) - batch["n_objects"]).abs().float()  # counts are ordered: off by 2 is worse than off by 1
+def box_acc(out, batch): return (out["box_logits"].argmax(-1) == batch["box"]).float()
 def com_error(out, batch): return com_err(out["com"], batch["coms"], batch["n_objects"])  # as a fraction of the box
 def area_rel_err(out, batch): return ((out["log_area"].expm1() - mask_area(batch["mask_true"])).abs() / mask_area(batch["mask_true"]))[mask_area(batch["mask_true"]) > 0]
 
-METRICS = {"iou": iou, "object_acc": object_acc, "n_objects_err": n_objects_err, "com_err": com_error, "area_rel_err": area_rel_err}
+METRICS = {"iou": iou, "object_acc": object_acc, "n_objects_err": n_objects_err, "box_acc": box_acc, "com_err": com_error, "area_rel_err": area_rel_err}
 
 #*** 7 model
 
@@ -170,10 +172,11 @@ class Boombox(ComposerModel):
         self.n_objects_head = mlp(max_objects + 1) # how many objects, 0..max_objects
         self.com_head = mlp(2 * max_objects)       # (row,col) com of each object
         self.area_head = mlp(1)                    # log(1 + mask area)
+        self.box_head = mlp(len(data_info["boxes"])) # which box type
 
         # loss = mask loss + weighted aux losses (a weight of 0 means that head doesn't train)
         self.mask_loss = partial(bce_dice_loss, alpha=alpha) if loss_fn == "bce-dice" else LOSS_FN[loss_fn]
-        self.loss_weights = loss_weights or dict(object=0.1, n_objects=0.1, com=1.0, area=0.1)
+        self.loss_weights = loss_weights or dict(object=0.1, n_objects=0.1, com=1.0, area=0.1, box=0.1)
 
         # metrics, the same ones on train and test: tag each with its key so update_metric knows which one it was handed
         self.train_metrics = {key: MeanMetric() for key in METRICS}
@@ -191,6 +194,7 @@ class Boombox(ComposerModel):
             n_objects_logits=self.n_objects_head(emb),                # (B,d_model) -> (B,max_objects+1)
             com=self.com_head(emb).sigmoid().view(len(emb), -1, 2),   # (B,d_model) -> (B,max_objects,2) in [0,1]
             log_area=self.area_head(emb).squeeze(-1),                 # (B,d_model) -> (B,)
+            box_logits=self.box_head(emb),                            # (B,d_model) -> (B,n_boxes)
         )
 
     def loss(self, out, batch):
@@ -200,6 +204,7 @@ class Boombox(ComposerModel):
             n_objects=n_objects_loss(out["n_objects_logits"], batch["n_objects"]),
             com=com_loss(out["com"], batch["coms"], batch["n_objects"]),
             area=area_loss(out["log_area"], batch["mask_true"]),
+            box=box_loss(out["box_logits"], batch["box"]),
         )
         total = losses["mask"] + sum(weight * losses[key] for key, weight in self.loss_weights.items())
         return dict(total=total, **losses)  # composer backprops 'total' and logs every key

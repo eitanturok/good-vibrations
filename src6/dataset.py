@@ -47,8 +47,8 @@ def process_x(samples: dict[Path, dict], signal: str, norm: str, patch_size: int
 
 #*** 3 process y
 
-def process_y(samples: dict[Path, dict], objects: list[str], max_objects: int, out_h: int, out_w: int, rgb: bool) -> list[dict]:
-    """downsample mask image, map object to index, map coms to tensor"""
+def process_y(samples: dict[Path, dict], objects: list[str], boxes: list[str], max_objects: int, out_h: int, out_w: int, rgb: bool) -> list[dict]:
+    """downsample mask image, map object and box to index, map coms to tensor"""
     ys = []
     for d, meta in tqdm(samples.items(), desc="processing y"):
         # y: the mask (h,w) or overhead photo (h,w,3), downsampled. Float before BOX resampling, so edge cells keep partial coverage
@@ -61,7 +61,7 @@ def process_y(samples: dict[Path, dict], objects: list[str], max_objects: int, o
         # metadata stores each object's com as [[row, col]] in pixels
         H, W = meta["crop_overhead_shape"][:2]
         coms = [[c[0][0] / H, c[0][1] / W] for c in meta["coms"]]
-        ys.append(dict(y=y, object=obj, coms=np.array(coms + [[0.0, 0.0]] * (max_objects - len(coms)), dtype=np.float32)))
+        ys.append(dict(y=y, object=obj, box=boxes.index(meta["box"]), coms=np.array(coms + [[0.0, 0.0]] * (max_objects - len(coms)), dtype=np.float32)))
     return ys
 
 #*** 4 datasets
@@ -184,7 +184,7 @@ def print_splits(splits: dict, metas: list[dict], idxs: dict[str, list[int]]) ->
 def write_mds(mds_dir: Path, metas: list[dict], Xs, ys: list[dict]) -> None:
     """Xs, ys: each sample's processed input and targets, in the same order as metas; row i of the MDS is metas[i]"""
     shutil.rmtree(mds_dir, ignore_errors=True)
-    columns = {"X": "ndarray:float32", "y": "ndarray:float32", "object": "int", "coms": "ndarray:float32", "experiment": "str", "position_id": "int"}
+    columns = {"X": "ndarray:float32", "y": "ndarray:float32", "object": "int", "box": "int", "coms": "ndarray:float32", "experiment": "str", "position_id": "int"}
     with MDSWriter(out=str(mds_dir), columns=columns, size_limit="200MB") as w:
         for meta, X, y in zip(metas, Xs, ys):
             w.write({"X": X, **y, "experiment": meta["experiment"], "position_id": int(meta["position_id"])})
@@ -198,7 +198,8 @@ def get_data_info(samples: dict[Path, dict], train_idxs: list[int]) -> dict:
     _, n_freqs, n_channels = load_fft(next(iter(samples))).shape  # (L,F,C); n_freqs = real bins, before tokenize pads to whole patches
     return dict(n_laser_rows=metas[0]["n_rows"], n_laser_cols=metas[0]["n_cols"], n_freqs=n_freqs, n_channels=n_channels,
                 objects=sorted({"+".join(sorted(metas[i]["objects"])) for i in train_idxs}) + ["unseen"],  # object combos seen in train, + "unseen" for any other
-                n_objects=sorted({meta["n_objects"] for meta in metas}))                     # every object count in the data, train and eval
+                n_objects=sorted({meta["n_objects"] for meta in metas}),                     # every object count in the data, train and eval
+                boxes=sorted({meta["box"] for meta in metas}))                               # every box type in the data, train and eval
 
 #*** 8 dataloader
 
@@ -216,7 +217,7 @@ class VibrationDataset(StreamingDataset):
         assert key(meta) not in self.banned, f"served banned position {key(meta)}"
 
         return dict(fft=torch.from_numpy(row["X"].copy()), mask_true=torch.from_numpy(row["y"].copy()),
-                    object=row["object"], coms=torch.from_numpy(row["coms"].copy()),
+                    object=row["object"], box=row["box"], coms=torch.from_numpy(row["coms"].copy()),
                     experiment=meta["experiment"], position_id=meta["position_id"], speaker=meta["speaker"],
                     sample_id=meta["sample_id"], n_objects=meta["n_objects"], layout=meta["layout"],
                     crop_h=meta["crop_overhead_shape"][0], crop_w=meta["crop_overhead_shape"][1])  # full-res box size, so viz can draw the real aspect
@@ -243,9 +244,9 @@ def build_dataset(dataset: str = "gastronorm_plastic", test_size: float = 0.2, s
     # process inputs: compute fft magnitude, normalize fft, tokenize
     Xs = process_x(samples, signal, norm, patch_size)
 
-    # process outputs: downsample mask, map object to index, map coms to tensor
+    # process outputs: downsample mask, map object and box to index, map coms to tensor
     data_info = get_data_info(samples, idxs["train"])
-    ys = process_y(samples, data_info["objects"], max(data_info["n_objects"]), out_h, out_w, rgb)
+    ys = process_y(samples, data_info["objects"], data_info["boxes"], max(data_info["n_objects"]), out_h, out_w, rgb)
 
     # save as MDS for fast training + delete when done
     (EXPERIMENTS / "mds").mkdir(exist_ok=True)

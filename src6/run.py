@@ -25,7 +25,7 @@ from composer.utils.reproducibility import seed_all
 
 from dataset import DATASETS, build_dataset
 from arch import Boombox
-from callbacks import VisualizeSMask, OutputSaver, PositionLogger
+from callbacks import VisualizeSMask, OutputSaver, PositionLogger, ConfidenceLogger
 from composer.optim import ConstantScheduler, CosineAnnealingScheduler, CosineAnnealingWithWarmupScheduler, LinearWithWarmupScheduler
 
 
@@ -98,6 +98,7 @@ def get_parser():
     parser.add_argument("--n-objects-weight",           type=float, default=0.1, help="Loss weight of the object-count head; 0 = off.")
     parser.add_argument("--com-weight",                 type=float, default=1.0, help="Loss weight of the per-object com head; 0 = off.")
     parser.add_argument("--area-weight",                type=float, default=0.1, help="Loss weight of the mask-area head; 0 = off.")
+    parser.add_argument("--box-weight",                 type=float, default=0.1, help="Loss weight of the box-type head; 0 = off.")
 
     return parser
 
@@ -132,7 +133,7 @@ def run(**kwargs):
     # build model
     assert args.patch_size is None, "Boombox convolves the raw spectrum: use --patch-size none"
     model = Boombox(args.d_model, data_info, args.out_h, args.out_w, rgb=bool(args.rgb), loss_fn=args.loss_fn, alpha=args.alpha,
-                    loss_weights=dict(object=args.object_weight, n_objects=args.n_objects_weight, com=args.com_weight, area=args.area_weight))
+                    loss_weights=dict(object=args.object_weight, n_objects=args.n_objects_weight, com=args.com_weight, area=args.area_weight, box=args.box_weight))
     print(f"{sum(p.numel() for p in model.parameters()):,} parameters")
 
     # loggers
@@ -148,7 +149,7 @@ def run(**kwargs):
         LRMonitor(), SpeedMonitor(), RuntimeEstimator(skip_batches=64, time_unit="minutes"), NaNMonitor(),
         OptimizerMonitor(log_optimizer_metrics=True, batch_log_interval=10),               # grad + weight norms
         OOMObserver(folder="runs/{run_name}/torch_traces", remote_file_name=None, overwrite=True),  # memory traces if a run OOMs
-        VisualizeSMask(args.eval_interval), OutputSaver(args.eval_interval), PositionLogger(),
+        VisualizeSMask(args.eval_interval), OutputSaver(args.eval_interval, data_info["objects"]), PositionLogger(), ConfidenceLogger(data_info["objects"]),
     ]
 
     # optimizer + lr schedule
