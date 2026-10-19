@@ -89,7 +89,7 @@ class OutputSaver(Callback):
         path.parent.mkdir(parents=True, exist_ok=True)
         metrics, geometry = sample_metrics(state.outputs, b)
         heads = {k: state.outputs[k].detach().float().cpu() for k in HEADS}
-        torch.save(dict(mask_pred=state.outputs["mask_pred"].detach().float().cpu(), **heads, objects=self.objects,
+        torch.save(dict(mask_pred=state.outputs["mask_pred"].detach().half().cpu(), **heads, objects=self.objects,
                         info=info, metrics=metrics, geometry=geometry), path)
 
     def after_forward(self, state, logger):
@@ -159,3 +159,35 @@ class ConfidenceLogger(Callback):
         pred, true = zip(*self.evals)
         log_scores(state, logger, state.dataloader_label, torch.cat(pred), torch.cat(true))
         self.evals = []
+
+def nanmean(vs): return {k: torch.tensor([v[k] for v in vs]).nanmean().item() for k in vs[0] if k != "n"} | {"n": sum(v["n"] for v in vs)}
+
+class EvalSummary(Callback):
+    """per box with CATEGORIES (dataset.py): each category's mean over its eval splits, id, ood (mean over the categories not in
+    not_ood) and DELTAS, logged as metrics/eval/<box>/{id,ood,cat/<category>,delta/<name>}/<metric>, next to composer's
+    metrics/eval/<box>/<split>/<metric>. A split counts once, as its mean over samples (what composer logs), so big splits don't
+    drown small ones; n = samples behind each number. train is never averaged."""
+    def __init__(self, categories, deltas, not_ood): self.categories, self.deltas, self.not_ood, self.splits = categories, deltas, not_ood, {}
+
+    def eval_end(self, state, logger):  # composer fires this once per eval split
+        label, metrics = state.dataloader_label, state.eval_metrics[state.dataloader_label]
+        if label.startswith("eval/"): self.splits[label] = {k: m.compute().item() for k, m in metrics.items()} | {"n": int(metrics["iou"].weight.item())}
+
+    def summarize(self, logger):
+        splits, self.splits = self.splits, {}
+        for box, cats in self.categories.items():
+            have = {l.split("/", 2)[2]: v for l, v in splits.items() if l.split("/")[1] == box}  # eval/<box>/<split>
+            if not have: continue
+            listed = [s for ss in cats.values() for s in ss]
+            assert len(listed) == len(set(listed)), f"{box}: a split is in two categories"
+            assert not set(have) - set(listed), f"{box}: eval splits in no category: {sorted(set(have) - set(listed))}"
+            mean = lambda names: nanmean([have[s] for s in names if s in have]) if any(s in have for s in names) else None
+            out = {f"cat/{c}": m for c, ss in cats.items() if (m := mean(ss))}
+            if "cat/id" in out: out["id"] = out["cat/id"]
+            if ood := [m for c, m in out.items() if c.split("/")[-1] not in self.not_ood and c.startswith("cat/")]: out["ood"] = nanmean(ood)
+            for name, (a, b) in self.deltas.get(box, {}).items():
+                if (ma := mean(a)) and (mb := mean(b)): out[f"delta/{name}"] = {k: ma[k] - mb[k] for k in ma if k != "n"}
+            logger.log_metrics({f"metrics/eval/{box}/{g}/{k}": v for g, m in out.items() for k, v in m.items()})
+
+    def eval_after_all(self, state, logger): self.summarize(logger)       # evals during fit
+    def eval_standalone_end(self, state, logger): self.summarize(logger)  # trainer.eval before/after training

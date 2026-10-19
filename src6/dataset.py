@@ -50,7 +50,12 @@ def process_x(samples: dict[Path, dict], signal: str, norm: str, patch_size: int
 def process_y(samples: dict[Path, dict], objects: list[str], boxes: list[str], max_objects: int, out_h: int, out_w: int, rgb: bool) -> list[dict]:
     """downsample mask image, map object and box to index, map coms to tensor"""
     ys = []
+    # a with-lid sample takes its targets from the same spot (and speaker) without the lid: its own photo shows the lid, not the object
+    where = {(meta["experiment"], meta["position_id"], meta["speaker"]): d for d, meta in samples.items()}
     for d, meta in tqdm(samples.items(), desc="processing y"):
+        if "without_lid_position_id" in meta:
+            d = where[meta["experiment"], meta["without_lid_position_id"], meta["speaker"]]
+            meta = samples[d]
         # y: the mask (h,w) or overhead photo (h,w,3), downsampled. Float before BOX resampling, so edge cells keep partial coverage
         img = Image.open(d / ("image/02_cropped_overhead.png" if rgb else "image/03_smask.png")).convert("RGB" if rgb else "F")
         y = np.clip(np.asarray(img.resize((out_w, out_h), Image.BOX), dtype=np.float32) / 255.0, 0.0, 1.0)
@@ -71,7 +76,7 @@ def split(layouts, eval_frac, speakers=None, keep=lambda position_id: True):  # 
 
 # speakers=None trains and evals on every speaker and holds none out: the unseen-speaker splits go, and their
 # positions become one more held-out-positions split, so every other split keeps the same eval positions
-def gastronorm(test_size=0.2, speakers=(1, 3, 7)) -> dict[str, dict]:
+def gastronorm(test_size=0.2, speakers=(1, 3, 5, 7)) -> dict[str, dict]:
     # 35 gastro cube positions held out of gastro/cube, to compare an unseen speaker (4) with the trained ones at the same positions
     UNSEEN_SPK = {8, 17, 18, 20, 21, 27, 49, 52, 54, 57, 62, 76, 84, 86, 106, 118, 119, 120, 122, 127,
                   133, 143, 148, 150, 180, 182, 185, 193, 204, 224, 226, 239, 245, 269, 291}
@@ -85,7 +90,8 @@ def gastronorm(test_size=0.2, speakers=(1, 3, 7)) -> dict[str, dict]:
         "soap-dispenser":               split(["soap-dispenser-grid-1", "soap-dispenser-grid-2", "soap-dispenser-grid-3"], test_size, speakers),
         "cube-vase":                    split(["cube-vase"], test_size, speakers),
         "two-cubes":                    split(["two-cubes-grid-1", "two-cubes-grid-2"], test_size, speakers),
-        "cube-lid":                     split(["red-cube-lid"], 1.0, speakers),
+        "cube-with-lid":                split(["red-cube-with-lid"], 1.0, speakers),     # told apart by spectrum (the lid's photos still show the cube)
+        "cube-without-lid":             split(["red-cube-without-lid"], 1.0, speakers),
         "cylinder-1000g":               split(["cylinder-1000g"], 1.0, speakers),
         "cylinder-500g":                split(["cylinder-500g"], 1.0, speakers),
         "cylinder-100g":                split(["cylinder-100g"], 1.0, speakers),
@@ -97,7 +103,7 @@ def gastronorm(test_size=0.2, speakers=(1, 3, 7)) -> dict[str, dict]:
         gastro["cube-35pos"] = split(["red-cube-grid1", "red-cube-grid2", "red-cube-grid3_test"], test_size, None, keep=lambda p: p in UNSEEN_SPK)
     return {f"gastro/{k}": dict(v, experiment="2026_09_27_gastronorm_four_objs") for k, v in gastro.items()}
 
-def plastic(test_size=0.2, speakers=(1, 3, 7)) -> dict[str, dict]:
+def plastic(test_size=0.2, speakers=(1, 3, 5, 7)) -> dict[str, dict]:
     plastic = {
         "empty-box":                      split(["empty-box-grid-1", "empty-box-2", "empty-box-3", "empty-box-4", "empty-box-5"], 0.0, speakers),
         "soap-dispenser":                 split([f"soap-dispenser-grid-{i}" for i in range(1, 6)], test_size, speakers),
@@ -109,7 +115,8 @@ def plastic(test_size=0.2, speakers=(1, 3, 7)) -> dict[str, dict]:
         "cube-vase":                      split(["cube-vase"], test_size, speakers),
         "cube-unseen-speaker-baseline":   split(["cube-5-speakers"], 1.0, speakers),
         "cube-unseen-speaker-unseen":     split(["cube-5-speakers"], 1.0, (4,)),
-        "cube-lid":                       split(["red-cube-lid"], 1.0, speakers),
+        "cube-with-lid":                  split(["red-cube-with-lid"], 1.0, speakers),     # same 8 spots as cube-without-lid; the lid hides the cube from the overhead camera
+        "cube-without-lid":               split(["red-cube-without-lid"], 1.0, speakers),
         "portable-charger":               split(["portable-charger"], 1.0, speakers),
         "cylinder-200g":                  split(["cylinder-200g"], 1.0, speakers),
         "soap-dispenser-sideways":        split(["soap-dispenser-sideways"], 1.0, speakers),
@@ -125,9 +132,103 @@ def plastic(test_size=0.2, speakers=(1, 3, 7)) -> dict[str, dict]:
         plastic["cube-5-speakers"] = split(["cube-5-speakers"], test_size, None)
     return {f"plastic/{k}": dict(v, experiment="2026_10_05_green_plastic_four_objs") for k, v in plastic.items()}
 
-def gastronorm_plastic(test_size=0.2, speakers=(1, 3, 7)) -> dict[str, dict]: return gastronorm(test_size, speakers) | plastic(test_size, speakers)
+def cardboard(test_size=0.2, speakers=(1, 3, 5, 7)) -> dict[str, dict]:
+    cardboard = {
+        "empty-box":                    split(["empty-box-3", "empty-box-4", "empty-box-5", "empty-box-6", "empty-box-grid-1", "empty-box-grid-2"], 0.0, speakers),
+        "biscoff":                      split(["biscoff"], 1.0, speakers),
+        "candle":                       split(["candle-grid-1", "candle-grid-2", "candle-grid-3"], test_size, speakers),
+        "vase":                         split(["vase-grid-1", "vase-grid-2", "vase-grid-3"], test_size, speakers),
+        "vase-laser-shifted-2":         split(["vase-laser-shifted-2"], 1.0, speakers),
+        "vase-laser-shifted-3":         split(["vase-laser-shifted-3"], 1.0, speakers),
+        "vase-laser-shifted-4":         split(["vase-laser-shifted-4", "empty-laser-shifted-4"], 1.0, speakers),
+        "vase-with-lid":                split(["vase-with-lid"], 1.0, speakers),     # same 9 spots as vase-without-lid; the lid hides the vase from the overhead camera
+        "vase-without-lid":             split(["vase-without-lid"], 1.0, speakers),
+        "vase-unseen-speaker-baseline": split(["vase-unseeen-speaker4"], 1.0, speakers),
+        "vase-unseen-speaker-unseen":   split(["vase-unseeen-speaker4"], 1.0, (4,)),
+        "cube-vase":                    split(["cube-vase"], test_size, speakers),
+        "soap-dispenser-rotated":       split(["soap-dispenser-rotated", "soap-dispenser-rotated-2", "soap-dispenser-sideways"], test_size, speakers),
+        "coffee-pot":                   split(["coffee-pot"], 1.0, speakers),
+        "cube-rotated":                 split(["cube-different-rotations"], test_size, speakers),
+        "cube":                         split(["cube-grid-1", "cube-grid-2", "cube-random_poses", "cube-random-pos2"], test_size, speakers),
+        "cylinder-1000g":               split(["cylinder-1000g", "cylinder-1000g-grid-1"], test_size, speakers),
+        "cylinder-500g":                split(["cylinder-500g-grid-1", "cylinder-500g-grid-2", "cylinder-500g-grid-2."], test_size, speakers),
+        "cylinder-100g":                split(["cylinder-100g-grid-1"], test_size, speakers),
+        "cylinder-200g":                split(["cylinder-200g-grid-1", "cylinder-200g-grid-2"], test_size, speakers),
+        "glass-cup":                    split(["glass-cup"], test_size, speakers),
+        "glass-cup-broken":             split(["glass-cup-broken"], test_size, speakers),
+        "portable-charger":             split(["portable-charger"], 1.0, speakers),
+        "portable-charger-sideways":    split(["portable-charger-sideways"], 1.0, speakers),
+        "soap-dispenser":               split(["soap-dispenser-grid-1", "soap-dispenser-grid-2", "soap-dispenser-grid-3"], test_size, speakers),
+        "tomato-sauce":                 split(["tomato-sauce"], 1.0, speakers),
+        "two-cubes":                    split(["two-cubes"], test_size, speakers),
+    }
+    if speakers is None:
+        del cardboard["vase-unseen-speaker-baseline"], cardboard["vase-unseen-speaker-unseen"]
+        cardboard["vase-5-speakers"] = split(["vase-unseeen-speaker4"], test_size, None)
+    return {f"cardboard/{k}": dict(v, experiment="2026_10_11_cardboard_four_objs") for k, v in cardboard.items()}
 
-DATASETS = {"gastronorm": gastronorm, "plastic": plastic, "gastronorm_plastic": gastronorm_plastic}
+def gastronorm_plastic(test_size=0.2, speakers=(1, 3, 5, 7)) -> dict[str, dict]: return gastronorm(test_size, speakers) | plastic(test_size, speakers)
+def gastronorm_plastic_cardboard(test_size=0.2, speakers=(1, 3, 5, 7)) -> dict[str, dict]: return gastronorm_plastic(test_size, speakers) | cardboard(test_size, speakers)
+
+# eval splits grouped into categories, per box: every eval split of a box is in exactly one category (the eval
+# callback asserts it). control splits are only there as the reference of a delta, so neither id nor ood averages them
+CATEGORIES = {
+    "gastro": {
+        "id":                    ["candle", "cube", "soap-dispenser", "vase", "cube-35pos"],
+        "cylinder":              ["cylinder-1000g", "cylinder-500g", "cylinder-100g"],
+        "multiple":              ["two-cubes", "cube-vase"],
+        "rotated":               ["soap-dispenser-sideways"],
+        "lid":                   ["cube-with-lid"],
+        "unseen-object":         ["coffee-pot"],
+        "unseen-speaker":        ["cube-unseen-speaker-unseen"],
+        "control":               ["cube-without-lid", "cube-unseen-speaker-baseline"],
+    },
+    "plastic": {
+        "id":                    ["candle", "cube", "soap-dispenser", "vase", "cube-5-speakers"],
+        "cylinder":              ["cylinder-1000g", "cylinder-500g", "cylinder-200g", "cylinder-100g"],
+        "multiple":              ["two-cubes", "cube-vase"],
+        "rotated":               ["soap-dispenser-sideways"],
+        "lid":                   ["cube-with-lid"],
+        "unseen-object":         ["coffee-pot", "portable-charger"],
+        "unseen-speaker":        ["cube-unseen-speaker-unseen"],
+        "unseen-laser":          ["cube-shifted-lasers-1", "cube-shifted-lasers-2", "cube-shifted-lasers-3-backside"],
+        "control":               ["cube-without-lid", "cube-unseen-speaker-baseline"],
+    },
+    "cardboard": {
+        "id":                    ["candle", "cube", "soap-dispenser", "vase", "vase-5-speakers"],
+        "cylinder":              ["cylinder-1000g", "cylinder-500g", "cylinder-200g", "cylinder-100g"],
+        "multiple":              ["two-cubes", "cube-vase"],
+        "rotated":               ["soap-dispenser-rotated", "cube-rotated"],
+        "lid":                   ["vase-with-lid"],
+        "broken":                ["glass-cup-broken"],
+        "unseen-object":         ["biscoff", "tomato-sauce", "coffee-pot", "portable-charger"],
+        "unseen-rotated-object": ["portable-charger-sideways"],
+        "unseen-speaker":        ["vase-unseen-speaker-unseen"],
+        "unseen-laser":          ["vase-laser-shifted-2", "vase-laser-shifted-3", "vase-laser-shifted-4"],
+        "control":               ["vase-without-lid", "glass-cup", "vase-unseen-speaker-baseline"],
+    },
+}
+NOT_OOD = ("id", "control")  # ood = mean over every other category
+# delta = mean of the first splits' means - mean of the second's: the same positions (or object) with and without the change
+DELTAS = {
+    "gastro": {
+        "lid":     (["cube-with-lid"], ["cube-without-lid"]),
+        "speaker": (["cube-unseen-speaker-unseen"], ["cube-unseen-speaker-baseline"]),
+    },
+    "plastic": {
+        "lid":     (["cube-with-lid"], ["cube-without-lid"]),
+        "speaker": (["cube-unseen-speaker-unseen"], ["cube-unseen-speaker-baseline"]),
+        "laser":   (["cube-shifted-lasers-1", "cube-shifted-lasers-2", "cube-shifted-lasers-3-backside"], ["cube"]),
+    },
+    "cardboard": {
+        "lid":     (["vase-with-lid"], ["vase-without-lid"]),
+        "broken":  (["glass-cup-broken"], ["glass-cup"]),
+        "speaker": (["vase-unseen-speaker-unseen"], ["vase-unseen-speaker-baseline"]),
+        "laser":   (["vase-laser-shifted-2", "vase-laser-shifted-3", "vase-laser-shifted-4"], ["vase"]),
+    },
+}
+
+DATASETS = {"gastronorm": gastronorm, "plastic": plastic, "cardboard": cardboard, "gastronorm_plastic": gastronorm_plastic, "gastronorm_plastic_cardboard": gastronorm_plastic_cardboard}
 
 # positions are numbered per capture, so a position is (experiment, position_id)
 def key(meta: dict) -> tuple[str, int]: return meta["experiment"], meta["position_id"]
@@ -172,10 +273,12 @@ def print_splits(splits: dict, metas: list[dict], idxs: dict[str, list[int]]) ->
         for name, split in splits.items():
             if split["experiment"] != exp: continue
             n, n_eval = n_pos(rows(split, metas)), n_pos(idxs.get(f"eval/{name}", []))
-            table.append([len(table), name, n, n - n_eval, n_eval, round(100 * split["eval_frac"]), split["speakers"] or "all", wrap(split["layouts"])])
+            table.append([name.split("/", 1)[-1], n, n - n_eval, n_eval, round(100 * split["eval_frac"]), split["speakers"] or "all", wrap(split["layouts"])])  # drop the box prefix
+        table = [[k, *row] for k, row in enumerate(sorted(table, key=lambda row: -row[1]))]  # biggest split first
         table.append(total("total", lambda i: metas[i]["experiment"] == exp))
         print(f"\n{exp}\n" + tabulate(table, headers, tablefmt="simple_grid"))
-    table = [[k, *total(exp, lambda i, exp=exp: metas[i]["experiment"] == exp)[1:]] for k, exp in enumerate(exps)]
+    table = sorted((total(exp, lambda i, exp=exp: metas[i]["experiment"] == exp)[1:] for exp in exps), key=lambda row: -row[1])
+    table = [[k, *row] for k, row in enumerate(table)]
     table += [total("total", lambda i: True)]
     print("\nall experiments\n" + tabulate(table, ["#", "experiment", *headers[2:-1]], tablefmt="simple_grid"))
 
@@ -224,7 +327,7 @@ class VibrationDataset(StreamingDataset):
 
 #*** 9 build dataset
 
-def build_dataset(dataset: str = "gastronorm_plastic", test_size: float = 0.2, speakers=(1, 3, 7),
+def build_dataset(dataset: str = "gastronorm_plastic", test_size: float = 0.2, speakers=(1, 3, 5, 7),
                   signal: str = "magnitude", norm: str = "std", patch_size: int | None = None,
                   out_h: int = 64, out_w: int = 64, rgb: bool = False,
                   batch_size: int = 128, eval_batch_size: int = 108, num_workers: int = 4):

@@ -74,7 +74,7 @@
     <h2><b>02</b> Signals <em id="heatread" class="soft"></em></h2>
     <p class="ptitle" id="sigtitle"></p>
     <div class="legend" id="siglegend"></div>
-    <div class="stepbody">
+    <div class="stepbody sigbody">
       <div class="rail-l">
         <span class="cl">channel</span>
         <div class="seg chsel" id="ch">
@@ -82,7 +82,7 @@
           <button data-v="avg" class="on">avg</button><button data-v="both">both</button>
         </div>
         <span class="cl">laser <em id="lasernow"></em></span>
-        <svg id="grid" tabindex="0"></svg>
+        <svg id="grid" class="lgrid" tabindex="0"></svg>
         <span class="cl">spectrum</span>
         <div class="seg chsel" id="specmode">
           <button data-v="magphase" class="on">mag+φ</button><button data-v="reim">re+im</button>
@@ -93,7 +93,7 @@
         </div>
         <span class="cl">scale</span>
         <div class="seg chsel" id="speclog">
-          <button data-v="0">lin</button><button data-v="1" class="on">log</button>
+          <button data-v="0" class="on">lin</button><button data-v="1">log</button>
         </div>
         <span class="cl">shifts</span>
         <div class="seg chsel" id="kind">
@@ -102,7 +102,6 @@
         <span class="cl">peaks <em id="npk"></em></span>
         <div class="pklist" id="pklist"></div>
       </div>
-      <div class="vkey spacer"></div>
       <div class="lf">
         <button id="sigreset" class="zreset" title="reset zoom (or double-click a plot)">⤢ reset zoom</button>
         <div class="plot h110 gut"><i class="yl" id="y3"></i><img class="hm" id="h3" alt="">
@@ -116,7 +115,7 @@
   </section>
 
   <!-- 4 . the mode -->
-  <section class="card step">
+  <section class="card step stepmodes">
     <h2><b>03</b> Modes</h2>
     <p class="ptitle" id="modetitle"></p>
     <div class="stepbody">
@@ -126,18 +125,21 @@
         <input id="frame" type="range" min="0" max="59" step="1" value="0">
         <span class="cl">view</span>
         <div class="seg chsel" id="modeview">
-          <button data-v="quiver" class="on">quiver</button><button data-v="surface">surface</button>
+          <button data-v="quiver" class="on">quiver</button><button data-v="surface">surface</button><button data-v="stretch" title="the box's side photo, stretched by the measured slope">stretch</button><button data-v="inout" title="the box's side photo, the wall moving toward and away from you">in-out</button>
         </div>
         <span class="cl"><span id="asizelab">arrow size</span> <em id="asizenow"></em></span>
         <input id="asize" type="range" min="0.3" max="3" step="0.1" value="1">
         <span class="cl bgctl">background</span>
         <label class="chk bgctl"><input type="checkbox" id="fieldbg"> color</label>
+        <!-- phase reference for steps 2 AND 3: every laser rotated, bin by bin, so the
+             reference reads phase 0 -- z' = z·conj(z_ref)/|z_ref| (data.norm) -->
+        <span class="cl" title="rotate every laser's phase so the reference's phase is 0 at each bin: z' = z·conj(z_ref)/|z_ref|. Magnitudes unchanged. Applies to the spectra above too.">normalize φ <em id="refnow"></em></span>
+        <svg id="refgrid" class="lgrid"></svg>
         <div id="modekey" hidden>
           <canvas id="fkey2d" width="88" height="88"></canvas>
           <em>hue = direction<br>bright = amplitude</em>
         </div>
       </div>
-      <div class="vkey spacer"></div>
       <div class="lf">
       <div class="legend modelegend" id="modelegend"></div>
       <div class="modesplit">
@@ -167,7 +169,6 @@
       <!-- no controls here yet -- an empty rail, kept the same width as steps 2 and 3, so
            this section's content starts at the same x as their plots. -->
       <div class="rail-l"></div>
-      <div class="vkey spacer"></div>
       <div class="lf">
         <div class="vidsplit">
           <div class="vidsplit-gt">

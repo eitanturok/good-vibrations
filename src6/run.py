@@ -23,9 +23,9 @@ from composer.callbacks import LRMonitor, SpeedMonitor, NaNMonitor, RuntimeEstim
 from composer.loggers import WandBLogger, FileLogger
 from composer.utils.reproducibility import seed_all
 
-from dataset import DATASETS, build_dataset
+from dataset import DATASETS, CATEGORIES, DELTAS, NOT_OOD, build_dataset
 from arch import Boombox
-from callbacks import VisualizeSMask, OutputSaver, PositionLogger, ConfidenceLogger
+from callbacks import VisualizeSMask, OutputSaver, PositionLogger, ConfidenceLogger, EvalSummary
 from composer.optim import ConstantScheduler, CosineAnnealingScheduler, CosineAnnealingWithWarmupScheduler, LinearWithWarmupScheduler
 
 
@@ -48,7 +48,7 @@ def get_parser():
     # build data
     parser.add_argument("--dataset",                    type=str,   default="gastronorm_plastic", choices=tuple(DATASETS))
     parser.add_argument("--test-size",                  type=float, default=0.2, help="Fraction of each split's positions held out for eval.")
-    parser.add_argument("--speakers",                   type=lambda s: s if s == "all" else int(s), default=[1, 3, 7], nargs="+", help="Speakers to train/eval on, e.g. --speakers 1 3 7; 'all' = every speaker, none held out.")
+    parser.add_argument("--speakers",                   type=lambda s: s if s == "all" else int(s), default=[1, 3, 5, 7], nargs="+", help="Speakers to train/eval on, e.g. --speakers 1 3 5 7; 'all' = every speaker, none held out.")
     parser.add_argument("--signal",                     type=str,   default="magnitude", choices=("magnitude", "log_magnitude"))
     parser.add_argument("--norm",                       type=str,   default="std", choices=("std", "z"))
     parser.add_argument("--patch-size",                 type=lambda s: None if s.lower() == "none" else int(s), default=None, help="Freq bins per token; 'none' = no patching, x is (L,F,C).")
@@ -150,6 +150,7 @@ def run(**kwargs):
         OptimizerMonitor(log_optimizer_metrics=True, batch_log_interval=10),               # grad + weight norms
         OOMObserver(folder="runs/{run_name}/torch_traces", remote_file_name=None, overwrite=True),  # memory traces if a run OOMs
         VisualizeSMask(args.eval_interval), OutputSaver(args.eval_interval, data_info["objects"]), PositionLogger(), ConfidenceLogger(data_info["objects"]),
+        EvalSummary(CATEGORIES, DELTAS, NOT_OOD),
     ]
 
     # optimizer + lr schedule

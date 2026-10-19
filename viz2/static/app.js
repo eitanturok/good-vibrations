@@ -8,9 +8,11 @@ const S = {
   d: null, probe: null, mode: null, rng: {},
   probes: [], slots: {}, hot: null,
   fi: null, hoverFi: null,
-  log: { spec: 1 },
+  log: { spec: 0 },        // FFT magnitude linear by default
   specMode: 'magphase', phmode: 'cos', fieldbg: false, kind: 'clean',
+  ref: 'none',       // phase reference: none | avg | laser index (data.norm on the server)
   modeview: 'quiver',
+  cam: { az: -60, el: 25 },  // the one 3-D camera every surface shares (degrees); drag rotates it
   view: 'photo',     // photo | overlay | mask: how every sample photo is drawn (see photoFig)
   sort: 'pos', sortDir: 1,   // the gallery's order (gallerySort)
   // Per-plot box-zoom windows, as fractions [0..1] of each axis (see the zoom section).
@@ -54,9 +56,9 @@ const gallerySort = (a, b) => noImg(b) - noImg(a) ||
   a.pos - b.pos || a.spk - b.spk || cmp(a.id, b.id);
 
 /* Faceted counts: every filter list shows its row counts measured against the OTHER
-   filters, not itself. So with "1 object" chosen, the layout list still shows a number
-   for every layout -- how many 1-object samples that layout has -- and picking a speaker
-   updates all of them. `skip` is the facet whose own constraint is dropped. */
+   filters, not itself. So with "1 object" chosen, the layout list shows how many 1-object
+   samples each layout has (and hides layouts with none), and picking a speaker updates
+   all of them. `skip` is the facet whose own constraint is dropped. */
 function passExcept(s, skip) {
   return (skip === 'boxes' || !S.f.boxes.size || S.f.boxes.has(s.box)) &&
          (skip === 'objects' || !S.f.objects.size || hasObj(s)) &&
@@ -64,6 +66,9 @@ function passExcept(s, skip) {
          (skip === 'nobj' || !S.f.nobj.size || S.f.nobj.has(s.n)) &&
          (skip === 'spk' || !S.f.spk.size || S.f.spk.has(s.spk));
 }
+// Drop rows the other filters leave empty, so a list only offers values that would
+// match something -- except rows already picked, which stay so they can be unpicked.
+const live = (rows, on) => rows.filter((o) => o.count || on(o.v));
 function facetTally(field, skip) {
   const c = new Map();
   for (const s of S.all)
@@ -109,7 +114,6 @@ const fmt = (f) => (f >= 100 ? f.toFixed(0) : f.toFixed(1));
                   across the wheel, so samples saved one after another never look alike.
                   Every view of that sample uses it: its curves, mode tile, workbench card,
                   map outline, gallery ring, and its objects' outlines in the photos.
-     frequency -> SHADE of that base (darker / lighter), for 2+ probes of one sample
      channel   -> DASH       only x / y / avg, so a dash pattern stays readable
    Laser is left to the legend: too many values for any visual channel. Unsaved samples
    stay the one segmentation green (--seg).
@@ -129,40 +133,53 @@ function slotFor(key) {
   }
   return S.slots[key];
 }
-// #rrggbb mixed toward black (t < 0) or white (t > 0); render.py shades() is the same
-function mix(c, t) {
-  return '#' + [1, 3, 5].map((i) => {
-    const v = parseInt(c.slice(i, i + 2), 16);
-    return Math.round(t < 0 ? v * (1 + t) : v + (255 - v) * t).toString(16).padStart(2, '0');
-  }).join('');
-}
-// a sample's i-th saved frequency: the base first, then alternately darker / lighter, so
-// an existing probe never changes colour when another frequency is added
-const SHADE = [0, -0.3, 0.3, -0.45, 0.45, -0.15, 0.15];
-
-/* Called whenever the probe set changes: assigns every probe its base + shade, frees the
-   slots of samples with no probe left, and repaints the photos that show those colours. */
+/* Called whenever the probe set changes: gives every probe its sample's colour, frees the
+   slots of samples no longer saved, and repaints the photos that show those colours. */
 function reshade() {
-  const by = {};
-  for (const p of S.probes) (by[sampleKey(p)] ??= []).push(p);
-  for (const k of Object.keys(S.slots)) if (!by[k]) delete S.slots[k];
-  for (const [key, list] of Object.entries(by)) {
-    const base = PALETTE[slotFor(key) % PALETTE.length];
-    list.forEach((p, i) => Object.assign(p, { base, color: mix(base, SHADE[i % SHADE.length]) }));
-  }
+  const saved = new Set(S.probes.map(sampleKey));
+  for (const k of Object.keys(S.slots)) if (!saved.has(k)) delete S.slots[k];
+  for (const p of S.probes) p.base = p.color = PALETTE[slotFor(sampleKey(p)) % PALETTE.length];
   queueMicrotask(() => {
     $('#samplegrid')._updateThumbs?.();
     if (OM.sid) showMasks(OM.sid);
   });
 }
-// the saved-probe colour of this dataset's sample sid (hex, no #), or '' if it isn't saved
-const sampleHex = (sid) =>
-  S.probes.find((p) => p.ds === S.info.dataset && p.sid === sid)?.base.slice(1) || '';
+// this dataset's sample sid's saved probe, if it is saved (a sample is saved at most once)
+const savedOf = (sid) => S.probes.find((p) => p.ds === S.info.dataset && p.sid === sid);
+// its saved-probe colour (hex, no #), or '' if it isn't saved
+const sampleHex = (sid) => savedOf(sid)?.base.slice(1) || '';
 
 const DASH = { avg: [], x: [], y: [7, 6], both: [] };
 // The heatmap paints one plane, and avg IS a plane, so only "both" needs replacing there.
 const planeCh = (c) => (c === 'both' ? 'x' : c);
-const col = (p, a = 1) => p.color + (a >= 1 ? '' : Math.round(a * 255).toString(16).padStart(2, '0'));
+const col = (p, a = 1, k = null) => (k == null ? p.color : shade(p.color, k)) +
+  (a >= 1 ? '' : Math.round(a * 255).toString(16).padStart(2, '0'));
+/* A row's frequencies in shades of its sample's colour: same hue, a clear lightness step
+   per tile -- the 1st (strongest) darkest, the last lightest (reversed on a dark page).
+   The steps spread over the WHOLE range for however many tiles the row has: a fixed
+   ladder left the usual 3-tile row on its three darkest rungs, the strongest at L=.28,
+   which read as black. Mid-tone to light keeps every shade visibly the sample's colour.
+   Lightness, not opacity (faded already means "not in the big plot") nor hue (hue IS
+   the sample's identity). */
+const SHADE_LO = 0.40, SHADE_HI = 0.68;
+const NTOP = 3;          // peaks per sample in Modes: one row of three tiles
+// t in [0, 1]: the tile's place along its row
+function shade(hex, t) {
+  const [r, g, b] = [1, 3, 5].map((i) => parseInt(hex.slice(i, i + 2), 16) / 255);
+  const hi = Math.max(r, g, b), lo = Math.min(r, g, b), d = hi - lo;
+  const h = !d ? 0 : hi === r ? ((g - b) / d + 6) % 6 : hi === g ? (b - r) / d + 2 : (r - g) / d + 4;
+  const s = d ? d / (1 - Math.abs(hi + lo - 1)) : 0;
+  const dark = parseInt(css('--ink').slice(1, 3), 16) > 128;
+  const l = SHADE_LO + (SHADE_HI - SHADE_LO) * (dark ? 1 - t : t), c = (1 - Math.abs(2 * l - 1)) * Math.min(s, 0.85);
+  const x = c * (1 - Math.abs((h % 2) - 1)), m = l - c / 2;
+  const rgb = [[c, x, 0], [x, c, 0], [0, c, x], [0, x, c], [x, 0, c], [c, 0, x]][Math.floor(h) % 6];
+  return '#' + rgb.map((v) => Math.round((v + m) * 255).toString(16).padStart(2, '0')).join('');
+}
+// a tile's shade: its place along its row, 0..1 (the cursor's off-row tile keeps the plain colour)
+const rowShade = (p, fi) => {
+  const k = p.row?.findIndex((x) => x.fi === fi);
+  return k >= 0 ? k / Math.max(1, p.row.length - 1) : null;
+};
 
 /* One full oscillation of the mode, quantised into frames. The slider spans exactly one
    period, so scrubbing off either end wraps rather than dead-ending. */
@@ -213,7 +230,10 @@ function loadPayload(j) {
     (S.byPos[s.pos] ??= {})[s.spk] = s.id;
   }
   pruneFilters();
-  buildFilters(); buildScatter(); buildSpk(); buildGrid(); sizeModePanel(); applyFilter();
+  // a box without a laser photo can't stay in the box view
+  if (isBox() && !S.info.laser_view) $('#modeview [data-v="quiver"]').click();
+  viewCtls();
+  buildFilters(); buildScatter(); buildSpk(); buildGrid(); buildRefGrid(); sizeModePanel(); applyFilter();
   // new samples / another dataset: a "mask area" order needs their areas too
   ensureAreas().then((got) => got && $('#samplegrid')._draw());
 }
@@ -253,6 +273,10 @@ function sizeModePanel() {
 async function select(sid) {
   if (!S.byId[sid]) return;
   S.live.sid = sid;
+  S.muted = false;                          // picking a sample always shows it, even after Esc
+  // the current sample as a row owner, like a saved probe: its mode cache (modeAt) and its
+  // row of tiles (filled in once its curve arrives), both handed on by pin()
+  S.liveP = { sid, ds: S.info.dataset, get color() { return css('--ink'); } };
   // Cheap, sid-only feedback NOW: the rest below waits on /api/sample + probe + mode, and
   // holding the box-position dot until then meant a burst of arrow presses showed nothing
   // until the first request chain landed -- and then jumped straight to the last position.
@@ -268,6 +292,7 @@ async function select(sid) {
   // usually lands on noise. Clearing it makes refresh() snap to this sample's strongest
   // peak -- the most informative place to start, and the mode there is worth looking at.
   S.fi = null;
+  S.pkWho = 'live';                       // a new sample: its curve is the one you steer
   await refresh();
 }
 
@@ -279,7 +304,7 @@ async function refresh(paint = true) {
   viewerMedia(sid);
   // "both" is x and y in one axes. The endpoint serves one channel, so ask twice and let
   // the dash pattern -- the channel's own visual channel already -- tell them apart.
-  const q = (c) => api(`/api/probe/${sid}?ch=${c}&laser=${laser}&kind=${S.kind}`);
+  const q = (c) => api(`/api/probe/${sid}?ch=${c}&laser=${laser}&kind=${S.kind}&ref=${S.ref}`);
   let px, py = null;
   if (ch === 'both') [px, py] = await Promise.all([q('x'), q('y')]);
   else px = await q(ch);
@@ -287,6 +312,8 @@ async function refresh(paint = true) {
   // mix two samples' data (and flash the older one) -- let the newer chain paint instead.
   if (S.live.sid !== sid) return;
   S.probe = px; S.probeY = py;
+  // its three strongest peaks, none shown until you pick some
+  S.liveP.row ??= byMag(px).slice(0, NTOP).map((fi) => ({ fi, on: false, top: true }));
   // NOT S.peakMode = true here: every sample switch (gallery, box position, anywhere)
   // routes through here with S.fi reset to null, so unconditionally arming peak-mode on
   // every single one hijacked the very next arrow press into walking peaks -- via the
@@ -308,7 +335,7 @@ async function reprobePinned() {
   const { ch } = S.live, kind = S.kind;
   await Promise.all(S.probes.map(async (p) => {
     const laser = p.laser === 'all' ? 'avg' : p.laser;
-    const get = (c) => api(`/api/probe/${p.sid}?ch=${c}&laser=${laser}&kind=${kind}`);
+    const get = (c) => api(`/api/probe/${p.sid}?ch=${c}&laser=${laser}&kind=${kind}&ref=${S.ref}`);
     if (ch === 'both') [p.data, p.dataY] = await Promise.all([get('x'), get('y')]);
     else { p.data = await get(ch); p.dataY = null; }
     p.ch = ch;
@@ -318,8 +345,11 @@ async function reprobePinned() {
 
 const reviewChannel = async () => { await refresh(false); await reprobePinned(); paintAll(); };
 
+// The phase reference reaches the modes too; ch only matters when a reference is set.
+const modeQ = () => (S.ref === 'none' ? '' : `&ref=${S.ref}&ch=${S.live.ch}`);
+
 async function loadMode() {
-  const sid = S.live.sid, m = await api(`/api/mode/${sid}?fi=${S.fi}`);
+  const sid = S.live.sid, m = await api(`/api/mode/${sid}?fi=${S.fi}${modeQ()}`);
   if (S.live.sid === sid) S.mode = m;
 }
 
@@ -337,11 +367,11 @@ function paintAll() {
 // mask in one go while the card stays put.
 const shownProbes = () => S.probes.filter((p) => !p.hidden);
 // The live (black) sample is hidden when Esc muted it, or while it IS a shown saved probe --
-// just pinned, it should read as saved (the probe's colour), not still black. Any move
-// (another sample, laser, channel or frequency, or a hover preview) brings it back.
-const liveHidden = () => S.muted || (S.hoverLaser == null && S.hoverFi == null &&
+// the same curve, so it reads as saved (the probe's colour), not twice. Another sample,
+// laser or channel, or a laser hover preview, brings it back.
+const liveHidden = () => S.muted || (S.hoverLaser == null &&
   shownProbes().some((p) => p.ds === S.info.dataset && p.sid === S.live.sid &&
-    p.laser === S.live.laser && p.ch === S.live.ch && p.fi === S.fi));
+    p.laser === S.live.laser && p.ch === S.live.ch));
 
 // S.hot names whichever curve is highlighted right now -- a pinned probe object (by
 // identity), or the sentinel strings 'live'/'preview' for the other two curve kinds. Every
@@ -500,10 +530,10 @@ async function drawHeat() {
   const qs = [...HEATQ(), 'shifts'];
   qs.forEach((q, i) => {
     $(`#h${i + 1}`).src =
-      `/api/heat/${sid}.png?ch=${planeCh(ch)}&q=${q}&kind=${S.kind}&v=${S.rv}`;
+      `/api/heat/${sid}.png?ch=${planeCh(ch)}&q=${q}&kind=${S.kind}&ref=${S.ref}&v=${S.rv}`;
   });
   const rs = await Promise.all(qs.map((q) =>
-    api(`/api/heatrange/${sid}?ch=${planeCh(ch)}&q=${q}&kind=${S.kind}`)));
+    api(`/api/heatrange/${sid}?ch=${planeCh(ch)}&q=${q}&kind=${S.kind}&ref=${S.ref}`)));
   rs.forEach((r, i) => {
     const stops = r.lut === 'seq' ? SEQ : DIV;
     $(`#cb${i + 1}`).innerHTML =
@@ -541,7 +571,33 @@ function specKey(id) {
 function drawSpec() {
   multi($('#p1'), specKey('p1')); multi($('#p2'), specKey('p2'));
   yAxis('#p1ov', 'p1'); yAxis('#p2ov', 'p2');
+  weakBands();
   drawHeat();
+}
+
+/* Grey bands over the bins where the phase reference is weak (|r| < 0.2 x the median
+   laser's |x|, data.weak_runs): its phase there is noise, so the normalized phase is too.
+   "both" draws two channels, so a bin is grey if EITHER channel's reference is weak. */
+function weakBands() {
+  const runs = [...(S.probe?.weak || []), ...(S.probeY?.weak || [])];
+  const n = S.d ? S.d.freqs.length : 0;
+  const nw = new Set(runs.flatMap(([a, b]) => Array.from({ length: b - a + 1 }, (_, i) => a + i))).size;
+  $('#refnow').textContent = S.ref === 'none' ? '' :
+    `${S.ref}${n ? ` · ${Math.round((100 * nw) / n)}% weak` : ''}`;
+  for (const id of OVS) {
+    const svg = $(id);
+    let g = svg.querySelector('.weak');
+    if (!g) { g = document.createElementNS('http://www.w3.org/2000/svg', 'g');
+              g.setAttribute('class', 'weak'); svg.prepend(g); }
+    // half a bin either side, so a lone weak bin still shows as a sliver
+    g.innerHTML = runs.map(([a, b]) => {
+      const x0 = Math.max(0, specX(a - 0.5)), x1 = Math.min(100, specX(b + 0.5));
+      return x1 > x0 ? `<rect x="${x0}%" width="${x1 - x0}%" y="0" height="100%"/>` : '';
+    }).join('');
+    const why = S.ref === 'real' ? 'no dominant phase axis: |Σ x²| < 0.2 · Σ |x|²'
+                                  : 'weak phase reference: |r| < 0.2 × median laser';
+    g.innerHTML += runs.length ? `<title>${why}</title>` : '';
+  }
 }
 
 const drawShifts = () => { multi($('#p3'), 'shifts'); yAxis('#p3ov', 'p3'); };
@@ -601,8 +657,7 @@ function fmtTick(v) {
 /* ***** mode shape ***** */
 // A probe kept from another box may have a different laser grid; its mode field can only
 // be overlaid on a box with the same dims.
-const fitsGrid = (p) => p.mode
-  && p.mode.u.length === S.info.rows && p.mode.u[0]?.length === S.info.cols;
+const fitsGrid = (m) => m && m.u.length === S.info.rows && m.u[0]?.length === S.info.cols;
 
 function modeAxes() {
   const svg = $('#modeax');
@@ -621,40 +676,255 @@ function modeAxes() {
    label a grid that the surface's camera has rotated away from. */
 function viewCtls() {
   const q = S.modeview === 'quiver';
-  $('#asizelab').textContent = q ? 'arrow size' : 'height';
+  $('#asizelab').textContent = q ? 'arrow size' : isBox() ? 'size' : 'height';
   $('#modekey').hidden = !(q && S.fieldbg);
   $('#modeax').style.display = q ? '' : 'none';
+  $('.stepmodes').classList.toggle('surfview', S.modeview === 'surface');   // grab cursor: surfaces rotate
+  $('.stepmodes').classList.toggle('boxview', isBox());                    // no big plot, full-width tiles
+  // no laser photo for this box: the box view has nothing to stand on
+  for (const b of document.querySelectorAll('#modeview [data-v="stretch"], #modeview [data-v="inout"]')) b.disabled = !S.info?.laser_view;
   // Hidden rather than wrapped in a container: the rail is a flex column with its own
   // gap, so a wrapper div would change the spacing of everything around it.
   for (const e of document.querySelectorAll('.bgctl, .modewrap .mlab')) e.hidden = !q;
+}
+
+/* ***** the box views: the mode on the box's side photo *****
+   Same idea as notebooks/102_laser_grid_pixels.ipynb, sec. 4-6. Each tile warps the photo by
+   its own mode:
+   - stretch: every pixel moves by the measured speckle shift (U, V) -- the wall's local slope,
+     drawn as sideways motion -- with a mesh of cells, one per laser and centred on it.
+   - in-out: the height field Z (whose slopes are U, V), head-on: the photo in its own colors,
+     each pixel lit by its tilt and pushed out from the photo centre by perspective.
+   There is no big plot here: one photo can't be warped by several modes at once, so the
+   overlay has nothing to add. The tiles take its place, one per row, full width.
+
+   Per box, once (boxMesh): a vertex grid over the crop, each vertex's fractional laser
+   (col, row) through the inverse homography, and its fade: 1 on the laser grid's cells,
+   easing to 0 at the wall outline, 0 outside it. Past the grid the motion is extrapolated
+   (the edge value held), so the wall flexes like a sheet clamped at its edges.
+   Per mode, once (boxField): each vertex's (U, -V) and (Z, dZ/dx, dZ/dy).
+   Per tile per frame: one WebGL draw of the textured mesh. */
+const isBox = () => S.modeview === 'stretch' || S.modeview === 'inout';
+const BOXN = 120;                       // vertex columns across the crop
+const boxImg = {}, boxMeshes = {};
+function boxView() {
+  const lv = S.info?.laser_view;
+  if (!isBox() || !lv) return null;
+  if (!boxImg[lv.name]) {
+    boxImg[lv.name] = new Image();
+    boxImg[lv.name].onload = drawMode;
+    boxImg[lv.name].src = `/api/laserview/${lv.name}.jpg`;
+  }
+  const [x, y, w, h] = lv.crop;
+  return { lv, x, y, w, h, img: boxImg[lv.name] };
+}
+
+const homog = (M, x, y) => {
+  const d = M[6] * x + M[7] * y + M[8];
+  return [(M[0] * x + M[1] * y + M[2]) / d, (M[3] * x + M[4] * y + M[5]) / d];
+};
+const inPoly = ([x, y], P) => {
+  let c = false;
+  for (let i = 0, j = P.length - 1; i < P.length; j = i++) {
+    const [xi, yi] = P[i], [xj, yj] = P[j];
+    if ((yi > y) !== (yj > y) && x < ((xj - xi) * (y - yi)) / (yj - yi) + xi) c = !c;
+  }
+  return c;
+};
+const edgeDist = ([x, y], P) => Math.min(...P.map(([ax, ay], i) => {
+  const [bx, by] = P[(i + 1) % P.length], dx = bx - ax, dy = by - ay;
+  const u = Math.max(0, Math.min(1, ((x - ax) * dx + (y - ay) * dy) / (dx * dx + dy * dy)));
+  return Math.hypot(x - ax - u * dx, y - ay - u * dy);
+}));
+// 1 on the laser grid's cells, smoothly to 0 at the wall outline, 0 outside the wall
+function boxFade(p, grid, wall) {
+  if (!inPoly(p, wall)) return 0;
+  const out = inPoly(p, grid) ? 0 : edgeDist(p, grid), din = edgeDist(p, wall);
+  const u = din / (din + out + 1e-6);
+  return u * u * (3 - 2 * u);
+}
+// Catmull-Rom on the laser grid; (c, r) clamped first, so past the grid the edge value holds
+const crs = (a, b, c, d, t) => b + 0.5 * t * (c - a + t * (2 * a - 5 * b + 4 * c - d + t * (3 * (b - c) + d - a)));
+function bicubic(F, c, r) {
+  const R = F.length, C = F[0].length, cl = (v, n) => Math.max(0, Math.min(n - 1, v));
+  c = cl(c, C); r = cl(r, R);
+  const ci = Math.floor(c), ri = Math.floor(r), at = (i, j) => F[cl(i, R)][cl(j, C)];
+  const row = (i) => crs(at(i, ci - 1), at(i, ci), at(i, ci + 1), at(i, ci + 2), c - ci);
+  return crs(row(ri - 1), row(ri), row(ri + 1), row(ri + 2), r - ri);
+}
+
+function boxMesh(lv) {
+  if (boxMeshes[lv.name]) return boxMeshes[lv.name];
+  const [x0, y0, w, h] = lv.crop, R = lv.pts.length, C = lv.pts[0].length;
+  const grid = [[-0.5, -0.5], [C - 0.5, -0.5], [C - 0.5, R - 0.5], [-0.5, R - 0.5]].map(([c, r]) => homog(lv.H, c, r));
+  const nx = BOXN, ny = Math.round((BOXN * h) / w);
+  const src = new Float32Array(nx * ny * 2), cr = new Float32Array(nx * ny * 2), fade = new Float32Array(nx * ny);
+  for (let j = 0; j < ny; j++) for (let i = 0; i < nx; i++) {
+    const k = j * nx + i, x = x0 + (w * i) / (nx - 1), y = y0 + (h * j) / (ny - 1);
+    src[2 * k] = x; src[2 * k + 1] = y;
+    [cr[2 * k], cr[2 * k + 1]] = homog(lv.Hinv, x, y);
+    fade[k] = boxFade([x, y], grid, lv.wall);
+  }
+  const idx = new Uint16Array((nx - 1) * (ny - 1) * 6);
+  let n = 0;
+  for (let j = 0; j < ny - 1; j++) for (let i = 0; i < nx - 1; i++) {
+    const a = j * nx + i, b = a + 1, c = a + nx, d = c + 1;
+    idx.set([a, b, c, b, d, c], n); n += 6;
+  }
+  // cell boundaries on half-integers, continued over the whole wall: (c, r) samples + fade
+  const wc = lv.wall.map(([x, y]) => homog(lv.Hinv, x, y));
+  const lo = (k) => Math.floor(Math.min(...wc.map((p) => p[k]))) - 0.5;
+  const hi = (k) => Math.ceil(Math.max(...wc.map((p) => p[k]))) + 0.5;
+  const lines = [], seg = (f) => Array.from({ length: 81 }, (_, i) => f(i / 80));
+  for (let c = lo(0); c <= hi(0); c++) lines.push(seg((u) => [c, lo(1) + u * (hi(1) - lo(1))]));
+  for (let r = lo(1); r <= hi(1); r++) lines.push(seg((u) => [lo(0) + u * (hi(0) - lo(0)), r]));
+  const L = lines.map((l) => l.map(([c, r]) => {
+    const p = homog(lv.H, c, r);
+    return { p, c, r, f: boxFade(p, grid, lv.wall) };
+  }));
+  const cell = Math.hypot(lv.pts[0][C - 1][0] - lv.pts[0][0][0], lv.pts[0][C - 1][1] - lv.pts[0][0][1]) / (C - 1);
+  return (boxMeshes[lv.name] = { nx, ny, dx: w / (nx - 1), dy: h / (ny - 1), src, cr, fade, idx, lines: L, cell, gl: null });
+}
+
+// per-vertex (U, -V) * fade for one mode, cached on the mode object
+// per-vertex (U, -V) and (Z, dZ/dx, dZ/dy), all times the fade, for one mode; cached on the mode
+function boxField(M, m) {
+  if (m._box?.M === M) return m._box;
+  const { nx, ny } = M, n = nx * ny, d = new Float32Array(2 * n), z = new Float32Array(3 * n);
+  for (let k = 0; k < n; k++) {
+    const f = M.fade[k], c = M.cr[2 * k], r = M.cr[2 * k + 1];
+    if (!f) continue;
+    d[2 * k] = f * bicubic(m.u, c, r);
+    d[2 * k + 1] = -f * bicubic(m.v, c, r);                 // V up -> screen y down
+    if (m.z) z[3 * k] = f * bicubic(m.z, c, r);
+  }
+  // slopes in px, central differences on the vertex grid (one-sided at its edges)
+  const Z = (i, j) => z[3 * (Math.min(ny - 1, Math.max(0, j)) * nx + Math.min(nx - 1, Math.max(0, i)))];
+  for (let j = 0; j < ny; j++) for (let i = 0; i < nx; i++) {
+    z[3 * (j * nx + i) + 1] = (Z(i + 1, j) - Z(i - 1, j)) / (2 * M.dx);
+    z[3 * (j * nx + i) + 2] = (Z(i, j + 1) - Z(i, j - 1)) / (2 * M.dy);
+  }
+  const lines = M.lines.map((l) => l.map((q) => [q.f * bicubic(m.u, q.c, q.r), -q.f * bicubic(m.v, q.c, q.r)]));
+  return (m._box = { M, d, z, lines, umax: maxOf([{ m }]), zmax: m.z ? zmax([{ m }]) : 0 });
+}
+
+// k scales the stretch, kz the depth (px per unit Z); one of them is 0
+const BOX_VS = `attribute vec2 src, disp; attribute vec3 zg;
+uniform float k, kz, foc; uniform vec2 cen, size; uniform vec4 crop;
+varying vec2 uv; varying float shade, depth;
+void main() {
+  depth = kz * zg.x;
+  vec2 p = (cen + (src + k * disp - cen) * foc / (foc - depth) - crop.xy) / crop.zw;   // toward you: out from the centre
+  gl_Position = vec4(p.x * 2.0 - 1.0, 1.0 - p.y * 2.0, 0.0, 1.0);
+  vec3 n = normalize(vec3(-kz * zg.y, -kz * zg.z, 1.0)), L = normalize(vec3(-1.0, -1.0, 1.2));   // lit from the upper left
+  shade = clamp(dot(n, L) / L.z, 0.3, 1.8);
+  uv = src / size;
+}`;
+const BOX_FS = `precision mediump float;
+uniform sampler2D tex; uniform float relief, dmax;
+varying vec2 uv; varying float shade, depth;
+void main() {
+  vec3 c = texture2D(tex, uv).rgb;
+  // in-out: the photo's own colors, lit by the wall's tilt. Shadow darkens; light lifts toward
+  // white, since a saturated green has no headroom to be multiplied brighter.
+  if (relief > 0.5) c = shade < 1.0 ? c * shade : c + (1.0 - c) * min(shade - 1.0, 1.0) * 0.7;
+  gl_FragColor = vec4(c, 1.0);
+}`;
+
+// One offscreen WebGL canvas per box: the program, the static buffers and the photo texture.
+function boxGL(M, img) {
+  if (M.gl) return M.gl;
+  const cv = document.createElement('canvas'), gl = cv.getContext('webgl', { preserveDrawingBuffer: true });
+  if (!gl) return null;
+  const sh = (t, src) => { const s = gl.createShader(t); gl.shaderSource(s, src); gl.compileShader(s); return s; };
+  const pr = gl.createProgram();
+  gl.attachShader(pr, sh(gl.VERTEX_SHADER, BOX_VS)); gl.attachShader(pr, sh(gl.FRAGMENT_SHADER, BOX_FS));
+  gl.linkProgram(pr); gl.useProgram(pr);
+  const attr = (name, size, data) => {
+    const b = gl.createBuffer(), a = gl.getAttribLocation(pr, name);
+    gl.bindBuffer(gl.ARRAY_BUFFER, b);
+    if (data) gl.bufferData(gl.ARRAY_BUFFER, data, gl.STATIC_DRAW);
+    gl.enableVertexAttribArray(a); gl.vertexAttribPointer(a, size, gl.FLOAT, false, 0, 0);
+    return b;
+  };
+  attr('src', 2, M.src);
+  const disp = attr('disp', 2), zg = attr('zg', 3);
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, gl.createBuffer());
+  gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, M.idx, gl.STATIC_DRAW);
+  gl.bindTexture(gl.TEXTURE_2D, gl.createTexture());
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, img);
+  for (const [p, v] of [[gl.TEXTURE_MIN_FILTER, gl.LINEAR], [gl.TEXTURE_MAG_FILTER, gl.LINEAR],
+                        [gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE], [gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE]]) gl.texParameteri(gl.TEXTURE_2D, p, v);
+  const u = Object.fromEntries(['k', 'kz', 'foc', 'cen', 'size', 'crop', 'relief', 'dmax'].map((n) => [n, gl.getUniformLocation(pr, n)]));
+  return (M.gl = { cv, gl, disp, zg, u, m: null });
+}
+
+// one tile: the photo warped by mode m, normalised to its own peak
+function drawBox(g, w, h, m, bv) {
+  if (!bv.img.complete || !bv.img.naturalWidth) return;
+  const M = boxMesh(bv.lv), G = boxGL(M, bv.img), D = boxField(M, m), io = S.modeview === 'inout';
+  if (!G) return g.drawImage(bv.img, bv.x, bv.y, bv.w, bv.h, 0, 0, w, h);   // no WebGL: the still photo
+  const t = Math.cos((S.frame / NFRAME) * 2 * Math.PI), cell = M.cell * S.asize;
+  const k = io ? 0 : (t * 0.5 * cell) / (D.umax || 1);      // stretch: the biggest shift is half a laser cell at 1x
+  const kz = io ? (t * 1.5 * cell) / (D.zmax || 1) : 0;     // in-out: the biggest depth is 1.5 cells
+  const { gl, cv, u } = G, dp = devicePixelRatio || 1;
+  if (cv.width !== Math.round(w * dp) || cv.height !== Math.round(h * dp)) { cv.width = Math.round(w * dp); cv.height = Math.round(h * dp); }
+  gl.viewport(0, 0, cv.width, cv.height);
+  if (G.m !== m) {
+    gl.bindBuffer(gl.ARRAY_BUFFER, G.disp); gl.bufferData(gl.ARRAY_BUFFER, D.d, gl.DYNAMIC_DRAW);
+    gl.bindBuffer(gl.ARRAY_BUFFER, G.zg); gl.bufferData(gl.ARRAY_BUFFER, D.z, gl.DYNAMIC_DRAW);
+    G.m = m;
+  }
+  const { lv } = bv;
+  gl.uniform1f(u.k, k); gl.uniform1f(u.kz, kz); gl.uniform1f(u.foc, lv.w); gl.uniform2f(u.cen, lv.w / 2, lv.h / 2);
+  gl.uniform2f(u.size, lv.w, lv.h); gl.uniform4f(u.crop, bv.x, bv.y, bv.w, bv.h);
+  gl.uniform1f(u.relief, io ? 1 : 0); gl.uniform1f(u.dmax, 1.5 * cell);
+  gl.drawElements(gl.TRIANGLES, M.idx.length, gl.UNSIGNED_SHORT, 0);
+  g.drawImage(cv, 0, 0, w, h);
+  if (io) return;
+  // stretch: the cell mesh, moving with the sheet, clipped to the wall
+  const s = w / bv.w, at = ([x, y]) => [(x - bv.x) * s, (y - bv.y) * s];
+  g.save();
+  g.beginPath();
+  lv.wall.forEach((p, i) => g[i ? 'lineTo' : 'moveTo'](...at(p)));
+  g.clip();
+  g.strokeStyle = 'rgba(255,255,255,0.7)'; g.lineWidth = 0.6;
+  M.lines.forEach((l, i) => {
+    g.beginPath();
+    l.forEach((q, j) => g[j ? 'lineTo' : 'moveTo'](...at([q.p[0] + k * D.lines[i][j][0], q.p[1] + k * D.lines[i][j][1]])));
+    g.stroke();
+  });
+  g.restore();
 }
 
 function drawMode() {
   fieldGrid();
   recoveredGrid();
   modeAxes();
+  if (isBox()) return;                       // the box views are tiles only (fieldGrid above)
   const cv = $('#mode'), [g, w, h] = fit(cv);
-  if (!S.mode) return;
   const R = S.info.rows, C = S.info.cols, cw = w / C, chh = h / R;
-  const withMode = shownProbes().filter(fitsGrid);
-  const sets = [
-    ...withMode.filter((p) => p.id !== S.flash).map((p) => ({ m: p.mode, c: col(p, 0.9) })),
-    ...(liveHidden() && S.probes.length ? [] : [{ m: S.mode, c: css('--ink') }]),
-    ...withMode.filter((p) => p.id === S.flash).map((p) => ({ m: p.mode, c: col(p, 0.9) })),
-  ];
+  // The tiles you selected. None selected yet: the current sample at the cursor, so every
+  // view shows something from the start, before anything is picked or saved.
+  let sets = selectedModes().map((s) => ({ p: s.p, m: s.m, c: col(s.p, 0.9, rowShade(s.p, s.fi)) }));
+  if (!sets.length && liveShown() && fitsGrid(S.mode)) sets = [{ p: S.liveP, m: S.mode, c: col(S.liveP, 0.9) }];
+  if (!sets.length) return;
 
   if (S.modeview === 'surface') {
     if (!hasZ(sets)) return stale(g, w, h);
     // Every set on ONE shared height scale, so an overlaid surface still compares
     // amplitudes the way the overlaid quiver does.
-    surfaces(g, sets.map(surfCol), w, h, R, C, zmax(sets));
+    surfaces(g, sets, w, h, R, C, zmax(sets), sets.length <= 2 ? 2 : 1);
     return;
   }
   // The big plot always overlays every probe. Arrows from different probes share a cell
   // origin, so color alone would hide one under another: fan the tails around the centre.
   const k = (Math.min(cw, chh) * 0.42 * S.asize) / (maxOf(sets) || 1);
-  arrows(g, sets, w, h, R, C, cw, chh, k, sets.length > 1 ? Math.min(cw, chh) * 0.15 : 0);
+  arrows(g, sets, cellAt(cw, chh), k, sets.length > 1 ? Math.min(cw, chh) * 0.15 : 0);
 }
+
+// cell (r, c) -> its centre on an abstract grid of cw x chh cells
+const cellAt = (cw, chh) => (r, c) => [c * cw + cw / 2, r * chh + chh / 2];
 
 /* Peak of a quantity over any number of sets. `f` picks what a cell is worth: arrow
    length for the quiver, |height| for the surface -- one reduction, two views. */
@@ -667,17 +937,19 @@ const peakOf = (sets, f) => {
 const maxOf = (sets) => peakOf(sets, (m, r, c) => Math.hypot(m.u[r][c], m.v[r][c]));
 const zmax = (sets) => peakOf(sets, (m, r, c) => Math.abs(m.z[r][c]));
 
-function arrows(g, sets, w, h, R, C, cw, chh, k, fan) {
+// `at(r, c)` places each cell's arrow: an abstract grid (cellAt) or a laser's photo spot.
+function arrows(g, sets, at, k, fan) {
   const t = Math.cos((S.frame / NFRAME) * 2 * Math.PI);
   sets.forEach((s, n) => {
     const a = fan ? (n / sets.length) * 2 * Math.PI : 0;
     const ox = fan * Math.cos(a), oy = fan * Math.sin(a);
-    g.strokeStyle = s.c; g.fillStyle = s.c; g.lineWidth = 1.3;
+    g.strokeStyle = s.c; g.fillStyle = s.c; g.lineWidth = s.lw ?? 1.3;
+    const R = s.m.u.length, C = s.m.u[0].length, dot = s.lw ? 2.5 : 1.5;
     for (let r = 0; r < R; r++) for (let c = 0; c < C; c++) {
-      const x = c * cw + cw / 2 + ox, y = r * chh + chh / 2 + oy;
+      const [x0, y0] = at(r, c), x = x0 + ox, y = y0 + oy;
       const dx = s.m.u[r][c] * k * t, dy = -s.m.v[r][c] * k * t;
       g.beginPath(); g.moveTo(x, y); g.lineTo(x + dx, y + dy); g.stroke();
-      g.beginPath(); g.arc(x + dx, y + dy, 1.5, 0, 7); g.fill();
+      g.beginPath(); g.arc(x + dx, y + dy, dot, 0, 7); g.fill();
     }
   });
 }
@@ -703,35 +975,50 @@ function stale(g, w, h) {
    side by side, and the view most people actually picture when they hear "mode shape".
 
    A 2-D surface embedded in 3-D, drawn with plain canvas: the grid is a height field seen
-   from ONE fixed direction, so quads sorted back-to-front composite correctly with no
-   z-buffer, and a quad's normal against a fixed light gives the notebook's shaded look.
-   Matches the notebook's camera (elev 25, azim -60) and light (az 315, alt 45). */
-const ELEV = 25 * Math.PI / 180, AZIM = -60 * Math.PI / 180;
+   from one direction at a time, so quads sorted back-to-front composite correctly with no
+   z-buffer, and each quad's normal against a camera-fixed light gives the shading.
+   Starts at the notebook's camera (elev 25, azim -60); drag to rotate (S.cam). */
 /* The notebook's set_zlim(global_z_lims), where the limit is the peak times 2: the box is
    given twice the height it needs, so even a full-amplitude frame sits in the middle half
    and never grazes the top. Fixed, not tracking the height slider -- see zbox below. */
 const ZBOX = 2.0;
-const LIGHT = (() => {                    // unit vector toward the lamp
-  const a = 315 * Math.PI / 180, e = 45 * Math.PI / 180;
-  return [Math.cos(e) * Math.cos(a), Math.cos(e) * Math.sin(a), Math.sin(e)];
-})();
 
-/* The live mode draws in --ink, which is near-black and unsaturated. That is right for a
-   line but wrong for a lit surface: with l~0.1 and s~0 there is no headroom for the height
-   ramp to brighten into and no saturation for it to shift, so the surface would render as
-   a flat dark blob. Give it the app's own blue instead -- near the notebook's steel blue,
-   and the one color here that is already "the current sample". Pinned probes keep their
-   own hue, which is what identifies them. */
-const surfCol = (s) => (s.c === css('--ink') ? { ...s, c: css('--accent') } : s);
+/* The view basis for S.cam (matplotlib's azim/elev): V points from the scene to the
+   viewer, Rt is screen-right and Up screen-up. Recomputed only when the camera moves. */
+let VW = null, VWk = '';
+function vw() {
+  const key = `${S.cam.az},${S.cam.el}`;
+  if (key !== VWk) {
+    const a = S.cam.az * Math.PI / 180, e = S.cam.el * Math.PI / 180;
+    const ca = Math.cos(a), sa = Math.sin(a), ce = Math.cos(e), se = Math.sin(e);
+    const Rt = [-sa, ca, 0], Up = [-se * ca, -se * sa, ce], V = [ce * ca, ce * sa, se];
+    // the lamp sits up and to the left of the viewer and turns with the camera, so the
+    // shading reads the same from any angle
+    const L = norm3(Rt.map((x, i) => -0.45 * x + 0.65 * Up[i] + 0.6 * V[i]));
+    VW = { Rt, Up, V, L, H: norm3(L.map((x, i) => x + V[i])) };
+    VWk = key;
+  }
+  return VW;
+}
+const dot3 = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+const norm3 = (a) => { const n = Math.hypot(...a) || 1; return a.map((x) => x / n); };
 
-/* Grid cell + height -> a point in the camera's own units. Depth comes back too: it is
-   the sort key, and the only thing that makes the quads composite correctly. */
+/* Grid cell + height -> a point in the camera's own units. Depth (toward the viewer) comes
+   back too: it is the sort key, and the only thing that makes the quads composite. */
 function camera(c, r, z, C, R, zk) {
-  const x = c / (C - 1) - 0.5, y = 0.5 - r / (R - 1);
-  const ca = Math.cos(AZIM), sa = Math.sin(AZIM);
-  const px = x * ca - y * sa;                       // rotate about the vertical axis
-  const py = x * sa + y * ca;
-  return [px, -(py * Math.sin(ELEV) + z * zk), py];
+  const p = [c / (C - 1) - 0.5, 0.5 - r / (R - 1), z * zk], { Rt, Up, V } = vw();
+  return [dot3(p, Rt), -dot3(p, Up), dot3(p, V)];
+}
+
+/* The height field on a finer grid (k samples per laser cell, cubic): 9x9 flat quads read
+   as facets, not a membrane. Cached on the mode, so a frame only scales it by t. */
+function refinedZ(m, k) {
+  const c = (m._zr ??= {});
+  if (c[k]) return c[k];
+  const R = m.z.length, C = m.z[0].length, NC = (C - 1) * k + 1, NR = (R - 1) * k + 1;
+  const Z = new Float32Array(NR * NC);
+  for (let j = 0; j < NR; j++) for (let i = 0; i < NC; i++) Z[j * NC + i] = bicubic(m.z, i / k, j / k);
+  return (c[k] = Z);
 }
 
 /* The three axes, in the notebook's spirit: it blanks every pane, grid and tick label
@@ -773,7 +1060,9 @@ function axes3d(g, scr, R, C, zlim, labels) {
 
 /* Every set drawn into one scene. Quads from ALL of them share one depth sort, so an
    overlaid surface interleaves correctly instead of one being painted flat on top. */
-function surfaces(g, sets, w, h, R, C, max) {
+// k: samples per laser cell. Tiles and busy overlays draw the bare 10x10 grid (k = 1); only
+// the big plot with one or two surfaces is refined, so many surfaces at once stay cheap.
+function surfaces(g, sets, w, h, R, C, max, k = 1) {
   const t = Math.cos((S.frame / NFRAME) * 2 * Math.PI);
   // Height in camera units, relative to the unit-square footprint. Shared by every set,
   // so an overlay compares amplitudes rather than normalising them apart.
@@ -827,24 +1116,39 @@ function surfaces(g, sets, w, h, R, C, max) {
      the notebook's, and it matters: it keeps the mid-cycle frames from washing out. */
   const amp = Math.sqrt(Math.min(1, Math.abs(t)));
 
+  // finer on the big plot than on a tile; each laser cell keeps its outline (edge bits)
+  const NC = (C - 1) * k + 1, NR = (R - 1) * k + 1;
+  const { V, L, H } = vw();
+  const dxs = 1 / ((C - 1) * k), dys = 1 / ((R - 1) * k);       // one refined step, camera units
   const quads = [];
   sets.forEach((s) => {
-    const base = rgbOf(s.c);
-    const P = s.m.z.map((row, r) => row.map((z, c) => scr(c, r, z * t)));
-    for (let r = 0; r < R - 1; r++) for (let c = 0; c < C - 1; c++) {
-      const a = P[r][c], b = P[r][c + 1], d = P[r + 1][c + 1], e = P[r + 1][c];
-      // Central-ish differences on the cell, then Lambert against the fixed lamp.
-      const zc = s.m.z[r][c] * t, zr = s.m.z[r][c + 1] * t, zd = s.m.z[r + 1][c] * t;
-      const nx = -(zr - zc) / gx, ny = (zd - zc) / gy;
-      const len = Math.hypot(nx, ny, 1);
-      const lamb = (nx * LIGHT[0] + ny * LIGHT[1] + LIGHT[2]) / len;
-      // Height of the cell, signed and normalised to -1..1 -- crest vs trough.
-      const zn = max ? ((zc + zr + zd + s.m.z[r + 1][c + 1] * t) / 4) / max : 0;
+    // lit in the set's own hue AND lightness, so each frequency keeps its shade, as its arrows
+    // do. A grey (the current sample's ink) has no hue, so it takes the app's blue; the bare
+    // ink, unshaded and near-black, has no room for light and shadow, so mid-lightness.
+    let [hh, ss, ll] = rgbToHsl(...rgbOf(s.c));
+    if (ss < 0.15) [hh, ss] = rgbToHsl(...rgbOf(css('--accent')));
+    if (ll < 0.2 || ll > 0.85) ll = 0.55;
+    const Z = refinedZ(s.m, k), P = new Array(NR * NC);
+    for (let j = 0; j < NR; j++) for (let i = 0; i < NC; i++) P[j * NC + i] = scr(i / k, j / k, Z[j * NC + i] * t);
+    for (let j = 0; j < NR - 1; j++) for (let i = 0; i < NC - 1; i++) {
+      const q = j * NC + i, z00 = Z[q] * t, z01 = Z[q + 1] * t, z10 = Z[q + NC] * t, z11 = Z[q + NC + 1] * t;
+      // the quad's normal in camera units (y runs opposite to rows), two-sided
+      const sx = ((z01 + z11 - z00 - z10) / 2) * zk / dxs, sy = -((z10 + z11 - z00 - z01) / 2) * zk / dys;
+      let n = norm3([-sx, -sy, 1]);
+      if (dot3(n, V) < 0) n = n.map((x) => -x);
+      const diff = Math.max(0, dot3(n, L)), spec = Math.max(0, dot3(n, H)) ** 40;
+      // crest vs trough on lightness, scaled by how far into the cycle we are
+      const zn = max ? (z00 + z01 + z10 + z11) / 4 / max : 0;
+      const l = Math.max(0.04, Math.min(0.92, ll * (0.3 + 0.85 * diff) * (1 + 0.3 * zn * amp)));
+      const [r0, g0, b0] = hslToRgb(hh, Math.min(1, ss * 1.05), l);
+      const sp = 255 * 0.45 * spec;
+      const a = P[q], b = P[q + 1], d = P[q + NC + 1], e = P[q + NC];
       quads.push({
         pts: [a, b, d, e],
         depth: (a[2] + b[2] + d[2] + e[2]) / 4,
-        rgb: shadeQuad(base, lamb, zn, amp),
+        rgb: [Math.min(255, r0 + sp) | 0, Math.min(255, g0 + sp) | 0, Math.min(255, b0 + sp) | 0],
         alpha: sets.length > 1 ? 0.72 : 1,
+        edge: (i % k ? 0 : 1) | (j % k ? 0 : 2),
       });
     }
   });
@@ -859,15 +1163,15 @@ function surfaces(g, sets, w, h, R, C, max) {
     for (let i = 1; i < 4; i++) g.lineTo(q.pts[i][0], q.pts[i][1]);
     g.closePath();
     g.fill(); g.stroke();
-    /* The wireframe. Only two of the four edges per quad, so each interior line is drawn
-       once rather than twice -- doubling would make it read as a hard mesh instead of the
-       faint ruling that just gives the eye the surface's curvature. */
-    g.strokeStyle = `rgba(255,255,255,${0.13 * q.alpha})`;
-    g.lineWidth = 0.5;
+    /* The laser cells' outlines only, not every refined quad: a faint ruling that gives the
+       eye the curvature without turning into a dense mesh. Left and top edges, so each
+       interior line is drawn once. */
+    if (!q.edge) continue;
+    g.strokeStyle = `rgba(255,255,255,${0.22 * q.alpha})`;
+    g.lineWidth = 0.6;
     g.beginPath();
-    g.moveTo(q.pts[3][0], q.pts[3][1]);
-    g.lineTo(q.pts[0][0], q.pts[0][1]);
-    g.lineTo(q.pts[1][0], q.pts[1][1]);
+    if (q.edge & 1) { g.moveTo(q.pts[3][0], q.pts[3][1]); g.lineTo(q.pts[0][0], q.pts[0][1]); }
+    if (q.edge & 2) { g.moveTo(q.pts[0][0], q.pts[0][1]); g.lineTo(q.pts[1][0], q.pts[1][1]); }
     g.stroke();
   }
 
@@ -883,30 +1187,6 @@ function surfaces(g, sets, w, h, R, C, max) {
   g.restore();
 }
 
-/* One quad's color: the base carried through Lambert shading AND height.
-
-   HUE IS LEFT ALONE, deliberately. Hue is already spoken for -- each saved sample owns
-   one PALETTE colour (reshade). Riding height on hue too would spend that same budget
-   twice: a crest could drift a probe into its neighbour's colour, and the surface would
-   stop saying which probe it is.
-
-   So height moves LIGHTNESS and saturation instead, which nothing else here uses. Crests
-   lighten and saturate, troughs darken and mute -- the ordering the eye already reads as
-   high/low, and it stays legible in one still frame. The range is wide (0.55x..1.45x
-   lightness) because it is now carrying the height signal alone.
-
-   Everything scales by `amp`, so a flat frame collapses to the flat base color exactly as
-   the notebook's blend toward uniform_color does. */
-function shadeQuad([r, g, b], lamb, zn, amp) {
-  const [hh, ss, ll] = rgbToHsl(r, g, b);
-  const lit = 0.45 + 0.7 * Math.max(0, lamb);                // Lambert, never pure black
-  // Height rides on lightness, about the base: crest up, trough down.
-  const l = ll * (1 - amp) + ll * lit * (1 + 0.45 * zn) * amp;
-  // ...and on saturation in the SAME direction, so a crest reads bright-and-vivid and a
-  // trough muted. Two channels agreeing makes the height readable at tile size.
-  const sat = ss * (1 - amp) + ss * (1 + 0.30 * zn) * amp;
-  return hslToRgb(hh, Math.max(0, Math.min(1, sat)), Math.max(0.04, Math.min(0.96, l)));
-}
 
 function rgbToHsl(r, g, b) {
   r /= 255; g /= 255; b /= 255;
@@ -957,56 +1237,88 @@ function field(g, w, h, m, R, C, max = peak(m)) {
   }
 }
 
-/* One tile per probe (plus the live one): the SAME mode, drawn alone. The big plot above
-   overlays them to compare shapes; here each is isolated so a single probe can be read
-   without the others crossing it. Arrows always; the field background is opt-in, since a
-   dense fill is only wanted when you are reading direction rather than magnitude.
-   Every tile shares the big plot's scale and animation clock, so play moves all of them
-   together and arrow lengths stay comparable across tiles. */
+/* The mode tiles. On top, the CURSOR tile: whatever you are pointing at -- the live
+   cursor, or the cursor on a saved curve (a peak, or any frequency clicked on the
+   spectrum) -- with a button to add it to that position's row. Below, one ROW per saved
+   position: its three strongest peaks plus any frequency you added, in increasing frequency. Click
+   a tile to show / hide it in the big plot above; that plot overlays every shown tile.
+   Every tile shares the big plot's animation clock, so play moves all of them together. */
 function fieldGrid() {
   const box = $('#fgrid');
   if (!box) return;
-  const lm = S.byId[S.live.sid];
-  // id + freq on one line (freq flush right), then layout, then box -- each on its own line
-  const cap = (m, hzv) => `<span class="fc1"><b>${sampleId(m)}</b><i>${curveLine(null, null, hzv)}</i></span>` +
-    `<i>${m.layout || '—'}</i><i>${m.box}</i>`;
-  const cur = S.mode && lm ? { m: S.mode, c: css('--ink'), id: 0, t: cap(lm, hz(S.fi)) } : null;
-  const rest = shownProbes().filter(fitsGrid)
-    .map((p) => ({ m: p.mode, c: col(p), id: p.id, t: cap(p.meta, p.hzv) }));
-  const sets = [...(cur ? [cur] : []), ...rest];
-  // Draw even for a single set. The tiles are not only a comparison: the lone tile is the
-  // current mode on its OWN scale, which the overlaid plot above cannot show, so it is
-  // worth having before any probe is pinned.
-  if (!sets.length) { box.innerHTML = ''; box.dataset.sig = ''; return; }
+  // frequency, then |FFT| there flush right (dB on the log scale), from that tile's own curve
+  const cap = (fi, d) => `<b>${curveLine(null, null, hz(fi))}</b> <i>${d ? pkVal(d, fi) + (S.log.spec ? ' dB' : '') : ''}</i>`;
+  // Every row is one sample: its tiles, plus a leading cursor tile while the cursor (on
+  // the active curve) sits off the row. The cursor's tile is marked (.cur) and shows the
+  // hover preview.
+  const cur = cursorSet(), act = cur && ownerOf(cur.who);
+  const rows = rowOwners().map((p) => {
+    const live = p === S.liveP, d = live ? S.probe : p.data, curFi = p === act ? cur.fi : null;
+    const fis = p.row.map((x) => x.fi);
+    if (curFi != null && !fis.includes(curFi)) fis.push(curFi);
+    fis.sort((a, b) => a - b);             // tiles left to right in increasing frequency
+    return {
+      hd: live ? `current · ${sampleLine(S.byId[S.live.sid])} <button class="fadd">+ save</button>`
+        : `<i class="sw" style="background:${col(p)}"></i>${sampleLine(p.meta)}` +
+          `<span class="an"><button class="link" data-all="${p.id}">all</button>` +
+          `<button class="link" data-none="${p.id}">none</button></span>`,
+      tiles: fis.map((fi) => ({
+        who: live ? 'live' : p, fi, c: col(p, 1, rowShade(p, fi)), id: live ? 0 : p.id, t: cap(fi, d),
+        m: fi === curFi ? cur.m : modeAt(p, fi),
+        cls: (p.row.find((x) => x.fi === fi)?.on ? 'on' : 'off') + (fi === curFi ? ' cur' : ''),
+      })),
+    };
+  });
+  const tiles = rows.flatMap((r) => r.tiles);
+  if (!tiles.length) { box.innerHTML = ''; box.dataset.sig = ''; return; }
 
-  const sig = sets.map((s) => s.id).join(',') + '|' + sets.map((s) => s.t).join('|');
-  if (box.dataset.sig !== sig) {          // rebuild only when the SET changes, not per frame
-    box.dataset.sig = sig;
-    // one grid, current sample first, so `figure canvas` below walks in `sets` order.
-    const tile = (s) => `<figure data-id="${s.id}">` +
-      `<canvas width="124" height="124"></canvas>` +
-      `<figcaption style="border-left-color:${s.c}">${s.t}</figcaption></figure>`;
-    box.innerHTML = `<div class="fgrid-rest">${sets.map(tile).join('')}</div>`;
+  // rebuild only when the tiles change, not every animation frame
+  const html = `<div class="frows">` + rows.map((r) =>
+    `<div class="frow"><div class="frowhd">${r.hd}</div><div class="fgrid-rest">` +
+    r.tiles.map((s) => `<figure data-id="${s.id}" class="${s.cls}" style="--c:${s.c}">` +
+      `<canvas width="124" height="124"></canvas><figcaption>${s.t}</figcaption></figure>`).join('') +
+    `</div></div>`).join('') + `</div>`;
+  if (box.dataset.sig !== html) {
+    box.dataset.sig = box.innerHTML = html;
+    box.querySelectorAll('figure').forEach((f, i) => (f.onclick = () => pickPeak(tiles[i].who, tiles[i].fi, true)));
+    box.querySelector('.fadd')?.addEventListener('click', pin);
+    // all / none: every tile of that row into the big plot, or out of it
+    box.querySelectorAll('[data-all], [data-none]').forEach((b) => (b.onclick = () => {
+      const p = S.probes.find((q) => q.id === +(b.dataset.all ?? b.dataset.none));
+      for (const x of p.row) x.on = b.dataset.all != null;
+      paintAll();
+    }));
   }
   box.querySelectorAll('figure').forEach((f) =>
     f.classList.toggle('hot', !!S.hot && +f.dataset.id === S.hot.id));
+  box._tiles = tiles;
+  registerZone('modes', box, stepTile);
 
-  const R = S.info.rows, C = S.info.cols;
   /* Each tile is normalised to ITS OWN peak, so every one fills the cell and its shape is
      readable even for a weakly excited mode. Relative magnitude between probes is what the
      overlaid plot above is for -- on a shared scale here, a weak mode would collapse into
-     invisible arrows and the shape, the only thing these tiles are for, would be lost. */
+     invisible arrows and the shape, the only thing these tiles are for, would be lost.
+     And each on its OWN laser grid: a probe from another box may not match this one's. */
+  const bv = boxView();
+  box.style.setProperty('--ta', bv ? bv.w / bv.h : 1);          // box tiles take the photo crop's shape
   box.querySelectorAll('figure canvas').forEach((cv, i) => {
-    const [g, w, h] = fit(cv), cw = w / C, chh = h / R;
+    const t = tiles[i], [g, w, h] = fit(cv);
+    if (!t.m) return;                           // still loading
+    // a probe from another box has its own photo, not this one
+    if (bv && fitsGrid(t.m) && (t.who === 'live' || t.who.ds === S.info.dataset)) {
+      if (S.modeview === 'inout' && !hasZ([t])) return stale(g, w, h);
+      return drawBox(g, w, h, t.m, bv);
+    }
+    const R = t.m.u.length, C = t.m.u[0].length, cw = w / C, chh = h / R;
     if (S.modeview === 'surface') {
-      if (!hasZ([sets[i]])) return stale(g, w, h);
-      surfaces(g, [surfCol(sets[i])], w, h, R, C, zmax([sets[i]]));
+      if (!hasZ([t])) return stale(g, w, h);
+      surfaces(g, [t], w, h, R, C, zmax([t]));
       return;
     }
-    const max = maxOf([sets[i]]);
-    if (S.fieldbg) field(g, w, h, sets[i].m, R, C, max);
+    const max = maxOf([t]);
+    if (S.fieldbg) field(g, w, h, t.m, R, C, max);
     const k = (Math.min(cw, chh) * 0.42 * S.asize) / (max || 1);
-    arrows(g, [{ m: sets[i].m, c: S.fieldbg ? '#fff' : sets[i].c }], w, h, R, C, cw, chh, k, 0);
+    arrows(g, [{ m: t.m, c: S.fieldbg ? '#fff' : t.c }], cellAt(cw, chh), k, 0);
   });
 }
 
@@ -1200,46 +1512,90 @@ function buildOverlays() {
   }
 }
 
-// Every peak is labelled; alternating sides keeps close pairs from overlapping.
+/* ***** peaks: every drawn curve's, on the plot and in the rail table *****
+   A "peak column" is one curve that has peaks: the live sample (when drawn) and every shown
+   probe, in workbench order. One of them is ACTIVE (S.pkWho: 'live' or a probe object) --
+   its peaks are labelled on the plot, and the arrow keys walk them. Each column carries its
+   own CURSOR: the live S.fi, or a probe's p.cur. Moving a cursor only looks (the cursor
+   tile in Modes); clicking a saved curve's peak, or Space, adds it to / drops it from that
+   position's row. */
+function pkCols() {
+  const live = (S.probe && !liveHidden() && S.live.laser !== 'all')
+    ? [{ who: 'live', d: S.probe, c: css('--ink'), fi: S.fi, tag: 'now', title: sampleLine(S.byId[S.live.sid]) }] : [];
+  return [...live, ...shownProbes().filter((p) => p.data).map((p) => ({
+    who: p, d: p.data, c: col(p), fi: p.cur, tag: String(p.pos ?? p.meta?.pos ?? '?'), title: probeLines(p).join('  '),
+  }))];
+}
+const activeCol = (cols = pkCols()) => cols.find((c) => c.who === S.pkWho) ?? cols[0] ?? null;
 
-// Markers ride the magnitude curve itself, using the same y-mapping multi() drew with.
-function peakY(i) {
+// Markers ride their own curve, using the same y-mapping multi() drew with.
+function peakY(i, d = S.probe) {
   const m = S.p1;
-  if (!m || !S.probe) return 10;
-  const mag = S.specMode === 'magphase'
-    ? (S.log.spec ? S.probe.logmag : S.probe.mag) : S.probe.re;
-  return yMap(mag[i], m.lo, m.hi, m.h);
+  if (!m || !d) return 10;
+  const v = S.specMode === 'magphase' ? (S.log.spec ? d.logmag : d.mag) : d.re;
+  return yMap(v[i], m.lo, m.hi, m.h);
 }
 
-/* The detected resonances, listed. Clicking one is the same as clicking its marker. */
+// a curve's peaks, strongest |FFT| first -- the table's order
+const byMag = (d) => [...(d.peaks || [])].sort((a, b) => d.mag[b] - d.mag[a]);
+
+const pkVal = (d, i) => {
+  const m = d?.mag?.[i] ?? 0;
+  return S.log.spec ? (20 * Math.log10(m + 1e-8)).toFixed(0)
+                    : (m >= 10 ? m.toFixed(0) : m >= 1 ? m.toFixed(1) : m.toFixed(2));
+};
+
+/* The rail table: one column per curve, its peaks strongest first (up/down here walks
+   that order; left/right on the plot walks frequency). Three columns fit the rail; more page with the arrows,
+   and the page always follows the active column. */
+const PK_SHOW = 3;
 function peakList() {
   const el = $('#pklist');
   if (!el) return;
-  // Muted (esc) hides the current curve -- its peak list shouldn't linger either.
-  const pk = liveHidden() ? [] : (S.probe?.peaks || []);
-  $('#npk').textContent = pk.length || '';
-  // Strongest first: when hunting resonances, rank is the useful order. dB is shown so
-  // "how much stronger" is answerable, not just "which is stronger".
-  const mag = S.probe ? S.probe.mag : null;
-  const lg = S.log.spec;
-  const val = (i) => {
-    const m = mag?.[i] ?? 0;
-    return lg ? `${(20 * Math.log10(m + 1e-8)).toFixed(0)} dB`
-              : (m >= 10 ? m.toFixed(0) : m >= 1 ? m.toFixed(1) : m.toFixed(2));
-  };
-  const sorted = mag ? [...pk].sort((x, y) => mag[y] - mag[x]) : pk;
-  el.innerHTML = sorted.map((i, r) =>
-    `<button class="pkrow${i === S.fi ? ' on' : ''}" data-fi="${i}" title="rank ${r + 1}">` +
-    `<span class="hzv">${fmt(hz(i))} Hz</span><span class="dbv">${val(i)}</span></button>`
-  ).join('');
+  const cols = pkCols(), act = activeCol(cols), ai = cols.indexOf(act);
+  $('#npk').textContent = act ? (act.d.peaks || []).length : '';
+  if (ai >= 0) S.pkOff = Math.min(Math.max(S.pkOff ?? 0, ai - PK_SHOW + 1), ai);
+  S.pkOff = Math.max(0, Math.min(S.pkOff ?? 0, cols.length - PK_SHOW));
+  const page = cols.slice(S.pkOff, S.pkOff + PK_SHOW);
+  const pager = cols.length > PK_SHOW
+    ? `<div class="pkpage"><button data-pg="-1"${S.pkOff ? '' : ' disabled'}>‹</button>` +
+      `<span>${S.pkOff + 1}–${S.pkOff + page.length} of ${cols.length}</span>` +
+      `<button data-pg="1"${S.pkOff + PK_SHOW < cols.length ? '' : ' disabled'}>›</button></div>` : '';
+  // rebuilt every paint: keep the table's own scroll, then bring the selection into view
+  const top = el.querySelector('.pkcols')?.scrollTop ?? 0;
+  el.innerHTML = pager + `<div class="pkcols">` + page.map((c) => {
+    const k = cols.indexOf(c), on = c === act;
+    return `<div class="pkcol${on ? ' on' : ''}" style="--c:${c.c}">` +
+      `<div class="pkhd" data-k="${k}" title="${c.title}">${c.tag}</div>` +
+      byMag(c.d).map((i) =>
+        `<button class="pkrow${pkState(c, i)}${i === c.fi ? ' cur' : ''}" data-k="${k}" data-fi="${i}" ` +
+        `title="${fmt(hz(i))} Hz · ${pkVal(c.d, i)}${S.log.spec ? ' dB' : ''}">` +
+        `<span class="hzv">${fmt(hz(i))}</span><span class="dbv">${pkVal(c.d, i)}</span></button>`).join('') +
+      `</div>`;
+  }).join('') + `</div>`;
+  const box = el.querySelector('.pkcols'), on = box.querySelector('.pkcol.on .pkrow.cur');
+  box.scrollTop = top;
+  // scroll only the table (scrollIntoView would also drag the page to it on every paint);
+  // the sticky header row covers the top, so keep the selection below it
+  if (on) {
+    const hd = box.querySelector('.pkhd')?.offsetHeight ?? 0;
+    const y = on.offsetTop - box.offsetTop;
+    if (y - hd < box.scrollTop) box.scrollTop = y - hd;
+    else if (y + on.offsetHeight > box.scrollTop + box.clientHeight) box.scrollTop = y + on.offsetHeight - box.clientHeight;
+  }
   el.querySelectorAll('.pkrow').forEach((b) => (b.onclick = () => {
-    S.peakMode = true;
-    setFi(+b.dataset.fi);
+    pickPeak(cols[+b.dataset.k].who, +b.dataset.fi, true);
     el.focus();
   }));
-  // Navigate the grid exactly as drawn (2 columns, PK_COLS) -- same as clicking a row, just
-  // by arrow key, whether this list is hovered or was the last thing clicked.
-  registerZone('peaks', el, (dx, dy) => stepGrid(dx, dy));
+  el.querySelectorAll('.pkhd').forEach((h) => (h.onclick = () => {
+    const c = cols[+h.dataset.k];
+    pickPeak(c.who, c.fi);
+  }));
+  el.querySelectorAll('[data-pg]').forEach((b) => (b.onclick = () => {
+    stepCol(+b.dataset.pg * PK_SHOW);
+  }));
+  // Arrows here move as drawn: up/down through a column, left/right across columns.
+  registerZone('peaks', el, (dx, dy) => (dx ? stepCol(dx) : stepPeak(dy, true)));
   if (!el.dataset.armedVis) {
     el.dataset.armedVis = '1';
     el.tabIndex = 0;
@@ -1248,29 +1604,34 @@ function peakList() {
   }
 }
 
+/* A dot on every peak of every drawn curve, in that curve's colour; only the active
+   curve's are labelled, or several curves' labels would bury the plot. */
 function buildPeaks() {
   const g = $('#p1ov').querySelector('.pks');
   if (!g) return;
-  // The markers ride the magnitude curve; with an image in its place they have no y, and
-  // muted (esc) hides that curve too -- riderless markers would just float there.
-  const pk = (S.live.laser === 'all' || liveHidden()) ? [] : (S.probe?.peaks || []);
-  let lastX = -99, up = true;
-  g.innerHTML = pk.map((i) => {
-    const x = specX(i);
-    up = (x - lastX) < 6 ? !up : true;       // too close to the previous label -> flip
-    lastX = x;
-    return `<circle class="pk" r="3.4" data-fi="${i}"/>` +
-           `<text class="pklab" data-fi="${i}" data-up="${up ? 1 : 0}">${fmt(hz(i))}</text>`;
+  const cols = pkCols(), act = activeCol(cols);
+  // the active curve last, so its dots sit on top
+  const order = [...cols.filter((c) => c !== act), ...(act ? [act] : [])];
+  g.innerHTML = order.map((c) => {
+    const k = cols.indexOf(c);
+    let lastX = -99, up = true;
+    return (c.d.peaks || []).map((i) => {
+      const dot = `<circle class="pk${c === act ? ' act' : ''}${pkState(c, i)}" r="${c === act ? 3.4 : 2.6}" ` +
+                  `data-k="${k}" data-fi="${i}" style="--c:${c.c}"/>`;
+      if (c !== act) return dot;
+      const x = specX(i);
+      up = (x - lastX) < 6 ? !up : true;     // too close to the previous label -> flip
+      lastX = x;
+      return dot + `<text class="pklab" data-k="${k}" data-fi="${i}" data-up="${up ? 1 : 0}">${fmt(hz(i))}</text>`;
+    }).join('');
   }).join('');
-  g.querySelectorAll('.pk').forEach((c) => (c.onclick = (e) => {
+  g.querySelectorAll('.pk').forEach((dot) => (dot.onclick = (e) => {
     e.stopPropagation();
-    S.peakMode = true;
     // Clicking a peak marker ON THE PLOT is the one zone-worthy click that doesn't happen
     // on a registerZone'd element (the plot itself isn't a zone) -- set armedZone directly
-    // so it's consistent with every other "click something, arrows now act on it" case, and
-    // so hovering #pklist right after still shows it as armed.
+    // so it's consistent with every other "click something, arrows now act on it" case.
     armedZone = 'peaks';
-    setFi(+c.dataset.fi);
+    pickPeak(cols[+dot.dataset.k].who, +dot.dataset.fi, true);
   }));
 }
 
@@ -1280,25 +1641,29 @@ function cursors() {
   for (const id of OVS) {
     const svg = $(id);
     const sel = svg.querySelector('.sel'), hov = svg.querySelector('.hov');
-    sel.setAttribute('x1', at(S.fi)); sel.setAttribute('x2', at(S.fi));
-    sel.style.display = inSpecX(S.fi) ? '' : 'none';
-    const show = S.hoverFi != null && S.hoverFi !== S.fi && S.live.laser !== 'all'
+    const cf = activeCol()?.fi ?? S.fi;      // the active curve's cursor
+    sel.setAttribute('x1', at(cf)); sel.setAttribute('x2', at(cf));
+    sel.style.display = inSpecX(cf) ? '' : 'none';
+    const show = S.hoverFi != null && S.hoverFi !== cf && S.live.laser !== 'all'
                  && inSpecX(S.hoverFi);
     hov.style.display = show ? '' : 'none';
     if (show) { hov.setAttribute('x1', at(S.hoverFi)); hov.setAttribute('x2', at(S.hoverFi)); }
   }
+  const cols = pkCols();
   $('#p1ov').querySelectorAll('.pk').forEach((c) => {
-    const i = +c.dataset.fi;
-    c.setAttribute('cx', at(i)); c.setAttribute('cy', peakY(i));
+    const i = +c.dataset.fi, k = cols[+c.dataset.k];
+    if (!k) return;
+    c.setAttribute('cx', at(i)); c.setAttribute('cy', peakY(i, k.d));
     c.style.display = inSpecX(i) ? '' : 'none';
-    c.classList.toggle('on', i === S.fi);
+    c.classList.toggle('cur', i === k.fi);
   });
   $('#p1ov').querySelectorAll('.pklab').forEach((tx) => {
-    const i = +tx.dataset.fi;
-    tx.setAttribute('x', at(i)); tx.setAttribute('y', peakY(i));
+    const i = +tx.dataset.fi, k = cols[+tx.dataset.k];
+    if (!k) return;
+    tx.setAttribute('x', at(i)); tx.setAttribute('y', peakY(i, k.d));
     tx.setAttribute('dy', tx.dataset.up === '1' ? -8 : 15);
     tx.style.display = inSpecX(i) ? '' : 'none';
-    tx.classList.toggle('on', i === S.fi);
+    tx.classList.toggle('on', i === k.fi);
   });
 }
 
@@ -1306,17 +1671,123 @@ async function setFi(i) {
   S.fi = i; S.modePreview = null; modeSeq++; await loadMode(); paintAll();
 }
 
-/* Walk the detected peaks. Once you land on one, plain left/right steps peak to peak --
-   which is what you want after clicking one -- and shift+arrows always do. */
-function stepPeak(d) {
-  const pk = S.probe?.peaks || [];
-  if (!pk.length) return;
+/* Move a curve's cursor to fi (and make that curve the active one). The live cursor IS
+   S.fi, so the live mode follows; a saved curve's cursor only changes what the cursor tile
+   shows. toggle (a click on a saved curve's peak) also adds / drops it in the row. */
+async function pickPeak(who, fi, toggle = false) {
   S.peakMode = true;
-  const at = pk.indexOf(S.fi);
+  S.pkWho = who;
+  if (toggle) toggleMode(ownerOf(who), fi);
+  if (who === 'live') return setFi(fi);
+  who.cur = fi;
+  paintAll();
+}
+
+/* ***** rows: a saved position's modes ***** */
+// A saved sample's mode at fi, fetched once and kept (a mode uses every laser and both
+// channels, so it never goes stale). null until it arrives -- the arrival repaints. The
+// server only reads the loaded box, so another box's probe has only what it fetched
+// while its box was loaded: every detected peak, prefetched by pin().
+function modeAt(p, fi) {
+  const m = (p.mcache ??= {})[fi];
+  if (m === undefined && p.ds === S.info.dataset) {   // /api/mode reads the current dataset
+    p.mcache[fi] = null;
+    api(`/api/mode/${p.sid}?fi=${fi}${modeQ()}`).then((r) => { p.mcache[fi] = r; paintAll(); });
+  }
+  return m || null;
+}
+// every shown tile of every shown row, with its field (null while loading)
+// the rows on screen: the current sample's (always, unless muted), then every shown probe's
+const liveShown = () => !S.muted && S.liveP?.row;
+const rowOwners = () => [...(liveShown() ? [S.liveP] : []), ...shownProbes()];
+const ownerOf = (who) => (who === 'live' ? S.liveP : who);
+const selectedModes = () => rowOwners().flatMap((p) =>
+  p.row.filter((x) => x.on).map((x) => ({ p, fi: x.fi, m: modeAt(p, x.fi) })))
+  .filter((s) => fitsGrid(s.m));
+// a peak's state in its column: shown in the big plot (pick) or in the row but hidden (in)
+const pkState = (c, i) => {
+  const x = ownerOf(c.who).row?.find((r) => r.fi === i);
+  return x ? (x.on ? ' pick' : ' in') : '';
+};
+/* Show / hide fi in p's row. A frequency not in the row joins it, shown; hiding one you
+   added drops it again, while the three strongest stay as tiles to switch back on. */
+function toggleMode(p, fi) {
+  const x = p.row.find((r) => r.fi === fi);
+  if (!x && !modeAt(p, fi) && p.ds !== S.info.dataset) return;   // can't be fetched from here
+  if (!x) p.row.push({ fi, on: true, top: false });
+  else if (x.on && !x.top) p.row = p.row.filter((r) => r !== x);
+  else x.on = !x.on;
+}
+/* Arrows over the mode tiles: left/right to the previous / next tile in reading order,
+   up/down to the tile straight above / below. Landing on one moves the cursor there. */
+function stepTile(dx, dy) {
+  const box = $('#fgrid'), figs = [...box.querySelectorAll('figure')];
+  const at = figs.findIndex((f) => f.classList.contains('cur'));
+  let next = figs[at === -1 ? 0 : at + dx];
+  if (dy && at !== -1) {
+    const r = figs[at].getBoundingClientRect(), box2 = (f) => f.getBoundingClientRect();
+    const line = figs.filter((f) => (dy > 0 ? box2(f).top > r.bottom : box2(f).bottom < r.top));
+    const y = (dy > 0 ? Math.min : Math.max)(...line.map((f) => box2(f).top));
+    next = line.filter((f) => box2(f).top === y)
+      .sort((a, b) => Math.abs(box2(a).left - r.left) - Math.abs(box2(b).left - r.left))[0];
+  }
+  if (next) { const s = box._tiles[figs.indexOf(next)]; pickPeak(s.who, s.fi); }
+}
+
+// Space: show / hide the cursor's frequency in its row
+function addCursor() {
+  const a = activeCol();
+  if (a) pickPeak(a.who, a.fi, true);
+}
+/* What the cursor is on: the active curve's cursor, or while hovering the spectrum, the
+   frequency under the pointer. { who, fi, m, c, meta }, or null with nothing to show. */
+function cursorSet() {
+  if (S.muted) return null;               // Esc hides whatever the cursor is on
+  const who = activeCol()?.who ?? 'live';
+  const hov = S.modePreview && S.hoverFi != null;    // hovering the spectrum previews there
+  if (who === 'live') return S.mode && { who, fi: hov ? S.hoverFi : S.fi, m: S.mode,
+                                         c: css('--ink'), meta: S.byId[S.live.sid] };
+  const fi = hov ? S.hoverFi : who.cur, m = hov ? S.modePreview : modeAt(who, fi);
+  return m && { who, fi, m, c: col(who), meta: who.meta };
+}
+
+/* Left/right on the plot (up/down in the table): the active curve's previous/next peak.
+   Off a peak, the first one past its frequency in that direction. */
+function stepPeak(d, ranked = false) {
+  const c = activeCol();
+  if (!c) return;
+  const pk = ranked ? byMag(c.d) : c.d.peaks || [];   // the table's order, or the plot's
+  if (!pk.length) return;
+  const at = pk.indexOf(c.fi);
   const next = at === -1
-    ? (d > 0 ? pk.find((i) => i > S.fi) ?? pk[0] : [...pk].reverse().find((i) => i < S.fi) ?? pk.at(-1))
+    ? ranked ? pk[0] : (d > 0 ? pk.find((i) => i > c.fi) ?? pk[0] : [...pk].reverse().find((i) => i < c.fi) ?? pk.at(-1))
     : pk[Math.max(0, Math.min(pk.length - 1, at + d))];
-  setFi(next);
+  pickPeak(c.who, next);
+}
+
+// Land on curve `c` at the peak nearest the active frequency (or just there, if it has none).
+function jumpTo(c) {
+  const f = activeCol()?.fi ?? S.fi, pk = c.d.peaks || [];
+  pickPeak(c.who, pk.length ? pk.reduce((a, b) => (Math.abs(b - f) < Math.abs(a - f) ? b : a)) : f);
+}
+
+/* Up/down on the plot: the curve drawn directly above / below the active one at its
+   frequency -- by where it is on screen, not by workbench order. */
+function stepCurve(d) {
+  const cols = pkCols(), act = activeCol(cols);
+  if (!act || cols.length < 2) return;
+  const f = act.fi;
+  const byY = [...cols].sort((a, b) => peakY(f, a.d) - peakY(f, b.d));   // top first
+  const next = byY[byY.indexOf(act) + d];
+  if (next) jumpTo(next);
+}
+
+// Left/right in the table (and its page buttons): the neighbouring column, `d` steps over.
+function stepCol(d) {
+  const cols = pkCols(), act = activeCol(cols);
+  if (!act) return;
+  const next = cols[Math.max(0, Math.min(cols.length - 1, cols.indexOf(act) + d))];
+  if (next !== act) jumpTo(next);
 }
 
 // The tallest detected resonance, or null when nothing was detected.
@@ -1324,27 +1795,6 @@ function strongestPeak() {
   const pk = S.probe?.peaks || [], mag = S.probe?.mag;
   if (!pk.length || !mag) return null;
   return pk.reduce((a, b) => (mag[b] > mag[a] ? b : a));
-}
-
-const PK_COLS = 2;                     // must match .pklist grid-template-columns
-
-function ranked() {
-  const pk = S.probe?.peaks || [], mag = S.probe?.mag;
-  return (pk.length && mag) ? [...pk].sort((x, y) => mag[y] - mag[x]) : pk;
-}
-
-/* Move within the ranked grid exactly as it is laid out: left/right to the neighbouring
-   cell (which wraps between columns, so left from the right column lands on the left
-   column of the SAME row), up/down a whole row. */
-function stepGrid(dx, dy) {
-  const r = ranked();
-  if (!r.length) return;
-  S.peakMode = true;
-  const at = r.indexOf(S.fi);
-  if (at === -1) return setFi(r[0]);
-  const next = at + dx + dy * PK_COLS;
-  if (next < 0 || next >= r.length) return;      // stay put at the edges
-  setFi(r[next]);
 }
 
 /* Each pinned probe sits at one frequency, but nothing on the spectrum showed where.
@@ -1359,12 +1809,12 @@ function probeTicks() {
       g.setAttribute('class', 'pticks');
       svg.insertBefore(g, svg.firstChild);
     }
-    g.innerHTML = shownProbes().filter((p) => inSpecX(p.fi)).map((p) => {
-      const x = specX(p.fi);
+    g.innerHTML = selectedModes().filter((s) => inSpecX(s.fi)).map(({ p, fi }) => {
+      const x = specX(fi);
       const dim = S.hot && S.hot !== p;
       const dash = p.dash?.length ? p.dash.join(' ') : '5 3';
       return `<line class="ptick" x1="${x}%" x2="${x}%" y1="0" y2="100%" ` +
-             `stroke-dasharray="${dash}" stroke="${col(p, dim ? 0.2 : 0.9)}"/>`;
+             `stroke-dasharray="${dash}" stroke="${col(p, dim ? 0.2 : 0.9, rowShade(p, fi))}"/>`;
     }).join('');
   }
 }
@@ -1486,9 +1936,20 @@ function freqAxis(el) {
   });
   el.addEventListener('click', () => {
     if (S.hoverFi == null) return;
-    // Landing on a detected peak keeps peak-stepping armed; anywhere else releases it.
-    S.peakMode = (S.probe?.peaks || []).includes(S.hoverFi);
-    setFi(S.hoverFi);
+    // A click anywhere on the spectrum moves a cursor there -- any frequency, not just a
+    // peak: the cursor of the curve under the pointer, else the active curve's. The cursor
+    // tile in Modes shows the mode there; Space (or its button) adds it to the row.
+    const hit = S.hot && S.hot !== 'live' && S.hot !== 'preview' ? S.hot : null;
+    const who = hit || activeCol()?.who || 'live';
+    const fi = S.hoverFi;
+    S.modePreview = null;
+    if (who === 'live') {
+      S.pkWho = 'live';
+      S.peakMode = (S.probe?.peaks || []).includes(fi);
+      return setFi(fi);
+    }
+    pickPeak(who, fi);
+    S.peakMode = (who.data?.peaks || []).includes(fi);
   });
 }
 
@@ -1522,11 +1983,15 @@ async function previewMode(fi) {
     return;
   }
   if (modePending) return;                // coalesce: one request in flight at a time
+  // the preview is of the active curve's sample -- a saved one's, when that is active
+  const a = activeCol()?.who, p = a && a !== 'live' && a.ds === S.info.dataset ? a : null;
+  if (a && a !== 'live' && !p) return;
   modePending = true;
   try {
-    const d = await api(`/api/mode/${S.live.sid}?fi=${fi}`);
+    const d = await api(`/api/mode/${p ? p.sid : S.live.sid}?fi=${fi}${modeQ()}`);
     if (seq !== modeSeq) return;
-    S.modePreview = d; S.mode = d;
+    S.modePreview = d;
+    if (!p) S.mode = d;
     drawMode();
   } finally { modePending = false; }
 }
@@ -1536,7 +2001,7 @@ async function previewLaser(i) {
   const seq = ++previewSeq;
   if (i == null) { S.preview = null; if (seq === previewSeq) { drawSpec(); drawShifts(); legends(); } return; }
   const { sid, ch } = S.live;
-  const d = await api(`/api/probe/${sid}?ch=${ch}&laser=${i}&kind=${S.kind}`);
+  const d = await api(`/api/probe/${sid}?ch=${ch}&laser=${i}&kind=${S.kind}&ref=${S.ref}`);
   if (seq !== previewSeq) return;
   S.preview = d;
   drawSpec(); drawShifts(); legends();
@@ -1574,7 +2039,7 @@ function pickbox(host, { opts, on, pick, multi = false, current, cap = 400, plac
       const picked = opts().filter((o) => on(o.v));
       selbar.innerHTML = picked.map((o) => {
         const dot = o.hue == null ? '' : `<span class="pbdot" style="--h:${o.hue}"></span>`;
-        return `<span class="pbchip">${dot}${o.label}` +
+        return `<span class="pbchip" title="${o.label}">${dot}<span class="pbct">${o.label}</span>` +
           `<button class="pbx" data-v="${o.v}" title="remove">×</button></span>`;
       }).join('');
       // only the × removes -- a chip is a label for what's selected, not a control
@@ -1683,7 +2148,7 @@ function buildFilters() {
     // same as layout/n_objects: a sample passes if it's in ANY of the picked boxes.
     opts: () => {
       const f = facetTally('box', 'boxes');
-      return tally('box').map(([b], i) => ({ v: b, label: b, count: f.get(b) || 0 }));
+      return live(tally('box').map(([b]) => ({ v: b, label: b, count: f.get(b) || 0 })), (v) => S.f.boxes.has(v));
     },
     on: (v) => S.f.boxes.has(v),
     pick: (v) => { toggle(S.f.boxes, v); applyFilter(); },
@@ -1694,20 +2159,20 @@ function buildFilters() {
     // the picked types. Count is faceted against the other filters.
     opts: () => {
       const f = facetObjTally();
-      return objectValues().map((o, i) =>
-        ({ v: o, label: o === NONE_OBJ ? 'no-object' : o, count: f.get(o) || 0 }));
+      return live(objectValues().map((o) =>
+        ({ v: o, label: o === NONE_OBJ ? 'no-object' : o, count: f.get(o) || 0 })), (v) => S.f.objects.has(v));
     },
     on: (v) => S.f.objects.has(v),
     pick: (v) => { toggle(S.f.objects, v); applyFilter(); },
     multi: true, placeholder: 'filter objects',
   });
   pickbox($('#nobjbox'), {
-    // Order fixed by the dataset-wide total (tally); the COUNT is faceted -- how many
-    // samples with that object count survive the layout + speaker filters.
+    // Ascending by object count; the COUNT is faceted -- how many samples with that
+    // object count survive the other filters.
     opts: () => {
       const f = facetTally('n', 'nobj');
-      return tally('n').map(([n]) => n).sort((a, b) => a - b)
-        .map((n) => ({ v: n, label: String(n), count: f.get(n) || 0 }));
+      return live(tally('n').map(([n]) => n).sort((a, b) => a - b)
+        .map((n) => ({ v: n, label: String(n), count: f.get(n) || 0 })), (v) => S.f.nobj.has(v));
     },
     on: (v) => S.f.nobj.has(+v),
     pick: (v) => { toggle(S.f.nobj, +v); applyFilter(); },
@@ -1716,8 +2181,8 @@ function buildFilters() {
   pickbox($('#layoutbox'), {
     opts: () => {
       const f = facetTally('layout', 'layouts');
-      return tally('layout').map(([l], i) =>
-        ({ v: l, label: l, count: f.get(l) || 0 }));
+      return live(tally('layout').map(([l]) => l).sort(cmp)   // alphabetical
+        .map((l) => ({ v: l, label: l, count: f.get(l) || 0 })), (v) => S.f.layouts.has(v));
     },
     on: (v) => S.f.layouts.has(v),
     pick: (v) => { toggle(S.f.layouts, v); applyFilter(); },
@@ -2042,7 +2507,7 @@ function renderScatter() {
   const svg = $('#scatter');
   let sel = null;
   svg.querySelectorAll('.pt').forEach((c) => {
-    const on = +c.dataset.p === S.byId[S.live.sid]?.pos && !liveHidden();
+    const on = +c.dataset.p === S.byId[S.live.sid]?.pos && !S.muted;   // saved or not
     c.classList.toggle('on', on);
     if (on) sel = c;
   });
@@ -2282,6 +2747,69 @@ async function setLaser(i) {
   paintAll();
 }
 
+/* The phase-reference picker: the same laser grid, with NONE and AVG above it. Picking a
+   reference rotates every laser's phase, bin by bin, so the reference reads 0 there:
+   z'_l = z_l * conj(z_r)/|z_r|. Magnitudes and laser-to-laser phase differences survive. */
+function buildRefGrid() {
+  const svg = $('#refgrid'), R = S.info.rows, C = S.info.cols;
+  const L = 11, PAD = 8, BOX = 100, step = (BOX - 2 * PAD) / (C - 1);
+  const TOP = 36, W = L + BOX, H = TOP + BOX + L;
+  svg.setAttribute('viewBox', `0 0 ${W} ${H}`);
+  const cell = (cls, y, label) => `<g class="${cls}"><rect x="${L}" y="${y}" width="${BOX}" height="14" rx="3"/>` +
+    `<text x="${L + BOX / 2}" y="${y + 7.6}">${label}</text></g>`;
+  const half = (BOX - 2) / 2;
+  let out = cell('nonecell', 0, 'NONE') +
+            `<g class="avgcell"><rect x="${L}" y="18" width="${half}" height="14" rx="3"/>` +
+            `<text x="${L + half / 2}" y="25.6">AVERAGE</text></g>` +
+            `<g class="realcell"><rect x="${L + half + 2}" y="18" width="${half}" height="14" rx="3"/>` +
+            `<text x="${L + half + 2 + half / 2}" y="25.6">MOST-REAL</text></g>` +
+            `<rect class="box" x="${L}" y="${TOP}" width="${BOX}" height="${BOX}" rx="4"/>`;
+  for (let r = 0; r < R; r++) {
+    out += `<text class="gl" x="${L - 3}" y="${TOP + PAD + r * step + 1.6}">${r}</text>`;
+    for (let c = 0; c < C; c++)
+      out += `<circle class="ls" data-i="${r * C + c}" cx="${L + PAD + c * step}" cy="${TOP + PAD + r * step}" r="3.2"/>`;
+  }
+  for (let c = 0; c < C; c++)
+    out += `<text class="gl col" x="${L + PAD + c * step}" y="${TOP + BOX + 7}">${c}</text>`;
+  svg.innerHTML = out;
+  svg.querySelector('.nonecell').onclick = (e) => { e.stopPropagation(); setRef('none'); };
+  svg.querySelector('.avgcell').onclick = (e) => { e.stopPropagation(); setRef('avg'); };
+  svg.querySelector('.realcell').onclick = (e) => { e.stopPropagation(); setRef('real'); };
+  svg.onclick = (e) => { const t = e.target.closest('.ls'); if (t) setRef(+t.dataset.i); };
+  svg.onpointermove = (e) => {
+    const t = e.target.closest('.ls');
+    svg.querySelectorAll('.ls').forEach((x) => x.classList.toggle('hot', x === t));
+  };
+  svg.onpointerleave = () => svg.querySelectorAll('.ls').forEach((x) => x.classList.remove('hot'));
+  renderRefGrid();
+}
+
+async function setRef(r) {
+  S.ref = r;
+  renderRefGrid();
+  dropModes();
+  await reviewChannel();
+}
+
+/* Cached mode fields were rotated by the old reference (or channel); forget them so the
+   tiles refetch. Another box's probe can't refetch, so it keeps what it has. */
+function dropModes() {
+  S.modePreview = null;
+  for (const p of [S.liveP, ...S.probes]) if (p && p.ds === S.info.dataset) p.mcache = {};
+}
+
+function renderRefGrid() {
+  const r = S.ref, svg = $('#refgrid');
+  svg.querySelectorAll('.ls').forEach((x) => {
+    const on = typeof r === 'number' && +x.dataset.i === r;
+    x.classList.toggle('on', on);
+    x.setAttribute('r', on ? 5.4 : 3.2);
+  });
+  svg.querySelector('.nonecell').classList.toggle('on', r === 'none');
+  svg.querySelector('.avgcell').classList.toggle('on', r === 'avg');
+  svg.querySelector('.realcell').classList.toggle('on', r === 'real');
+}
+
 function renderGrid() {
   const i = S.live.laser;
   const svg = $('#grid');
@@ -2364,22 +2892,50 @@ function renderRepeats() {
 }
 
 /* ***** probes ***** */
+/* Save the current sample to the workbench -- once: a sample already saved is not added
+   again, its card just flashes and its curve becomes the active one. Either way the current
+   row's picks move down into the saved row, and the current row is left blank. */
 function pin() {
-  const p = {
-    ...S.live, fi: S.fi, hzv: hz(S.fi), id: Date.now(),
-    pos: S.byId[S.live.sid].pos,
-    box: S.info.box,                      // the box this probe was measured in
-    ds: S.info.dataset,                   // ids repeat across datasets (gallery pin rings)
-    dash: DASH[S.live.ch] || [],
-    data: S.probe, dataY: S.probeY, mode: S.mode,
-    meta: S.byId[S.live.sid],
-  };
-  S.probes.push(p);
-  reshade();
+  const old = savedOf(S.live.sid), p = old ?? newProbe(), lp = S.liveP;
+  if (old && lp) {
+    p.mcache = { ...lp.mcache, ...p.mcache };
+    for (const x of lp.row.filter((r) => r.on)) {
+      const y = p.row.find((r) => r.fi === x.fi);
+      if (y) y.on = true; else p.row.push({ ...x });
+    }
+  }
+  if (lp?.row) lp.row = lp.row.filter((x) => x.top).map((x) => ({ ...x, on: false }));
+  S.pkWho = p;                            // the live curve is now this probe's
   S.flash = p.id;
   paintAll();
   clearTimeout(pin._t);
   pin._t = setTimeout(() => { S.flash = null; paintAll(); }, 1400);
+  return p;
+}
+
+function newProbe() {
+  const p = {
+    ...S.live, id: Date.now(),
+    pos: S.byId[S.live.sid].pos,
+    box: S.info.box,                      // the box this probe was measured in
+    ds: S.info.dataset,                   // ids repeat across datasets (gallery pin rings)
+    dash: DASH[S.live.ch] || [],
+    data: S.probe, dataY: S.probeY,
+    meta: S.byId[S.live.sid],
+    mcache: { ...S.liveP?.mcache, ...(S.fi != null && S.mode ? { [S.fi]: S.mode } : {}) },
+  };
+  // its row in Modes: the three strongest peaks, only the strongest shown to start
+  const pk = S.probe?.peaks || [];
+  // the current row's tiles and picks, or by default the three strongest with only #1 shown
+  const live = S.liveP?.row || [];
+  p.row = live.some((x) => x.on) ? live.map((x) => ({ ...x }))
+    : byMag(S.probe || {}).slice(0, NTOP).map((fi, r) => ({ fi, on: r === 0, top: true }));
+  if (!p.row.length && S.fi != null) p.row = [{ fi: S.fi, on: true, top: false }];
+  p.cur = S.fi ?? p.row[0]?.fi;            // the cursor stays where it was
+  for (const fi of pk) modeAt(p, fi);     // every peak, so they all still work from another box
+  S.probes.push(p);
+  reshade();
+  return p;
 }
 
 /* THE sample / probe label, used everywhere in viz2:
@@ -2397,7 +2953,7 @@ const curveLine = (laser, ch, hzv) =>
   [laser != null && `L${laser}`, ch != null && `C${ch}`, hzv != null && `F${pad4(hzv)}`]
     .filter(Boolean).join(' ');
 // a probe's own two lines
-const probeLines = (p) => [sampleLine(p.meta), curveLine(p.laser, p.ch, p.hzv)];
+const probeLines = (p) => [sampleLine(p.meta), curveLine(p.laser, p.ch, null)];
 
 /* The current sample's label shows in two places, both fed from here: the lines above the
    photo at the top of the right panel (#curmeta), and the live row above the pinned probes (#nowrow). Laser / channel / freq are
@@ -2780,7 +3336,7 @@ function legends() {
     return live + shownProbes().map((p) => {
       // The row text carries the probe's own colour, so the key reads without cross-checking
       // the swatch.
-      const c = col(p), tail = `${sampleLine(p.meta)}  ${fields(p.laser, p.ch, p.hzv)}`;
+      const c = col(p), tail = `${sampleLine(p.meta)}  ${fields(p.laser, p.ch, null, p)}`;
       return p.dataY
         ? `<span data-id="${p.id}" style="color:${c}">${swatch(c, DASH.x)}x ${swatch(c, DASH.y)}y  ${tail}</span>`
         : `<span data-id="${p.id}" style="color:${c}">${swatch(c, p.dash)}${tail}</span>`;
@@ -2791,7 +3347,10 @@ function legends() {
   $('#siglegend').innerHTML = S.probes.length || S.preview
     ? legend((l, ch) => curveLine(l, ch, null)) + prev : '';
   // The big mode plot always overlays every probe, so the legend always applies.
-  $('#modelegend').innerHTML = S.probes.length ? legend((l, ch, hzv) => curveLine(null, null, hzv)) : '';
+  // each shown frequency in its own shade, as its arrows are drawn
+  $('#modelegend').innerHTML = S.probes.length ? legend((l, ch, hzv, p = S.liveP) =>
+    (p?.row || []).filter((x) => x.on).map((x) =>
+      `<b style="color:${col(p, 1, rowShade(p, x.fi))}">${curveLine(null, null, hz(x.fi))}</b>`).join(' ')) : '';
   for (const el of [$('#siglegend'), $('#modelegend')]) {
     el.querySelectorAll('span[data-id]').forEach((sp) => {
       sp.style.cursor = 'pointer';
@@ -2849,9 +3408,14 @@ function registerZone(name, el, step) {
   zoneWired.add(el);
   el.addEventListener('pointerenter', () => { hoverZone = name; });
   el.addEventListener('pointerleave', () => { if (hoverZone === name) hoverZone = null; });
-  el.addEventListener('mousedown', () => { armedZone = name; });
-  el.addEventListener('focusin', () => { armedZone = name; });
+  // Arming any other zone also drops peak mode: it is sticky (every new sample's cursor
+  // lands on a peak), so without this a peak clicked once kept every later arrow press --
+  // on the position map, say -- walking peaks instead.
+  const arm = () => { armedZone = name; if (!PEAKZ.has(name)) S.peakMode = false; };
+  el.addEventListener('mousedown', arm);
+  el.addEventListener('focusin', arm);
 }
+const PEAKZ = new Set(['peaks', 'modes']);
 
 /* One player per pinned probe, so you can compare what they sound like. */
 /* ***** wiring ***** */
@@ -3017,7 +3581,7 @@ function wire() {
   dir.onclick = () => { S.sortDir = -S.sortDir; applySort(); };
   applySort();
 
-  seg('#ch', (v) => { S.live.ch = v; reviewChannel(); });
+  seg('#ch', (v) => { S.live.ch = v; if (S.ref !== 'none') dropModes(); reviewChannel(); });
   seg('#specmode', (v) => { S.specMode = v; phVis(); drawSpec(); buildPeaks(); peakList(); cursors(); axes(); refreshTip(); });
   seg('#phmode', (v) => { S.phmode = v; drawSpec(); axes(); refreshTip(); });
   // axes() too: lin/log swaps the y label between |FFT| and log |FFT|, and without it
@@ -3025,7 +3589,34 @@ function wire() {
   seg('#speclog', (v) => { S.log.spec = +v; drawSpec(); buildPeaks(); peakList(); cursors(); axes(); refreshTip(); });
   seg('#kind', (v) => { S.kind = v; reviewChannel(); });
   wheel($('#fkey2d'));                    // the square 2-D key, drawn once
-  seg('#modeview', (v) => { S.modeview = v; viewCtls(); drawMode(); });
+  /* Drag any surface -- the big plot or a tile -- to rotate it. They all draw through the one
+     S.cam, so they turn together. One redraw per animation frame however fast the pointer
+     moves; double-click resets. A drag that moved doesn't also count as a tile click. */
+  let drag = null, rotRaf = 0;
+  const onDown = (e) => {
+    if (S.modeview !== 'surface' || !e.target.closest('canvas')) return;
+    drag = { x: e.clientX, y: e.clientY, az: S.cam.az, el: S.cam.el, moved: false };
+  };
+  addEventListener('pointermove', (e) => {
+    if (!drag) return;
+    const dx = e.clientX - drag.x, dy = e.clientY - drag.y;
+    if (Math.abs(dx) + Math.abs(dy) > 3) drag.moved = true;
+    S.cam = { az: drag.az - dx * 0.5, el: Math.max(-89, Math.min(89, drag.el + dy * 0.4)) };
+    rotRaf ||= requestAnimationFrame(() => { rotRaf = 0; drawMode(); });
+  });
+  addEventListener('pointerup', () => {
+    if (drag?.moved) { S.justDragged = true; setTimeout(() => (S.justDragged = false), 0); }
+    drag = null;
+  });
+  for (const el of [$('#mode'), $('#fgrid')]) {
+    el.addEventListener('pointerdown', onDown);
+    el.addEventListener('dblclick', () => { if (S.modeview === 'surface') { S.cam = { az: -60, el: 25 }; drawMode(); } });
+  }
+  $('#fgrid').addEventListener('click', (e) => { if (S.justDragged) e.stopPropagation(); }, true);
+
+  seg('#modeview', (v) => {
+    S.modeview = v; viewCtls(); sizeModePanel(); drawMode();
+  });
   $('#fieldbg').onchange = (e) => {
     S.fieldbg = e.target.checked;
     $('#modekey').hidden = !S.fieldbg;      // the key only means something with the fill on
@@ -3059,8 +3650,8 @@ function wire() {
     $('#play').textContent = S.anim ? '\u275a\u275a pause' : '\u25b6 play';
   };
   let animSeq = 0;              // pause/play faster than a frame would otherwise stack loops
-  $('#play').onclick = () => {
-    setPlay(!S.anim);
+  const play = (on) => {
+    setPlay(on);
     if (!S.anim) return;
     // rAF is display-rate, which would spin the mode far too fast; step on a fixed
     // interval instead so the speed does not depend on the monitor.
@@ -3073,6 +3664,10 @@ function wire() {
     };
     requestAnimationFrame(tick);
   };
+  // Plays by default, but only while Modes is on screen; a pause you press sticks.
+  $('#play').onclick = () => { S.userPaused = S.anim; play(!S.anim); };
+  new IntersectionObserver(([e]) => { if (!S.userPaused) play(e.isIntersecting); }, { threshold: 0.2 })
+    .observe($('.stepmodes'));
   // Dragging is a manual scrub: take over from the animation rather than fighting it.
   $('#frame').oninput = (e) => { setPlay(false); setFrame(+e.target.value); };
   // Arrow keys nudge it, the same way the range input already handles them natively;
@@ -3096,6 +3691,8 @@ function wire() {
     // Enter/Escape are global -- they must work while a panel has focus. Only the
     // arrow keys defer to a focused panel, which uses them for its own navigation.
     if (e.key === 'Enter') { e.preventDefault(); return pin(); }
+    // Space: the cursor's frequency into its row (buttons and players keep their own Space)
+    if (e.key === ' ' && !e.target.closest('button, video, audio')) { e.preventDefault(); return addCursor(); }
     if (e.key === 'Escape') {
       e.preventDefault();
       S.muted = !S.muted;
@@ -3103,15 +3700,18 @@ function wire() {
     }
     const K = { ArrowLeft: [-1, 0], ArrowRight: [1, 0], ArrowUp: [0, -1], ArrowDown: [0, 1] }[e.key];
     if (K) {
-      // Shift+arrows always walk the peaks, and plain arrows do too once you've clicked a
-      // peak marker ON THE PLOT (S.peakMode) -- that's a click on neither #pklist nor any
-      // other registered zone (the plot itself isn't one), so it's handled as its own
-      // override, ahead of the unified dispatch below. Left/right walk frequency order
-      // (what makes sense on a spectrum plot); up/down still walk rank, same as the list.
-      const onPeak = S.peakMode && (S.probe?.peaks || []).includes(S.fi);
+      // Shift+arrows always walk the peaks, and plain arrows do too once you've picked a
+      // peak (S.peakMode) -- unless the mouse is over the peak table, which navigates as
+      // drawn (its own zone). Left/right walk the active curve's peaks in frequency order;
+      // up/down jump to the curve drawn directly above / below it.
+      const act = activeCol();
+      // over ANY zone, that zone wins (the peak/mode zones navigate as drawn; the others,
+      // like the position map, aren't about peaks at all)
+      const inZone = !!ZONES[hoverZone] || (!hoverZone && armedZone === 'modes');
+      const onPeak = S.peakMode && !inZone && (act?.d.peaks || []).includes(act.fi);
       if (e.shiftKey || onPeak) {
         e.preventDefault();
-        return K[1] === 0 ? stepPeak(K[0]) : stepGrid(0, K[1]);
+        return K[1] === 0 ? stepPeak(K[0]) : stepCurve(K[1]);
       }
       // Unified hover/click navigation (see registerZone, above seg()): whichever zone the
       // mouse is physically over wins; off every zone -- hovering a plot, most often --
@@ -3131,5 +3731,5 @@ function wire() {
     }
   });
 
-  addEventListener('resize', () => paintAll());
+  addEventListener('resize', paintAll);
 }
