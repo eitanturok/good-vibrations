@@ -27,7 +27,8 @@
   <section class="panel">
     <h2>Rows</h2>
     <div class="seg" id="rowmode-seg">
-      <button data-rowmode="dataset" class="on" title="Each run's column is grouped by which dataset(s) it was trained on. Columns sharing a dataset stay row-aligned to the same sample, like today; columns from different datasets are just juxtaposed at the same row position, not claimed to be the same scene. No shared ground-truth column, since there is no longer one shared sample per row.">By dataset</button>
+      <button data-rowmode="linked" class="on" title="Runs sharing any dataset share rows and one sort: a combined-box run and a single-box run show the same sample on every row, and sorting either column reorders both. A run that didn't predict a row's sample shows 'not in run'.">Linked</button>
+      <button data-rowmode="dataset" title="Each run's column is grouped by which dataset(s) it was trained on. Columns sharing a dataset stay row-aligned to the same sample, like today; columns from different datasets are just juxtaposed at the same row position, not claimed to be the same scene. No shared ground-truth column, since there is no longer one shared sample per row.">By dataset</button>
       <button data-rowmode="single" title="One shared sample per row across every column, exactly as before -- a column whose run doesn't cover that sample shows 'not in run'. The only mode with a ground-truth column.">Single sample</button>
     </div>
   </section>
@@ -106,7 +107,7 @@
   <section class="panel browse">
     <div class="phead"><h2>Objects</h2>
       <span class="count" id="obj-count"></span>
-      <span class="links"><button class="link" data-none="objects">clear</button></span>
+      <span class="links"><button class="link" data-all="objects">all</button><button class="link" data-none="objects">none</button></span>
     </div>
     <div class="chips" id="obj-chips"></div>
   </section>

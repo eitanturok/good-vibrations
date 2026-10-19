@@ -475,17 +475,23 @@ body.stacked .gtwrap { margin-top: calc(var(--mask-h) + 4px); }
    The clamp still caps growth so one pathological name cannot push the header
    arbitrarily tall; the ellipsis reappears past it. .hcell has no fixed height and every
    header shares a flex row, so columns re-align on their own. Wrapping also makes the
-   full name selectable with the cursor, which a title= tooltip never allowed -- see the
-   .hname click handler in app.js, which skips the sort when a selection was just made. */
+   full name selectable with the cursor, which a title= tooltip never allowed; copying is
+   the .hcopy button beside it. */
 .hname {
-  flex: 1 1 auto; min-width: 0;
+  flex: 0 1 auto; min-width: 0;
   font-size: 11.5px; font-weight: 700;
   /* anywhere: these names are long hyphenated runs, and the default only breaks at the
      hyphens -- a 30-char unhyphenated segment would otherwise overflow the column. */
   overflow-wrap: anywhere;
   display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 3; line-clamp: 3;
-  overflow: hidden; cursor: pointer;
+  overflow: hidden;
 }
+/* The only click that copies the run name (app.js runHeaderCell). */
+.hcopy {
+  flex: none; border: 0; background: none; padding: 0 2px; cursor: pointer;
+  font-size: 12px; line-height: 1; color: var(--ink-3);
+}
+.hcopy:hover { color: var(--accent); }
 /* First on the chip line, so it starts at the cell's text edge like the name above it. */
 .hep { flex: none; white-space: nowrap; }
 .hchips .status { flex: none; align-self: center; }
@@ -493,8 +499,8 @@ body.stacked .gtwrap { margin-top: calc(var(--mask-h) + 4px); }
 /* Drag handle. Faint until the column is hovered, like .hclose -- always-on grips on
    every column would compete with the run names for attention.
 
-   margin-left:auto pins it and the close button to the right end of the name's line, so
-   the name still starts at the cell's text edge, aligned with the mse/iou/cd row below. */
+   It ends the sort row, margin-left:auto pinning it to the bottom-right corner under the
+   close button. */
 .hgrip {
   flex: none; margin-left: auto; cursor: grab; user-select: none;
   font-size: 12px; line-height: 1; color: var(--ink-3);
@@ -523,9 +529,19 @@ body.dragging-col .cell.run:not(.dragging) { transition: transform .14s ease; }
 /* Kill text selection and the browser's own touch panning for the whole gesture. */
 body.dragging-col { user-select: none; cursor: grabbing; }
 body.dragging-col .hgrip { cursor: grabbing; }
-.hname:hover { color: var(--accent); }
+
+/* Copy confirmation (see toast() in app.js). Ink-on-surface reads in both themes. */
+#toast {
+  position: fixed; z-index: 1000; pointer-events: none; transform: translateX(-50%);
+  padding: 3px 9px; border-radius: 999px; white-space: nowrap;
+  background: var(--ink); color: var(--surface-1); font-size: 11px; font-weight: 500;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, .14);
+  opacity: 0; transition: opacity .18s ease;
+}
+#toast.show { opacity: 1; }
+/* margin-left:auto: the name and its copy button start at the text edge, close sits at the right. */
 .hclose {
-  flex: none; width: 16px; height: 16px; padding: 0; line-height: 1;
+  flex: none; margin-left: auto; width: 16px; height: 16px; padding: 0; line-height: 1;
   border: 0; background: none; cursor: pointer;
   color: var(--ink-3); font-size: 15px; border-radius: 3px;
   /* Faint until hover rather than hidden: an invisible control is undiscoverable, but a

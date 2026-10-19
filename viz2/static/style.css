@@ -272,9 +272,13 @@ h2 em { font-style:normal; color:var(--accent); font-family:var(--mono);
           border:1px solid var(--line); background:var(--s1); color:var(--ink2);
           font:9px var(--mono); line-height:1.5; padding:1px 4px 1px 6px; border-radius:3px; }
 .pbchip .pbdot { width:7px; height:7px; }
-/* dataset names are long and the column is narrow: wrap them, never cut them short */
-#datasetbox .pbl, .ds .pbchip { white-space:normal; overflow-wrap:anywhere; }
-.ds .pbchip { flex:initial; max-width:100%; }
+/* dataset and layout names are long and the column is narrow: wrap them, never cut them short */
+#datasetbox .pbl, #layoutbox .pbl, .ly .pbchip { white-space:normal; overflow-wrap:anywhere; }
+.ly .pbchip { flex:initial; max-width:100%; }
+/* the dataset chip stays ONE line like every other chip; a name too long for the column
+   ends in an ellipsis (full name on hover) */
+.ds .pbchip { flex:initial; max-width:100%; min-width:0; white-space:nowrap; }
+.ds .pbchip .pbct { overflow:hidden; text-overflow:ellipsis; min-width:0; }
 /* a filter chip is a plain label; only its × is a control (#spkat's chips are buttons) */
 .pbx { border:0; background:none; padding:0 1px; color:inherit; cursor:pointer;
        font:11px/1 var(--sans); opacity:.5; }
@@ -367,6 +371,7 @@ button.pbchip:hover { border-color:var(--firm); color:var(--ink); }
        background:var(--s1); padding:2px; overflow:visible; }
 #grid { width:126px; height:153px; display:block; overflow:visible;
         align-self:center; }
+#refgrid { width:126px; height:170px; display:block; overflow:visible; align-self:center; }
 /* Empty-box drift repeats: always shown, in their own labelled strip under the scatter --
    they have no spatial COM so they can't be scatter points. */
 .repeatslab { display:flex; align-items:baseline; width:100%; margin-top:4px; font-size:9px; letter-spacing:.06em;
@@ -421,7 +426,12 @@ main { flex:1; display:grid; grid-template-columns:minmax(0,1fr) 6px var(--aside
                font-variant-numeric:tabular-nums; }
 .step h2 em.soft { font-size:11px; }
 /* Steps 2 and 3 keep the rail + working-area split; step 1 has its own .s1 bands. */
-.stepbody { display:flex; flex-wrap:wrap; gap:16px 22px; align-items:flex-start; }
+/* column gap = step 1's hairline gutter (16 + 16), so with the rail as wide as its filter
+   column, every step's working area starts at the same x as the gallery */
+.stepbody { display:flex; flex-wrap:wrap; gap:16px 32px; align-items:flex-start; }
+/* Signals: the rail is exactly as tall as the plots, and the peak table takes whatever
+   the controls leave (scrolling inside), so its length never depends on the peak count */
+.sigbody { align-items:stretch; }
 .lasercol { flex:none; width:150px; }
 .lasercol .mt { margin-top:10px; }
 .chsel { width:150px; }
@@ -467,7 +477,7 @@ main { flex:1; display:grid; grid-template-columns:minmax(0,1fr) 6px var(--aside
 [hidden] { display:none !important; }
 .mlab { position:absolute; font:11px var(--mono); font-style:normal; color:var(--ink3);
         letter-spacing:.04em; }
-.mlab.my { left:-4px; top:50%; transform:rotate(-90deg) translateX(50%);
+.mlab.my { left:30px; top:50%; transform:rotate(-90deg) translateX(50%);
            transform-origin:left center; white-space:nowrap; }
 .mlab.mx { left:64px; width:var(--mw); bottom:2px; text-align:center; }
 
@@ -517,15 +527,19 @@ main { flex:1; display:grid; grid-template-columns:minmax(0,1fr) 6px var(--aside
 .ov rect.lr { fill:none; stroke:var(--accent); stroke-width:1.2; }
 .ov rect.lr.hov { stroke:var(--ink); stroke-dasharray:3 2; opacity:.75; }
 .ov line.cur { stroke:var(--accent); stroke-width:1; }
+/* bins with a weak phase reference (app.js weakBands) */
+.ov g.weak rect { fill:var(--ink3); fill-opacity:.22; }
 .ov .ax line.grid { stroke:var(--firm); stroke-width:1; opacity:.85; }
 .ov .ax text { font:600 11px var(--mono); fill:var(--ink2); text-anchor:middle; }
 .ov .ax text.unit { fill:var(--ink); font-size:12px; }
 .ov .lax text.ly { font:10.5px var(--mono); fill:var(--ink3); text-anchor:end; }
 .ov text { font:9px var(--mono); fill:var(--ink3); }
-.ov circle.pk { fill:var(--s1); stroke:var(--ink2); stroke-width:1.2; }
+.ov circle.pk { fill:var(--s1); stroke:var(--c, var(--ink2)); stroke-width:1.2; }
+.ov circle.pk:not(.act) { opacity:.75; }
 .ov text.pklab { font:9px var(--mono); fill:var(--ink3); text-anchor:middle; }
-.ov text.pklab.on { fill:var(--accent); font-weight:600; }
-.ov circle.pk.on { stroke:var(--accent); fill:var(--accent); r:4.5; }
+.ov text.pklab.on { fill:var(--ink); font-weight:600; }
+.ov circle.pk.pick { fill:var(--c, var(--accent)); }
+.ov circle.pk.act.cur { stroke:var(--accent); stroke-width:2; r:4.5; }
 
 /* ***** pickers: svg ***** */
 #scatter .pt { fill:var(--firm); }
@@ -556,24 +570,24 @@ main { flex:1; display:grid; grid-template-columns:minmax(0,1fr) 6px var(--aside
 #spk .s.absent circle { fill:var(--s2); stroke:var(--line); }
 #spk .s.absent text { opacity:.25; }
 #spk .s.absent .xm { display:inline; }
-#spk .box, #grid .box { fill:var(--s2); stroke:var(--firm); }
+#spk .box, .lgrid .box { fill:var(--s2); stroke:var(--firm); }
 /* Lasers are green dots -- the beam color -- on the same grey box the other
    pickers use, even though they physically enter from the side. */
-#grid .avgcell rect, #grid .allcell rect { fill:var(--s2); stroke:var(--firm); cursor:pointer; }
-#grid .avgcell text, #grid .allcell text { font:600 6px var(--sans); fill:var(--ink2); text-anchor:middle;
+.lgrid .avgcell rect, .lgrid .allcell rect, .lgrid .nonecell rect, .lgrid .realcell rect { fill:var(--s2); stroke:var(--firm); cursor:pointer; }
+.lgrid .avgcell text, .lgrid .allcell text, .lgrid .nonecell text, .lgrid .realcell text { font:600 6px var(--sans); fill:var(--ink2); text-anchor:middle;
                       dominant-baseline:middle; pointer-events:none; letter-spacing:.08em; }
-#grid .avgcell:hover rect, #grid .allcell:hover rect { fill:var(--accent-sf); stroke:var(--accent); }
-#grid .gl { font:5px var(--mono); fill:var(--ink3); text-anchor:end;
+.lgrid .avgcell:hover rect, .lgrid .allcell:hover rect, .lgrid .nonecell:hover rect, .lgrid .realcell:hover rect { fill:var(--accent-sf); stroke:var(--accent); }
+.lgrid .gl { font:5px var(--mono); fill:var(--ink3); text-anchor:end;
             dominant-baseline:middle; pointer-events:none; }
-#grid .gl.col { text-anchor:middle; }
-#grid .avgcell.on rect, #grid .allcell.on rect { fill:var(--accent); stroke:var(--accent); }
-#grid .avgcell.on text, #grid .allcell.on text { fill:#fff; }
-#grid .ls { fill:#2f9e5e; opacity:.55; cursor:pointer; }
-#grid .ls.hot { opacity:.85; }
-#grid .ls.on { opacity:1; stroke:var(--ink); stroke-width:1.6; }
+.lgrid .gl.col { text-anchor:middle; }
+.lgrid .avgcell.on rect, .lgrid .allcell.on rect, .lgrid .nonecell.on rect, .lgrid .realcell.on rect { fill:var(--accent); stroke:var(--accent); }
+.lgrid .avgcell.on text, .lgrid .allcell.on text, .lgrid .nonecell.on text, .lgrid .realcell.on text { fill:#fff; }
+.lgrid .ls { fill:#2f9e5e; opacity:.55; cursor:pointer; }
+.lgrid .ls.hot { opacity:.85; }
+.lgrid .ls.on { opacity:1; stroke:var(--ink); stroke-width:1.6; }
 /* The index of the selected laser, centred in its dot. pointer-events off so the label
    never swallows a click meant for the circle underneath it. */
-#grid .lsnum { font:600 4.6px var(--mono); fill:#fff; text-anchor:middle;
+.lgrid .lsnum { font:600 4.6px var(--mono); fill:#fff; text-anchor:middle;
                pointer-events:none; }
 svg:focus, .plot:focus { outline:1px solid var(--accent); outline-offset:2px; }
 .plot:focus { border-radius:3px; }
@@ -639,7 +653,7 @@ svg:focus, .plot:focus { outline:1px solid var(--accent); outline-offset:2px; }
 /* ***** the control rail, shared by the signal and mode steps so their plots line up *****
    One rail width for both means the spectrum's x-axis and the mode's sit at exactly the
    same page x. */
-:root { --rail: 132px; }
+:root { --rail: 220px; }   /* = step 1's filter column */
 
 .rail-l { width:var(--rail); flex:none; display:flex; flex-direction:column;
           gap:3px; align-items:stretch; }
@@ -655,17 +669,31 @@ svg:focus, .plot:focus { outline:1px solid var(--accent); outline-offset:2px; }
 .chsel { width:100%; }
 .chsel button { flex:1; padding:3px 0; font-size:11px; }
 h2 em.soft { color:var(--ink3); font-weight:400; margin-left:auto; }
-.pklist { display:grid; grid-template-columns:1fr 1fr; gap:2px; outline:none;
-           border-radius:4px; }
+.pklist { flex:1 1 0; min-height:120px; display:flex; flex-direction:column; gap:3px;
+          outline:none; border-radius:4px; }
 .pklist.armed { box-shadow:0 0 0 2px var(--accent-sf); }
-.pkrow { font:9.5px var(--mono); padding:2px 4px; border:1px solid transparent;
+.pkpage { display:flex; align-items:center; justify-content:space-between;
+          font:9px var(--mono); color:var(--ink3); }
+.pkpage button { padding:0 6px; font-size:12px; line-height:1.3; }
+.pkpage button:disabled { opacity:.3; cursor:default; }
+/* one column per curve, each in its own colour (--c); the active one is outlined */
+.pkcols { flex:1 1 0; min-height:0; overflow-y:auto; display:grid;
+          grid-template-columns:repeat(3, minmax(0, 1fr)); gap:2px; align-items:start; }
+.pkcol { display:flex; flex-direction:column; gap:2px; padding:2px; border-radius:4px;
+         border:1px solid transparent; min-width:0; }
+.pkcol.on { border-color:var(--c); }
+.pkhd { font:600 9px var(--mono); text-align:center; color:var(--ink2); cursor:pointer;
+        border-top:3px solid var(--c); padding:2px 0 1px; white-space:nowrap; overflow:hidden;
+        text-overflow:ellipsis; position:sticky; top:0; z-index:1; background:var(--s1); }
+.pkrow { font:9.5px var(--mono); padding:1px 2px; border:1px solid transparent;
          border-radius:3px; background:var(--s2); color:var(--ink2); cursor:pointer;
-         display:flex; flex-direction:column; align-items:center; gap:0; line-height:1.25; }
+         display:flex; flex-direction:column; align-items:center; gap:0; line-height:1.2; }
 .pkrow .hzv { font-weight:600; }
 .pkrow .dbv { font-size:8px; opacity:.6; }
 .pkrow:hover { border-color:var(--firm); color:var(--ink); }
-.pkrow.on { background:var(--accent); border-color:var(--accent); color:#fff; }
-.pkrow.on i { opacity:.75; }
+.pkrow.in { border-color:var(--c); }                   /* in its row, hidden */
+.pkrow.pick { background:var(--c); border-color:var(--c); color:#fff; }   /* in the big plot */
+.pkcol.on .pkrow.cur { border-color:var(--accent); }   /* the cursor: same box, its border recoloured */
 
 /* The color key reads vertically, beside the ramp it explains. */
 .vkey { display:flex; flex-direction:column; align-items:center; gap:3px; flex:none;
@@ -701,10 +729,34 @@ h2 em.soft { color:var(--ink3); font-weight:400; margin-left:auto; }
 .fgrid figure { margin:0; transition:opacity .12s; }
 .fgrid-rest canvas { width:108px; height:108px; display:block; border-radius:3px; }
 .fgrid figcaption { font:9.5px/1.4 var(--mono); margin-top:5px;
-                    padding-left:6px; border-left:2px solid var(--ink); }
+                    padding-left:6px; border-left:2px solid var(--c, var(--ink)); }
 .fgrid figcaption b { color:var(--ink); font-weight:600; }
 .fgrid figcaption i { display:block; font-style:normal; color:var(--ink3); white-space:nowrap; }
-.fgrid figcaption .fc1 { display:flex; justify-content:space-between; gap:6px; }
+#fgrid figcaption { display:flex; justify-content:space-between; gap:6px; }
+/* the frequency label sits ABOVE its tile (markup has it after the canvas) */
+#fgrid figure { display:flex; flex-direction:column-reverse; }
+#fgrid figcaption { margin-top:0; margin-bottom:5px; }
+/* one row per saved position: its name once, then its frequency tiles. A tile in the big
+   plot is ringed in the probe's colour; one that isn't is faded. Click to switch. */
+.frows { display:flex; flex-direction:column; gap:12px; flex:1; min-width:0; }
+.frowhd { font:10px var(--mono); color:var(--ink2); margin-bottom:5px;
+          display:flex; align-items:center; gap:6px; }
+.frowhd .sw { width:9px; height:9px; border-radius:2px; }
+.frowhd .an { margin-left:auto; display:inline-flex; gap:8px; }
+/* three tiles across, so a row is one position's three strongest frequencies and its
+   all / none sit flush with the third; tiles scale to the column */
+#fgrid .fgrid-rest { grid-template-columns:repeat(3, minmax(0, 1fr)); }
+#fgrid .fgrid-rest canvas { width:100%; height:auto; aspect-ratio:var(--ta, 1); }
+.fadd { font:600 10px var(--sans); padding:1px 8px; border-radius:var(--r);
+        border:1px solid var(--accent); background:var(--accent-sf); color:var(--accent); cursor:pointer; }
+.fadd:hover { background:var(--accent); color:#fff; }
+#fgrid figure.on, #fgrid figure.off { cursor:pointer; }
+#fgrid figure.on canvas { outline:2px solid var(--c); outline-offset:1px; }
+#fgrid figure.off canvas { opacity:.4; }
+#fgrid figure.off:hover canvas { opacity:.8; }
+/* the cursor's tile (arrow keys move it, Space toggles it): dashed while not in the big plot */
+#fgrid figure.cur figcaption b { color:var(--accent); }
+#fgrid figure.cur.off canvas { opacity:1; outline:2px dashed var(--c); outline-offset:1px; }
 .fgrid figcaption i { overflow:hidden; text-overflow:ellipsis; }
 .fgrid-rest:has(figure.hot) figure:not(.hot) { opacity:.28; }
 /* The 2-D key: hue across x (direction), lightness down y (amplitude). */
@@ -742,14 +794,14 @@ h2 em.soft { color:var(--ink3); font-weight:400; margin-left:auto; }
 /* The overlay plot on the left, the per-probe tiles on the right half.
    .modeleft is pinned to the canvas width (320 + 34 label gutter): otherwise the legend,
    which grows with every probe, widened this column and walked the grid rightwards. */
-.modesplit { display:flex; flex-wrap:wrap; gap:20px; align-items:flex-start; }
+.modesplit { display:flex; flex-wrap:wrap; gap:20px; align-items:flex-start; align-content:flex-start; }
 .modeleft { flex:none; width:calc(var(--mw) + 64px); }
 /* One legend spanning the whole step, so it labels the overlay plot and the per-probe
    tiles at once. Vertical, so a long probe list reads down a single narrow column rather
    than wrapping into rows that push the plots around. */
 .modelegend { display:flex; flex-flow:row wrap; justify-content:flex-start;
               align-items:baseline; gap:3px 14px; margin:0 0 8px 64px; }
-.moderight { flex:1 1 240px; min-width:0; }
+.moderight { flex:1 1 380px; min-width:0; }   /* room for three big tiles; wraps under the plot if not */
 .modeleft .modewrap { display:inline-block; }
 .modeleft .mhint { display:block; margin:2px 0 0 64px; }
 /* Step 4's version of .modesplit: the ground-truth video fixed on the left (its own
@@ -826,3 +878,22 @@ h2 em.soft { color:var(--ink3); font-weight:400; margin-left:auto; }
 /* The probe id reads as one unit: P S (sample) on the first line, L C F on the second. */
 .card2 .pid { font-size:10px; color:var(--ink3); }
 .card2 .pid b { font-size:11px; color:var(--ink); font-weight:600; }
+
+/* Modes is one screen tall, like step 1: the overlay plot stays put and the rows of tiles
+   scroll in place once there are more than fit. */
+.stepmodes { flex:none; height:100%; display:flex; flex-direction:column; }
+.stepmodes > .stepbody { flex:1; min-height:0; align-items:stretch; }
+.stepmodes .lf { display:flex; flex-direction:column; min-height:0; }
+.stepmodes .modesplit { flex:1; min-height:0; }
+.stepmodes .moderight { align-self:stretch; min-height:0; overflow-y:auto; padding:3px; }   /* room for the tile rings */
+
+/* surfaces rotate by dragging (see the S.cam handlers) */
+.surfview #mode, .surfview #fgrid canvas { cursor:grab; touch-action:none; }
+.surfview #mode:active, .surfview #fgrid canvas:active { cursor:grabbing; }
+/* stretch / in-out: no big plot (one photo can't overlay several modes), just the grid of
+   tiles, three per row like the other views; with nothing to select into, none is faded */
+.boxview .modeleft { display:none; }
+.boxview #fgrid figure.off canvas { opacity:1; }
+/* the tiles scroll inside the step once there are more rows than fit, instead of pushing
+   the page down */
+.moderight { max-height:72vh; overflow-y:auto; overscroll-behavior:contain; }

@@ -13,6 +13,7 @@ Every `sid` argument in this module is a ROW, not a sample id -- see SPEC.md.
 """
 
 import io
+import os
 from functools import lru_cache
 
 import numpy as np
@@ -165,9 +166,12 @@ OVERLAY_GAIN = 0.85
 
 @lru_cache(maxsize=1)
 def dims_by_box() -> dict:
-    """{box_name: (width, height)} of the cropped frame each box's masks tile, in pixels.
+    """{(experiment, box_name): (width, height)} of the cropped frame each box's masks tile, in pixels.
 
-    Keyed on the BOX, not the sample: downsample_mask squashes every box into the same
+    Keyed on (experiment, box), not the box name alone: two captures can reuse a box name with
+    a different crop (2026_09_07_cardboard_box is portrait 925x1280, 2026_10_11_cardboard_four_objs
+    landscape 1287x907), and a name-only key drew the second at the first one's aspect.
+    Not per sample: downsample_mask squashes every box into the same
     (out_h,out_w), so the true frame a grid represents is a property of the enclosure and
     is identical for every sample inside it. That also makes this one PNG header read per
     box rather than per sample -- `Image.open().size` parses the header without decoding,
@@ -182,7 +186,7 @@ def dims_by_box() -> dict:
         # Rows, not sample ids: locate() takes a row. Passing ids read the wrong photos
         # on any dataset whose ids do not start at zero.
         _, gt, r = registry.locate(row)
-        box = gt.meta[r].get("box")
+        box = (gt.experiment_dir.name, gt.meta[r].get("box"))
         if box in out: continue
         # gt/r are already known, so build the path directly rather than going through
         # registry.sample_dir(row) -- that re-derives the same (gt, r) via another locate().
@@ -194,32 +198,32 @@ def dims_by_box() -> dict:
 
 
 def aspect_by_box() -> dict:
-    """{box_name: width/height}, derived from dims_by_box -- see its docstring."""
+    """{(experiment, box_name): width/height}, derived from dims_by_box -- see its docstring."""
     return {box: w / h for box, (w, h) in dims_by_box().items()}
 
 
-def aspect_for_box(box) -> float:
+def aspect_for_box(experiment, box) -> float:
     """Width/height of the frame a given box's masks tile, or the dataset-wide fallback.
 
     Per box rather than one global number, because a dataset holding two boxes has no
     single answer: gastronorm is 1.204 and green-plastic 1.120, and drawing both at one
     aspect slides every prediction off the features it refers to in at least one of them.
     """
-    a = aspect_by_box().get(box)
+    a = aspect_by_box().get((experiment, box))
     return a if a is not None else scene_aspect()
 
 
-def dims_for_box(box) -> tuple | None:
+def dims_for_box(experiment, box) -> tuple | None:
     """(width, height) in pixels of the frame a given box's masks tile, or None for a box
     whose backdrop could not be read (see dims_by_box)."""
-    return dims_by_box().get(box)
+    return dims_by_box().get((experiment, box))
 
 
 def row_aspect(row: int) -> float:
     """aspect_for_box, resolved from a row rather than a box already in hand."""
     from viz.app import registry
     _, gt, r = registry.locate(row)
-    return aspect_for_box(gt.meta[r].get("box"))
+    return aspect_for_box(gt.experiment_dir.name, gt.meta[r].get("box"))
 
 
 @lru_cache(maxsize=1)
@@ -425,12 +429,20 @@ def cached_colorbar(mode: str) -> bytes:
     return colorbar(mode)
 
 
-@lru_cache(maxsize=2048)
 def cached_backdrop(sid: int) -> bytes | None:
-    """The overhead frame, encoded once at full quality, for use behind canvas cells."""
-    im = _backdrop(sid)
-    if im is None:
-        return None
+    """The overhead frame as JPEG, for use behind canvas cells. Encoded once ever per sample:
+    written to config.CACHE_DIR/backdrop and re-encoded only if the source photo changes."""
+    from viz.app import registry
+    _, gt, local = registry.locate(sid)
+    src = registry.sample_dir(sid) / gt.layout.backdrop
+    dst = config.CACHE_DIR / "backdrop" / gt.experiment_dir.name / f"{gt.sample_ids[local]}-{config.BACKDROP_MAX_PX}.jpg"
+    try:
+        if dst.stat().st_mtime >= src.stat().st_mtime:
+            return dst.read_bytes()
+    except FileNotFoundError:
+        if not src.exists():
+            return None
+    im = Image.open(src).convert("RGB")
     # NATIVE resolution, only shrunk if it exceeds the cap. This photo is the sharpest
     # thing on screen and the mask is a coarse grid drawn over it -- so the MASK is the
     # layer that gets upscaled (NEAREST, keeping cells crisp), never the photo downscaled
@@ -439,9 +451,10 @@ def cached_backdrop(sid: int) -> bytes | None:
     if im.height > config.BACKDROP_MAX_PX:
         h = config.BACKDROP_MAX_PX
         im = im.resize((max(1, round(h * im.width / im.height)), h), Image.LANCZOS)
-    # Higher quality than the composited cells: this one is fetched ONCE per sample and
-    # reused across every run, epoch and repaint, so the extra bytes are paid once while
-    # the sharpness is what the whole view is read against.
     buf = io.BytesIO()
     im.save(buf, format="JPEG", quality=92, optimize=True)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dst.with_suffix(f".{os.getpid()}.tmp")
+    tmp.write_bytes(buf.getvalue())
+    tmp.replace(dst)   # atomic: a concurrent request sees no file or the whole file
     return buf.getvalue()

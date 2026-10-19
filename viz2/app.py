@@ -116,6 +116,14 @@ def box_thumb(name: str):
     return Response(render.thumb(p), media_type="image/jpeg", headers=CACHE)
 
 
+@app.get("/api/laserview/{name}.jpg")
+def laser_view_photo(name: str):
+    """The photo behind the mode's box view (see data.laser_view)."""
+    if name not in data.LASER_VIEWS:
+        raise HTTPException(404, "unknown box")
+    return FileResponse(data.REPO / f"assets/{name}_laser_view.jpg", headers=CACHE)
+
+
 def _hex(c: str) -> str:
     """The ?c= colour param (a saved probe's colour, 6 hex digits), or '' for none."""
     if c and not re.fullmatch(r"[0-9a-fA-F]{6}", c):
@@ -307,23 +315,23 @@ def masks(ids: str = "", colors: str = ""):
 
 
 @app.get("/api/heat/{sid}.png")
-def heat(sid: str, ch: str = "avg", q: str = "logmag", kind: str = "clean"):
+def heat(sid: str, ch: str = "avg", q: str = "logmag", kind: str = "clean", ref: str = "none"):
     """One quantity for every laser at once: rows = lasers, columns = frequency (or time).
 
     Signed quantities are scaled symmetrically about zero on the diverging ramp, so the
     neutral middle really is zero and the sign is readable.
     """
     _d(sid)
-    v, lut, lo, hi = _plane(sid, ch, q, kind)
+    v, lut, lo, hi = _plane(sid, ch, q, kind, ref)
     return Response(render.heat(v, lo, hi, lut), media_type="image/png", headers=CACHE)
 
 
-def _plane(sid, ch, q, kind):
+def _plane(sid, ch, q, kind, ref="none"):
     """The (lasers x columns) array for one quantity, plus its palette and range."""
     if q == "shifts":
         v = data.chan(data.shifts(sid, kind), ch)
     else:
-        z = data.chan(data.fft(sid)[0], ch)
+        z = data.norm(data.chan(data.fft(sid)[0], ch), ref)
         v = {"logmag": lambda: data.logmag(np.abs(z)), "mag": lambda: np.abs(z),
              "phase": lambda: np.angle(z), "cosphase": lambda: np.cos(np.angle(z)),
              "re": lambda: z.real, "im": lambda: z.imag}[q]()
@@ -334,19 +342,20 @@ def _plane(sid, ch, q, kind):
 
 
 @app.get("/api/heatrange/{sid}")
-def heatrange(sid: str, ch: str = "avg", q: str = "logmag", kind: str = "clean"):
+def heatrange(sid: str, ch: str = "avg", q: str = "logmag", kind: str = "clean", ref: str = "none"):
     """Just the colorbar bounds, so the client can label without decoding the PNG."""
     _d(sid)
-    _, lut, lo, hi = _plane(sid, ch, q, kind)
+    _, lut, lo, hi = _plane(sid, ch, q, kind, ref)
     return {"lo": lo, "hi": hi, "lut": lut}
 
 
 @app.get("/api/probe/{sid}")
-def probe(sid: str, ch: str = "avg", laser: str = "avg", kind: str = "clean"):
+def probe(sid: str, ch: str = "avg", laser: str = "avg", kind: str = "clean", ref: str = "none"):
     """Everything a probe needs from one round trip."""
     _d(sid)
     f, _ = data.fft(sid)
-    z = data.pick(data.chan(f, ch), laser)
+    zc = data.chan(f, ch)
+    z = data.pick(data.norm(zc, ref), laser)
     mag = np.abs(z)
     s = data.pick(data.chan(data.shifts(sid, kind), ch), laser)
     r = lambda a: [round(float(x), 5) for x in a]
@@ -356,16 +365,17 @@ def probe(sid: str, ch: str = "avg", laser: str = "avg", kind: str = "clean"):
         "peaks": data.peaks(sid),
         "shifts": [round(float(x), 5) for x in data.envelope(s)],
         "dur": len(s) / data.INFO["fps"],
+        "weak": data.weak_runs(zc, ref),      # bins whose phase reference is unreliable
     }
 
 
 @app.get("/api/mode/{sid}")
-def mode(sid: str, fi: int = 0):
+def mode(sid: str, fi: int = 0, ref: str = "none", ch: str = "x"):
     """The gradient field AND the height field it integrates to -- the quiver and the
     surface are two views of one mode, so they ship together rather than costing a second
     round trip when the view is switched."""
     _d(sid)
-    U, V = data.mode(sid, fi)
+    U, V = data.mode(sid, fi, ref, ch)
     Z = data.surface(U, V)
     return {"u": U.round(6).tolist(), "v": V.round(6).tolist(), "z": Z.round(6).tolist()}
 

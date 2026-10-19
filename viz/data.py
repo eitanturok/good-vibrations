@@ -8,6 +8,7 @@ Sample ids are NOT row indices into these arrays -- see SPEC.md for which of the
 every field, argument and map is keyed by.
 """
 
+import hashlib
 import json
 import os
 import pickle
@@ -16,6 +17,7 @@ from datetime import datetime
 import resource
 import threading
 import time
+from collections import Counter
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
@@ -70,11 +72,7 @@ def parse_com(v) -> list[float]:
     return [-1.0, -1.0]
 
 
-def _fullres_smask(sample_dir: Path) -> Path | None:
-    """The full-resolution segmentation mask (e.g. image/03_smask.npy), or None."""
-    hits = sorted(p for p in (sample_dir / "image").glob("*smask.npy")
-                  if "downsampled" not in p.name)
-    return hits[0] if hits else None
+_fullres_smask = config.fullres_smask
 
 
 def _box_downsample(mask: np.ndarray, h: int, w: int) -> np.ndarray:
@@ -229,11 +227,12 @@ def load_gt(experiment_dir: Path, mask_h: int, mask_w: int) -> GtIndex:
     layout = config.Layout.detect(samples_dir, mask_h, mask_w)
     sample_dirs = config.subdirs(samples_dir)
     cache = config.CACHE_DIR / f"gt-{experiment_dir.name}-{mask_h}x{mask_w}.pkl"
-    inputs = [q for d in sample_dirs for q in (d, d / "image", d / "metadata.jsonl")]
+    # Plain strings: ~4 paths per sample, and building Path objects for them cost more
+    # than the stat calls they feed.
+    inputs = [q for d in map(str, sample_dirs) for q in (d, d + "/image", d + "/metadata.jsonl")]
     try:
         c = pickle.loads(cache.read_bytes())
-        if c["inputs"] == [str(q) for q in inputs] + c["masks_used"] and \
-                c["stamp"] == _stamp(inputs + [Path(q) for q in c["masks_used"]]):
+        if c["inputs"] == inputs + c["masks_used"] and c["stamp"] == _stamp(inputs + c["masks_used"]):
             return GtIndex(c["ids"], c["masks"], c["meta"], c["com_gt"], c["obj_com"], c["avg_com"],
                            layout, {s: i for i, s in enumerate(c["ids"])}, experiment_dir=experiment_dir)
     except Exception:
@@ -241,9 +240,14 @@ def load_gt(experiment_dir: Path, mask_h: int, mask_w: int) -> GtIndex:
     ids, masks, meta, used = [], [], [], []
     for d in sample_dirs:
         gt = layout.resolve_gt_mask(d, mask_h, mask_w)
-        if gt is None:
-            continue
-        m = np.load(gt)
+        if gt is not None:
+            m = np.load(gt)
+        else:
+            # no exported file at this size: build it from the full-res mask, as masks_at does
+            gt = _fullres_smask(d)
+            if gt is None:
+                continue
+            m = _box_downsample(np.load(gt), mask_h, mask_w)
         # A dataset can carry masks at several downsample sizes side by side (gastronorm
         # writes both 20x40 and 30x30). Only the requested target shape is loadable as
         # ground truth; a mismatch would otherwise fail deep inside np.stack.
@@ -272,8 +276,8 @@ def load_gt(experiment_dir: Path, mask_h: int, mask_w: int) -> GtIndex:
         config.CACHE_DIR.mkdir(parents=True, exist_ok=True)
         tmp = cache.with_suffix(f".{os.getpid()}.tmp")
         tmp.write_bytes(pickle.dumps(dict(
-            inputs=[str(q) for q in inputs] + used, masks_used=used,
-            stamp=_stamp(inputs + [Path(q) for q in used]),
+            inputs=inputs + used, masks_used=used,
+            stamp=_stamp(inputs + used),
             ids=ids, masks=masks, meta=meta, com_gt=com_gt, obj_com=obj_com, avg_com=avg_com),
             protocol=pickle.HIGHEST_PROTOCOL))
         tmp.replace(cache)   # atomic: a concurrent reader sees the old file or the new one
@@ -314,6 +318,12 @@ class RunEntry:
 
 # Both run on every prediction file of every run each rescan (~240k calls): os.path on the
 # raw string, because Path.stem parses the whole path first and that was ~1.3s of startup.
+def _mmap(p):
+    """A prediction file with its tensors memory-mapped: indexing a few rows reads only
+    those pages, not the whole ~17MB batch."""
+    return torch.load(p, map_location="cpu", weights_only=False, mmap=True)
+
+
 def _epoch_of(p) -> int:
     """Epoch from `ep{E}-ba{B}.pt`."""
     return int(os.path.basename(p)[2:].split("-", 1)[0])
@@ -510,7 +520,7 @@ def _probe(files: list[Path]) -> tuple[dict | None, str | None]:
     exps: list = []    # and its experiment name (None on older runs), same alignment
     for p in files[:5]:
         try:
-            obj = torch.load(p, map_location="cpu", weights_only=False)
+            obj = _mmap(p)   # only shapes and info are read, never the mask data
         except Exception:
             continue
         mask, info = obj.get("mask_pred"), obj.get("info") or {}
@@ -738,6 +748,9 @@ def load_experiments(path: Path, runs_dir: Path,
             usable = config.usable_mask_shapes(samples_dir)
             if usable:
                 h, w = most_trained_shape(shape_counts, usable) or usable[0]
+            elif any(_fullres_smask(s) is not None for s in config.subdirs(samples_dir)[:25]):
+                # no exported masks, but every grid is derivable from the full-res mask: use the grid most runs train at
+                h, w = most_trained_shape(shape_counts, shape_counts) or config.DEFAULT_MASK_SHAPE
             elif single:
                 # load_gt raises its own descriptive "available sizes: ..." error below,
                 # matching today's single-experiment behaviour exactly.
@@ -813,10 +826,9 @@ class RunData:
     name: str
     epoch: int
     sample_ids: np.ndarray       # (M,) sample dir names
-    masks: np.ndarray            # (M,20,40) float32, sigmoid probabilities
+    masks: "RunMasks | np.ndarray"   # masks[i] -> (H,W) float32 sigmoid probabilities
     splits: list[str]            # per row: "train" or the eval split name
     metrics: dict               # {name: (M,) array} -- see METRIC_KEYS
-    com_pred: np.ndarray         # (M,2) grid-space, for display
     row_of: dict[int, int]
     skipped_files: list[str]
     family: str = "unknown"
@@ -846,44 +858,104 @@ class RunData:
     missing: list = field(default_factory=list)
 
 
+class RunMasks:
+    """A loaded run's masks, left in its memory-mapped prediction files: masks[i] reads
+    row i from disk. Every consumer wants one row at a time, and decoding all of them was
+    most of the cost of adding a run (a 16k-row run is 270MB of fp32)."""
+
+    def __init__(self, parts: list, part: np.ndarray, local: np.ndarray):
+        self.parts, self.part, self.local = parts, part, local   # parts: (B,H,W) mmapped tensors
+
+    def __len__(self) -> int:
+        return len(self.part)
+
+    def __getitem__(self, i: int) -> np.ndarray:
+        return self.parts[self.part[i]][self.local[i]].float().numpy()
+
+
 def _split_dirs(outputs: Path) -> list[tuple[str, Path]]:
     out = [("train", outputs / "train")] if (outputs / "train").is_dir() else []
     return out + _eval_dirs(outputs)
 
 
-def load_epoch_masks(name: str, runs_dir: Path, registry: "Registry", epoch: int,
-                     want: set[str]) -> dict[str, np.ndarray]:
-    """Just the masks for `want` (global ids) at one epoch, as {global_id: (H,W)}.
+# (run, epoch) -> ({global id: (file, row)}, metric keys saved). A numbered epoch never
+# changes once written, so its index is kept once every file loaded and a later epoch exists.
+_EPOCH_INDEX: dict[tuple[str, int], tuple[dict[str, tuple[str, int]], list[str]]] = {}
 
-    Rows are routed with registry.resolve, exactly as load_run does, so a scrubbed frame
-    and the latest frame can never disagree about which sample a row is. (Matching on
-    (local id, box) instead returned nothing for runs whose files carry `experiment` but
-    no `box` -- every scrubbed epoch drew as "not saved".) No metrics: the scrubber only
-    needs pixels.
-    """
-    outputs = runs_dir / name / config.OUTPUTS_SUBDIR
-    want_local = {g.split(":", 1)[1] for g in want}
+
+def epoch_index(name: str, runs_dir: Path, registry: "Registry",
+                epoch: int) -> tuple[dict[str, tuple[str, int]], list[str]]:
+    """Where each sample's prediction lives at one epoch, and which metrics that epoch's
+    files carry. Rows are routed with registry.resolve exactly as load_run routes them, so
+    a scrubbed frame and the latest frame can never disagree about which sample a row is."""
+    if (name, epoch) in _EPOCH_INDEX:
+        return _EPOCH_INDEX[(name, epoch)]
     run_exps = _config_experiments(runs_dir / name)
-    out: dict[str, np.ndarray] = {}
-    for _, d in _split_dirs(outputs):
+    idx: dict[str, tuple[str, int]] = {}
+    keys: dict[str, None] = {}   # ordered set
+    complete = True
+    for _, d in _split_dirs(runs_dir / name / config.OUTPUTS_SUBDIR):
         for p in sorted(d.glob(f"ep{epoch:04d}-*.pt"), key=_batch_of):   # last write wins
             try:
-                obj = torch.load(p, map_location="cpu", weights_only=False)
+                obj = _mmap(p)
             except Exception:
-                continue
-            sid = _info_dirs(obj["info"])
-            hit = [i for i, s in enumerate(sid) if s in want_local]   # cheap prefilter
-            if not hit:
+                complete = False
                 continue
             info = obj["info"]
-            boxes = np.array(_as_box_list(info, len(sid)), dtype=object)[hit]
-            exps = [_as_exp_list(info, len(sid))[i] for i in hit]
-            gis = registry.resolve(sid[hit], boxes, exps, run_exps, p.stat().st_mtime)
-            for i, gi in zip(hit, gis):
-                g = None if gi is None else registry.global_id(gi, sid[i])
-                if g in want:
-                    out[g] = obj["mask_pred"][i].float().numpy()
-    return out
+            keys.update(dict.fromkeys(obj.get("metrics") or {}))
+            sid = _info_dirs(info)
+            gis = registry.resolve(sid, np.array(_as_box_list(info, len(sid)), dtype=object),
+                                   _as_exp_list(info, len(sid)), run_exps, p.stat().st_mtime)
+            for i, (gi, s) in enumerate(zip(gis, sid)):
+                if gi is not None:
+                    idx[registry.global_id(gi, s)] = (str(p), i)
+    if complete and epoch < max(run_epochs(name, runs_dir), default=epoch + 1):
+        _EPOCH_INDEX[(name, epoch)] = (idx, list(keys))
+    return idx, list(keys)
+
+
+def load_epoch(name: str, runs_dir: Path, registry: "Registry", epoch: int,
+               gids: list[str], cells: int) -> np.ndarray:
+    """Masks (len(gids), cells) fp16 for `gids` at one epoch; NaN where the epoch has no
+    prediction. Only the files holding those rows are opened, and only their rows are read."""
+    idx, _ = epoch_index(name, runs_dir, registry, epoch)
+    masks = np.full((len(gids), cells), np.nan, dtype=np.float16)
+    by_file: dict[str, tuple[list[int], list[int]]] = {}
+    for k, g in enumerate(gids):
+        if g in idx:
+            f, r = idx[g]
+            ks, rs = by_file.setdefault(f, ([], []))
+            ks.append(k); rs.append(r)
+    for f, (ks, rs) in by_file.items():
+        masks[ks] = _mmap(f)["mask_pred"][rs].reshape(len(rs), -1).half().numpy()
+    return masks
+
+
+def epoch_metrics(name: str, runs_dir: Path, registry: "Registry", epoch: int) -> dict[str, dict[str, float]]:
+    """The saved per-sample metrics of EVERY sample at one epoch, {gid: {key: value}}, for the
+    column header's aggregates and the scrubbed row cells. No masks: those stay per-row
+    (load_epoch). Empty for runs from before training saved metrics.
+
+    Cached on disk as CACHE_DIR/epoch_metrics/<run>/ep<epoch>.json, one row per sample keyed by
+    experiment + sample_id (gids number experiments in load order, so they are not stable across
+    restarts). Only epochs older than the run's newest are cached: those never change."""
+    cache = config.CACHE_DIR / "epoch_metrics" / name / f"ep{epoch:04d}.json"
+    try:
+        rows = json.loads(cache.read_text())
+    except (OSError, ValueError):   # missing or unreadable: compute
+        idx, _ = epoch_index(name, runs_dir, registry, epoch)
+        rows = []
+        for g, (f, r) in idx.items():
+            gi, sid = g.split(":", 1)
+            m = {k: float(v[r]) for k, v in (_mmap(f).get("metrics") or {}).items()}
+            rows.append(dict(run=name, epoch=epoch, experiment=registry.gts[int(gi)].experiment_dir.name, sample_id=sid,
+                             metrics={k: v if np.isfinite(v) else None for k, v in m.items()}))
+        if rows and rows[0]["metrics"] and epoch < max(run_epochs(name, runs_dir), default=epoch + 1):
+            cache.parent.mkdir(parents=True, exist_ok=True)
+            cache.write_text(json.dumps(rows))
+    gi_of = {gt.experiment_dir.name: gi for gi, gt in enumerate(registry.gts)}
+    return {registry.global_id(gi_of[r["experiment"]], r["sample_id"]): r["metrics"]
+            for r in rows if r["metrics"] and r["experiment"] in gi_of}
 
 
 # Epochs whose every file failed to load, keyed by (run, epoch). A truncated .pt (a run
@@ -903,6 +975,18 @@ def run_epochs(name: str, runs_dir: Path) -> list[int]:
     outputs = runs_dir / name / config.OUTPUTS_SUBDIR
     files = _pred_files(outputs)
     eps = sorted({_epoch_of(p) for p in files})
+
+    # A live run writes its newest epoch batch by batch, train first, then one eval split
+    # at a time, so for a while that epoch holds only some of its samples: the column
+    # shrank, and scrubbed cells said "not saved". Every saved epoch runs the same loaders,
+    # so it is complete once each split dir has as many files as at the saved epoch before.
+    # Live runs only: older code saved fewer train batches at the final epoch, and a run
+    # that stopped mid-save will never fill in, so for those the newest epoch is all there is.
+    if len(eps) >= 2 and run_status(runs_dir / name) == "running":
+        count = lambda e: Counter(os.path.dirname(p) for p in files if _epoch_of(p) == e)
+        new, prev = count(eps[-1]), count(eps[-2])
+        if any(new[d] < n for d, n in prev.items()):
+            eps.pop()
 
     # The newest epoch is the one at risk: a run killed mid-write leaves a truncated .pt
     # that still names a valid epoch. Verify only that one -- the cost is a single load,
@@ -947,6 +1031,48 @@ def _loadable(path) -> bool:
     return _loadable_at(path, st.st_mtime, st.st_size)
 
 
+def _score(name: str, read: list[str], masks: list, rows: np.ndarray,
+           truth: np.ndarray) -> tuple[dict, list]:
+    """Metrics + crosshair geometry for a run training did not score (saved before
+    2026-10-08). Scoring is ~0.5s per 1k samples, mostly connected-component labelling, and
+    its result depends only on the prediction files read, which of their rows were kept and
+    the targets they were scored against -- so it is kept on disk under a hash of those and
+    computed once per run, not on every add."""
+    h = hashlib.blake2b(digest_size=16)
+    h.update(pickle.dumps((read, _stamp(read))))
+    h.update(rows.tobytes())
+    h.update(truth.tobytes())
+    key = h.hexdigest()
+    cache = config.CACHE_DIR / "scores" / f"{name}.pkl"
+    try:
+        c = pickle.loads(cache.read_bytes())
+        if c["key"] == key:
+            return c["metrics"], c["geom"]
+    except Exception:
+        pass   # missing, stale or unreadable: rescore
+    # One call, not two: geometry=True returns the crosshair geometry from the SAME
+    # labelling/matching pass that produces the numbers, which halves the scoring cost of a
+    # run and makes it impossible for a drawn line to disagree with its metric.
+    pred = torch.cat([m.float() for m in masks])[torch.from_numpy(rows)]
+    truth_t = torch.from_numpy(truth)
+    loc, geom = localization(pred, truth_t, geometry=True)
+    metrics = {
+        'localization_rel': loc['localization_rel'].numpy(),
+        'localization_raw': loc['localization_raw'].numpy(),
+        'iou': soft_iou(pred, truth_t).numpy(),
+        'contour': contour_f(pred, truth_t).numpy(),
+    }
+    try:
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        tmp = cache.with_suffix(f".{os.getpid()}.tmp")
+        tmp.write_bytes(pickle.dumps(dict(key=key, metrics=metrics, geom=geom),
+                                     protocol=pickle.HIGHEST_PROTOCOL))
+        tmp.replace(cache)   # atomic, as in load_gt
+    except OSError as e:
+        print(f"[viz] could not cache scores for {name}: {e}", flush=True)
+    return metrics, geom
+
+
 def load_run(name: str, runs_dir: Path, registry: "Registry", family: str = "unknown",
              epoch: int | None = None, shape: tuple[int, int] | None = None) -> RunData:
     """Load one run's predictions and score every sample against the target.
@@ -966,7 +1092,7 @@ def load_run(name: str, runs_dir: Path, registry: "Registry", family: str = "unk
     against the numbers in the run's own logs-rank0.txt.
     """
     outputs = runs_dir / name / config.OUTPUTS_SUBDIR
-    ids, masks, splits, boxes, exps, skipped = [], [], [], [], [], []
+    ids, masks, splits, boxes, exps, skipped, read = [], [], [], [], [], [], []
     # Per-sample metrics + crosshair geometry, written by training (src6 OutputSaver) since
     # 2026-10-08. None for a file that predates it; then the run is scored here instead.
     saved, geoms = [], []
@@ -974,10 +1100,10 @@ def load_run(name: str, runs_dir: Path, registry: "Registry", family: str = "unk
     _t0 = time.perf_counter()
     _n_files = 0   # see the [viz] load_run print at the end of this function
 
+    complete = set(run_epochs(name, runs_dir))
     for split, d in _split_dirs(outputs):
         files = sorted(d.glob("ep*.pt"), key=_epoch_of)
-        if want is not None:
-            files = [f for f in files if _epoch_of(f) == want]
+        files = [f for f in files if (_epoch_of(f) == want if want is not None else _epoch_of(f) in complete)]
         if not files:
             continue
         # Walk this split's epochs newest-first until one actually loads. Without this a
@@ -990,18 +1116,19 @@ def load_run(name: str, runs_dir: Path, registry: "Registry", family: str = "unk
             # of this epoch the LAST write is the one kept by the dedupe below.
             for p in sorted([f for f in files if _epoch_of(f) == last], key=_batch_of):
                 try:
-                    obj = torch.load(p, map_location="cpu", weights_only=False)
+                    obj = _mmap(p)
                 except Exception:
                     skipped.append(str(p.relative_to(outputs)))
                     continue
                 sid = _info_dirs(obj["info"])
                 ids.append(sid)
-                masks.append(obj["mask_pred"].float().numpy())
+                masks.append(obj["mask_pred"])   # mmapped; rows are read on demand (RunMasks)
                 splits += [split] * len(sid)
                 boxes += _as_box_list(obj["info"], len(sid))
                 exps += _as_exp_list(obj["info"], len(sid))
                 saved.append(obj.get("metrics"))
                 geoms += obj.get("geometry") or [None] * len(sid)
+                read.append(str(p))
                 got = True
                 _n_files += 1
             if got:
@@ -1025,11 +1152,11 @@ def load_run(name: str, runs_dir: Path, registry: "Registry", family: str = "unk
         out_shape = shape or (registry.gts[0].masks.shape[1], registry.gts[0].masks.shape[2])
         return RunData(name, epoch, np.zeros(0, dtype=str),
                        np.zeros((0, *out_shape), dtype=np.float32), [],
-                       {k: empty_f for k in METRIC_KEYS}, np.zeros((0, 2)), {}, skipped, family,
+                       {k: empty_f for k in METRIC_KEYS}, {}, skipped, family,
                        out_shape, "no readable prediction files")
 
     sample_ids = np.concatenate(ids)
-    preds = np.concatenate(masks).astype(np.float32)
+    shape = tuple(masks[0].shape[-2:])
     rows = np.arange(len(sample_ids))   # original row of each kept row, filtered in lockstep below
     boxes_arr = np.array(boxes, dtype=object)
 
@@ -1044,14 +1171,13 @@ def load_run(name: str, runs_dir: Path, registry: "Registry", family: str = "unk
     gi_arr = np.array([r for r in routed if r is not None], dtype=np.int64)
     missing = sorted({str(x) for x in sample_ids[~keep]})
     if not keep.all():
-        sample_ids, preds, rows = sample_ids[keep], preds[keep], rows[keep]
+        sample_ids, rows = sample_ids[keep], rows[keep]
         splits = [s for s, k in zip(splits, keep) if k]
 
     if len(sample_ids) == 0:
         empty_f = np.zeros(0, dtype=np.float64)
-        return RunData(name, epoch, sample_ids, preds, splits,
-                       {k: empty_f for k in METRIC_KEYS}, np.zeros((0, 2)), {}, skipped, family,
-                       (preds.shape[-2], preds.shape[-1]),
+        return RunData(name, epoch, sample_ids, np.zeros((0, *shape), dtype=np.float32), splits,
+                       {k: empty_f for k in METRIC_KEYS}, {}, skipped, family, shape,
                        "no predicted sample belongs to a loaded experiment")
 
     # (experiment, id) identifies a scene -- the same numeric key load_run ultimately
@@ -1068,22 +1194,23 @@ def load_run(name: str, runs_dir: Path, registry: "Registry", family: str = "unk
         # Later rows come from later batches, so reversing makes "first seen" the newest.
         _, first = np.unique(scene_ids[::-1], return_index=True)
         keep[len(sample_ids) - 1 - first] = True
-        sample_ids, preds, gi_arr, scene_ids, rows = (
-            sample_ids[keep], preds[keep], gi_arr[keep], scene_ids[keep], rows[keep])
+        sample_ids, gi_arr, scene_ids, rows = (
+            sample_ids[keep], gi_arr[keep], scene_ids[keep], rows[keep])
         splits = [s for s, k in zip(splits, keep) if k]
 
     # Score against ground truth AT THIS RUN'S GRID. Runs trained at different
     # resolutions each get their own targets, so a 16x16 and a 30x30 column can sit side
     # by side; scoring both against one fixed size would broadcast-error or, worse,
     # compare a prediction to a target of a different shape.
-    shape = (preds.shape[-2], preds.shape[-1])
-
     # Ground truth gathered PER ROW from that row's own experiment -- a combined run's
     # rows can come from different GtIndex objects, so this is no longer one shared array
     # indexed once. Grouped by experiment rather than looped element-by-element: a handful
     # of experiments, not a Python loop over every row.
+    # Training scored every file since 2026-10-08 (see `saved`): then the targets are only
+    # needed to exist, not gathered, since nothing is re-scored.
+    scored = all(m is not None and all(k in m for k in METRIC_KEYS) for m in saved)
     global_rows = np.empty(len(sample_ids), dtype=np.int64)
-    truth = np.zeros((len(sample_ids), *shape), dtype=np.float32)
+    truth = None if scored else np.zeros((len(sample_ids), *shape), dtype=np.float32)
     ok = np.ones(len(sample_ids), dtype=bool)
     for gi in np.unique(gi_arr).tolist():
         m = gi_arr == gi
@@ -1096,41 +1223,30 @@ def load_run(name: str, runs_dir: Path, registry: "Registry", family: str = "unk
             # filenames) but none could actually be decoded for this experiment.
             ok[m] = False
             continue
-        truth[m] = gt_masks[local_rows]
+        if truth is not None:
+            truth[m] = gt_masks[local_rows]
 
     if not ok.all():
-        sample_ids, preds, gi_arr, global_rows, truth, rows = (
-            sample_ids[ok], preds[ok], gi_arr[ok], global_rows[ok], truth[ok], rows[ok])
+        sample_ids, gi_arr, global_rows, rows = (
+            sample_ids[ok], gi_arr[ok], global_rows[ok], rows[ok])
+        truth = truth if truth is None else truth[ok]
         splits = [s for s, k in zip(splits, ok) if k]
 
     if len(sample_ids) == 0:
         empty_f = np.zeros(0, dtype=np.float64)
         return RunData(name, epoch, np.zeros(0, dtype=str),
                        np.zeros((0, *shape), dtype=np.float32), [],
-                       {k: empty_f for k in METRIC_KEYS}, np.zeros((0, 2)), {}, skipped, family,
+                       {k: empty_f for k in METRIC_KEYS}, {}, skipped, family,
                        shape, f"no ground truth at {shape[0]}x{shape[1]}")
 
-    pred = torch.from_numpy(preds)
-    truth_t = torch.from_numpy(truth)
-
-    if all(m is not None and all(k in m for k in METRIC_KEYS) for m in saved):
+    if scored:
         # Scored by training: read, don't recompute (scoring was ~90% of a load). Every key
         # every file shares is kept, so the extra ones (fill, miss, com_err, ...) reach /api/run.
         keys = set.intersection(*(set(m) for m in saved))
         metrics = {k: np.concatenate([m[k].numpy() for m in saved])[rows] for k in keys}
         geom = [geoms[i] for i in rows]
     else:
-        # One call, not two: geometry=True returns the crosshair geometry from the SAME
-        # labelling/matching pass that produces the numbers, which halves the scoring cost of a
-        # run and makes it impossible for a drawn line to disagree with its metric.
-        loc, geom = localization(pred, truth_t, geometry=True)
-        metrics = {
-            'localization_rel': loc['localization_rel'].numpy(),
-            'localization_raw': loc['localization_raw'].numpy(),
-            'iou': soft_iou(pred, truth_t).numpy(),
-            'contour': contour_f(pred, truth_t).numpy(),
-        }
-    com_pred = center_of_mass(pred, epsilon=config.EPSILON).numpy()
+        metrics, geom = _score(name, read, masks, rows, truth)
 
     # Keyed by GLOBAL ROW, not sample id: every consumer (render._cached, /api/mask.png,
     # /api/values, /api/neighbors) resolves the id through _sid() at the HTTP edge and
@@ -1141,10 +1257,12 @@ def load_run(name: str, runs_dir: Path, registry: "Registry", family: str = "unk
     # See PERF_NOTES.md. `_n_files` .pt reads (each a disk read + torch.load deserialize)
     # is usually the dominant cost here -- this is what tells you whether a slow add is
     # "many small files" (fix: fewer/larger saves upstream) or something in scoring.
+    part = np.repeat(np.arange(len(masks)), [len(m) for m in masks])
+    local = np.concatenate([np.arange(len(m)) for m in masks])
     print(f"[viz] load_run {name!r}: {_n_files} .pt files, {len(sample_ids)} samples, "
           f"{time.perf_counter() - _t0:.2f}s", flush=True)
-    return RunData(name, epoch, sample_ids, pred.numpy(), splits,
-                   metrics, com_pred, row_of, skipped, family, shape,
+    return RunData(name, epoch, sample_ids, RunMasks(masks, part[rows], local[rows]), splits,
+                   metrics, row_of, skipped, family, shape,
                    com_pairs=geom, global_ids=global_ids, missing=missing)
 
 

@@ -38,12 +38,14 @@ a real backdrop and `canvas_size()` sizes from the photo, flooring at `h * UPSCA
 
 Two hops: `SampleId` —(`_sid`)→ `Row` —(`rd.row_of`)→ run-row.
 
-`RunData.masks`, `.mse`, `.iou`, `.comdist`, `.com_pred`, `.splits` and `.sample_ids` all
-share one row space, established by filtering them in lockstep in `load_run`.
+`RunData.masks`, `.metrics`, `.com_pairs`, `.splits` and `.sample_ids` all share one row
+space, established by filtering them in lockstep in `load_run`. `RunData.masks` is a
+`RunMasks`: `masks[i]` reads row i from the memory-mapped prediction file it lives in, so
+nothing indexes it with arrays or slices.
 
-`/api/frames` is the **one exception**: it stays in `SampleId` space end-to-end, because
-`load_epoch_masks` matches raw ids read out of the `.pt`. It calls `sample_index()` only to
-validate, and discards the result. Do not "fix" this.
+`/api/frames` is the **one exception** for numbered epochs: it stays in `GlobalId` space
+end-to-end, because `data.epoch_index` maps the ids read out of each `.pt` (routed with
+`registry.resolve`, exactly as `load_run` routes them) to `(file, row)`. Do not "fix" this.
 
 The wire is `SampleId` everywhere — `/api/run/{name}` keys its per-sample metrics by id, to
 match `/api/samples`.
@@ -107,12 +109,9 @@ by `Row` exactly as section 2/5 describe, and `RunData.global_ids` (parallel to
 `sample_ids`) carries each row's own `GlobalId`, computed from ITS OWN routed `gi` rather
 than one shared run-level offset.
 
-`/api/frames` is still the one place that works in `SampleId`/`GlobalId` space end-to-end
-(see section 2), and it too has to be per-row now: it decodes each requested `GlobalId`
-via `registry.locate()` into `(local_id, box)` and matches `load_epoch_masks` on that pair
-(not the bare id), so two experiments' colliding local ids can never serve each other's
-mask. Do not "fix" this into row space either; both exceptions exist for the same reason
-(`load_epoch_masks` matches ids read straight out of the `.pt`, never rows).
+`/api/frames` is still the one place that works in `GlobalId` space end-to-end (see
+section 2): `epoch_index` keys every routed row by its own `GlobalId`, so two experiments'
+colliding local ids can never serve each other's mask.
 
 `/api/run/{name}`'s per-sample `samples` dict is keyed by `GlobalId`, read straight off
 `RunData.global_ids` (to match `/api/samples`' `s.i`, which `app.js` looks it up by).

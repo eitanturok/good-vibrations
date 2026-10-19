@@ -9,17 +9,20 @@ Routes speak sample ids; everything below this module speaks rows. _sid() is the
 conversion between them -- see SPEC.md.
 """
 
+import gc
 import json
 import time
 from pathlib import Path
 
 import numpy as np
+import torch
 from fastapi import FastAPI, HTTPException, Query, Response
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from viz import config, data, render
 from utils.ids import meta_sample_name
+from utils.metrics import center_of_mass
 from viz.data import Registry
 
 app = FastAPI(title="viz")
@@ -34,6 +37,10 @@ def init(experiment_dir: Path = None, runs_dir: Path = None,
     global registry
     registry = Registry(experiment_dir or config.EXPERIMENT_DIR,
                         runs_dir or config.RUNS_DIR, mask_override)
+    # Startup leaves ~650k objects that live as long as the process (ground-truth metadata,
+    # the run scan). Each full GC pass re-scanned all of them, ~0.6s landing on whichever
+    # request allocated next -- usually adding a run. Freezing exempts them from the scan.
+    gc.freeze()
     # Warm the default runs in the BACKGROUND: each can take ~50s to load+score, and doing
     # it inline kept the server from listening for minutes after launch.
     import threading
@@ -187,11 +194,11 @@ def _build_samples() -> dict:
                 # the grid is a fixed (out_h,out_w) for every box, so the aspect it must be
                 # drawn at is the only thing that says which box it came from. /api/lut's
                 # `aspect` is a fallback and is wrong the moment two boxes are loaded.
-                "aspect": render.aspect_for_box(m.get("box")),
+                "aspect": render.aspect_for_box(gt.experiment_dir.name, m.get("box")),
                 # True pixel (width, height) of that same frame -- the table cell draws
                 # every box at one uniform size now, so this is what the corner label
                 # shows to say what shape got stretched to fit it.
-                "dims": render.dims_for_box(m.get("box")),
+                "dims": render.dims_for_box(gt.experiment_dir.name, m.get("box")),
                 # Target object centroids, normalized [0,1] cell centres, for the ground-truth
                 # column's crosshairs. The run columns carry their own (see /api/run "coms"),
                 # matched against the target at THEIR grid rather than this one.
@@ -204,8 +211,8 @@ def _build_samples() -> dict:
 
 @app.get("/api/run/{name}")
 def api_run(name: str, reload: int = 0):
-    """Per-sample metrics for one run, at its latest epoch. The epoch scrubber only swaps
-    masks (/api/frames); re-scoring every sample per scrubbed epoch cost ~7s per run."""
+    """Per-sample metrics for one run, at its latest epoch. Scrubbed epochs get their masks
+    and saved metrics from /api/frames."""
     _t0 = time.perf_counter()
     # reload=1 re-reads the run's prediction files, picking up epochs written since it
     # was first loaded (a run still training keeps producing them).
@@ -223,7 +230,6 @@ def api_run(name: str, reload: int = 0):
     for i, gid in enumerate(rd.global_ids):
         samples[str(gid)] = {
             "split": rd.splits[i],
-            "com": [_clean(rd.com_pred[i][0]), _clean(rd.com_pred[i][1])],
             # Crosshair geometry: matched prediction/target object centroids, plus the
             # unmatched ones. Normalized [0,1] so the client draws it at any grid size.
             # Same pairing localization scores with, so lines and numbers agree.
@@ -400,39 +406,41 @@ def api_lut():
 
 
 @app.get("/api/frames")
-def api_frames(run: str, sids: str, epochs: str = "latest"):
-    """Raw mask values for samples x epochs, as one fp16 blob [n_epochs][n_sids][H*W].
-
-    `epochs` is a comma list of epoch numbers and/or "latest". "latest" is served from the
-    loaded run in memory (no file read; exactly the masks its metrics scored); a numbered
-    epoch reads that epoch's files. The client asks for the epoch on screen first, then all
-    the others for the same rows, so the epoch slider repaints from local data.
-    Samples with no prediction are NaN.
-    """
+def api_frames(run: str, sids: str, epoch: str = "latest"):
+    """One epoch's masks for `sids` as fp16 [n_sids][H*W] (NaN = no prediction). Metrics are
+    /api/run's (latest) and /api/epoch_metrics' (numbered). "latest" is served from the loaded
+    run in memory; a numbered epoch reads only the rows asked for (data.load_epoch)."""
     entry = registry.by_name.get(run)
     if entry is None or not entry.compatible:
         raise HTTPException(404, "unknown or incompatible run")
-    rows = [_sid(s) for s in sids.split(",") if s.strip()]
-    eps = [e.strip() for e in epochs.split(",") if e.strip()]
-    if not rows or not eps:
-        raise HTTPException(400, "no sids or epochs")
-    h, w = entry.shape
-    out = np.full((len(eps), len(rows), h * w), np.nan, dtype=np.float16)
     gids = [s.strip() for s in sids.split(",") if s.strip()]
-    for ei, ep in enumerate(eps):
-        if ep == "latest":
-            rd = _run(run)
-            for i, r in enumerate(rows):
-                if r in rd.row_of:
-                    out[ei, i] = rd.masks[rd.row_of[r]].reshape(-1)
-            continue
-        masks = data.load_epoch_masks(run, registry.runs_dir, registry, int(ep), set(gids))
+    if not gids:
+        raise HTTPException(400, "no sids")
+    cells = entry.shape[0] * entry.shape[1]
+    if epoch == "latest":
+        rd = _run(run)
+        masks = np.full((len(gids), cells), np.nan, dtype=np.float16)
         for i, g in enumerate(gids):
-            if g in masks:
-                out[ei, i] = masks[g].reshape(-1)
-    # "latest" moves as a run trains, so only all-numbered responses are immutable.
-    cache = {"Cache-Control": "no-store"} if "latest" in eps else IMMUTABLE
-    return Response(out.tobytes(), media_type="application/octet-stream", headers=cache)
+            r = _sid(g)
+            if r in rd.row_of:
+                masks[i] = rd.masks[rd.row_of[r]].reshape(-1)
+    else:
+        masks = data.load_epoch(run, registry.runs_dir, registry, int(epoch), gids, cells)
+    # "latest" moves as a run trains, so only numbered epochs are immutable.
+    return Response(masks.tobytes(), media_type="application/octet-stream",
+                    headers={"Cache-Control": "no-store"} if epoch == "latest" else IMMUTABLE)
+
+
+@app.get("/api/epoch_metrics")
+def api_epoch_metrics(run: str, epoch: int):
+    """Every sample's saved metrics at one numbered epoch, {saved, samples: {sid: {key: value}}},
+    for the column header and the row cells while scrubbed. The latest epoch's come with
+    /api/run."""
+    entry = registry.by_name.get(run)
+    if entry is None or not entry.compatible:
+        raise HTTPException(404, "unknown or incompatible run")
+    s = data.epoch_metrics(run, registry.runs_dir, registry, epoch)
+    return JSONResponse({"saved": bool(s), "samples": s}, headers=IMMUTABLE)
 
 
 @app.get("/api/neighbors")
@@ -447,7 +455,7 @@ def api_neighbors(run: str, sid: str, k: int = 5):
     rd = _run(run)
     if i not in rd.row_of:
         raise HTTPException(404, "no prediction for this sample")
-    pred = np.asarray(rd.com_pred[rd.row_of[i]], dtype=np.float64)
+    pred = center_of_mass(torch.from_numpy(rd.masks[rd.row_of[i]]), epsilon=config.EPSILON).double().numpy()
 
     # Neighbours are searched within the SAME experiment the queried sample came from --
     # comparing "which real scene looks like this prediction" only makes sense against
@@ -456,7 +464,7 @@ def api_neighbors(run: str, sid: str, k: int = 5):
     # Grid cells are not square (20 rows x 40 cols over the same scene), so normalise to
     # [0,1] on each axis before measuring -- otherwise a column offset counts double.
     # Scale by THIS RUN's grid, and compare against targets measured on that same grid:
-    # com_pred is in the run's coordinates, so using the global default would divide a
+    # the prediction's COM is in the run's coordinates, so using the global default would divide a
     # 30x30 prediction by 20x40 and rank neighbours in a mixed coordinate system.
     scale = np.array([rd.shape[0] - 1, rd.shape[1] - 1], dtype=np.float64)
     com_gt = gt.com_at(rd.shape)

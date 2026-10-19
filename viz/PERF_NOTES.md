@@ -183,3 +183,53 @@ init 11.4s -> 2.1s, measured without the profiler, each step found with cProfile
 Old-format runs (scored in viz) load in 1.2-5s instead of 7-14s, from the same `_label` fix.
 Every startup payload (/api/samples, /api/runs, /api/lut, /api/run for old and new runs)
 checked JSON-equal against the previous code.
+
+## Scrolling, scrubbing, startup (2026-10-12)
+
+Symptom: cells sat on "loading" / "loading metrics…" while scrolling. Measured with
+playwright on s6-gastro-plastic-cardboard-3k (16k rows, 40 epochs) + s6-cardboard-3k (121).
+
+- Root cause: after painting the epoch on screen, `ensureFrames` fetched EVERY other epoch
+  for the visible rows in one request, and the server answered each numbered epoch by
+  `torch.load`ing every .pt of that epoch (~250MB). 60 rows x 40 epochs = 11.8s, repeated on
+  every scroll (new rows, same files), and the next scroll's fetch queued behind it.
+  Fix: `data.epoch_index` maps (run, epoch) -> {global id: (file, row)} once (kept for
+  completed epochs), and `load_epoch` opens only the files holding the asked rows with
+  `torch.load(mmap=True)`, so only those rows' pages are read. The client fetches only the
+  epoch on screen. Saved metrics ride in the same response (header `X-Metric-Keys`), so
+  `/api/epoch_metrics` and "loading metrics…" are gone. 60 rows: 6-20ms warm, 40-100ms
+  the first time an epoch is touched (index build). Bit-identical to a full load.
+- Scroll repainted every pooled row each frame (pool slot k showed rank first+k, so every
+  slot changed sample whenever `first` moved): ~69 cell paints, 7.4ms p50 per frame. Rows
+  are now pooled by rank % pool.length and scrolling paints only rows that came into view:
+  1.2 cell paints, ~0ms p50, 3ms max.
+- Backdrops were PNG-decoded + JPEG-encoded per sample per process (~54ms, 0.5s/screen
+  cold) and held in a 2048-entry in-memory lru (~230MB). Now written once to
+  ~/.cache/viz/backdrop/<experiment>/: 0.02s/screen.
+- Startup: GT cache validation built ~270k Path objects (~1.2s) -- now plain strings, same
+  stats. `_probe` reads files with mmap (no tensor data). Registry init ~7s -> 2.5-3.5s
+  warm. GT load still swings 1.5-5.5s with page-cache state (training jobs evict it).
+- load_run: dropped a redundant 263MB `.astype(float32)` copy and the per-row GT gather
+  when training saved the metrics: 1.7s -> 1.1s for 16k rows; the rest is reading 1.5GB of
+  fp32 64x64 masks.
+
+## Adding a run (2026-10-12, later)
+
+Measured per phase (wrapped calls + a line tracer; cProfile under-reported wall time here).
+
+- The full mask array was built for every add: 16k x 64x64 fp32 = 270MB `torch.load`ed and
+  concatenated, though every consumer (/api/frames latest, /api/values, /api/mask.png,
+  /api/neighbors) reads one row. Under training-job memory pressure the allocation alone
+  took 0.1-1.4s. `load_run` now keeps the .pt files memory-mapped and `RunMasks` reads a row
+  on demand; `com_pred` for every row (only /api/neighbors used it, for one row) is gone.
+- One full GC pass rescanned ~650k startup objects (GT metadata, run scan): 0.5-0.65s,
+  landing on whichever request allocated next -- usually an add. `gc.freeze()` after the
+  registry is built.
+  Result for runs training scored: 16k rows 0.4-2.2s -> 0.12-0.35s; 7k rows 1.0s -> 0.1-0.2s.
+- Runs from before training saved metrics were re-scored on every add (4-9s, ~80%
+  connected-component labelling). `_score` caches metrics + geometry at
+  ~/.cache/viz/scores/<run>.pkl keyed by a hash of the files read (stat), the kept rows and
+  the targets; a hit is 0.3-0.9s (gathering + hashing the targets), first add unchanged.
+  Hit verified identical to a rescore.
+- Browser add (playwright, fetch -> cells painted): s6-cardboard-3k 1.3s -> 0.2-0.3s;
+  s6-box-both-allspk-v1 9.2s -> 1.2s cached. Client-side work after the fetch is ~0.1-0.2s.

@@ -64,7 +64,7 @@ const S = {
   samples: [], runs: {}, order: [], runOrder: [], meta: null,
   filters: {
     splits: new Set(), speakers: new Set(), layouts: new Set(), nObjects: new Set(),
-    objects: new Set(),          // object TYPES present, independent of layout
+    objects: null,               // object TYPES present, independent of layout; null = no filter, a Set = scenes with ANY of them
     boxes: new Set(),            // enclosure the scene sits in
     datasets: new Set(),         // true data-identity field, distinct from box
     positions: null, ranges: {},
@@ -72,19 +72,24 @@ const S = {
     // exactly those samples/positions, unioned so both searches can be used at once.
     findSamples: new Set(), findPositions: new Set(),
   },
-  sort: { run: null, metric: "iou", dir: "worst" },
+  // One sort per row group (sortGroupOf): {group key: {run, metric, dir}}. Columns in
+  // different groups have their own row lists, so sorting one must not reorder another.
+  sorts: {},
   // relative=false is the default on purpose: a fixed [0,1] domain is the only scale
   // under which two cells mean the same thing, which is the point of a comparison table.
   // background is an on/off switch (the "b" key, the checkbox); bgOp is the level it
   // returns to when switched back on, so the two are stored separately. maskOp is the
   // Prediction slider: it fades predicted masks only (never ground truth), applied as a
   // per-layer canvas alpha rather than to the cell, whose backdrop must not move with it.
-  // rowMode "dataset" (default): each loaded run's column is grouped by which dataset(s)
+  // rowMode "linked" (default): like "dataset", but runs whose dataset sets OVERLAP share one
+  // group (sortGroupOf), so a combined gastro+plastic+cardboard column and a cardboard-only
+  // column show the same sample on every row and one sort orders both.
+  // rowMode "dataset": each loaded run's column is grouped by which dataset(s)
   // it was trained on and independently resolves its own row content -- see computeGroups
   // and S.groups, below. "single": today's original behaviour, one shared sample per row
   // across every column, via the flat S.order.
-  view: { mode: "pred", rowMode: "dataset", background: true, relative: false, coms: false, bgOp: 1, maskOp: 1 },
-  groups: null,   // computed in applyFilters() when rowMode is "dataset" -- see computeGroups
+  view: { mode: "pred", rowMode: "linked", background: true, relative: false, coms: false, bgOp: 1, maskOp: 1 },
+  groups: null,   // computed in applyFilters() unless rowMode is "single" -- see computeGroups
   domain: {}, positions: [], activePos: -1, modalRow: -1,
   hidden: new Map(),  // filter key -> samples that ONLY that filter is holding back
   focus: null,        // run shown full screen as a grid (setFocus), or null for the table
@@ -93,7 +98,8 @@ const S = {
   epochIdx: null,     // null = each run's latest; otherwise an index into the epoch list
   playing: false,
   modalComs: null,    // {coms} for the open modal, so "m" can repaint it
-  frameData: {},      // run -> fp16 masks for the visible rows, all epochs
+  epochMetrics: {},   // run -> {epoch: {saved, samples: {sid: {metric: value}}} | null while in flight}
+  frameData: {},      // run -> {epoch | "latest": Map sid -> {m: fp16 mask}}
   truthCache: {},     // sid -> ground-truth values, for client-side diff
 };
 
@@ -136,6 +142,10 @@ function identity(s) {
    wire id. Searches may skip the padding: "12-3" -> "000012-3". */
 const padId = (t) => t.replace(/^(\d+)-/, (_, p) => `${p.padStart(6, "0")}-`);
 const byId = (a, b) => (a.i < b.i ? -1 : a.i > b.i ? 1 : 0);
+/* The table's base order: position id (output_id, shared by a position's 8 speaker
+   samples), then id. Samples without one go last. */
+const posKey = (s) => (s.output_id == null ? Infinity : +s.output_id);
+const byPosition = (a, b) => posKey(a) - posKey(b) || byId(a, b);
 
 function shortLayout(s) {
   if (!s) return "–";
@@ -301,9 +311,11 @@ async function addRunNow(name, reload) {
 
 function removeRun(name) {
   delete S.runs[name];
+  delete S.frameData[name];
+  delete S.epochMetrics[name];
   S.runOrder = S.runOrder.filter((n) => n !== name);
   invalidateEpochs();
-  if (S.sort.run === name) S.sort.run = null;
+  for (const k in S.sorts) if (S.sorts[k].run === name) delete S.sorts[k];
   recomputeDomains();
   refresh();
 }
@@ -403,10 +415,11 @@ function failures(s) {
   if (!f.nObjects.has(s.n_objects)) out.push("nObjects");
   if (!f.boxes.has(s.box)) out.push("boxes");
   if (!f.datasets.has(s.dataset)) out.push("datasets");
-  // Picked objects, like viz2: none picked = no filter; else a scene passes if it
-  // contains ANY picked object. Empty boxes match the "(none)" pseudo-object.
+  // Picked objects, like viz2: null = no filter ("all"); else a scene passes if it
+  // contains ANY picked object, so an empty pick ("none") hides everything.
+  // Empty boxes match the "(none)" pseudo-object.
   const objs = s.objects && s.objects.length ? s.objects : ["(none)"];
-  if (f.objects.size && !objs.some((o) => f.objects.has(o))) out.push("objects");
+  if (f.objects && !objs.some((o) => f.objects.has(o))) out.push("objects");
   if (f.positions && !(s.pos >= 0 && f.positions.has(s.pos))) out.push("positions");
 
   // With no runs loaded the table is a ground-truth browser, so every sample qualifies;
@@ -419,7 +432,7 @@ function failures(s) {
   // overlapping datasets at all) marked EVERY sample of every other loaded box's dataset
   // "nopred", because that new run obviously never predicted them either. A cardboard
   // sample's coverage should only ever be judged against cardboard-trained runs.
-  const relevantRuns = S.view.rowMode === "dataset"
+  const relevantRuns = grouped()
     ? S.runOrder.filter((n) => runDs(n).includes(s.dataset))
     : S.runOrder;
   if (S.runOrder.length) {
@@ -437,13 +450,13 @@ function failures(s) {
     }
   }
 
-  // Metric ranges read the sorted run when one is chosen, else any RELEVANT loaded run
-  // may satisfy them (union) — the intuitive reading of "show me samples where MSE is
-  // high", scoped the same way as the split check just above and for the same reason.
-  // The sorted run only judges samples it covers: a plastic sample is not in a gastro
+  // Metric ranges read the sorted runs that cover this sample, else any RELEVANT loaded
+  // run may satisfy them (union) — the intuitive reading of "show me samples where MSE
+  // is high", scoped the same way as the split check just above and for the same reason.
+  // A sorted run only judges samples it covers: a plastic sample is not in a gastro
   // run, so sorting the gastro column must leave the plastic column as it was.
-  const sorted = S.sort.run && S.runs[S.sort.run];
-  const names = sorted && sorted.splitOf && sorted.splitOf[s.i] ? [S.sort.run] : relevantRuns;
+  const judges = activeSorts().map((st) => st.run).filter((n) => (S.runs[n].splitOf || {})[s.i]);
+  const names = judges.length ? judges : relevantRuns;
   if (!names.length) return out;
   let any = false;
   for (const n of names) {
@@ -472,7 +485,7 @@ const FILTERS = {
   speakers:  { label: "speaker",  clear: (f) => S.samples.forEach((s) => f.speakers.add(s.speaker)) },
   splits:    { label: "split",    clear: (f) => S.runOrder.forEach((n) => S.runs[n].splits.forEach((sp) => f.splits.add(sp))) },
   nObjects:  { label: "objects",  clear: (f) => S.samples.forEach((s) => f.nObjects.add(s.n_objects)) },
-  objects:   { label: "object",   clear: (f) => f.objects.clear() },
+  objects:   { label: "object",   clear: (f) => { f.objects = null; } },
   layouts:   { label: "layout",   clear: (f) => S.samples.forEach((s) => s.layout && f.layouts.add(s.layout)) },
   boxes:     { label: "box",      clear: (f) => S.samples.forEach((s) => s.box && f.boxes.add(s.box)) },
   datasets:  { label: "dataset",  clear: (f) => S.samples.forEach((s) => s.dataset && f.datasets.add(s.dataset)) },
@@ -492,46 +505,111 @@ function clearFilter(key) {
   refresh();
 }
 
+/* The chip value(s) a sample sits under, per faceted filter (objects and splits are sets). */
+const FACET_VALUES = {
+  layouts:  (s) => [s.layout],
+  nObjects: (s) => [s.n_objects],
+  boxes:    (s) => [s.box],
+  datasets: (s) => [s.dataset],
+  objects:  (s) => (s.objects && s.objects.length ? s.objects : ["(none)"]),
+  splits:   (s) => splitsOf(s.i),
+};
+
 function applyFilters() {
   // One pass, two answers: the rows to draw, and -- for everything held back -- which
   // filter would have to be relaxed to admit it. A sample failing several filters at
   // once is not attributed to any of them: clearing one would not bring it back, so
   // promising that it would is worse than staying quiet.
   const rows = [], solo = new Map();
+  // Chip counts are faceted: each value counts the samples that pass every OTHER filter,
+  // so picking object=cube leaves only the layouts holding a cube, and n_objects=1 turns
+  // the object counts into "how many 1-object samples have this object". A sample counts
+  // toward a filter's chips if nothing hides it, or if that filter is the only one that does.
+  const facets = {};
+  const tallyFacet = (s, k) => {
+    const m = facets[k] || (facets[k] = new Map());
+    for (const v of FACET_VALUES[k](s)) m.set(v, (m.get(v) || 0) + 1);
+  };
   for (const s of S.samples) {
     const why = failures(s);
-    if (!why.length) rows.push(s);
-    else if (why.length === 1) solo.set(why[0], (solo.get(why[0]) || 0) + 1);
+    if (!why.length) {
+      rows.push(s);
+      for (const k in FACET_VALUES) tallyFacet(s, k);
+    } else if (why.length === 1) {
+      solo.set(why[0], (solo.get(why[0]) || 0) + 1);
+      if (FACET_VALUES[why[0]]) tallyFacet(s, why[0]);
+    }
   }
   S.hidden = solo;
-  const { run, metric, dir } = S.sort;
+  S.facets = facets;
+  // Rows are always in position order; a metric sort reorders on top of it (stably, so
+  // ties stay in position order). "Single sample" mode only exists when every run shares
+  // one dataset set, so it has exactly one group and at most one sort; "by dataset" sorts
+  // each group's own rows.
+  rows.sort(byPosition);
+  S.order = grouped() ? rows : sortRows(rows, activeSorts()[0]);
+  S.groups = grouped() ? computeGroups(rows) : null;
+}
 
-  if (run && S.runs[run]) {
-    const m = METRICS.find((x) => x.key === metric);
-    // "worst" means high for localization, LOW for IoU/contour; the direction button is
-    // labelled semantically so this inversion never lands on the user.
-    const isAbs = m.worst === "abs";
-    const desc = isAbs ? dir === "worst" : (m.worst === "high") === (dir === "worst");
-    const key = (v) => (isAbs ? Math.abs(v) : v);
-    const tbl = S.runs[run].samples;
-    rows.sort((a, b) => {
-      const x = tbl[a.i], y = tbl[b.i];
-      // A missing prediction, or a metric undefined for this sample (localization on an
-      // empty box), sinks to the end in BOTH directions.
-      const xv = x && x[metric] != null ? x[metric] : null;
-      const yv = y && y[metric] != null ? y[metric] : null;
-      if (xv == null && yv == null) return byId(a, b);
-      if (xv == null) return 1;
-      if (yv == null) return -1;
-      const d = (key(yv) - key(xv)) * (desc ? 1 : -1);
-      return d || byId(a, b);
-    });
+/* Whether columns resolve rows per group (computeGroups) rather than one flat S.order. */
+const grouped = () => S.view.rowMode !== "single";
+
+/* The row group a run's column belongs to, and so its one sort. "dataset": runs predicting
+   the same SET of datasets. "linked": runs connected through any shared dataset, so the
+   group's rows are the union of what its runs predicted and a run that didn't predict a
+   row's sample shows "not in run" there. Keyed by the group's dataset union. */
+function sortGroupOf(name) {
+  if (S.view.rowMode !== "linked") return runDs(name).join("|");
+  let ds = new Set(runDs(name)), grew = true;
+  while (grew) {
+    grew = false;
+    for (const n of S.runOrder) {
+      const d = runDs(n);
+      if (d.some((x) => ds.has(x)) && d.some((x) => !ds.has(x))) { d.forEach((x) => ds.add(x)); grew = true; }
+    }
   }
-  S.order = rows;
-  // Sort runs first every group's own row list, so "sort by this run's metric" is
-  // preserved WITHIN each dataset group too, at no extra cost -- filtering into groups
-  // below is a stable partition of the already-sorted `rows`.
-  S.groups = S.view.rowMode === "dataset" ? computeGroups(rows) : null;
+  return [...ds].sort().join("|");
+}
+
+/* The sort applying to `name`'s column, or null. A sort whose run was removed, or whose
+   run no longer lands in this group (its dataset set changed on reload), is ignored. */
+function sortOf(name) {
+  const st = S.sorts[sortGroupOf(name)];
+  return st && S.runs[st.run] && sortGroupOf(st.run) === sortGroupOf(name) ? st : null;
+}
+
+const activeSorts = () => S.runOrder.map((n) => sortOf(n)).filter((st, k, a) => st && a.indexOf(st) === k);
+
+/* `rows` (already in position order) ordered by one run's metric, worst or best first;
+   unchanged when there is no sort. */
+function sortRows(rows, sort) {
+  if (!sort) return rows;
+  const { run, metric, dir } = sort;
+  const m = METRICS.find((x) => x.key === metric);
+  // "worst" means high for localization, LOW for IoU/contour; the direction button is
+  // labelled semantically so this inversion never lands on the user.
+  const isAbs = m.worst === "abs";
+  const desc = isAbs ? dir === "worst" : (m.worst === "high") === (dir === "worst");
+  const key = (v) => (isAbs ? Math.abs(v) : v);
+  const tbl = S.runs[run].samples;
+  return [...rows].sort((a, b) => {
+    const x = tbl[a.i], y = tbl[b.i];
+    // A missing prediction, or a metric undefined for this sample (localization on an
+    // empty box), sinks to the end in BOTH directions.
+    const xv = x && x[metric] != null ? x[metric] : null;
+    const yv = y && y[metric] != null ? y[metric] : null;
+    if (xv == null && yv == null) return 0;
+    if (xv == null) return 1;
+    if (yv == null) return -1;
+    return (key(yv) - key(xv)) * (desc ? 1 : -1);
+  });
+}
+
+/* metric "position" puts the group back in its base order. */
+function setSort(name, metric, dir) {
+  if (metric === "position") delete S.sorts[sortGroupOf(name)];
+  else S.sorts[sortGroupOf(name)] = { run: name, metric, dir };
+  refresh(true);
 }
 
 /* The datasets a run predicted: what /api/run read off its loaded rows, else the scan's
@@ -539,27 +617,19 @@ function applyFilters() {
 const runDs = (n) => S.runs[n].datasets || (S.runs[n].entry && S.runs[n].entry.datasets) || [];
 
 /* "By dataset" row mode: runs predicting the same SET of datasets share a group, and a
-   group's rows are the filtered/sorted `rows` that one of its runs predicted. Sorted by a
-   run in the group, that is one ranking across all its datasets; otherwise they are
-   interleaved round-robin, so a combined run (gastro + plastic) shows both from the first
-   row instead of one dataset starting thousands of rows down. */
+   group's rows are the filtered `rows` (position order) that one of its runs predicted,
+   sorted by the group's OWN sort (sortOf), so sorting one group never moves another. */
 function computeGroups(rows) {
   if (!S.runOrder.length) return null;
   const groups = new Map();
   for (const name of S.runOrder) {
-    const ds = runDs(name), key = ds.join("|");
-    if (!ds.length) continue;
-    if (!groups.has(key)) groups.set(key, { datasets: ds, runs: [], order: [] });
+    const key = sortGroupOf(name);
+    if (!key) continue;   // no datasets known yet
+    if (!groups.has(key)) groups.set(key, { runs: [], order: [] });
     groups.get(key).runs.push(name);
   }
-  for (const g of groups.values()) {
-    const mine = rows.filter((s) => g.runs.some((n) => S.runs[n].splitOf[s.i]));
-    // Sorted by one of THIS group's runs: keep that one ranking across all its datasets.
-    if (g.runs.includes(S.sort.run)) { g.order = mine; continue; }
-    const per = g.datasets.map((d) => mine.filter((s) => s.dataset === d));
-    for (let k = 0; g.order.length < mine.length; k++)
-      for (const l of per) if (k < l.length) g.order.push(l[k]);
-  }
+  for (const g of groups.values())
+    g.order = sortRows(rows.filter((s) => g.runs.some((n) => S.runs[n].splitOf[s.i])), sortOf(g.runs[0]));
   return [...groups.values()];
 }
 
@@ -567,15 +637,26 @@ function computeGroups(rows) {
    mode, or the longest group in "by dataset" mode -- shorter groups just paint blank past
    their own end (see paintRow). */
 function rowCount() {
-  if (S.view.rowMode === "dataset" && S.groups && S.groups.length)
+  if (grouped() && S.groups && S.groups.length)
     return S.groups.reduce((n, g) => Math.max(n, g.order.length), 0);
   return S.order.length;
 }
 
 /* ***** table ***** */
 
+/* Per-sample metrics {sid: {metric: value}} of `run` at the epoch on screen: the latest
+   epoch's come with the run, a scrubbed one's from epochMetrics. null while that epoch is in
+   flight, false when the run never saved per-epoch metrics. */
+function metricsAt(run) {
+  const r = S.runs[run], ep = epochFor(run), eps = r.epochs || [];
+  if (ep == null || ep === eps[eps.length - 1]) return r.samples;
+  const em = epochMetrics(run, ep);
+  return em && (em.saved ? em.samples : false);
+}
+
+/* Aggregates over the filtered rows at the epoch on screen; all null ("–") while it loads. */
 function statsFor(name) {
-  const tbl = S.runs[name].samples, out = {};
+  const tbl = metricsAt(name) || {}, out = {};
   for (const m of METRICS) {
     const vals = [];
     for (const s of S.order) {
@@ -724,11 +805,12 @@ function setGtCol(open, persist = true) {
   if (persist) { try { localStorage.setItem("viz.gtcol", open ? "1" : "0"); } catch (_) {} }
 }
 
-/* "By dataset" (default) vs "single sample" -- see S.view.rowMode's doc comment and
+/* "Linked" (default) / "by dataset" vs "single sample" -- see S.view.rowMode's doc comment and
    paintRow. Switching away from "single" force-collapses the ground-truth column;
    switching back restores whatever the user last had it set to. */
 function setRowMode(mode) {
   S.view.rowPref = mode;
+  try { localStorage.setItem("viz.rowmode", mode); } catch (_) {}
   syncRowMode();
   refresh(true);
 }
@@ -746,7 +828,8 @@ function runDatasets() {
    adding/removing a run flips it; returns whether the mode changed. */
 function syncRowMode() {
   const mixed = runDatasets().size > 1;
-  const mode = mixed ? "dataset" : (S.view.rowPref || "dataset");
+  const pref = S.view.rowPref || "linked";
+  const mode = mixed && pref === "single" ? "linked" : pref;
   const single = $("#rowmode-seg").querySelector('[data-rowmode="single"]');
   single.dataset.title ??= single.title;   // the static tooltip from index.html
   single.disabled = mixed;
@@ -785,13 +868,59 @@ function renderHeader() {
   return h;
 }
 
+/* navigator.clipboard needs a secure context (https/localhost); viz is often opened over
+   plain http, so fall back to the old execCommand route there. */
+async function copyText(text) {
+  try { await navigator.clipboard.writeText(text); return true; } catch (_) {}
+  const ta = Object.assign(document.createElement("textarea"), { value: text });
+  ta.style.cssText = "position:fixed;opacity:0";
+  document.body.appendChild(ta);
+  ta.select();
+  const ok = document.execCommand("copy");
+  ta.remove();
+  return ok;
+}
+
+/* A tiny pill just above `anchor` (below it if there is no room), then fades. One element
+   is reused, so repeat clicks restart it rather than stacking. */
+const toastEl = Object.assign(document.createElement("div"), { id: "toast" });
+let toastTimer;
+function toast(msg, anchor) {
+  if (!toastEl.isConnected) document.body.appendChild(toastEl);
+  toastEl.textContent = msg;
+  toastEl.classList.remove("show");
+  const r = anchor.getBoundingClientRect(), h = toastEl.offsetHeight;  // also restarts the fade
+  toastEl.style.left = `${r.left + r.width / 2}px`;
+  toastEl.style.top = `${r.top > h + 8 ? r.top - h - 6 : r.bottom + 6}px`;
+  toastEl.classList.add("show");
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => toastEl.classList.remove("show"), 1100);
+}
+
 /* One run's header cell. Shared by the table header and the focus view's header, so the
    two can never disagree about a run's stats or sort state. */
+function statsHTML(st) {
+  return METRICS.map((m) => {
+    const s = st[m.key];
+    return `<span><span class="k">${m.short}</span> <b>${s ? fmt(s.mean, 3) : "–"}</b>${
+      s ? `<span class="k">±${fmt(s.sd, 3)}</span>` : ""}</span>`;
+  }).join("");
+}
+
+/* Repaints only the stats line of every header (table and focus view), so an epoch step
+   does not rebuild the header under a dragging pointer. */
+function renderHeaderStats() {
+  document.querySelectorAll(".hstats").forEach((el) => {
+    if (S.runs[el.dataset.run]) el.innerHTML = statsHTML(statsFor(el.dataset.run));
+  });
+}
+
 function runHeaderCell(name) {
   const r = S.runs[name], st = statsFor(name);
-  const sorted = S.sort.run === name;
+  const so = sortOf(name), sorted = !!so && so.run === name;
   const cell = document.createElement("div");
-  cell.className = "hcell run" + (sorted ? " sorted" : S.sort.run ? " dim" : "");
+  // Dimmed only when ANOTHER column in this run's own group sets its row order.
+  cell.className = "hcell run" + (sorted ? " sorted" : so ? " dim" : "");
   const warn = r.entry && r.entry.family === "unknown"
     ? `<span class="warnbadge" title="No eval split directories; dataset identity unconfirmed">?</span>` : "";
   const skipped = r.skipped_files.length
@@ -815,7 +944,7 @@ function runHeaderCell(name) {
   cell.innerHTML = `
     <div class="htop">
       <div class="hname">${name}${warn}</div>
-      <span class="hgrip" title="Drag to reorder this column">⠿</span>
+      <button class="hcopy" title="Copy the run name" aria-label="Copy the run name">⧉</button>
       <button class="hclose" title="Remove this run">&times;</button>
     </div>
     <div class="hchips">
@@ -826,15 +955,12 @@ function runHeaderCell(name) {
     </div>
     ${why}
     ${skipped + moved ? `<div class="hmeta">${(skipped + moved).replace(/^ · /, "")}</div>` : ""}
-    <div class="hstats">${METRICS.map((m) => {
-      const s = st[m.key];
-      return `<span><span class="k">${m.short}</span> <b>${s ? fmt(s.mean, 3) : "–"}</b>${
-        s ? `<span class="k">±${fmt(s.sd, 3)}</span>` : ""}</span>`;
-    }).join("")}</div>
+    <div class="hstats" data-run="${name}">${statsHTML(st)}</div>
     <div class="hsort">
-      <select>${METRICS.map((m) =>
-        `<option value="${m.key}" ${sorted && S.sort.metric === m.key ? "selected" : ""}>${m.label}</option>`).join("")}</select>
-      <button class="dir ${sorted ? "on" : ""}">${sorted ? (S.sort.dir === "worst" ? "↓ worst" : "↑ best") : "sort"}</button>
+      <select><option value="position" ${so ? "" : "selected"}>Position</option>${METRICS.map((m) =>
+        `<option value="${m.key}" ${sorted && so.metric === m.key ? "selected" : ""}>${m.label}</option>`).join("")}</select>
+      <button class="dir ${sorted ? "on" : ""}">${sorted ? (so.dir === "worst" ? "↓ worst" : "↑ best") : "sort"}</button>
+      <span class="hgrip" title="Drag to reorder this column">⠿</span>
     </div>`;
 
   const focused = S.focus === name;
@@ -857,14 +983,14 @@ function runHeaderCell(name) {
     if (sel && !sel.isCollapsed && sel.anchorNode && cell.contains(sel.anchorNode)) return;
     setFocus(focused ? null : name);
   };
-  cell.querySelector("select").onchange = (e) => {
-    S.sort = { run: name, metric: e.target.value, dir: S.sort.run === name ? S.sort.dir : "worst" };
-    refresh(true);
-  };
+  // Only the copy button copies the name; it is a button, so the focus toggle above skips it.
+  const copy = cell.querySelector(".hcopy");
+  copy.onclick = () => copyText(name).then((ok) => toast(ok ? "Copied" : "Couldn't copy", copy));
+  cell.querySelector("select").onchange = (e) => setSort(name, e.target.value, sorted ? so.dir : "worst");
+  // On a position-ordered column the button starts a metric sort, IoU unless one is picked.
   cell.querySelector(".dir").onclick = () => {
-    if (S.sort.run !== name) S.sort = { run: name, metric: S.sort.metric, dir: "worst" };
-    else S.sort.dir = S.sort.dir === "worst" ? "best" : "worst";
-    refresh(true);
+    const v = cell.querySelector("select").value;
+    setSort(name, v === "position" ? METRICS[0].key : v, sorted && so.dir === "worst" ? "best" : "worst");
   };
   return cell;
 }
@@ -963,7 +1089,7 @@ function paintRow(el, rank) {
   el.style.transform = `translateY(${rank * rowH()}px)`;
   el.querySelector(".idxn").textContent = rank + 1;
 
-  if (S.view.rowMode !== "dataset") {
+  if (!grouped()) {
     // The true pixel shape stamped in every mask cell's corner (see .shapelabel) -- every
     // cell in the row needs it, ground truth included, so it is computed once up front
     // rather than separately per cell.
@@ -1114,15 +1240,17 @@ function paintRunCell(c, name, cs, mixed) {
   }
   if (c._np) c._np.hidden = true;
   // Split and epoch moved up to the title (see head.innerHTML above); this is just the
-  // grid-size tag, when shown, followed by the metrics. Metrics are scored at the latest
-  // epoch only (re-scoring every sample per scrubbed epoch took ~7s per run), so they are
-  // hidden while scrubbed rather than captioning an early mask with final numbers.
-  chips.innerHTML =
-    gs + (!latest ? `<span class="tag"><span class="k">metrics at latest epoch only</span></span>` :
-    METRICS.map((mm) => {
-      const v = e[mm.key];
+  // grid-size tag, when shown, followed by the metrics at the epoch on screen (metricsAt,
+  // the same numbers the header averages). Runs that never saved per-epoch metrics are not
+  // re-scored, so they say so rather than caption an early mask with final numbers. Rows,
+  // sort and filters still follow the latest epoch.
+  const tbl = metricsAt(name), vals = tbl && tbl[cs.i];
+  chips.innerHTML = gs + (tbl === false
+    ? `<span class="tag"><span class="k">metrics at latest epoch only</span></span>`
+    : METRICS.map((mm) => {
+      const v = vals ? vals[mm.key] : null;
       return `<span class="tag"><span class="k">${mm.short}</span> <b>${
-        v == null ? "–" : fmt(v, 3)}</b></span>`;
+        v == null || Number.isNaN(v) ? "–" : fmt(v, 3)}</b></span>`;
     }).join(""));
   predBox.hidden = false;
   predBox.querySelector(".shapelabel").textContent = shape;
@@ -1216,26 +1344,31 @@ function renderFocus() {
   });
 }
 
+/* Rows are pooled by rank (slot rank % pool.length), so a row that stays on screen keeps
+   its element. Scrolling (moved=true) paints only the rows that just came into view;
+   everything else -- new data, a setting, a re-sort -- repaints every visible row. */
 const pool = [];
-function renderVisible() {
+function renderVisible(moved = false) {
   // The focus view covers the table, and both share one frame store per run: painting
   // the hidden table too would have each view evict the other's window forever.
   if (S.focus) { renderFocus(); return; }
   const { first, last } = visibleRange();
-  const need = Math.max(0, last - first);
   const rowsEl = $("#rows");
-  while (pool.length < need) { const r = buildRow(); pool.push(r); rowsEl.appendChild(r); }
-  pool.forEach((el, k) => {
-    const rank = first + k;
-    if (rank < last) { el.hidden = false; paintRow(el, rank); }
-    else el.hidden = true;
-  });
+  while (pool.length < last - first) { const r = buildRow(); pool.push(r); rowsEl.appendChild(r); }
+  const show = new Set();
+  for (let rank = first; rank < last; rank++) {
+    const el = pool[rank % pool.length];
+    show.add(el);
+    el.hidden = false;
+    if (!moved || el._rank !== rank) { el._rank = rank; paintRow(el, rank); }
+  }
+  for (const el of pool) if (!show.has(el)) { el.hidden = true; el._rank = -1; }
 }
 
 let raf = 0;
 function onScroll() {
   if (raf) return;
-  raf = requestAnimationFrame(() => { raf = 0; renderVisible(); });
+  raf = requestAnimationFrame(() => { raf = 0; renderVisible(true); });
 }
 
 function refresh(toTop = false) {
@@ -1364,11 +1497,9 @@ function renderChips() {
   // object_count_train12 has `2-obj` where prep-r0 has `2-cubes` over the same captures --
   // so a single tally attributed each sample to whichever run happened to be loaded first
   // and left the other run's chips reading 0. Each chip now counts every sample any run
-  // filed under that name, which is a number that stays true no matter what else is open.
+  // filed under that name (that also passes the other filters -- see FACET_VALUES).
   const splits = new Set();
   S.runOrder.forEach((n) => S.runs[n].splits.forEach((s) => splits.add(s)));
-  const counts = new Map();
-  S.samples.forEach((s) => splitsOf(s.i).forEach((sp) => counts.set(sp, (counts.get(sp) || 0) + 1)));
   // Which runs use each name. Kept off the chip face -- a run name on every chip is the
   // kind of noise that made these labels unreadable before -- and put in the tooltip,
   // where it answers "why does this chip exist / why is it empty for what I'm looking at"
@@ -1378,37 +1509,36 @@ function renderChips() {
     if (!owners.has(sp)) owners.set(sp, []);
     owners.get(sp).push(n);
   }));
-  chipRow($("#split-chips"), [...splits].sort().map((s) => [s, counts.get(s) || 0]), f.splits,
+  // Faceted counts (applyFilters); a value nothing under the other filters has is hidden.
+  const faceted = (k, vals) => vals.map((v) => [v, (S.facets[k] && S.facets[k].get(v)) || 0])
+    .filter(([v, n]) => n || (k === "objects" && f.objects && f.objects.has(v)));   // keep a picked object
+  chipRow($("#split-chips"), faceted("splits", [...splits].sort()), f.splits,
     (v) => v, (v) => `${v} — used by ${(owners.get(v) || []).join(", ") || "no loaded run"}`);
-  chipRow($("#layout-chips"), uniq((s) => s.layout), f.layouts, (v) => v);
-  chipRow($("#nobj-chips"), uniq((s) => s.n_objects), f.nObjects, (v) => `${v}`);
-  chipRow($("#box-chips"), uniq((s) => s.box), f.boxes, (v) => v);
-  chipRow($("#dataset-chips"), uniq((s) => s.dataset), f.datasets, (v) => v);
+  chipRow($("#layout-chips"), faceted("layouts", uniq((s) => s.layout).map(([v]) => v)), f.layouts, (v) => v);
+  chipRow($("#nobj-chips"), faceted("nObjects", uniq((s) => s.n_objects).map(([v]) => v)), f.nObjects, (v) => `${v}`);
+  chipRow($("#box-chips"), faceted("boxes", uniq((s) => s.box).map(([v]) => v)), f.boxes, (v) => v);
+  chipRow($("#dataset-chips"), faceted("datasets", uniq((s) => s.dataset).map(([v]) => v)), f.datasets, (v) => v);
   // Contains-object: one chip per object TYPE, counted across every layout it appears
   // in, so "purple-cube" covers both the solo and the two-object scenes.
-  const objCounts = new Map();
-  S.samples.forEach((s) => {
-    (s.objects && s.objects.length ? s.objects : ["(none)"])
-      .forEach((o) => objCounts.set(o, (objCounts.get(o) || 0) + 1));
-  });
-  const objVals = [...objCounts.entries()].sort((a, b) => (a[0] > b[0] ? 1 : -1));
-  // Click picks (viz2 style); nothing picked = no filter, so every chip reads as on.
+  const objVals = [...new Set(S.samples.flatMap(FACET_VALUES.objects))].sort();
+  // Click picks (viz2 style); no filter (null) = every chip reads as on, and the first click picks just that one.
   $("#obj-chips").innerHTML = "";
-  for (const [v, n] of objVals) {
+  for (const [v, n] of faceted("objects", objVals)) {
     const b = document.createElement("button");
-    b.className = "chip" + (f.objects.size && !f.objects.has(v) ? " off" : "");
+    b.className = "chip" + (f.objects && !f.objects.has(v) ? " off" : "");
     b.innerHTML = `${v === "(none)" ? "empty" : v}<span class="n">${n}</span>`;
-    b.onclick = () => { f.objects.has(v) ? f.objects.delete(v) : f.objects.add(v); refresh(); };
+    b.onclick = () => { f.objects ??= new Set(); f.objects.has(v) ? f.objects.delete(v) : f.objects.add(v); refresh(); };
     $("#obj-chips").appendChild(b);
   }
-  $("#obj-count").textContent = f.objects.size ? `${f.objects.size}/${objVals.length}` : "all";
+  $("#obj-count").textContent = f.objects ? `${f.objects.size}/${objVals.length}` : "all";
   $("#split-count").textContent = `${f.splits.size}/${splits.size}`;
   $("#layout-count").textContent = `${f.layouts.size}/${uniq((s) => s.layout).length}`;
   $("#nobj-count").textContent = `${f.nObjects.size}/${uniq((s) => s.n_objects).length}`;
   $("#box-count").textContent = `${f.boxes.size}/${uniq((s) => s.box).length}`;
   $("#dataset-count").textContent = `${f.datasets.size}/${uniq((s) => s.dataset).length}`;
   $("#spk-count").textContent = `${f.speakers.size}/8`;
-  $("#metric-scope").textContent = S.sort.run ? `range applies to ${S.sort.run}` : "any loaded run in range";
+  const sortRuns = activeSorts().map((st) => st.run);
+  $("#metric-scope").textContent = sortRuns.length ? `range applies to ${sortRuns.join(", ")}` : "any loaded run in range";
 }
 
 /* ***** sidebar: speaker diagram *****
@@ -1688,24 +1818,24 @@ function syncSliders() {
 }
 
 /* ***** epoch frames *****
-   Mask values are fetched as one fp16 blob per run (1600 bytes per cell per epoch --
-   usually smaller than a PNG of the same cell) and drawn to <canvas> on the client. That
-   makes scrubbing the epoch slider and playing the animation pure local work: no network
-   round-trip and no server render per frame. */
+   Mask values are fetched as fp16 (2 bytes per grid cell -- usually smaller than a PNG of
+   the same cell) and drawn to <canvas> on the client, one epoch for the rows on screen at a
+   time; the server reads only those rows, so a slider step is one small request. */
 
-/* Masks for `sids` at each of `eps` (epoch numbers and/or "latest"), as one Map
-   sid -> fp16 mask per epoch, in the order asked. */
-async function fetchFrames(run, sids, eps) {
+/* One epoch's frames for `sids`, as Map sid -> {m: fp16 mask}. Body: see app.py api_frames. */
+async function fetchFrames(run, sids, ep) {
   const r = await fetch(`/api/frames?run=${encodeURIComponent(run)}&sids=${sids.join(",")}` +
-    `&epochs=${eps.join(",")}&v=${S.renderVersion}`);
+    `&epoch=${ep}&v=${S.renderVersion}`);
   if (!r.ok) throw new Error("frames");
-  const raw = new Uint16Array(await r.arrayBuffer());
-  const cells = raw.length / (eps.length * sids.length);
-  return eps.map((_, e) => new Map(sids.map((s, i) => {
-    const o = (e * sids.length + i) * cells;
-    return [s, raw.subarray(o, o + cells)];
-  })));
+  const masks = new Uint16Array(await r.arrayBuffer());
+  const cells = runShape(run)[0] * runShape(run)[1];
+  return new Map(sids.map((s, i) => [s, { m: masks.subarray(i * cells, (i + 1) * cells) }]));
 }
+
+const frameFor = (run, ep, sid) => {
+  const st = S.frameData[run] && S.frameData[run][ep ?? "latest"];
+  return st && st.get(sid);
+};
 
 /* Minimal IEEE half -> float. Only needed because DataView has no float16 reader. */
 function half(u) {
@@ -1915,7 +2045,6 @@ const scratchFor = (n) => (scratch.length >= n ? scratch : (scratch = new Float3
 
 function paintCanvas(cv, run, sid, epoch) {
   if (!S.lut) return;
-  const store = S.frameData[run];   // {epoch | "latest": Map sid -> fp16 mask}
   const [rh, rw] = runShape(run);
   const cells = rh * rw;
   // Every early return clears first. A canvas keeps its last drawing until something
@@ -1931,8 +2060,15 @@ function paintCanvas(cv, run, sid, epoch) {
     cv.getContext("2d").clearRect(0, 0, cv.width, cv.height);
     cv.parentElement.dataset.state = state;
   };
-  const raw = store && store[epoch ?? "latest"] && store[epoch ?? "latest"].get(sid);
-  if (!raw) { blank("loading"); ensureFrames(run); return; }
+  const fr = frameFor(run, epoch, sid);
+  if (!fr) {
+    // Same run and sample, another epoch: keep that drawing up until this one lands, so
+    // stepping the slider doesn't flash every cell blank.
+    if (cv._drawn !== `${run}|${sid}`) blank("loading");
+    ensureFrames(run);
+    return;
+  }
+  const raw = fr.m;
   const buf = scratchFor(cells);
   for (let i = 0; i < cells; i++) buf[i] = half(raw[i]);
   if (Number.isNaN(buf[0])) { blank("unsaved"); return; }
@@ -1946,15 +2082,14 @@ function paintCanvas(cv, run, sid, epoch) {
   const truth = wantTruth ? S.truthCache[tkey] : null;
   if (wantTruth && !truth) { blank("loading"); ensureTruth(sid, rh, rw); return; }
   cv.parentElement.dataset.state = "";
+  cv._drawn = `${run}|${sid}`;
   drawMask(cv, buf, mode, truth, [rh, rw], comsFor(run, sid));
 }
 
-/* Fetch masks for the rows on screen plus a screen ahead into the run's store
-   {epoch | "latest": Map sid -> fp16 mask}: first the epoch on screen (paints the scroll),
-   then every other epoch for the same rows in the background, so moving the epoch slider
-   repaints from local data with no request. Merged, so scrolling back never refetches.
-   Rows come from visibleRange(), the same window renderVisible paints. A call while one
-   is in flight queues one re-check, since scrolling moves the rows. */
+/* Fetch the epoch on screen for the rows on screen plus a screen ahead into the run's
+   store. Merged, so scrolling back or returning to an epoch never refetches. Rows come
+   from visibleRange(), the same window renderVisible paints. A call while one is in flight
+   queues one re-check, since scrolling and scrubbing move what is needed. */
 const framesPending = new Set();
 const framesStale = new Set();
 async function ensureFrames(run) {
@@ -1968,18 +2103,12 @@ async function ensureFrames(run) {
       const { first, last } = f ? focusRange() : visibleRange();
       const sids = (f ? S.focusList : orderFor(run)).slice(first, 2 * last - first).filter(Boolean).map((s) => s.i);
       const store = S.frameData[run] || (S.frameData[run] = {});
-      const now = epochFor(run) ?? "latest";
-      const rest = ["latest", ...(S.runs[run].epochs || [])].filter((e) => e !== now);
-      for (const eps of [[now], rest]) {
-        const need = sids.filter((i) => eps.some((e) => !store[e] || !store[e].has(i)));
-        if (!need.length) continue;
-        const got = await fetchFrames(run, need, eps);
-        eps.forEach((e, k) => {
-          store[e] = store[e] || new Map();
-          for (const [sid, v] of got[k]) store[e].set(sid, v);
-        });
-        renderVisible();
-      }
+      const ep = epochFor(run) ?? "latest";
+      const have = store[ep] || (store[ep] = new Map());
+      const need = sids.filter((i) => !have.has(i));
+      if (!need.length) continue;
+      for (const [sid, fr] of await fetchFrames(run, need, ep)) have.set(sid, fr);
+      renderVisible();
     } while (framesStale.has(run));
   } finally {
     framesPending.delete(run);
@@ -2018,6 +2147,19 @@ function allEpochs() {
   return (epochsCache = [...set].sort((a, b) => a - b));
 }
 const invalidateEpochs = () => { epochsCache = null; };
+
+/* Saved metrics for every sample of `run` at numbered epoch `ep`, fetched once per
+   (run, epoch): {saved, samples: {sid: {metric: value}}}, or null while in flight (header
+   and cells repaint when it lands). A failed fetch is dropped so the next paint retries. */
+function epochMetrics(run, ep) {
+  const store = S.epochMetrics[run] || (S.epochMetrics[run] = {});
+  if (ep in store) return store[ep];
+  store[ep] = null;
+  api(`/api/epoch_metrics?run=${encodeURIComponent(run)}&epoch=${ep}&v=${S.renderVersion}`)
+    .then((d) => { if (S.epochMetrics[run] === store) { store[ep] = d; renderHeaderStats(); renderVisible(); } })
+    .catch(() => { if (S.epochMetrics[run] === store) delete store[ep]; });
+  return null;
+}
 
 function epochFor(run) {
   const eps = allEpochs();
@@ -2068,8 +2210,7 @@ function stepEpoch(delta) {
    press, a pause to keep single clicks single, then a steady stream.
 
    Repeat is driven by requestAnimationFrame rather than setInterval so it cannot outrun
-   the display or pile up work in a background tab. Each step only repaints canvases from
-   frame data already in memory, so holding the button costs no requests. */
+   the display or pile up work in a background tab. */
 const HOLD_DELAY = 350;   // before repeat begins
 const HOLD_EVERY = 60;    // ~16 epochs/sec while held
 
@@ -2118,14 +2259,15 @@ function gotoEpoch(ep) {
   setEpochIdx(idx);
 }
 
-/* Every epoch change -- slider, steppers, playback -- goes through here. Pure local work:
-   masks repaint from the frames already fetched for every epoch, and nothing else moves --
-   rows, order, filters and metrics all belong to the latest epoch. */
+/* Every epoch change -- slider, steppers, playback -- goes through here. Masks and
+   metrics repaint from that epoch's frames (fetched on first view), and nothing else
+   moves -- rows, order and filters belong to the latest epoch. */
 function setEpochIdx(i) {
   const eps = allEpochs();
   S.epochIdx = i == null ? null : Math.max(0, Math.min(i, eps.length - 1));
   renderEpochPanel();
   document.querySelectorAll(".hep").forEach((el) => { el.innerHTML = epochLabel(el.dataset.run); });
+  renderHeaderStats();
   renderVisible();
 }
 
@@ -2136,7 +2278,6 @@ function togglePlay() {
   if (S.playing) {
     const eps = allEpochs();
     if (S.epochIdx == null || S.epochIdx >= eps.length - 1) S.epochIdx = 0;
-    // Frames are already local, so this is just an index advance -- no fetch per step.
     playTimer = setInterval(() => {
       const n = allEpochs().length;
       if (S.epochIdx >= n - 1) { S.playing = false; clearInterval(playTimer); renderEpochPanel(); return; }
@@ -2179,6 +2320,9 @@ async function poll() {
     return cur && prevStatus.get(n) !== cur.status;
   });
 
+  // A slider parked on the newest epoch keeps following it as runs save new ones, instead
+  // of staying pinned to that index while the newest epoch moves on without it.
+  const followNewest = S.epochIdx != null && S.epochIdx >= allEpochs().length - 1;
   const advanced = [];
   for (const name of S.runOrder) {
     const cur = meta.runs.find((r) => r.name === name);
@@ -2192,6 +2336,7 @@ async function poll() {
     // Only "latest" moved; numbered epochs are immutable, so their frames stay.
     for (const name of advanced) if (S.frameData[name]) delete S.frameData[name].latest;
     invalidateEpochs();
+    if (followNewest && !S.playing) S.epochIdx = null;   // null = each run's latest
     // New metrics can reorder a sorted table. Keep whichever sample is at the top of the
     // viewport in view, so rows don't slide out from under the user mid-read.
     const sc = $("#scroller");
@@ -2638,9 +2783,9 @@ function bindUI() {
   $("#rowmode-seg").querySelectorAll("button").forEach((b) => {
     b.onclick = () => setRowMode(b.dataset.rowmode);
   });
-  let storedRowMode = "dataset";
-  try { storedRowMode = localStorage.getItem("viz.rowmode") || "dataset"; } catch (_) {}
-  setRowMode(storedRowMode === "single" ? "single" : "dataset");
+  let storedRowMode = "linked";
+  try { storedRowMode = localStorage.getItem("viz.rowmode") || "linked"; } catch (_) {}
+  setRowMode(["single", "dataset"].includes(storedRowMode) ? storedRowMode : "linked");
 
   $("#mode-seg").querySelectorAll("button").forEach((b) => {
     b.onclick = () => {
@@ -2705,6 +2850,7 @@ function bindUI() {
       if (k === "layouts") S.filters.layouts = new Set(uniq((s) => s.layout).map((x) => x[0]));
       if (k === "nObjects") S.filters.nObjects = new Set(uniq((s) => s.n_objects).map((x) => x[0]));
       if (k === "boxes") S.filters.boxes = new Set(uniq((s) => s.box).map((x) => x[0]));
+      if (k === "objects") S.filters.objects = null;
       if (k === "datasets") S.filters.datasets = new Set(uniq((s) => s.dataset).map((x) => x[0]));
       if (k === "splits") { const a = new Set(); S.runOrder.forEach((n) => S.runs[n].splits.forEach((x) => a.add(x))); S.filters.splits = a; }
       refresh();

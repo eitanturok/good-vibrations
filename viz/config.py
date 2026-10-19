@@ -51,6 +51,14 @@ def subdirs(path) -> list[Path]:
         return [Path(p) for p in sorted(e.path for e in it if e.is_dir())]
 
 
+def fullres_smask(sample_dir) -> Path | None:
+    """The full-resolution segmentation mask (e.g. image/03_smask.npy), or None. Every capture
+    writes it, so any grid's target can be built from it when no downsampled file was exported."""
+    hits = sorted(p for p in (Path(sample_dir) / "image").glob("*smask.npy")
+                  if "downsampled" not in p.name)
+    return hits[0] if hits else None
+
+
 def mask_shapes(samples_dir) -> list[tuple[int, int]]:
     """Downsampled-mask sizes actually present, newest-layout first, for error messages
     and for --mask's default. Reads one sample dir; sizes are uniform across a dataset."""
@@ -282,7 +290,8 @@ class Layout:
         for strict in (True, False):
             for layout in layouts:
                 for d in probes:
-                    if layout.resolve_gt_mask(d, mask_h, mask_w) is None:
+                    # a capture with no downsampled export (e.g. a new box) still has its full-res mask
+                    if layout.resolve_gt_mask(d, mask_h, mask_w) is None and fullres_smask(d) is None:
                         continue
                     if not (d / layout.backdrop).exists():
                         continue
@@ -298,7 +307,7 @@ class Layout:
             f"[viz] no known sample layout under {samples_dir}.\n"
             f"       tried: {known}. Expected a mask matching "
             + GT_MASK_GLOB.format(h=mask_h, w=mask_w)
-            + " plus that layout's backdrop.\n"
+            + " (or a full-res *smask.npy) plus that layout's backdrop.\n"
               "       Add a new entry to LAYOUTS in viz/config.py if this is a new "
               "dataset format."
         )

@@ -255,6 +255,52 @@ def stim_params(sid: str) -> dict:
     return {k: m[k] for k in ("f_start", "f_end", "T_start", "T_end") if k in m}
 
 
+# A camera shot of the lasers on each box's side, with the pixel center of every laser in it
+# (notebooks/102_laser_grid_pixels.ipynb). The mode's box view warps this photo by the mode.
+# Laser (row, col) is image order: lasers are numbered row-major in the laser camera's image
+# (record/utils/geometry.compute_roi_grid), the same way the photo shows them.
+REPO = Path(__file__).resolve().parent.parent
+LASER_VIEWS = ("plastic", "gastro", "cardboard")
+# Each box's front face in its side photo, picked by hand: TL, TR, BR, BL (px).
+WALLS = {"plastic":   [[150, 405], [1465, 405], [1390, 915], [225, 915]],
+         "gastro":    [[10, 385], [1545, 385], [1515, 880], [45, 880]],
+         "cardboard": [[68, 488], [1485, 475], [1485, 945], [95, 945]]}
+WALL_PAD = 0.05     # crop margin around the wall, as a fraction of its width
+
+
+def laser_view(box: str, rows: int, cols: int) -> dict | None:
+    """The box view's geometry for a box with a side photo, else None."""
+    name = next((n for n in LASER_VIEWS if n in box.lower()), None)
+    g = box_geometry(name) if name else None
+    return g if g and len(g["pts"]) == rows and len(g["pts"][0]) == cols else None
+
+
+@lru_cache(maxsize=None)
+def box_geometry(name: str) -> dict | None:
+    """Everything the browser needs to warp one box's side photo, computed once:
+    pts[row][col] = laser px, the wall outline, the homography (col, row) -> px and its
+    inverse (row-major 3x3), and the crop: the wall's bounding box plus a margin."""
+    import cv2
+    csv, img = REPO / "notebooks/102_laser_grid_pixels.csv", REPO / f"assets/{name}_laser_view.jpg"
+    if not csv.exists() or not img.exists():
+        return None
+    rows = [l.split(",") for l in csv.read_text().splitlines()[1:]]
+    rows = [(int(r), int(c), int(x), int(y)) for b, r, c, x, y in rows if b == name]
+    R, C = max(r for r, *_ in rows) + 1, max(c for _, c, *_ in rows) + 1
+    pts = [[None] * C for _ in range(R)]
+    for r, c, x, y in rows:
+        pts[r][c] = [x, y]
+    cr = np.array([[c, r] for r, c, *_ in rows], np.float32)
+    H, _ = cv2.findHomography(cr, np.array([[x, y] for *_, x, y in rows], np.float32))
+    w, h = Image.open(img).size
+    wall = np.array(WALLS[name], float)
+    pad = WALL_PAD * np.ptp(wall[:, 0])
+    x0, y0 = np.maximum(wall.min(0) - pad, 0)
+    x1, y1 = np.minimum(wall.max(0) + pad, [w, h])
+    return dict(name=name, w=w, h=h, pts=pts, wall=WALLS[name], H=H.ravel().tolist(),
+                Hinv=np.linalg.inv(H).ravel().tolist(), crop=[float(x0), float(y0), float(x1 - x0), float(y1 - y0)])
+
+
 @lru_cache(maxsize=32)
 def box_photo(name: str) -> Path | None:
     """A cropped-overhead shot that stands for a whole dataset: an empty-box sample's if
@@ -488,6 +534,7 @@ def _load(name: str) -> None:
         overhead=[ow, oh], max_overhead=list(MAX_OVERHEAD),
     )
     INFO["scale"] = _scales()
+    INFO["laser_view"] = laser_view(INFO["box"], INFO["rows"], INFO["cols"])
 
 
 # Signed quantities vary ~5x between samples and log magnitude shifts by ~0.7 decades, so
@@ -584,6 +631,56 @@ def pick(a, laser):
     return a.mean(0) if laser == "avg" else a[int(laser)]
 
 
+def refsig(z, ref):
+    """The reference r(f) that norm() rotates by, from z (L, ...) complex:
+       laser k -> z_k;  "avg" -> mean_l z_l;
+       "real"  -> sqrt(sum_l z_l^2), so arg r = 1/2 arg sum_l z_l^2 -- the one rotation
+                  that puts the most energy in the real part, sum_l Re(e^{-i th} z_l)^2
+                  (Re(w)^2 = (|w|^2 + Re(w^2))/2). Squaring doubles angles, so lasers in
+                  antiphase add instead of cancelling as they do in the mean. Defined
+                  only up to a pi flip: the sign can change from bin to bin."""
+    if ref == "real":
+        return np.sqrt((z * z).sum(0))
+    return pick(z, ref)
+
+
+def norm(z, ref):
+    """Rotate every laser's phase so the reference's phase is 0 at each bin.
+
+        z'_l(f) = z_l(f) * conj(r(f)) / |r(f)|     <=>   phi'_l = wrap(phi_l - arg r)
+
+    One unit-modulus factor per bin, shared by all lasers: magnitudes are untouched and
+    every laser-to-laser phase difference survives. `ref` is a laser index, "avg", "real"
+    (refsig) or "none". z is (L, F) complex, already reduced to one channel.
+    """
+    if ref in (None, "", "none"):
+        return z
+    r = refsig(z, ref)
+    return z * (np.conj(r) / (np.abs(r) + 1e-12))
+
+
+WEAK_REF = 0.2
+
+
+def weak_runs(z, ref, k=WEAK_REF):
+    """Bins where the reference's phase is too unreliable to mean anything, as [i0, i1]
+    runs (inclusive). z is (L, F), one channel.
+      laser / avg: |r(f)| < k * median_l |z_l(f)| -- next to a typical laser the reference
+                   is near a node (or, for avg, the lasers cancel), so its phase is noise
+                   and norm() spreads that noise into every laser at that bin.
+      real:        |sum_l z_l^2| / sum_l |z_l|^2 < k -- the lasers' points in the complex
+                   plane have no dominant axis (a round cloud), so th is arbitrary.
+    """
+    if ref in (None, "", "none"):
+        return []
+    if ref == "real":
+        w = np.abs((z * z).sum(0)) < k * (np.abs(z) ** 2).sum(0)
+    else:
+        w = np.abs(refsig(z, ref)) < k * np.median(np.abs(z), 0)
+    d = np.diff(np.r_[0, w.astype(np.int8), 0])
+    return [[int(a), int(b) - 1] for a, b in zip(np.flatnonzero(d == 1), np.flatnonzero(d == -1))]
+
+
 def logmag(z):
     return np.log10(np.abs(z) + 1e-8)
 
@@ -627,7 +724,7 @@ def peaks(sid, k_prom: float = 4.0, distance_hz: float = 5.0, smooth_hz: float =
     return sorted(int(i) for i in idx)
 
 
-def mode(sid, fi):
+def mode(sid, fi, ref="none", ch="x"):
     """Mode shape at one bin: (U,V) real displacement on the laser grid.
 
     ALWAYS both components. The mode is a 2-D displacement field; zeroing one channel
@@ -639,7 +736,12 @@ def mode(sid, fi):
     """
     f, _ = fft(sid)
     z = f[:, int(fi), :]                                  # (L, C)
-    z = z * (np.conj(z[0, 0]) / (abs(z[0, 0]) + 1e-12))
+    # With a phase reference picked, the same per-bin rotation the spectra get (norm()),
+    # taken from the reference in the viewed channel and applied to BOTH components --
+    # one rotation, so the field's shape is untouched and only its snapshot instant moves.
+    # Without one, laser 0's x phase, as before.
+    r = z[0, 0] if ref in (None, "", "none") else refsig(chan(z, "x" if ch == "both" else ch), ref)
+    z = z * (np.conj(r) / (abs(r) + 1e-12))
     r, c = INFO["rows"], INFO["cols"]
     return z[:, 0].real.reshape(r, c), z[:, 1].real.reshape(r, c)
 
