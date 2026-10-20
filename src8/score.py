@@ -13,7 +13,7 @@ from PIL import Image
 from scipy import ndimage
 
 sys.path.insert(0, str(Path(__file__).parent))
-from dataset import EXPERIMENTS, CATEGORIES, load_meta
+from dataset import EXPERIMENTS, CATEGORIES, UNSEEN_ANGLE, load_meta
 
 ROOT = Path(__file__).resolve().parents[1]
 CACHE = ROOT / "runs/_score_truth"
@@ -146,11 +146,17 @@ def summarize(df, cols):
     sp["category"] = [cat.get(s, "?") for s in sp.split]
     out = {}
     for (b, c), g in sp.groupby(["box", "category"]): out[f"{b}/{c}"] = g[cols].mean()
-    nc = sp[sp.category != "control"]
+    nc = sp[~sp.category.isin(["control", "unseen-angle"])]                            # unseen-angle: WEDGE, on its own (ALL stays comparable)
     for b, g in nc.groupby("box"): out[f"{b}/all"] = g[cols].mean()
     core = sp[sp.split.isin(["candle", "cube", "soap-dispenser", "vase"])]
     out["CORE"] = core[cols].mean()                                                    # the four base objects x 3 boxes: headline
     out["HARD"] = sp[(sp.box == "cardboard") & (sp.split == "soap-dispenser-rotated")][cols].mean()  # the hardest case
+    # the 30-60 deg wedge (dataset.UNSEEN_ANGLE): unseen in a *_wedge run (its own split), its 6 eval positions at trained angles
+    # otherwise; HARD-kept = the rotated soap outside the wedge, the same angles in both kinds of run
+    rot = (df.box == "cardboard") & (df.split == "soap-dispenser-rotated")
+    wedge = df.position_id.astype(int).isin(UNSEEN_ANGLE)
+    out["WEDGE"] = df[(df.box == "cardboard") & ((df.split == "soap-dispenser-unseen-angle") | rot & wedge)][cols].mean()
+    out["HARD-kept"] = df[rot & ~wedge][cols].mean()
     out["ALL"] = nc[cols].mean()
     out["ALL-ood"] = nc[nc.category != "id"][cols].mean()
     out["ALL-id"] = nc[nc.category == "id"][cols].mean()
@@ -169,4 +175,4 @@ if __name__ == "__main__":
         t = a.thr[0]
         s, _ = summarize(df, [f"iou@{t}", f"miss@{t}", f"phantom@{t}", f"area_ratio@{t}", f"biou@{t}", f"orient_err@{t}", "iou_auc", f"spk_consistency@{t}"])
         res[f"{run}@{ep}"] = s
-        print(f"\n== {run} ep{ep} ({len(df)} samples)\n" + s.loc[["CORE", "HARD", "ALL", "ALL-ood"] + [k for k in s.index if k.endswith("/all")]].round(4).to_string())
+        print(f"\n== {run} ep{ep} ({len(df)} samples)\n" + s.loc[["CORE", "HARD", "HARD-kept", "WEDGE", "ALL", "ALL-ood"] + [k for k in s.index if k.endswith("/all")]].round(4).to_string())

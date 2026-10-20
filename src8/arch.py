@@ -287,7 +287,7 @@ class ModalFormer(nn.Module):
         if self.training and self.band_drop > 0:                                              # the same bands for all lasers of a sample
             bkeep = (torch.rand(B, 1, n_bands, device=x.device) >= torch.rand(B, 1, 1, device=x.device) * self.band_drop).expand(B, L, n_bands)
         if self.remove_bands is not None: bkeep = bkeep & ~self.remove_bands.to(x.device).expand(L, n_bands)[None]
-        if not bkeep.all(): x = x * bkeep.repeat_interleave(64, 2)[:, :, :F_, None].to(x.dtype)  # removed bins -> box mean
+        x = x * bkeep.repeat_interleave(64, 2)[:, :, :F_, None].to(x.dtype)                 # removed bins -> box mean (always: a data-dependent if breaks the compiled graph)
         x_in = x                                                                               # (B,L,F,C), for lin_skip
         x = torch.cat([x, self.logf[:, None].expand(B, L, F_, 1)], -1).permute(0, 3, 1, 2)    # (B,L,F,C) -> (B,C+1,L,F)
         if self.film is None: x = self.conv3(self.conv2(self.conv1(x)))                       # -> (B,128,L,P)
@@ -325,6 +325,7 @@ class ModalFormer(nn.Module):
             x, w = self.run(block, explain, x, None, drop)
             if explain: maps[f"laser{i}"] = w
         emb = self.to_emb(x * keep.float()[..., None])                                        # (B,L,d) -> (B,d_model), dropped lasers zeroed
+        maps["tokens"], maps["keep"] = x, keep                                              # (B,L,d), (B,L): for --obj-decoder queries
         if self.lin_skip is not None: emb = emb + self.lin_skip(x_in[:, :, :self.lin_bins * 10].unflatten(2, (self.lin_bins, 10)).mean(3).flatten(1))
         if not self.queries: return None, emb, maps
         q = (self.query_pos(fourier(self.query_rc, 8))[None] + box_e[:, None]).expand(B, -1, -1)  # (B,G*G,d)
@@ -382,6 +383,201 @@ class PoseBranch(nn.Module):
         if self.merge == "slots": return warped.view(B, K, self.out_h, self.out_w), v       # (B,K,H,W): Boombox merges them with exists
         return warped.view(B, K, self.out_h, self.out_w).logsumexp(1), v
 
+#*** 3c multi-object decoders (src8): any number of objects, each drawn once, on the conv trunk's pixel features
+
+def match_sets(masks, exists, inst, real):
+    """set matching (DETR / Mask2Former): (B,K,H,W) mask logits, (B,K) exists logits, (B,N,H,W) instance masks, (B,N) bool real ->
+    (B,N) the query matched to each true object. Cost per (query, object) = 5 bce + 5 dice - 2 p(exists) (Mask2Former's weights);
+    every ordered choice of N of the K queries is tried (K!/(K-N)!: 20 for K=5, N=2), the cheapest over the real objects kept"""
+    B, K, H, W = masks.shape
+    N = inst.shape[1]
+    x, t = masks.detach().float().flatten(2), inst.float().flatten(2)                       # (B,K,HW), (B,N,HW)
+    bce = F.softplus(x).mean(-1)[:, :, None] - x @ t.transpose(1, 2) / (H * W)             # (B,K,N) mean bce of query k vs object j
+    p = x.sigmoid()
+    dice = 1 - (2 * p @ t.transpose(1, 2) + 1) / (p.sum(-1)[:, :, None] + t.sum(-1)[:, None] + 1)
+    cost = 5 * bce + 5 * dice - 2 * exists.detach().float().sigmoid()[:, :, None]          # (B,K,N)
+    orders = torch.tensor(list(itertools.permutations(range(K), N)), device=masks.device)  # (P,N)
+    tot = (cost[:, orders, torch.arange(N, device=masks.device)] * real[:, None]).sum(-1)  # (B,P,N) -> (B,P)
+    return orders[tot.argmin(1)]                                                           # (B,N)
+
+class ObjectQueries(nn.Module):
+    """Mask2Former-style set decoder (Cheng et al. 2022): K learned object queries; per layer they cross-attend to the ModalFormer's
+    laser tokens (the signal), then MASKED cross-attention to the pixel features (each query only where its previous mask is on:
+    Mask2Former's localization trick), then self-attend (two queries learn not to claim one object). Before the first layer and after
+    every one, each query predicts mask_k = <mlp(q_k), pixel embedding> and an exists logit (deep supervision). Any count up to K"""
+    def __init__(self, d_tok, c_pix, K=5, d=256, heads=8, layers=3, pose=False, out_hw=(32, 32), window=0.35, pix_head=True, init="learned", pose_merge="sum", shape="dot"):
+        super().__init__()
+        self.K, self.init, self.pose_merge, self.shape = K, init, pose_merge, shape
+        # shape "gauss" (--obj-shape gauss): each query IS an object = (centroid, principal angle, two std devs) + a shape residual.
+        # Its mask = the uniform ellipse with those moments (logit 4 - |x'|^2 in the object's own frame x' = diag(1/s) R^T (p - mu):
+        # a uniform ellipse with std s has its edge at |x'| = 2) + a 16x16 canvas over |x'| <= 3 decoded from the query. The canvas
+        # lives in the object's frame, so a shape is learned once for every rotation, and the angle is read straight off the query.
+        # The moments are what the plate's modes see (centroid to first order, mass covariance to second); obj_gauss supervises them
+        if shape == "gauss":
+            self.gauss, self.canvas = nn.Linear(d, 6), nn.Linear(d, 16 * 16)
+            nn.init.zeros_(self.canvas.weight); nn.init.zeros_(self.canvas.bias)
+            with torch.no_grad(): self.gauss.weight.mul_(0.1); self.gauss.bias.copy_(torch.tensor([0.0, 0.0, 0.1, 0.0, math.log(0.05), math.log(0.05)]))
+        # init="peaks" (two-stage, as Deformable DETR / DINO): each query starts at one of the K highest local maxima of the direct head's
+        # map -- its content = a learned embedding + the pixel features there, plus the fourier code of where it is. Learned queries all
+        # start identical and hedge at the mean position for a long time (s8-mag-qpose-v3 at ep50: all 5 at the middle of the two cubes)
+        if init == "peaks": self.peak_feat, self.peak_pos = nn.Linear(128 if pix_head else c_pix, d), nn.Linear(4 * 8, d)
+        # pix_head: the pixel embedding is a small conv head (3x3, 3x3, as the direct head) on the trunk's features + the direct head's
+        # logits, not a 1x1 linear readout: at 64x64 the trunk has 32 channels, and a linear readout of them could not localize --
+        # s8-mag-qpose v2 drew one input-independent blob at the image centre (std over samples .018 vs the direct head's .089)
+        self.pix_head = nn.Sequential(nn.Conv2d(c_pix + 1, 128, 3, padding=1), nn.ReLU(), nn.Conv2d(128, 128, 3, padding=1), nn.ReLU()) if pix_head else None
+        c_pix = 128 if pix_head else c_pix
+        # pose: each query also decodes a canonical (object-centred, long axis along the rows) mask + an angle from its embedding (the
+        # pose branch, once per query), warped to the soft centroid of the query's own mask and added to its last mask (residual,
+        # zero-init): rotation as one shared parameter, any count
+        # pose_merge "only": the query's last mask IS its warped canonical mask (rotation must go through the angle: qpose-v3's residual
+        # let the free-form part memorize rotated templates -- rotated soap 25.8 deg vs 17.1 for the single pose slot); its free-form mask
+        # stays supervised as one more layer and still places it (the soft-argmax centre)
+        self.pose = PoseBranch(d, 1, *out_hw, window, "only" if pose_merge == "only" else "sum") if pose else None
+        self.q = nn.Parameter(nn.init.trunc_normal_(torch.zeros(K, d), std=0.02))
+        self.tok_in, self.tok_pos = nn.Linear(d_tok, d), nn.Linear(4 * 8, d)
+        self.pix_in, self.pix_pos, self.pix_emb = nn.Conv2d(c_pix, d, 1), nn.Linear(4 * 8, d), nn.Conv2d(c_pix, d, 1)
+        self.layers = nn.ModuleList([nn.ModuleList([Block(d, heads, cross=True), Block(d, heads, cross=True), Block(d, heads)]) for _ in range(layers)])
+        self.norm = nn.LayerNorm(d)
+        self.mask_mlp = nn.Sequential(nn.Linear(d, d), nn.ReLU(), nn.Linear(d, d))
+        self.exists = nn.Linear(d, 1)
+        self.mask_bias = nn.Parameter(torch.tensor(-4.0))                                     # masks start faint: K queries at 0 would paint the union everywhere
+
+    def predict(self, q, emb):
+        qn = self.norm(q)
+        if self.shape == "gauss": return *self.render(qn, *emb.shape[-2:]), self.exists(qn)[..., 0]
+        return torch.einsum("bkd,bdhw->bkhw", self.mask_mlp(qn), emb) + self.mask_bias, None, self.exists(qn)[..., 0]  # (B,K,H,W), -, (B,K)
+
+    def render(self, qn, H, W):
+        """(B,K,d) -> (B,K,H,W) mask logits of each query's object (shape "gauss"), and its moments for the loss: (B,K,2) centroid,
+        (B,K,2) doubled-angle vector, (B,K,3) covariance (rr, cc, rc, box fractions, as moments())"""
+        B, K = qn.shape[:2]
+        g = self.gauss(qn).float()
+        mu, v, s = g[..., :2].sigmoid(), g[..., 2:4], g[..., 4:].exp().clamp(0.004, 0.5)
+        th = 0.5 * torch.atan2(v[..., 1], v[..., 0])                                          # row-axis angle, as orientation()
+        cos, sin = th.cos(), th.sin()
+        d = grid_coords(H, W, qn.device)[None, None] - mu[:, :, None]                         # (B,K,HW,2) (row, col)
+        a = (d[..., 0] * cos[..., None] + d[..., 1] * sin[..., None]) / s[..., :1]           # along the long axis, in std devs
+        b = (-d[..., 0] * sin[..., None] + d[..., 1] * cos[..., None]) / s[..., 1:]
+        prior = (4 - a ** 2 - b ** 2).clamp_min(-20)
+        canvas = self.canvas(qn).float().view(B * K, 1, 16, 16)                               # rows = the long axis
+        res = F.grid_sample(canvas, torch.stack([b, a], -1).view(B * K, H * W, 1, 2) / 3, padding_mode="zeros", align_corners=False)
+        s2 = s ** 2
+        cov = torch.stack([s2[..., 0] * cos ** 2 + s2[..., 1] * sin ** 2, s2[..., 0] * sin ** 2 + s2[..., 1] * cos ** 2, (s2[..., 0] - s2[..., 1]) * sin * cos], -1)
+        return (prior + res.view(B, K, H * W)).view(B, K, H, W), dict(mu=mu, v=v, cov=cov)
+
+    def forward(self, tokens, laser_rc, keep, feats, direct=None):
+        """(B,L,d_tok) laser tokens, (L,2) their grid coords, (B,L) kept lasers, (B,c,H,W) pixel features ->
+        (B,layers+1,K,H,W) mask logits, (B,layers+1,K) exists logits"""
+        B, _, H, W = feats.shape
+        if self.pix_head is not None: feats = self.pix_head(torch.cat([feats, direct[:, None].to(feats.dtype)], 1))
+        t = self.tok_in(tokens) + self.tok_pos(fourier(laser_rc, 8))[None]                   # (B,L,d)
+        tb = torch.zeros(B, 1, 1, t.shape[1], device=t.device).masked_fill(~keep[:, None, None], -1e4)
+        pix = self.pix_in(feats).flatten(2).transpose(1, 2) + self.pix_pos(fourier(grid_coords(H, W, feats.device), 8))[None]  # (B,HW,d)
+        emb = self.pix_emb(feats)                                                             # (B,d,H,W)
+        q = self.q[None].expand(B, -1, -1)
+        if self.init == "peaks":                                                              # the direct map's top-K local maxima (no grad)
+            with torch.no_grad():
+                h = direct.float()[:, None]
+                h = h.masked_fill(F.max_pool2d(h, 3, 1, 1) != h, -1e4).flatten(1)
+                idx = h.topk(self.K, 1).indices                                               # (B,K)
+                rc = torch.stack([(idx // W + 0.5) / H, (idx % W + 0.5) / W], -1)            # (B,K,2) row, col in [0,1]
+            f = feats.flatten(2).gather(2, idx[:, None].expand(-1, feats.shape[1], -1)).transpose(1, 2)  # (B,K,c)
+            q = q + self.peak_feat(f.to(q.dtype)) + self.peak_pos(fourier(rc, 8)).to(q.dtype)
+        m, g, e = self.predict(q, emb)
+        ms, es = [m], [e]
+        for cross_t, cross_p, self_ in self.layers:
+            q = cross_t(q, t, tb)[0]
+            off = m.detach().flatten(2) < 0                                                   # (B,K,HW) outside the query's own mask
+            off = off & ~off.all(-1, keepdim=True)                                            # a query that drew nothing looks everywhere
+            q = cross_p(q, pix, off[:, None].to(q.dtype) * -1e4)[0]
+            q = self_(q)[0]
+            m, g, e = self.predict(q, emb)
+            ms.append(m); es.append(e)
+        ang = g["v"] if g is not None else None
+        if self.pose is not None:
+            # each query's centre = the soft-argmax (spatial softmax) of its mask logits. Not the sigmoid^2-weighted centroid: a faint mask's
+            # diffuse background (logit ~-4 on 4096 px) outweighs the object and drags it to the image centre (qpose v1 / v2: one central blob;
+            # toy: both found .16 vs 1.00 without the pose head)
+            w = m.detach().float().flatten(2).softmax(-1).view_as(m)                          # (B,K,H,W); detached: the shape loss must not move the centre
+            r, c = (torch.arange(H, device=w.device) + 0.5) / H, (torch.arange(W, device=w.device) + 0.5) / W
+            centre = torch.stack([(w.sum(3) * r).sum(2), (w.sum(2) * c).sum(2)], -1)          # (B,K,2)
+            warped, v = self.pose(self.norm(q).reshape(B * self.K, -1), centre.reshape(B * self.K, 1, 2))
+            if self.pose_merge == "only": ms.append(warped.view(B, self.K, H, W).to(m.dtype)); es.append(e)
+            else: ms[-1] = m + warped.view(B, self.K, H, W).to(m.dtype)
+            ang = v.view(B, self.K, 2)
+        return torch.stack(ms, 1), torch.stack(es, 1), ang, g                                 # g: the last layer's moments (gauss) or None
+
+class CenterObjects(nn.Module):
+    """CenterNet (Zhou et al. 2019) with the pose branch per object: a class-agnostic centre heatmap on the pixel features (its peaks
+    are the objects, any number), and at each centre a vector (the pixel features there + the embedding) that decodes the object's
+    canonical mask and angle (PoseBranch, one slot), warped there. Training: at the true centres (teacher forcing, as CenterNet: heatmap
+    and shapes learn separately); eval: the top-N peaks above thresh (3x3 max-pool NMS), refined by the 3x3 soft centroid"""
+    def __init__(self, c_pix, d_model, N, out_h, out_w, window=0.35, thresh=0.3, d=256):
+        super().__init__()
+        self.N, self.thresh = N, thresh
+        self.heat = nn.Sequential(nn.Conv2d(c_pix, 64, 3, padding=1), nn.ReLU(), nn.Conv2d(64, 1, 1))
+        nn.init.constant_(self.heat[-1].bias, -2.19)                                           # CenterNet's prior: p = .1
+        self.z = nn.Sequential(nn.Linear(c_pix + d_model, d), nn.ReLU(), nn.Linear(d, d))
+        self.pose = PoseBranch(d, 1, out_h, out_w, window, "slots")
+
+    def peaks(self, heat):
+        """(B,H,W) logits -> (B,N,2) centres (row,col in [0,1]), (B,N) scores"""
+        B, H, W = heat.shape
+        h = heat.float().sigmoid()[:, None]
+        h = h * (F.max_pool2d(h, 3, 1, 1) == h)
+        score, idx = h.flatten(1).topk(self.N, 1)                                             # (B,N)
+        nb = F.unfold(heat.float().sigmoid()[:, None], 3, padding=1)                          # (B,9,HW) each pixel's 3x3 neighbourhood
+        w = nb.gather(2, idx[:, None].expand(-1, 9, -1))                                      # (B,9,N)
+        d = torch.tensor([-1.0, 0.0, 1.0], device=heat.device)
+        dr, dc = d.repeat_interleave(3), d.repeat(3)                                          # (9,) unfold's order: row-major
+        a = w.sum(1).clamp_min(1e-6)
+        r = (idx // W + 0.5 + (w * dr[None, :, None]).sum(1) / a) / H
+        c = (idx % W + 0.5 + (w * dc[None, :, None]).sum(1) / a) / W
+        return torch.stack([r, c], -1), score
+
+    def forward(self, feats, emb, centre=None, on=None, n_min=None):
+        """(B,c,H,W), (B,d_model), training: (B,N',2) true centres + (B,N') real -> heat (B,H,W), masks (B,N,H,W), angles (B,N,2), on (B,N).
+        eval: the peaks above thresh, and at least the n_min (B,) best ones (--obj-count-floor: the count head's argmax)"""
+        B = len(feats)
+        heat = self.heat(feats)[:, 0]
+        if centre is None:
+            centre, score = self.peaks(heat)
+            on = score > self.thresh
+            if n_min is not None: on = on | (torch.arange(self.N, device=on.device)[None] < n_min[:, None])  # topk: best first
+        n = centre.shape[1]
+        f = F.grid_sample(feats.float(), (2 * centre.float() - 1).flip(-1)[:, :, None], align_corners=False)[..., 0].transpose(1, 2)  # (B,n,c)
+        z = self.z(torch.cat([f.to(emb.dtype), emb[:, None].expand(-1, n, -1)], -1))
+        masks, v = self.pose(z.reshape(B * n, -1), centre.reshape(B * n, 1, 2))              # (B*n,1,H,W), (B*n,1,2)
+        return heat, masks.view(B, n, *masks.shape[-2:]), v.view(B, n, 2), on
+
+def soft_or(masks, gates):
+    """(B,K,H,W) mask logits, (B,K) gate logits -> (B,H,W) logits of p = 1 - prod_k (1 - sigmoid(mask_k) sigmoid(gate_k)): an object
+    query / slot that says "no object" adds at most its own p(exists). Adding log p(exists) to the logits and taking a logsumexp
+    (the first version) let a confident blob through at any p(exists): s8-mag-qpose v1 at ep50 drew 125-px phantoms with p .01"""
+    q = (masks.float().sigmoid() * gates.float().sigmoid()[..., None, None]).clamp(max=1 - 1e-6)
+    S = torch.log1p(-q).sum(1).clamp(max=-1e-7)                                              # log(1 - p)
+    return torch.log(-torch.expm1(S)) - S                                                  # logit(p)
+
+def centre_heat_loss(logits, centre, real, sigma=1.5, cov=None):
+    """CornerNet / CenterNet penalty-reduced focal loss (alpha 2, beta 4) vs gaussians (sigma px) at the true centres, per object.
+    cov (B,N,3) (--obj-heat-sigma obj): each object's gaussian is its own mask covariance x 1/4 (+ 1 px^2): sized and oriented as
+    the object, so an unsure centre is not punished for a peak a few px off inside the object (CenterNet sizes its gaussians too)"""
+    B, H, W = logits.shape
+    r, c = torch.arange(H, device=logits.device) + 0.5, torch.arange(W, device=logits.device) + 0.5
+    dr, dc = r[None, None, :, None] - centre[..., 0, None, None] * H, c[None, None, None] - centre[..., 1, None, None] * W  # (B,N,H,W) px
+    if cov is None: d2 = (dr ** 2 + dc ** 2) / sigma ** 2
+    else:
+        srr, scc, src = cov[..., 0] * H * H / 4 + 1, cov[..., 1] * W * W / 4 + 1, cov[..., 2] * H * W / 4          # (B,N) px^2
+        det = srr * scc - src ** 2
+        d2 = (scc[..., None, None] * dr ** 2 - 2 * src[..., None, None] * dr * dc + srr[..., None, None] * dc ** 2) / det[..., None, None]
+    g = (torch.exp(-d2 / 2) * real[..., None, None]).amax(1)                                 # (B,H,W)
+    px = (centre[..., 0] * H).long().clamp(0, H - 1) * W + (centre[..., 1] * W).long().clamp(0, W - 1)  # (B,N) each centre's pixel
+    pos = torch.zeros(B, H * W, device=logits.device).scatter_add(1, px, real.float()).view(B, H, W) > 0
+    p = logits.float().sigmoid().clamp(1e-4, 1 - 1e-4)
+    lp = -(1 - p) ** 2 * p.log() * pos
+    ln = -(1 - g) ** 4 * p ** 2 * (1 - p).log() * ~pos
+    return (lp.sum() + ln.sum()) / real.sum().clamp_min(1)
+
 #*** 3 decoder
 
 class MLPDecoder(nn.Module):
@@ -425,8 +621,10 @@ class Decoder(nn.Module):
             x = F.interpolate(x, size=(self.out_h, self.out_w), mode="bilinear", align_corners=False)  # (B,c,S,S) -> (B,c,out_h,out_w)
         return x
 
-    def forward(self, emb):
-        x = feats = self.features(emb)                     # (B,d_model) -> (B,c,out_h,out_w)
+    def forward(self, emb): return self.from_features(self.features(emb))
+
+    def from_features(self, feats):
+        x = feats                                          # (B,c,out_h,out_w)
         x = F.relu(self.conv1(x))                          # (B,c,out_h,out_w) -> (B,32,out_h,out_w)
         x = F.relu(self.conv2(x))                          # (B,32,out_h,out_w) -> (B,32,out_h,out_w)
         x = self.conv3(x)                                  # (B,32,out_h,out_w) -> (B,out_c+edge+n_heat,out_h,out_w)
@@ -703,6 +901,26 @@ def moment_loss(pred, true, n_objects, terms="acs"):
     if "s" in terms: l = l + 100 * (cp - ct).abs().sum(-1)
     return l.mean()
 
+def instance_moment_loss(pred, inst, real, terms="acs"):
+    """moment_loss for every object, any count: each pixel goes to the true object nearest in Mahalanobis distance (its centroid and
+    covariance, + log det: a gaussian mixture's assignment, so an elongated object keeps its own cell), and the predicted mask inside
+    each object's cell is matched to that object's area, centroid and covariance (size + orientation). One object: the whole image
+    is its cell, = moment_loss. Physics: to second order an object's mode shifts read its centroid and its mass covariance"""
+    B, N, H, W = inst.shape
+    if not real.any(): return pred.sum() * 0
+    _, mt, ct = moments(inst.flatten(0, 1))
+    mt, ct = mt.view(B, N, 2), ct.view(B, N, 3)
+    S = torch.stack([torch.stack([ct[..., 0] + 1e-3, ct[..., 2]], -1), torch.stack([ct[..., 2], ct[..., 1] + 1e-3], -1)], -2)  # (B,N,2,2)
+    d = grid_coords(H, W, pred.device)[None, None] - mt[:, :, None]                       # (B,N,HW,2)
+    md = torch.einsum("bnpi,bnij,bnpj->bnp", d, torch.linalg.inv(S), d) + torch.logdet(S)[..., None]
+    cell = F.one_hot(md.masked_fill(~real[..., None], float("inf")).argmin(1), N).permute(0, 2, 1).float().view(B, N, H, W)
+    (ap, mp, cp), (at, mt_, ct_) = moments((pred.float()[:, None] * cell)[real]), moments(inst[real])
+    l = 0
+    if "a" in terms: l = l + 0.1 * (ap.log() - at.log()).abs()
+    if "c" in terms: l = l + (mp - mt_).abs().sum(-1)
+    if "s" in terms: l = l + 100 * (cp - ct_).abs().sum(-1)
+    return l.mean()
+
 def orient_target(true):
     """(B,H,W) -> (B,2) ecc * (cos 2θ, sin 2θ) of the mask's principal axis: ~0 for round objects, so no angle to fight over"""
     _, _, cov = moments(true)
@@ -783,7 +1001,35 @@ def far_fp(out, batch):
     b, near = out["mask_pred"] > THR, dilate((batch["mask_true"] > 0.5).float()[:, None], 9)[:, 0] > 0
     return ((b & ~near).flatten(1).sum(1) / b.flatten(1).sum(1).clamp_min(1)).float()
 
-METRICS = {"iou08": hard_iou, "miss08": miss, "orient_err": orient_err, "area_ratio08": area_ratio, "biou08": biou08, "iou_auc": iou_auc, "far_fp08": far_fp, "iou": iou, "ray_iou": ray_iou, "boundary_iou": boundary_iou, "object_acc": object_acc, "n_objects_err": n_objects_err, "box_acc": box_acc, "com_err": com_error, "area_rel_err": area_rel_err}
+def gray_losses(out, batch):
+    """the object is 2-5% of the image, so a whole-image L1 is mostly the floor. Three terms:
+    gray       L1 of the composite over the whole image: the floor (bg) and the final picture
+    gray_obj   L1 of the appearance head vs the photo on the TRUE object pixels, per-object-area mean (a small object weighs as much as the
+               floor; teacher-forced by the true mask, so appearance learns even where the predicted mask is off)
+    gray_grad  L1 of the composite's image gradients vs the photo's within 2 px of the object: its contour and inner detail (label, lid)
+               stay sharp, not averaged into a flat blob"""
+    t, o = batch["gray"].float(), (batch["mask_true"] > 0.5).float()
+    has = o.flatten(1).sum(1) > 0
+    obj = ((out["gray_app"] - t).abs() * o).flatten(1).sum(1) / o.flatten(1).sum(1).clamp_min(1)
+    near = dilate(o[:, None], 5)[:, 0] > 0
+    dr = lambda x: x[:, 1:] - x[:, :-1]; dc = lambda x: x[:, :, 1:] - x[:, :, :-1]
+    p = out["gray_pred"]
+    gr = ((dr(p) - dr(t)).abs() * (near[:, 1:] & near[:, :-1])).flatten(1).sum(1) + ((dc(p) - dc(t)).abs() * (near[:, :, 1:] & near[:, :, :-1])).flatten(1).sum(1)
+    gr = gr / near.flatten(1).sum(1).clamp_min(1)
+    z = p.sum() * 0
+    return dict(gray=(p - t).abs().mean(), gray_obj=obj[has].mean() if has.any() else z, gray_grad=gr[has].mean() if has.any() else z)
+
+def gray_l1(out, batch): return (out["gray_pred"].float() - batch["gray"]).abs().flatten(1).mean(1)
+def _obj_l1(pred, batch):
+    """mean |pred - photo| over the true object's pixels, per sample with an object"""
+    o = (batch["mask_true"] > 0.5).float()
+    return ((pred.float() - batch["gray"]).abs() * o).flatten(1).sum(1)[o.flatten(1).sum(1) > 0] / o.flatten(1).sum(1)[o.flatten(1).sum(1) > 0]
+def gray_obj_l1(out, batch): return _obj_l1(out["gray_pred"], batch)
+def gray_bg_l1(out, batch): return _obj_l1(out["gray_bg"], batch)  # the empty floor drawn over the object: what appearance must beat
+GRAY = ("gray_l1", "gray_obj_l1", "gray_bg_l1")
+
+METRICS = {"iou08": hard_iou, "miss08": miss, "orient_err": orient_err, "area_ratio08": area_ratio, "biou08": biou08, "iou_auc": iou_auc, "far_fp08": far_fp, "iou": iou, "ray_iou": ray_iou, "boundary_iou": boundary_iou, "object_acc": object_acc, "n_objects_err": n_objects_err, "box_acc": box_acc, "com_err": com_error, "area_rel_err": area_rel_err,
+           "gray_l1": gray_l1, "gray_obj_l1": gray_obj_l1, "gray_bg_l1": gray_bg_l1}
 
 #*** 8 model
 
@@ -793,6 +1039,8 @@ class Boombox(ComposerModel):
                  freq_gain: bool = False, freq_coord: bool = False, freq_pool: str = "mean",
                  head: str = "mask", n_rays: int = 36, ray_shape: str = "free", n_harmonics: int = 4, center_radius: float = 1.5, peak_thresh: float = 0.3,
                  slots_aux: bool = False, encoder: str = "conv", decoder: str = "conv", patch_size: int | None = None, pose_branch: bool = False, pose_window: float = 0.35, pose_merge: str = "or", pose_center: str = "com", moment_terms: str = "acs", color_ell: float = 0.0, laser_jitter: float = 0.0, laser_jitter_p: float = 1.0, freq_jitter: float = 0.0,
+                 obj_decoder: str = "none", n_queries: int = 5, obj_layers: int = 3, obj_thresh: float = 0.3, obj_pose: bool = False, obj_pix: bool = True, obj_init: str = "learned", obj_pose_merge: str = "sum",
+                 obj_shape: str = "dot", obj_heat_sigma: str = "px", obj_count_floor: bool = False, obj_jitter: float = 0.0, gray: bool = False,
                  heads: int = 2, freq_layers: int = 2, laser_layers: int = 2, ffn_dim: int | None = None, modal: dict | None = None, color_aug: float = 0.0):
         super().__init__()
         self.loss_weights = loss_weights or dict(object=0.1, n_objects=0.1, com=1.0, area=0.1, box=0.1)
@@ -850,6 +1098,13 @@ class Boombox(ComposerModel):
         # pose_merge "slots" (Mask2Former-style, one pose branch per object slot): each slot k has its own centre heatmap (decoder channel k),
         # canonical mask + angle, and an exists logit; slots are matched to the true objects by centre, supervised per object
         self.exists_head = mlp(max_objects) if pose_branch and pose_merge == "slots" else None
+        # obj_decoder (multi-object, any count): the mask is the union of per-object masks drawn on the conv trunk's pixel features; the
+        # direct head stays as an auxiliary (loss "direct"). queries = Mask2Former object queries (set-matched to the instances); centernet =
+        # a centre heatmap whose peaks each get a pose-branch canonical mask + angle
+        self.obj_decoder, self.obj_heat_sigma, self.obj_count_floor, self.obj_jitter = obj_decoder, obj_heat_sigma, obj_count_floor, obj_jitter
+        assert obj_decoder == "none" or (encoder == "modal" and decoder == "conv" and not pose_branch and not rgb), "--obj-decoder: on the hybrid's conv trunk, instead of the pose branch"
+        if obj_decoder == "queries": self.objq = ObjectQueries(self.modal.laser_emb.shape[1], self.decoder.width, n_queries, layers=obj_layers, pose=obj_pose, out_hw=(out_h, out_w), window=pose_window, pix_head=obj_pix, init=obj_init, pose_merge=obj_pose_merge, shape=obj_shape)
+        if obj_decoder == "centernet": self.objc = CenterObjects(self.decoder.width, d_model, n_queries, out_h, out_w, pose_window, obj_thresh)
         if self.slots or slots_aux:                  # per slot: exists logit, com (row, col), ray params
             n_params = RAY_PARAMS[ray_shape](n_rays, n_harmonics)
             self.slot_head = mlp(max_objects * (3 + n_params))
@@ -858,11 +1113,20 @@ class Boombox(ComposerModel):
                 b = self.slot_head[-1].bias.view(max_objects, 3 + n_params); b.zero_()
                 for k in range(max_objects): init_ray_bias(b[k, 3:], ray_shape, n_params)
 
+        # gray: the overhead photo in grayscale as an alpha composite, gray = (1 - m) bg[box] + m app: bg a learned per-box floor (a
+        # parameter, no input), app a 2-conv head on the trunk's pixel features, m the predicted mask DETACHED -- the photo loss teaches only
+        # what the object looks like, never where it is, so every mask metric means what it did. Where the mask is off it draws the empty box
+        self.gray = gray
+        assert not gray or (encoder == "modal" and decoder == "conv" and obj_decoder == "none" and not pose_branch and not rgb), "--gray: the hybrid's direct head"
+        if gray:
+            self.gray_bg = nn.Parameter(torch.zeros(len(data_info["boxes"]), out_h, out_w))
+            self.gray_head = nn.Sequential(nn.Conv2d(self.decoder.width, 32, 3, padding=1), nn.ReLU(), nn.Conv2d(32, 1, 3, padding=1))
+
         # loss = mask loss + weighted aux losses (a weight of 0 means that head doesn't train)
         self.mask_loss = partial(LOSS_FN[loss_fn], alpha=alpha) if loss_fn in ("bce-dice", "bce-tversky") else LOSS_FN[loss_fn]
 
         # metrics, the same ones on train and test: tag each with its key so update_metric knows which one it was handed
-        keys = [key for key in METRICS if head != "mask" or slots_aux or key != "ray_iou"]  # ray_iou needs rays
+        keys = [key for key in METRICS if (head != "mask" or slots_aux or key != "ray_iou") and (gray or key not in GRAY)]  # ray_iou needs rays
         self.train_metrics = {key: MeanMetric() for key in keys}
         self.test_metrics = {key: MeanMetric() for key in keys}
         for key, metric in [*self.train_metrics.items(), *self.test_metrics.items()]: metric.key = key
@@ -993,7 +1257,7 @@ class Boombox(ComposerModel):
         centre = torch.stack([(w.sum(3) * r).sum(2), (w.sum(2) * c).sum(2)], -1)            # (B,K,2) row, col in [0,1]
         warped, v = self.pose(emb, centre)                                                 # (B,K,H,W), (B,K,2)
         ex = self.exists_head(emb).float()                                                 # (B,K)
-        out["mask_logits"] = (warped + F.logsigmoid(ex)[..., None, None]).logsumexp(1)
+        out["mask_logits"] = soft_or(warped, ex)
         out.update(mask_pred=out["mask_logits"].sigmoid(), slot_heat=hm, slot_centre=centre, slot_masks=warped, slot_exists=ex, slot_angle=v,
                    orient=v[:, 0])                                                         # orient: replaced by the matched slot's in the loss
         return out
@@ -1026,9 +1290,15 @@ class Boombox(ComposerModel):
 
     def forward_modal(self, x, batch, explain=False):
         y, emb, maps = self.modal(x, batch["box"], explain)                               # (B,out_c+extra,H,W), (B,d_model)
+        if y is None and self.obj_decoder != "none": return self.forward_objects(emb, maps, batch, explain)
         if y is None:                                                                      # hybrid: the conv decoder draws from the embedding
-            logits, edge, *heat = self.decoder(emb)
+            feats = self.decoder.features(emb)
+            logits, edge, *heat = self.decoder.from_features(feats)
             out = dict(mask_logits=logits, mask_pred=logits.sigmoid(), **self.heads(emb))
+            if self.gray:
+                m, bg = out["mask_pred"].detach().float(), self.gray_bg[batch["box"]].sigmoid()  # (B,H,W) each
+                app = self.gray_head(feats)[:, 0].float().sigmoid()
+                out.update(gray_pred=(1 - m) * bg + m * app, gray_bg=bg, gray_app=app)
             if self.pose is not None: out = self.with_pose(out, emb, *heat)
             if edge is not None: out["edge_logits"] = edge
             if explain: out["maps"] = maps
@@ -1041,6 +1311,69 @@ class Boombox(ComposerModel):
         if self.loss_weights.get("sdf"): out["sdf_pred"] = y[:, k].float().tanh()
         if explain: out["maps"] = maps
         return out
+
+    def forward_objects(self, emb, maps, batch, explain=False):
+        """--obj-decoder: per-object masks on the trunk's pixel features, mask = their soft union (logsumexp of logit + log p(on))"""
+        feats = self.decoder.features(emb)                                                 # (B,c,H,W)
+        direct, edge = self.decoder.from_features(feats)
+        out = dict(direct_logits=direct, **self.heads(emb))
+        if edge is not None: out["edge_logits"] = edge
+        if self.obj_decoder == "queries":
+            ms, es, ang, g = self.objq(maps["tokens"], self.modal.laser_rc, maps["keep"], feats, direct)  # (B,Ly,K,H,W), (B,Ly,K), (B,K,2) or None
+            if ang is not None: out["set_angle"] = ang
+            if g is not None: out.update(set_mu=g["mu"], set_cov=g["cov"])
+            m, e = ms[:, -1].float(), es[:, -1].float()
+            union = soft_or(m, e)
+            out.update(set_masks=ms, set_exists=es, obj_masks=m.sigmoid(), obj_scores=e.sigmoid())
+        else:
+            if self.training:                                                              # teacher forcing at the true centres
+                inst = (batch["inst"] > 0.5).float()                                       # (B,N,H,W); eval needs no targets (explain callback)
+                real = inst.flatten(2).sum(-1) > 0
+                centre = moments(inst.flatten(0, 1))[1].view(*inst.shape[:2], 2)
+                if self.obj_jitter:                                                        # --obj-jitter px: the masks learn to draw from an imperfect peak
+                    centre = centre + torch.randn_like(centre) * self.obj_jitter / torch.tensor(inst.shape[-2:], device=centre.device)
+                heat, m, v, on = self.objc(feats, emb, centre, real)
+                out["obj_centre_true"] = centre
+            else: heat, m, v, on = self.objc(feats, emb, n_min=out["n_objects_logits"].argmax(-1) if self.obj_count_floor else None)
+            m = m.float()
+            union = m.masked_fill(~on[..., None, None], -30.0).logsumexp(1)                  # no object: ~0, a finite loss
+            out.update(center_heat=heat, obj_masks_logits=m, obj_on=on, obj_masks=m.sigmoid(), obj_scores=on.float(), orient=v[:, 0], obj_angle=v)
+        out.update(mask_logits=union, mask_pred=union.sigmoid())
+        if explain: out["maps"] = maps
+        return out
+
+    def loss_objects(self, out, batch):
+        """queries: per decoder layer, set matching then bce-dice of each matched query vs its instance + exists bce (unmatched queries'
+        weight .1, DETR's eos_coef), averaged over layers. centernet: focal heatmap loss + each teacher-forced mask vs its instance"""
+        inst = (batch["inst"] > 0.5).float()                                               # (B,N,H,W)
+        real = inst.flatten(2).sum(-1) > 0                                                 # (B,N)
+        losses = dict(direct=self.mask_loss(out["direct_logits"], batch["mask_true"]))
+        if "set_masks" in out:
+            lm, le = [], []
+            for l in range(out["set_masks"].shape[1]):
+                m, e = out["set_masks"][:, l].float(), out["set_exists"][:, l].float()
+                sel = match_sets(m, e, inst, real)                                         # (B,N)
+                on = torch.zeros_like(e).scatter(1, sel, real.float())
+                le.append(F.binary_cross_entropy_with_logits(e, on, weight=0.1 + 0.9 * on))
+                mm = m.gather(1, sel[..., None, None].expand(-1, -1, *m.shape[-2:]))[real]
+                lm.append(self.mask_loss(mm, inst[real]) if real.any() else m.sum() * 0)
+            losses.update(obj_mask=torch.stack(lm).mean(), obj_exists=torch.stack(le).mean())
+            if "set_angle" in out:                                                         # the last layer's match: each object's own angle
+                a = out["set_angle"].float().gather(1, sel[..., None].expand(-1, -1, 2))[real]
+                losses["obj_orient"] = F.mse_loss(a, orient_target(inst[real])) if real.any() else a.sum() * 0
+            if "set_mu" in out:                                                            # gauss: each object's moments straight from its query
+                _, mt, ct = moments(inst[real])
+                g = lambda k, n: out[k].float().gather(1, sel[..., None].expand(-1, -1, n))[real]
+                losses["obj_gauss"] = ((g("set_mu", 2) - mt).abs().sum(-1) + 100 * (g("set_cov", 3) - ct).abs().sum(-1)).mean() if real.any() else out["set_mu"].sum() * 0
+        else:                                                                              # the masks only at the true centres (training)
+            if "obj_centre_true" in out:
+                m = out["obj_masks_logits"]
+                losses["obj_mask"] = self.mask_loss(m[real], inst[real]) if real.any() else m.sum() * 0
+                a = out["obj_angle"].float()[real]
+                losses["obj_orient"] = F.mse_loss(a, orient_target(inst[real])) if real.any() else a.sum() * 0
+            _, mt, ct = moments(inst.flatten(0, 1))
+            losses["obj_heat"] = centre_heat_loss(out["center_heat"], mt.view(*inst.shape[:2], 2), real, cov=ct.view(*inst.shape[:2], 3) if self.obj_heat_sigma == "obj" else None)
+        return losses
 
     def forward_polar(self, emb):
         center_logits, centerness_logits, params = self.polar_head(self.decoder.features(emb))  # (B,d_model) -> (B,H,W), (B,H,W), (B,P,H,W)
@@ -1101,7 +1434,12 @@ class Boombox(ComposerModel):
         if self.loss_weights.get("boundary"): losses["boundary"] = boundary_loss(out["mask_logits"], batch["mask_true"])
         if self.loss_weights.get("edge"): losses["edge"] = edge_loss(out["edge_logits"], batch["mask_true"])
         if self.loss_weights.get("sdf"): losses["sdf"] = sdf_loss(out["sdf_pred"], batch["mask_true"])
-        if "slot_exists" in out: losses.update(self.loss_slots_pose(out, batch))  # before orient: it picks the matched slot's angle
+        if self.gray: losses.update(gray_losses(out, batch))
+        if "slot_exists" in out: losses.update(self.loss_slots_pose(out, batch))
+        if "direct_logits" in out: losses.update(self.loss_objects(out, batch))  # before orient: it picks the matched slot's angle
+        if self.loss_weights.get("imoment"):
+            inst = (batch["inst"] > 0.5).float()
+            losses["imoment"] = instance_moment_loss(out["mask_pred"], inst, inst.flatten(2).sum(-1) > 0, self.moment_terms)
         if self.loss_weights.get("moment"): losses["moment"] = moment_loss(out["mask_pred"], batch["mask_true"], batch["n_objects"], self.moment_terms)
         if self.loss_weights.get("orient"): losses["orient"] = orient_loss(out["orient"], batch["mask_true"], batch["n_objects"])
         if "center_logits" in out: losses["heatmap"] = heatmap_loss(out["center_logits"], batch["mask_true"])

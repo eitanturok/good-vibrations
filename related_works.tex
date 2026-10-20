@@ -1,0 +1,138 @@
+% Related work, Version B structure, three flows. Pick one. Citations: related_works.bib
+% Thesis: the container wall is the sensor. Sound shakes the wall, the object inside changes the shaking,
+% we read it remotely at many points and learn to turn it into an image. So: any wall (incl. metal),
+% no contact, object at rest, spatial output, cheap and safe hardware.
+
+% =====================================================================
+% FLOW 1: simple funnel (background -> limitation -> ours, in every subsection)
+% =====================================================================
+\section{Related Work}
+\label{sec:related}
+
+\subsection{Inferring contents via active sensing}
+Seeing inside a closed container usually means sending a wave through its walls.
+X-rays are the standard tool in security screening, but they are ionizing, need shielding, and are blocked by dense metal.
+Radio waves are safe and pass through walls and packaging.
+WiFi can detect people behind a wall~\cite{adib2013see}, and networks trained with a camera as the teacher recover their pose and body shape from radio alone~\cite{zhao2018rfpose,wang2019personinwifi,geng2022densepose}.
+Millimeter-wave radar goes further and images objects inside envelopes and boxes~\cite{ganse2021envelopes,dodds2025mmnorm,lu2026geraf,dodds2025waveformer}.
+However, most objects reflect radio waves like a mirror, so the radar sees only the surfaces that face it, and the rest must be filled in by surface-normal estimation~\cite{dodds2025mmnorm}, neural fields~\cite{lu2026geraf}, or learned shape completion~\cite{dodds2025waveformer}.
+Radio also cannot pass through metal.
+Acoustic echoes~\cite{lindell2019acoustic,christensen2020batvision} and optical time-of-flight~\cite{velten2012recovering} can recover hidden geometry too, but they need an open path to the object and their resolution is limited by the wavelength.
+
+Our method sends nothing through the wall.
+We vibrate the wall with sound and measure how the object inside changes that vibration.
+Because the wall itself carries the signal, the method works for any wall material, including metal, and needs only a speaker, a laser, and a camera.
+
+\subsection{Inferring contents via contact vibration sensing}
+Vibration is a rich source of information about objects.
+The sound of a struck object reveals its shape and material~\cite{zhang2017shape,gao2023objectfolder,clarke2023realimpact}.
+Contact microphones let robots recognize what they hold~\cite{liu2024sonicsense} and where they are touched~\cite{zaielamri2026vibrosense}, and let ordinary surfaces act as touch sensors~\cite{liu2017vibsense,iravantchi2023sawsense}.
+In structural engineering, shifts in a structure's frequency response reveal added masses and damage~\cite{dackermann2013identification,ostachowicz2002location,azuara2021damage}.
+These methods attach sensors to the object and predict a label, a property, or a location.
+The Boombox~\cite{chen2021boombox} comes closest to our goal.
+Contact microphones on a box record objects as they are dropped in, and a network predicts an image of where they land.
+Its signal comes from the impact, so it only works while the object is moving.
+We excite the container with a speaker instead, which lets us image objects at rest, and we sense the wall from a distance, so nothing touches the container.
+
+\subsection{Inferring contents via remote vibration sensing}
+Cameras can sense vibration without contact.
+Small motions in video reveal material properties~\cite{bouman2013estimating,davis2015visual} and recover sound~\cite{davis2014visual}, and with a physical model they can map stiffness inside an object~\cite{feng2022visual} or beneath a surface~\cite{ogren2025visual}.
+These methods need visible motion and surface texture.
+Laser speckle removes both needs.
+A defocused camera sees the speckle pattern shift whenever the surface tilts, which makes tiny vibrations easy to track~\cite{zalevsky2009simultaneous}.
+Speckle has been used to recover sound~\cite{sheinin2022dual,cai2025event2audio,bagon2026drum} and to locate impacts~\cite{zhang2023analyzing}.
+Most relevant to us, Kichler et al.~\cite{kichler2025learning} used a speckle grid to estimate how full an opaque bottle is.
+A fill level is one number, and it changes the response of the whole container.
+We recover an image of an unknown object instead, whose effect on the wall is local and depends on its shape and position.
+To do this, we measure the wall at many points over a wide range of frequencies and train a network, with a camera as the teacher, to turn these measurements into an image.
+
+
+% =====================================================================
+% FLOW 2: narrative, "the wall is the sensor" (through it -> on it -> watching it)
+% =====================================================================
+\section{Related Work}
+\label{sec:related}
+
+There are three broad ways to learn what is inside a closed container: send a wave through its walls, attach sensors that listen to it, or watch it vibrate from a distance.
+We review each in turn.
+
+\subsection{Inferring contents via active sensing}
+The classic approach treats the container wall as an obstacle and tries to get past it.
+X-rays pass through most materials, which is why they are used to screen luggage, but they are ionizing and are stopped by dense metal.
+Radio waves are safer.
+WiFi can sense people behind a wall~\cite{adib2013see}, and when a camera supplies the training labels, networks learn to predict pose and body shape from radio alone~\cite{zhao2018rfpose,wang2019personinwifi,geng2022densepose}.
+Millimeter-wave radar brings this to smaller scales, imaging objects inside envelopes and sealed boxes~\cite{ganse2021envelopes,dodds2025mmnorm,lu2026geraf,dodds2025waveformer}.
+Yet radar sees objects the way a flashlight sees a mirror.
+Only surfaces that face the antenna send a signal back, so these methods must rebuild the rest through surface-normal estimation~\cite{dodds2025mmnorm}, neural fields~\cite{lu2026geraf}, or learned shape completion~\cite{dodds2025waveformer}.
+And if the wall is metal, no radio gets through at all.
+Sound~\cite{lindell2019acoustic,christensen2020batvision} and light~\cite{velten2012recovering} can also recover hidden geometry from echoes, but only when there is an open path to the object.
+
+In all of these methods, the wall is what stands in the way.
+In ours, the wall is the sensor.
+A speaker makes the wall vibrate, and whatever sits inside the container changes that vibration.
+We never need to see past the wall, so its material does not matter, and the hardware is just a speaker, a laser, and a camera.
+
+\subsection{Inferring contents via contact vibration sensing}
+Listening to vibrations is an old way to learn about objects.
+Tap an object and the sound tells you about its shape and material, an idea that has been formalized with physics models~\cite{zhang2017shape} and large multisensory datasets~\cite{gao2023objectfolder,clarke2023realimpact}.
+Robots listen through contact microphones to identify what they grasp~\cite{liu2024sonicsense} and where they are touched~\cite{zaielamri2026vibrosense}, and tables and walls become touch sensors the same way~\cite{liu2017vibsense,iravantchi2023sawsense}.
+Engineers listen to buildings and plates, finding added masses and damage from shifts in their resonances~\cite{dackermann2013identification,ostachowicz2002location,azuara2021damage}.
+In every case the sensor touches the structure, and what comes out is a label, a property, or a point.
+
+The Boombox~\cite{chen2021boombox} is the first to produce an image this way, and it is the work closest to ours.
+It records objects falling into a box with contact microphones and learns to draw where they land.
+But the Boombox can only hear an object while it is moving.
+Once the object settles, the box goes quiet.
+We supply the sound ourselves with a speaker, so a resting object is still heard through the way it changes the wall's response, and we listen with a camera instead of a microphone, so nothing touches the container.
+
+\subsection{Inferring contents via remote vibration sensing}
+Vibrations can also be seen.
+Davis et al.\ showed that a camera can recover sound from the tiny motions of a chip bag~\cite{davis2014visual} and estimate material properties from how objects sway~\cite{davis2015visual}, following earlier work on fabric~\cite{bouman2013estimating}.
+With a physical model, such videos can even reveal stiffness inside an object~\cite{feng2022visual} or beneath a surface~\cite{ogren2025visual}.
+These methods need motion large enough to see and a surface with texture.
+
+Laser speckle lifts both limits.
+A laser spot on a rough surface forms a speckle pattern, and a defocused camera sees that pattern slide whenever the surface tilts, even by a tiny amount~\cite{zalevsky2009simultaneous}.
+Speckle has turned everyday objects into microphones~\cite{sheinin2022dual,cai2025event2audio,bagon2026drum} and located impacts on surfaces~\cite{zhang2023analyzing}.
+Kichler et al.~\cite{kichler2025learning} took the step closest to ours, aiming a speckle grid at opaque bottles to learn how full they are.
+A fill level, however, is a single number that shifts the response of the whole container.
+An object sitting somewhere inside changes only part of the response, and the change depends on its shape and position.
+We capture this with a grid of laser spots and a broad frequency sweep, and we train a network, with a camera as the teacher, to read an image of the contents out of the wall's vibration.
+
+
+% =====================================================================
+% FLOW 3: requirements (three goals stated up front, each subsection checks them)
+% =====================================================================
+\section{Related Work}
+\label{sec:related}
+
+A practical way to see inside containers should meet three goals.
+It should work through any wall, including metal.
+It should need neither contact with the container nor motion of the object.
+And it should recover what the object looks like and where it is, not just a label.
+We review prior work against these goals.
+
+\subsection{Inferring contents via active sensing}
+Most methods for seeing inside containers send a wave through the wall.
+X-rays are reliable but ionizing, and dense metal blocks them.
+Radio waves are safe, and learned models trained with camera labels can recover people's pose and body shape through walls from WiFi~\cite{adib2013see,zhao2018rfpose,wang2019personinwifi,geng2022densepose}.
+Millimeter-wave radar can image objects inside envelopes and boxes~\cite{ganse2021envelopes,dodds2025mmnorm,lu2026geraf,dodds2025waveformer}, but most objects reflect radio like a mirror, so only the surfaces facing the antenna are seen and the rest must be inferred~\cite{dodds2025mmnorm,lu2026geraf,dodds2025waveformer}.
+Acoustic echoes~\cite{lindell2019acoustic,christensen2020batvision} and optical time-of-flight~\cite{velten2012recovering} recover hidden geometry only when there is an open path to the object.
+These methods meet the second and third goals, but not the first, since none of them works through metal.
+Our method does, because the signal is the vibration of the wall itself, not a wave that must cross it.
+
+\subsection{Inferring contents via contact vibration sensing}
+Vibrations reveal an object's shape and material~\cite{zhang2017shape,gao2023objectfolder,clarke2023realimpact}, what a robot is holding~\cite{liu2024sonicsense}, where a surface was touched~\cite{zaielamri2026vibrosense,liu2017vibsense,iravantchi2023sawsense}, and where a structure carries extra mass or damage~\cite{dackermann2013identification,ostachowicz2002location,azuara2021damage}.
+These methods work through any material, but they attach sensors to the structure and output a label, a property, or a location.
+The Boombox~\cite{chen2021boombox} reaches the third goal: it predicts an image of objects dropped into a box from contact microphones on its walls.
+It still fails the second, because it needs contact, and because its signal comes from the impact, so it cannot see an object at rest.
+We excite the container with a speaker and sense the wall optically, which removes both requirements.
+
+\subsection{Inferring contents via remote vibration sensing}
+Cameras can measure vibration from a distance, recovering sound~\cite{davis2014visual}, material properties~\cite{bouman2013estimating,davis2015visual}, and stiffness inside objects~\cite{feng2022visual,ogren2025visual} from small motions in video.
+Laser speckle makes these measurements far more sensitive, since a defocused camera sees the speckle pattern shift whenever the surface tilts~\cite{zalevsky2009simultaneous}.
+Speckle has been used to recover sound~\cite{sheinin2022dual,cai2025event2audio,bagon2026drum} and to locate impacts~\cite{zhang2023analyzing}.
+Kichler et al.~\cite{kichler2025learning} meet the first two goals, using a speckle grid to estimate how full an opaque bottle is.
+A fill level, however, is a single number that changes the whole container's response, so the third goal remains open.
+An object inside a container changes only part of the response, in a way that depends on its shape and position.
+By measuring the wall at many points across a wide frequency sweep and training a network with a camera as the teacher, our method recovers an image of the contents and, to our knowledge, is the first to meet all three goals.

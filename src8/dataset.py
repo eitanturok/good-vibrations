@@ -1,4 +1,5 @@
 import atexit, json, random, shutil, tempfile, textwrap
+from functools import lru_cache
 from pathlib import Path
 
 import numpy as np
@@ -116,7 +117,7 @@ def process_x(samples: dict[Path, dict], signal: str, norm: str, patch_size: int
 
 #*** 3 process y
 
-def process_y(samples: dict[Path, dict], objects: list[str], boxes: list[str], max_objects: int, out_h: int, out_w: int, rgb: bool) -> list[dict]:
+def process_y(samples: dict[Path, dict], objects: list[str], boxes: list[str], max_objects: int, out_h: int, out_w: int, rgb: bool, gray: bool = False) -> list[dict]:
     """downsample mask image + each object's own mask, map object and box to index, map coms to tensor"""
     ys = []
     # a with-lid sample takes its targets from the same spot (and speaker) without the lid: its own photo shows the lid, not the object
@@ -140,6 +141,8 @@ def process_y(samples: dict[Path, dict], objects: list[str], boxes: list[str], m
                 for f in sorted((d / "image/smasks").glob("*.npy"))] if not rgb else []
         inst = np.stack(inst + [np.zeros((out_h, out_w), np.float32)] * (max_objects - len(inst)))[:max_objects]
         ys.append(dict(y=y, inst=inst, object=obj, box=boxes.index(meta["box"]), coms=np.array(coms + [[0.0, 0.0]] * (max_objects - len(coms)), dtype=np.float32)))
+        # gray: the overhead photo in grayscale (h,w) in [0,1], downsampled like y (the photo and the mask share the crop)
+        if gray: ys[-1]["gray"] = np.asarray(Image.open(d / "image/02_cropped_overhead.png").convert("L").resize((out_w, out_h), Image.BOX), dtype=np.float32) / 255.0
     return ys
 
 #*** 4 datasets
@@ -244,8 +247,68 @@ def cardboard(test_size=0.2, speakers=(1, 3, 5, 7)) -> dict[str, dict]:
 def cardboard_no_rotations(test_size=0.2, speakers=(1, 3, 5, 7)) -> dict[str, dict]:
     return {k: dict(v, eval_frac=1.0) if k in ("cardboard/soap-dispenser-rotated", "cardboard/cube-rotated") else v for k, v in cardboard(test_size, speakers).items()}
 
+# cardboard soap-dispenser-rotated positions whose mask axis is at 30-60 deg (03_smask principal axis, mod 180: the footprint is
+# 180-deg and mirror symmetric, iou .94), held out entirely: an unseen angle. The upright soap grids all sit at 75-105 deg and
+# sideways at ~0, so nothing in train is inside the wedge; a wedge sample's nearest kept angle is 8.6 deg away on average (max 15)
+UNSEEN_ANGLE = {4502, 4513, 4514, 4540, 4541, 4556, 4557, 4558, 4559, 4604, 4605, 4606, 4607, 4610, 4613, 4616, 4620, 4625, 4626,
+                4628, 4633, 4634, 4635, 4636, 4641, 4642, 4643}
+def cardboard_wedge(test_size=0.2, speakers=(1, 3, 5, 7)) -> dict[str, dict]:
+    c = cardboard(test_size, speakers)
+    rot = c["cardboard/soap-dispenser-rotated"]
+    # eval positions drawn as without the wedge (shuffle_keep), then the wedge's taken out: HARD = the old HARD's 25 positions outside
+    # the wedge (score.py's HARD-kept for runs on the old split), so HARD stays comparable; train loses the wedge's 21 train positions
+    c["cardboard/soap-dispenser-rotated"] = dict(rot, keep=lambda p: p not in UNSEEN_ANGLE, shuffle_keep=rot["keep"])
+    c["cardboard/soap-dispenser-unseen-angle"] = dict(rot, eval_frac=1.0, keep=lambda p: p in UNSEEN_ANGLE)
+    return c
+
+#*** 4b paper splits: one model, Table 1 (id, every box) + Table 2 (ood, every box that has the data)
+
+# unseen positions: an interior block of the floor (row0, row1, col0, col1 as box fractions; the lasers are on the row-1 wall). Single
+# objects centred inside it are eval-only, and nothing centred within BLOCK_MARGIN of it is trained on. Interior, not a wall: the
+# edges are their own spectral regime (nb95)
+BLOCK, BLOCK_MARGIN = (0.4, 0.6, 0.4, 0.6), 0.05
+
+@lru_cache(maxsize=None)
+def position_coms(exp: str) -> dict[int, np.ndarray]:
+    """{position_id: (K,2) object coms as (row, col) box fractions}; empty-box positions left out"""
+    out = {}
+    for d in (EXPERIMENTS / exp / "samples").iterdir():
+        if (d / "metadata.jsonl").exists() and (m := load_meta(d)).get("coms"):
+            H, W = m["crop_overhead_shape"][:2]
+            out[m["position_id"]] = np.array([[k[0][0] / H, k[0][1] / W] for k in m["coms"]])
+    return out
+
+def in_block(exp: str, margin: float = 0.0, every: bool = False) -> set[int]:
+    """positions with any (every=True: every) object com inside BLOCK grown by margin"""
+    r0, r1, c0, c1 = BLOCK
+    inside = lambda c: (r0 - margin <= c[:, 0]) & (c[:, 0] < r1 + margin) & (c0 - margin <= c[:, 1]) & (c[:, 1] < c1 + margin)
+    return {p for p, c in position_coms(exp).items() if (inside(c).all() if every else inside(c).any())}
+
+def paper(test_size=0.2, speakers=(1, 3, 5, 7)) -> dict[str, dict]:
+    """the three boxes' splits (cardboard with the unseen-angle wedge), changed so every ood split is held out entirely:
+    cylinders: every weight trained (test_size held out), a trend of performance vs mass. broken glass cup: eval-only. shifted lasers: one split per box,
+    no backside wall. gastro lid: 1254/1255 dropped (1255 has no without-lid twin). unseen-position: the BLOCK, in every box"""
+    splits = gastronorm(test_size, speakers) | plastic(test_size, speakers) | cardboard_wedge(test_size, speakers)
+    for k, s in splits.items():
+        if "/cylinder-" in k: s["eval_frac"] = test_size
+    splits["cardboard/glass-cup-broken"]["eval_frac"] = 1.0
+    for k in ("gastro/cube-with-lid", "gastro/cube-without-lid"): splits[k]["keep"] = lambda q: q not in (1254, 1255)
+    for k in ("plastic/cube-shifted-lasers-2", "plastic/cube-shifted-lasers-3-backside", "cardboard/vase-laser-shifted-3", "cardboard/vase-laser-shifted-4"): del splits[k]
+    splits["plastic/laser-shifted"] = dict(splits.pop("plastic/cube-shifted-lasers-1"), layouts=["cube-shifted-lasers-1", "cube-shifted-lasers-2"])
+    splits["cardboard/laser-shifted"] = dict(splits.pop("cardboard/vase-laser-shifted-2"), layouts=["vase-laser-shifted-2", "vase-laser-shifted-3", "vase-laser-shifted-4"])  # no empty-laser-shifted-4: nothing to score
+    for box in ("gastro", "plastic", "cardboard"):
+        exp = splits[f"{box}/candle"]["experiment"]
+        near, inside = in_block(exp, BLOCK_MARGIN), in_block(exp, every=True)
+        for k, s in splits.items():
+            if k.startswith(box + "/") and s["eval_frac"] < 1.0: s["keep"] = lambda q, keep=s["keep"], near=near: keep(q) and q not in near
+        layouts = [l for o in ("candle", "cube", "soap-dispenser", "vase") for l in splits[f"{box}/{o}"]["layouts"]]
+        taken = splits[f"{box}/cube-unseen-speaker-baseline"]["keep"] if box == "gastro" and speakers else lambda q: False  # gastro's 35 unseen-speaker cube positions
+        splits[f"{box}/unseen-position"] = dict(split(layouts, 1.0, speakers, keep=lambda q, inside=inside, taken=taken: q in inside and not taken(q)), experiment=exp)
+    return splits
+
 def gastronorm_plastic(test_size=0.2, speakers=(1, 3, 5, 7)) -> dict[str, dict]: return gastronorm(test_size, speakers) | plastic(test_size, speakers)
 def gastronorm_plastic_cardboard(test_size=0.2, speakers=(1, 3, 5, 7)) -> dict[str, dict]: return gastronorm_plastic(test_size, speakers) | cardboard(test_size, speakers)
+def gastronorm_plastic_cardboard_wedge(test_size=0.2, speakers=(1, 3, 5, 7)) -> dict[str, dict]: return gastronorm_plastic(test_size, speakers) | cardboard_wedge(test_size, speakers)
 
 # eval splits grouped into categories, per box: every eval split of a box is in exactly one category (the eval
 # callback asserts it). control splits are only there as the reference of a delta, so neither id nor ood averages them
@@ -280,12 +343,13 @@ CATEGORIES = {
         "broken":                ["glass-cup-broken"],
         "unseen-object":         ["biscoff", "tomato-sauce", "coffee-pot", "portable-charger"],
         "unseen-rotated-object": ["portable-charger-sideways"],
+        "unseen-angle":          ["soap-dispenser-unseen-angle"],
         "unseen-speaker":        ["vase-unseen-speaker-unseen"],
         "unseen-laser":          ["vase-laser-shifted-2", "vase-laser-shifted-3", "vase-laser-shifted-4"],
         "control":               ["vase-without-lid", "glass-cup", "vase-unseen-speaker-baseline"],
     },
 }
-NOT_OOD = ("id", "control")  # ood = mean over every other category
+NOT_OOD = ("id", "control", "unseen-angle", "weight")  # ood = mean over every other category; unseen-angle (the _wedge split) is reported on its own, so ood stays comparable with runs on the old split; weight (paper) is a trend over trained cylinders
 # delta = mean of the first splits' means - mean of the second's: the same positions (or object) with and without the change
 DELTAS = {
     "gastro": {
@@ -305,7 +369,26 @@ DELTAS = {
     },
 }
 
-DATASETS = {"gastronorm": gastronorm, "plastic": plastic, "cardboard": cardboard, "cardboard_no_rotations": cardboard_no_rotations, "gastronorm_plastic": gastronorm_plastic, "gastronorm_plastic_cardboard": gastronorm_plastic_cardboard}
+# the paper's question per eval split name, in every box; also the older datasets' names for the same questions, so notebook 109
+# can score runs trained on them. A name not listed (e.g. the backside lasers) is in no table
+PAPER_ID = ["candle", "cube", "soap-dispenser", "vase", "two-cubes", "cube-vase"]
+PAPER_CATEGORY = {s: "id" for s in PAPER_ID} | {
+    "unseen-position": "unseen-position",
+    "cube-unseen-speaker-unseen": "unseen-speaker", "vase-unseen-speaker-unseen": "unseen-speaker",
+    "coffee-pot": "unseen-object", "portable-charger": "unseen-object", "biscoff": "unseen-object", "tomato-sauce": "unseen-object",
+    "soap-dispenser-sideways": "unseen-rotation", "soap-dispenser-unseen-angle": "unseen-rotation",
+    "portable-charger-sideways": "unseen-object-rotation",
+    "cylinder-100g": "weight", "cylinder-200g": "weight", "cylinder-500g": "weight", "cylinder-1000g": "weight",  # trained: performance vs mass
+    "laser-shifted": "unseen-laser", "cube-shifted-lasers-1": "unseen-laser", "cube-shifted-lasers-2": "unseen-laser",
+    "vase-laser-shifted-2": "unseen-laser", "vase-laser-shifted-3": "unseen-laser", "vase-laser-shifted-4": "unseen-laser",
+    "cube-with-lid": "lid", "vase-with-lid": "lid",
+    "glass-cup-broken": "broken",
+    "soap-dispenser-rotated": "rotated", "cube-rotated": "rotated",  # cardboard: trained rotations, held-out positions
+} | {s: "control" for s in ("cube-without-lid", "vase-without-lid", "glass-cup", "cube-unseen-speaker-baseline", "vase-unseen-speaker-baseline",
+                            "cube-35pos", "cube-5-speakers", "vase-5-speakers")}
+PAPER_CATEGORIES = {b: {c: [s for s, cc in PAPER_CATEGORY.items() if cc == c] for c in set(PAPER_CATEGORY.values())} for b in ("gastro", "plastic", "cardboard")}
+
+DATASETS = {"paper": paper, "gastronorm": gastronorm, "plastic": plastic, "cardboard": cardboard, "cardboard_no_rotations": cardboard_no_rotations, "gastronorm_plastic": gastronorm_plastic, "gastronorm_plastic_cardboard": gastronorm_plastic_cardboard, "gastronorm_plastic_cardboard_wedge": gastronorm_plastic_cardboard_wedge}
 
 # positions are numbered per capture, so a position is (experiment, position_id)
 def key(meta: dict) -> tuple[str, int]: return meta["experiment"], meta["position_id"]
@@ -319,7 +402,8 @@ def build_splits(splits: dict, metas: list[dict], seed: int = 42) -> dict[str, l
     idxs = {"train": []}
     for name, split in splits.items():
         rs = rows(split, metas)
-        positions = sorted({metas[i]["position_id"] for i in rs})
+        pool = rows(dict(split, keep=split["shuffle_keep"]), metas) if "shuffle_keep" in split else rs  # draw eval from a wider pool, then keep
+        positions = sorted({metas[i]["position_id"] for i in pool})
         random.Random(seed).shuffle(positions)  # split by position, so every speaker at a position lands on the same side
         held = set(positions[:round(split["eval_frac"] * len(positions))])
         idxs["train"] += [i for i in rs if metas[i]["position_id"] not in held]
@@ -361,10 +445,10 @@ def print_splits(splits: dict, metas: list[dict], idxs: dict[str, list[int]]) ->
 
 #*** 6 cast to mds
 
-def write_mds(mds_dir: Path, metas: list[dict], Xs, ys: list[dict]) -> None:
+def write_mds(mds_dir: Path, metas: list[dict], Xs, ys: list[dict], gray: bool = False) -> None:
     """Xs, ys: each sample's processed input and targets, in the same order as metas; row i of the MDS is metas[i]"""
     shutil.rmtree(mds_dir, ignore_errors=True)
-    columns = {"X": "ndarray:float32", "y": "ndarray:float32", "inst": "ndarray:float32", "object": "int", "box": "int", "coms": "ndarray:float32", "experiment": "str", "position_id": "int"}
+    columns = {"X": "ndarray:float32", "y": "ndarray:float32", "inst": "ndarray:float32", "object": "int", "box": "int", "coms": "ndarray:float32", "experiment": "str", "position_id": "int"} | ({"gray": "ndarray:float32"} if gray else {})
     with MDSWriter(out=str(mds_dir), columns=columns, size_limit="200MB") as w:
         for meta, X, y in zip(metas, Xs, ys):
             w.write({"X": X, **y, "experiment": meta["experiment"], "position_id": int(meta["position_id"])})
@@ -403,15 +487,16 @@ class VibrationDataset(StreamingDataset):
                     object=row["object"], box=row["box"], coms=torch.from_numpy(row["coms"].copy()),
                     experiment=meta["experiment"], position_id=meta["position_id"], speaker=meta["speaker"],
                     sample_id=meta["sample_id"], n_objects=meta["n_objects"], layout=meta["layout"],
-                    crop_h=meta["crop_overhead_shape"][0], crop_w=meta["crop_overhead_shape"][1])  # full-res box size, so viz can draw the real aspect
+                    crop_h=meta["crop_overhead_shape"][0], crop_w=meta["crop_overhead_shape"][1],  # full-res box size, so viz can draw the real aspect
+                    **({"gray": torch.from_numpy(row["gray"].copy())} if "gray" in row else {}))
 
 #*** 9 build dataset
 
 def build_dataset(dataset: str = "gastronorm_plastic", test_size: float = 0.2, speakers=(1, 3, 5, 7),
                   signal: str = "magnitude", laser_center: bool = False, norm: str = "std", patch_size: int | None = None, window: str = "hann", gate_ms: float = 0, laser_norm: bool = False,
                   phase: str = "none", phase_ref: str = "none",
-                  out_h: int = 64, out_w: int = 64, rgb: bool = False,
-                  batch_size: int = 128, eval_batch_size: int = 108, num_workers: int = 4):
+                  out_h: int = 64, out_w: int = 64, rgb: bool = False, gray: bool = False,
+                  batch_size: int = 128, eval_batch_size: int = 108, num_workers: int = 4, multi_oversample: int = 1):
 
     # choose how to split the dataset
     splits = DATASETS[dataset](test_size, speakers) # list of split: (layouts, eval_frac, speakers, optional keep position_ids)
@@ -430,20 +515,25 @@ def build_dataset(dataset: str = "gastronorm_plastic", test_size: float = 0.2, s
 
     # process outputs: downsample mask, map object and box to index, map coms to tensor
     data_info = get_data_info(samples, idxs["train"], phase, window) | dict(signal=signal, laser_center=laser_center)
-    ys = process_y(samples, data_info["objects"], data_info["boxes"], max(data_info["n_objects"]), out_h, out_w, rgb)
+    ys = process_y(samples, data_info["objects"], data_info["boxes"], max(data_info["n_objects"]), out_h, out_w, rgb, gray)
 
     # save as MDS for fast training + delete when done
     (EXPERIMENTS / "mds").mkdir(exist_ok=True)
     mds_dir = Path(tempfile.mkdtemp(prefix=f"{dataset}_", dir=EXPERIMENTS / "mds"))
     atexit.register(shutil.rmtree, mds_dir, ignore_errors=True)
-    write_mds(mds_dir, metas, Xs, ys)
+    write_mds(mds_dir, metas, Xs, ys, gray)
 
     # build train/eval dataloaders
     train_pos = {key(metas[i]) for i in idxs["train"]}
     eval_pos = {key(metas[i]) for name, ids in idxs.items() if name != "train" for i in ids}
     train_ds, eval_ds = VibrationDataset(mds_dir, metas, eval_pos), VibrationDataset(mds_dir, metas, train_pos)
-    dl = lambda ds, idxs, bs, shuffle: DataLoader(Subset(ds, idxs), batch_size=bs, shuffle=shuffle, drop_last=shuffle, num_workers=num_workers,
-                                              pin_memory=True, persistent_workers=num_workers > 0)
-    train_dl = dl(train_ds, idxs["train"], batch_size, True)
+    # train: num_workers persistent workers. Eval: no workers (main process) -- ~70 eval splits x 4 persistent workers was ~280 resident
+    # processes: "Too many open files" (2026-10-19 23:30) and a 42 GB training scope that took the machine down (global OOM 10-20 01:20)
+    dl = lambda ds, idxs, bs, shuffle: DataLoader(Subset(ds, idxs), batch_size=bs, shuffle=shuffle, drop_last=shuffle, num_workers=num_workers if shuffle else 0,
+                                              pin_memory=True, persistent_workers=shuffle and num_workers > 0)
+    # multi_oversample k: every multi-object train sample k times per epoch (10% of the data; the decoders learn to draw one object)
+    multi = [i for i in idxs["train"] if metas[i]["n_objects"] > 1]
+    train_dl = dl(train_ds, idxs["train"] + multi * (multi_oversample - 1), batch_size, True)
+    train_dl.unique_dataset = Subset(train_ds, idxs["train"])                                   # each train sample once: the train evaluator's
     eval_dl = [Evaluator(label=name, dataloader=dl(eval_ds, ids, eval_batch_size, False)) for name, ids in idxs.items() if name != "train"]
     return train_dl, eval_dl, data_info

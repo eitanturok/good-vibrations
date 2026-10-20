@@ -69,6 +69,29 @@ cam() { .venv/bin/python src8/gradcam.py "$1" > "runs/gradcam_$1.log" 2>&1 && ec
 nb106() { (cd notebooks && ../.venv/bin/jupyter nbconvert --to notebook --execute --inplace 106_laser_freq_importance.ipynb > ../runs/nb106.log 2>&1) && echo "$(date +%T) notebook 106 executed" || echo "$(date +%T) notebook 106 FAILED"; }
 
 for r in s8-best-spkgain-500ep s8-best-mag-500ep; do imp $r mean; imp $r resample; cam $r; done
+# --- multi-object first (2026-10-19 19:45, the priority). The pose branch has one slot, and the direct map learned to suppress
+# everything outside it: s8-best-spkgain finds both objects in .29 of two-object scenes (s8-hybrid-base, no pose: .45; jitter: .01).
+# The decoders below draw any number of objects; all on s8-best-mag's encoder + recipe minus the pose branch ($NOPOSE), so they
+# differ only in the decoder. The 64 MB-ish per-object masks go to outputs_history (obj_masks / obj_scores) for multi_object.py
+#   mag-nopose-r2   baseline: the direct conv decoder (every object at once, one map), the hybrid encoder
+#   mag-queries     Mask2Former object queries (5): cross-attn to the laser tokens + masked cross-attn to the trunk's pixels, set-matched
+#   mag-centernet   centre heatmap (focal, gaussians) + per-peak pose-branch canonical mask + angle (teacher-forced at the true centres)
+#   conv-mag-r2     baseline: the original conv-conv model (conv encoder + conv decoder, every object at once), magnitude
+#   mag-slots2-r2   2 pose slots with DETR's matching cost (the pose branch made 2-object)
+#   mag-queries-os3 queries + every two-object train scene 3x per epoch (they are 10% of the data; +20% steps per epoch)
+#   mag-query       the ModalFormer's own pixel-query decoder (floor cells cross-attend to the lasers), every object at once
+run s8-mag-nopose-r2-$TAG     $HYBRID --signal magnitude --modal-order "" $NOPOSE
+run s8-mag-queries-$TAG       $HYBRID --signal magnitude --modal-order "" $NOPOSE --obj-decoder queries
+run s8-mag-centernet-$TAG     $HYBRID --signal magnitude --modal-order "" $NOPOSE --obj-decoder centernet
+run s8-conv-mag-r2-$TAG       $CONV   --signal magnitude
+run s8-mag-slots2-r2-$TAG     $HYBRID --signal magnitude --modal-order "" $BEST --pose-merge slots
+# queries / centernet v1 died (21:01, 21:30): queries OOMed at step 1 (the NVML assert) with 512-sample microbatches -- the masked
+# cross-attention keeps (512, 1024 px, 256) keys/values per layer; centernet read batch["inst"] in eval, which the explain callback
+# doesn't pass (fixed). Both again, queries at microbatch 256
+run s8-mag-queries-r2-$TAG    $HYBRID --signal magnitude --modal-order "" $NOPOSE --obj-decoder queries --microbatch 256
+run s8-mag-centernet-r2-$TAG  $HYBRID --signal magnitude --modal-order "" $NOPOSE --obj-decoder centernet
+run s8-mag-queries-os3-$TAG   $HYBRID --signal magnitude --modal-order "" $NOPOSE --obj-decoder queries --multi-oversample 3 --microbatch 256
+run s8-mag-query-$TAG         $QUERY  --signal magnitude $NOPOSE
 # augmentation ablation, no training: posesum-contour -> best-jitter adds only --laser-jitter 0.5; best-jitter -> spkgain adds only the
 # speaker gain. Does jitter make the laser importance diffuse (redundant neighbours)? And how far does each model tolerate a moved grid /
 # a stretched frequency axis (shift_probe.py)?
@@ -84,10 +107,8 @@ nb106
 run s8-mag-fjit-$TAG        $HYBRID --signal magnitude --modal-order "" $BEST --freq-jitter 0.002
 imp s8-mag-fjit-$TAG mean; probe s8-mag-fjit-$TAG s8-mag-drop-$TAG
 nb106
-run s8-mag-nopose-r2-$TAG    $HYBRID --signal magnitude --modal-order "" $NOPOSE
 run s8-mag-poseonly-r2-$TAG  $HYBRID --signal magnitude --modal-order "" $BEST --pose-merge only
 run s8-mag-spk2-r2-$TAG      $HYBRID --signal magnitude --modal-order "" $BEST --speakers 1 2 3 5 7
-run s8-mag-slots2-r2-$TAG    $HYBRID --signal magnitude --modal-order "" $BEST --pose-merge slots
 run s8-hybrid-mag-r2-$TAG    $HYBRID --signal magnitude --modal-order ""
 run s8-hybrid-nobn-r2-$TAG   $HYBRID --signal log_power --modal-order "" --box-norm 0
 run s8-hybrid-nolaser-r2-$TAG $HYBRID --signal log_power --modal-order "" --modal-laser-layers 0

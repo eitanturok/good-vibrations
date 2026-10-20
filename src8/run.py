@@ -24,7 +24,7 @@ from composer.callbacks import LRMonitor, SpeedMonitor, NaNMonitor, RuntimeEstim
 from composer.loggers import WandBLogger, FileLogger
 from composer.utils.reproducibility import seed_all
 
-from dataset import DATASETS, CATEGORIES, DELTAS, NOT_OOD, build_dataset
+from dataset import DATASETS, CATEGORIES, DELTAS, NOT_OOD, PAPER_CATEGORIES, build_dataset
 from arch import Boombox
 from callbacks import VisualizeSMask, OutputSaver, PositionLogger, ConfidenceLogger, EvalSummary, EvalExtras, Interpretability
 from composer.optim import ConstantScheduler, CosineAnnealingScheduler, CosineAnnealingWithWarmupScheduler, LinearWithWarmupScheduler
@@ -64,6 +64,8 @@ def get_parser():
     parser.add_argument("--patch-size",                 type=lambda s: None if s.lower() == "none" else int(s), default=None, help="Freq bins per token; 'none' = no patching, x is (L,F,C).")
     parser.add_argument("--out-h",                      type=int,   default=64)
     parser.add_argument("--out-w",                      type=int,   default=64)
+    parser.add_argument("--gray",                       type=int,   default=0, choices=(0, 1), help="Also draw the overhead photo in grayscale: (1 - mask) learned floor + mask appearance (mask detached).")
+    parser.add_argument("--gray-weight",                type=float, default=1.0, help="Weight of each grayscale photo loss: whole-image L1, object L1 (true mask), gradient L1 near the object.")
     parser.add_argument("--rgb",                        type=int,   default=0, choices=(0, 1), help="Predict the overhead photo instead of the mask.")
     parser.add_argument("--num-workers",                type=int,   default=4)
 
@@ -125,6 +127,22 @@ def get_parser():
     parser.add_argument("--color-aug",                  type=float, default=0.0, help="Training: random smooth spectral tilt per sample (an unseen speaker), std in input units.")
     parser.add_argument("--color-ell",                  type=float, default=0.0, help="--color-aug: > 0 = a random log-gain with knots every this many Hz (the measured speaker difference: 8-28 Hz); 0 = the old 4-cosine tilt.")
     parser.add_argument("--laser-jitter-p",             type=float, default=1.0, help="Training: fraction of samples --laser-jitter shifts (the rest keep the exact grid).")
+    parser.add_argument("--obj-decoder",                type=str,   default="none", choices=("none", "queries", "centernet"), help="Multi-object decoder on the hybrid's conv trunk (instead of the pose branch): queries = Mask2Former object queries, set-matched to the instances; centernet = centre heatmap peaks, each a pose-branch canonical mask + angle. The mask = their union; the direct head trains as an aux.")
+    parser.add_argument("--obj-pose",                   type=int,   default=0, choices=(0, 1), help="--obj-decoder queries: each query also gets a pose head (canonical mask + angle, warped to its mask's centroid, added to its mask; angle supervised per matched object).")
+    parser.add_argument("--obj-pix",                    type=int,   default=1, choices=(0, 1), help="--obj-decoder queries: pixel embedding = a conv head on the trunk features + the direct logits (1), or a 1x1 linear readout (0, qpose v1/v2: could not localize).")
+    parser.add_argument("--obj-init",                   type=str,   default="learned", choices=("learned", "peaks"), help="--obj-decoder queries: learned queries, or two-stage: each starts at one of the top-K local maxima of the direct head's map (its pixel features + position).")
+    parser.add_argument("--obj-shape",                  type=str,   default="dot", choices=("dot", "gauss"), help="queries: each mask = <mlp(q), pixel embedding> (dot), or an ellipse from the query's centroid / angle / std devs + a shape canvas in the object's own frame (gauss; moments supervised at --imoment-weight).")
+    parser.add_argument("--obj-heat-sigma",             type=str,   default="px", choices=("px", "obj"), help="centernet: heatmap gaussians of 1.5 px (px) or of each object's own covariance / 4 (obj).")
+    parser.add_argument("--obj-count-floor",            type=int,   default=0, help="centernet eval: keep at least the count head's argmax best peaks, besides those above --obj-thresh.")
+    parser.add_argument("--obj-jitter",                 type=float, default=0.0, help="centernet training: gaussian jitter (px) of the teacher-forced centres.")
+    parser.add_argument("--obj-pose-merge",             type=str,   default="sum", choices=("sum", "only"), help="--obj-pose 1: each query's mask = free-form + warped canonical (sum), or the warped canonical alone (only: rotation through the angle).")
+    parser.add_argument("--imoment-weight",             type=float, default=0.0, help="Per-instance moment loss (area, centroid, covariance of the predicted mask in each true object's Mahalanobis cell), every scene; 0 = off.")
+    parser.add_argument("--n-queries",                  type=int,   default=5, help="--obj-decoder: object queries / heatmap peaks (the most objects it can draw).")
+    parser.add_argument("--obj-layers",                 type=int,   default=3, help="--obj-decoder queries: decoder layers.")
+    parser.add_argument("--obj-thresh",                 type=float, default=0.3, help="--obj-decoder centernet: eval peaks above this heatmap score are objects.")
+    parser.add_argument("--obj-weight",                 type=float, default=1.0, help="--obj-decoder: weight of the per-object losses (matched masks, exists / heatmap).")
+    parser.add_argument("--direct-weight",              type=float, default=1.0, help="--obj-decoder: weight of the direct head's mask loss (aux).")
+    parser.add_argument("--multi-oversample",           type=int,   default=1, help="Repeat every multi-object train sample this many times per epoch (1 = off).")
     parser.add_argument("--freq-jitter",                type=float, default=0.0, help="Training: stretch each sample's frequency axis by a factor U(1-s, 1+s) (all lasers alike, linear interpolation); 0 = off.")
     parser.add_argument("--laser-jitter",               type=float, default=0.0, help="Training: resample the laser grid shifted by up to this many cells per axis (bilinear); 0 = off.")
     parser.add_argument("--sdf-weight",                 type=float, default=0.0, help="Loss weight of the signed-distance channel; 0 = off.")
@@ -173,13 +191,17 @@ def build_model(args, data_info):
                     loss_weights=dict(object=args.object_weight, n_objects=args.n_objects_weight, com=args.com_weight, area=args.area_weight, box=args.box_weight,
                                       boundary=args.boundary_weight, edge=args.edge_weight, rays=args.rays_weight, centerness=args.centerness_weight,
                                       render=args.render_weight, slot_com=args.slot_com_weight, slots=args.slots_aux_weight,
-                                      sdf=args.sdf_weight, moment=args.moment_weight, orient=args.orient_weight, heatmap=getattr(args, "heatmap_weight", 1.0), slot_exists=getattr(args, "slot_weight", 1.0), slot_mask=getattr(args, "slot_weight", 1.0)), edge_width=args.edge_width,
+                                      sdf=args.sdf_weight, moment=args.moment_weight, orient=args.orient_weight, heatmap=getattr(args, "heatmap_weight", 1.0), slot_exists=getattr(args, "slot_weight", 1.0), slot_mask=getattr(args, "slot_weight", 1.0),
+                                      obj_mask=getattr(args, "obj_weight", 1.0), obj_exists=getattr(args, "obj_weight", 1.0), obj_heat=getattr(args, "obj_weight", 1.0), direct=getattr(args, "direct_weight", 1.0),
+                                      imoment=getattr(args, "imoment_weight", 0.0), obj_orient=args.orient_weight, obj_gauss=getattr(args, "imoment_weight", 0.0), gray=getattr(args, "gray_weight", 1.0), gray_obj=getattr(args, "gray_weight", 1.0), gray_grad=getattr(args, "gray_weight", 1.0)), edge_width=args.edge_width,
                     freq_gain=bool(args.freq_gain), freq_coord=bool(args.freq_coord), freq_pool=args.freq_pool,
                     head=args.head, n_rays=args.n_rays, ray_shape=args.ray_shape, n_harmonics=args.n_harmonics, center_radius=args.center_radius, peak_thresh=args.peak_thresh,
                     slots_aux=args.slots_aux_weight > 0, encoder=args.encoder, decoder=args.decoder, patch_size=args.patch_size,
                     heads=args.heads, freq_layers=args.freq_layers, laser_layers=args.laser_layers, ffn_dim=args.ffn_dim, color_aug=args.color_aug,
                     pose_branch=bool(getattr(args, "pose_branch", 0)), pose_window=getattr(args, "pose_window", 0.35), pose_merge=getattr(args, "pose_merge", "or"), pose_center=getattr(args, "pose_center", "com"), moment_terms=getattr(args, "moment_terms", "acs"),
                     color_ell=getattr(args, "color_ell", 0.0), laser_jitter=getattr(args, "laser_jitter", 0.0), laser_jitter_p=getattr(args, "laser_jitter_p", 1.0), freq_jitter=getattr(args, "freq_jitter", 0.0),
+                    obj_decoder=getattr(args, "obj_decoder", "none"), n_queries=getattr(args, "n_queries", 5), obj_layers=getattr(args, "obj_layers", 3), obj_thresh=getattr(args, "obj_thresh", 0.3), obj_pose=bool(getattr(args, "obj_pose", 0)), obj_pix=bool(getattr(args, "obj_pix", 0)), obj_init=getattr(args, "obj_init", "learned"), obj_pose_merge=getattr(args, "obj_pose_merge", "sum"),
+                    obj_shape=getattr(args, "obj_shape", "dot"), obj_heat_sigma=getattr(args, "obj_heat_sigma", "px"), obj_count_floor=bool(getattr(args, "obj_count_floor", 0)), obj_jitter=getattr(args, "obj_jitter", 0.0), gray=bool(getattr(args, "gray", 0)),
                     modal=dict(d=args.modal_d, heads=args.modal_heads, order=args.modal_order, laser_layers=args.modal_laser_layers,
                                dec_layers=args.modal_dec_layers, grid=args.modal_grid, geo=bool(args.geo), laser_drop=args.laser_drop, band_drop=getattr(args, "band_drop", 0.0), lin_skip=args.lin_skip,
                                box_norm=bool(getattr(args, "box_norm", 1)), box_film=bool(getattr(args, "box_film", 0))))
@@ -216,9 +238,9 @@ def run(**kwargs):
 
     # build dataset
     train_dl, eval_dl, data_info = build_dataset(args.dataset, test_size=args.test_size, speakers=None if "all" in args.speakers else args.speakers, signal=args.signal, laser_center=bool(args.laser_center), norm=args.norm, patch_size=args.patch_size, window=args.window, gate_ms=args.gate_ms, laser_norm=bool(args.laser_norm),
-        phase=args.phase, phase_ref=args.phase_ref, out_h=args.out_h, out_w=args.out_w, rgb=bool(args.rgb), batch_size=args.batch_size, eval_batch_size=args.eval_batch_size,
-        num_workers=args.num_workers)
-    train_eval = Evaluator(label="train", dataloader=DataLoader(train_dl.dataset, batch_size=args.eval_batch_size, num_workers=args.num_workers))
+        phase=args.phase, phase_ref=args.phase_ref, out_h=args.out_h, out_w=args.out_w, rgb=bool(args.rgb), gray=bool(getattr(args, "gray", 0)), batch_size=args.batch_size, eval_batch_size=args.eval_batch_size,
+        num_workers=args.num_workers, multi_oversample=getattr(args, "multi_oversample", 1))
+    train_eval = Evaluator(label="train", dataloader=DataLoader(train_dl.unique_dataset, batch_size=args.eval_batch_size, num_workers=0))  # no workers: see build_dataset
 
     # build model
     model = build_model(args, data_info)
@@ -239,7 +261,7 @@ def run(**kwargs):
         OptimizerMonitor(log_optimizer_metrics=True, batch_log_interval=10),               # grad + weight norms
         OOMObserver(folder="runs/{run_name}/torch_traces", remote_file_name=None, overwrite=True),  # memory traces if a run OOMs
         VisualizeSMask(args.image_interval, args.wandb_images), OutputSaver(args.eval_interval, data_info["objects"]), PositionLogger(), ConfidenceLogger(data_info["objects"]),
-        EvalSummary(CATEGORIES, DELTAS, NOT_OOD), EvalExtras(), Interpretability(),
+        EvalSummary(PAPER_CATEGORIES if args.dataset == "paper" else CATEGORIES, DELTAS, NOT_OOD), EvalExtras(), Interpretability(),
     ]
 
     # optimizer + lr schedule

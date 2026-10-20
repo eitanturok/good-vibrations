@@ -119,7 +119,8 @@ def sample_metrics(out, batch):
     return {k: v.detach().float().cpu() for k, v in m.items()}, geom
 
 HEADS = ("object_logits", "n_objects_logits", "com", "log_area", "box_logits")  # the aux heads' raw outputs, saved per sample
-POLAR = ("peak_scores", "peak_rc", "peak_rays", "peak_keep")  # polar head: its peaks, saved per sample too
+POLAR = ("peak_scores", "peak_rc", "peak_rays", "peak_keep")
+OBJ = ("obj_masks", "obj_scores", "gray_pred", "gray_app")  # --obj-decoder: each query's / peak's mask (B,K,H,W) and p(on) (B,K)  # polar head: its peaks, saved per sample too
 
 def polar_outline(out):
     """polar head outputs -> the saved angles + outlines: ray_angles (n,) radians, ray j points row += sin, col += cos; polygon (B,N,n,2)
@@ -144,7 +145,7 @@ class OutputSaver(Callback):
         path = Path(f"runs/{state.run_name}/outputs_history/{state.dataloader_label}/ep{state.timestamp.epoch.value:04d}-ba{batch:06d}.pt")
         path.parent.mkdir(parents=True, exist_ok=True)
         metrics, geometry = sample_metrics(state.outputs, b)
-        heads = {k: state.outputs[k].detach().float().cpu() for k in HEADS + POLAR if k in state.outputs}
+        heads = {k: state.outputs[k].detach().float().cpu() for k in HEADS + POLAR + OBJ if k in state.outputs}
         if "peak_rays" in state.outputs: heads.update(polar_outline(state.outputs))
         torch.save(dict(mask_pred=state.outputs["mask_pred"].detach().half().cpu(), **heads, objects=self.objects,
                         info=info, metrics=metrics, geometry=geometry), path)
@@ -231,12 +232,14 @@ class EvalSummary(Callback):
 
     CORE = ("candle", "cube", "soap-dispenser", "vase")   # the four base objects, every box: the headline (src8)
     HARD = "eval/cardboard/soap-dispenser-rotated"         # the hardest case we care about
+    UNSEEN_ANGLE = "eval/cardboard/soap-dispenser-unseen-angle"  # --dataset *_wedge: rotated soap at angles never trained on
 
     def summarize(self, logger):
         splits, self.splits = self.splits, {}
         core = [v for l, v in splits.items() if l.split("/", 2)[-1] in self.CORE]
         if core: logger.log_metrics({f"metrics/eval/core/{k}": v for k, v in nanmean(core).items()})
         if self.HARD in splits: logger.log_metrics({f"metrics/eval/hard/{k}": v for k, v in splits[self.HARD].items()})
+        if self.UNSEEN_ANGLE in splits: logger.log_metrics({f"metrics/eval/unseen_angle/{k}": v for k, v in splits[self.UNSEEN_ANGLE].items()})
         for box, cats in self.categories.items():
             have = {l.split("/", 2)[2]: v for l, v in splits.items() if l.split("/")[1] == box}  # eval/<box>/<split>
             if not have: continue
