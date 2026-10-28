@@ -306,6 +306,43 @@ def paper(test_size=0.2, speakers=(1, 3, 5, 7)) -> dict[str, dict]:
         splits[f"{box}/unseen-position"] = dict(split(layouts, 1.0, speakers, keep=lambda q, inside=inside, taken=taken: q in inside and not taken(q)), experiment=exp)
     return splits
 
+# unseen region (the default split from 2026-10-22): a block of the floor left of centre (row0, row1, col0, col1 as box fractions; the
+# lasers are on the row-1 wall), decided by each object's FOOTPRINT (03_smask), not its com. Objects are ~0.13 box wide, so paper()'s
+# com rule leaked: 31-79 trained positions per box still covered its block, and 80-99% of its eval objects stuck out of it.
+# Nothing trained has an object pixel in the region; eval = single objects with >= REGION_EVAL of their footprint in it
+REGION, REGION_EVAL = (0.4, 0.6, 0.3, 0.5), 0.5
+
+def region_overlap(exp: str, region=REGION) -> dict[int, float]:
+    """{position_id: fraction of the objects' footprint (all objects, full-res 03_smask) inside region}, empty-box positions left out.
+    One sample per position (the speakers share the scene). Cached on disk: ~4k full-res masks take a minute"""
+    f = EXPERIMENTS.parent / "runs/_region_cache" / f"{exp}_{'_'.join(map(str, region))}.json"
+    if f.exists(): return {int(k): v for k, v in json.loads(f.read_text()).items()}
+    r0, r1, c0, c1, out = *region, {}
+    for d in sorted((EXPERIMENTS / exp / "samples").iterdir()):
+        if not (d / "metadata.jsonl").exists() or (m := load_meta(d)).get("position_id") in out or not m.get("coms"): continue
+        mk = np.asarray(Image.open(d / "image/03_smask.png").convert("L")) > 127
+        if not mk.any(): continue
+        H, W = mk.shape
+        out[m["position_id"]] = float(mk[int(round(r0 * H)):int(round(r1 * H)), int(round(c0 * W)):int(round(c1 * W))].sum() / mk.sum())
+    f.parent.mkdir(parents=True, exist_ok=True); f.write_text(json.dumps(out))
+    return out
+
+def gastronorm_plastic_cardboard_wedge_region(test_size=0.2, speakers=(1, 3, 5, 7)) -> dict[str, dict]:
+    """the wedge split + the unseen REGION in every box: every trained split loses the positions with any object pixel in the region
+    (train AND its random eval positions, which are still drawn as without the region, so the other splits' eval positions stay a
+    subset of the wedge run's); <box>/unseen-position = the base objects' single-object positions >= REGION_EVAL inside"""
+    splits = gastronorm_plastic_cardboard_wedge(test_size, speakers)
+    for box in ("gastro", "plastic", "cardboard"):
+        exp = splits[f"{box}/candle"]["experiment"]
+        frac = region_overlap(exp)
+        for k, s in splits.items():
+            if k.startswith(box + "/") and s["eval_frac"] < 1.0:
+                splits[k] = dict(s, keep=lambda q, keep=s["keep"], frac=frac: keep(q) and frac.get(q, 0.0) == 0.0, shuffle_keep=s.get("shuffle_keep", s["keep"]))
+        layouts = [l for o in ("candle", "cube", "soap-dispenser", "vase") for l in splits[f"{box}/{o}"]["layouts"]]
+        taken = splits[f"{box}/cube-unseen-speaker-baseline"]["keep"] if box == "gastro" and speakers else lambda q: False  # gastro's 35 unseen-speaker cube positions
+        splits[f"{box}/unseen-position"] = dict(split(layouts, 1.0, speakers, keep=lambda q, frac=frac, taken=taken: frac.get(q, 0.0) >= REGION_EVAL and not taken(q)), experiment=exp)
+    return splits
+
 def gastronorm_plastic(test_size=0.2, speakers=(1, 3, 5, 7)) -> dict[str, dict]: return gastronorm(test_size, speakers) | plastic(test_size, speakers)
 def gastronorm_plastic_cardboard(test_size=0.2, speakers=(1, 3, 5, 7)) -> dict[str, dict]: return gastronorm_plastic(test_size, speakers) | cardboard(test_size, speakers)
 def gastronorm_plastic_cardboard_wedge(test_size=0.2, speakers=(1, 3, 5, 7)) -> dict[str, dict]: return gastronorm_plastic(test_size, speakers) | cardboard_wedge(test_size, speakers)
@@ -321,6 +358,7 @@ CATEGORIES = {
         "lid":                   ["cube-with-lid"],
         "unseen-object":         ["coffee-pot"],
         "unseen-speaker":        ["cube-unseen-speaker-unseen"],
+        "unseen-position":       ["unseen-position"],   # the *_region split
         "control":               ["cube-without-lid", "cube-unseen-speaker-baseline"],
     },
     "plastic": {
@@ -332,6 +370,7 @@ CATEGORIES = {
         "unseen-object":         ["coffee-pot", "portable-charger"],
         "unseen-speaker":        ["cube-unseen-speaker-unseen"],
         "unseen-laser":          ["cube-shifted-lasers-1", "cube-shifted-lasers-2", "cube-shifted-lasers-3-backside"],
+        "unseen-position":       ["unseen-position"],   # the *_region split
         "control":               ["cube-without-lid", "cube-unseen-speaker-baseline"],
     },
     "cardboard": {
@@ -346,10 +385,11 @@ CATEGORIES = {
         "unseen-angle":          ["soap-dispenser-unseen-angle"],
         "unseen-speaker":        ["vase-unseen-speaker-unseen"],
         "unseen-laser":          ["vase-laser-shifted-2", "vase-laser-shifted-3", "vase-laser-shifted-4"],
+        "unseen-position":       ["unseen-position"],   # the *_region split
         "control":               ["vase-without-lid", "glass-cup", "vase-unseen-speaker-baseline"],
     },
 }
-NOT_OOD = ("id", "control", "unseen-angle", "weight")  # ood = mean over every other category; unseen-angle (the _wedge split) is reported on its own, so ood stays comparable with runs on the old split; weight (paper) is a trend over trained cylinders
+NOT_OOD = ("id", "control", "unseen-angle", "unseen-position", "weight")  # ood = mean over every other category; unseen-angle (the _wedge split) is reported on its own, so ood stays comparable with runs on the old split; weight (paper) is a trend over trained cylinders
 # delta = mean of the first splits' means - mean of the second's: the same positions (or object) with and without the change
 DELTAS = {
     "gastro": {
@@ -388,7 +428,7 @@ PAPER_CATEGORY = {s: "id" for s in PAPER_ID} | {
                             "cube-35pos", "cube-5-speakers", "vase-5-speakers")}
 PAPER_CATEGORIES = {b: {c: [s for s, cc in PAPER_CATEGORY.items() if cc == c] for c in set(PAPER_CATEGORY.values())} for b in ("gastro", "plastic", "cardboard")}
 
-DATASETS = {"paper": paper, "gastronorm": gastronorm, "plastic": plastic, "cardboard": cardboard, "cardboard_no_rotations": cardboard_no_rotations, "gastronorm_plastic": gastronorm_plastic, "gastronorm_plastic_cardboard": gastronorm_plastic_cardboard, "gastronorm_plastic_cardboard_wedge": gastronorm_plastic_cardboard_wedge}
+DATASETS = {"paper": paper, "gastronorm": gastronorm, "plastic": plastic, "cardboard": cardboard, "cardboard_no_rotations": cardboard_no_rotations, "gastronorm_plastic": gastronorm_plastic, "gastronorm_plastic_cardboard": gastronorm_plastic_cardboard, "gastronorm_plastic_cardboard_wedge": gastronorm_plastic_cardboard_wedge, "gastronorm_plastic_cardboard_wedge_region": gastronorm_plastic_cardboard_wedge_region}
 
 # positions are numbered per capture, so a position is (experiment, position_id)
 def key(meta: dict) -> tuple[str, int]: return meta["experiment"], meta["position_id"]
@@ -468,6 +508,19 @@ def get_data_info(samples: dict[Path, dict], train_idxs: list[int], phase: str =
                 n_objects=sorted({meta["n_objects"] for meta in metas}),                     # every object count in the data, train and eval
                 boxes=sorted({meta["box"] for meta in metas}))                               # every box type in the data, train and eval
 
+def logit(p): return np.log(p) - np.log1p(-p)
+
+def gray_prior(ys: list[dict], train_idxs: list[int], n_boxes: int, empty: list[bool], floor_from: str = "empty", eps: float = 0.02) -> dict:
+    """where the grayscale photo head starts (train photos only), in logits:
+    gray_floor     (n_boxes,H,W) each box's floor. "empty": the photo of its FIRST empty-box train sample (a real photo of that box
+                   with nothing in it). "median": its median train photo (objects cover 1-3% of a photo at scattered spots)
+    gray_contrast  mean over train object pixels of logit(photo) - logit(floor): how much brighter an object is than the floor under it"""
+    g = lambda i: np.clip(ys[i]["gray"], eps, 1 - eps)
+    if floor_from == "empty": floor = np.stack([logit(g(min(i for i in train_idxs if ys[i]["box"] == b and empty[i]))) for b in range(n_boxes)])
+    else: floor = np.stack([logit(np.median(np.stack([g(i) for i in train_idxs if ys[i]["box"] == b]), 0)) for b in range(n_boxes)])
+    diff = [(logit(g(i)) - floor[ys[i]["box"]])[ys[i]["y"] > 0.5] for i in train_idxs]
+    return dict(gray_floor=torch.from_numpy(floor).float(), gray_contrast=float(np.concatenate(diff).mean()))
+
 #*** 8 dataloader
 
 class VibrationDataset(StreamingDataset):
@@ -495,7 +548,7 @@ class VibrationDataset(StreamingDataset):
 def build_dataset(dataset: str = "gastronorm_plastic", test_size: float = 0.2, speakers=(1, 3, 5, 7),
                   signal: str = "magnitude", laser_center: bool = False, norm: str = "std", patch_size: int | None = None, window: str = "hann", gate_ms: float = 0, laser_norm: bool = False,
                   phase: str = "none", phase_ref: str = "none",
-                  out_h: int = 64, out_w: int = 64, rgb: bool = False, gray: bool = False,
+                  out_h: int = 64, out_w: int = 64, rgb: bool = False, gray: bool = False, gray_floor: str = "empty",
                   batch_size: int = 128, eval_batch_size: int = 108, num_workers: int = 4, multi_oversample: int = 1):
 
     # choose how to split the dataset
@@ -516,6 +569,7 @@ def build_dataset(dataset: str = "gastronorm_plastic", test_size: float = 0.2, s
     # process outputs: downsample mask, map object and box to index, map coms to tensor
     data_info = get_data_info(samples, idxs["train"], phase, window) | dict(signal=signal, laser_center=laser_center)
     ys = process_y(samples, data_info["objects"], data_info["boxes"], max(data_info["n_objects"]), out_h, out_w, rgb, gray)
+    if gray: data_info |= gray_prior(ys, idxs["train"], len(data_info["boxes"]), [not m["objects"] for m in metas], gray_floor)
 
     # save as MDS for fast training + delete when done
     (EXPERIMENTS / "mds").mkdir(exist_ok=True)

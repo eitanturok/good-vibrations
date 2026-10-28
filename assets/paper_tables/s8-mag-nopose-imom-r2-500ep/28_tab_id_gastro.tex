@@ -1,0 +1,13 @@
+\begin{table}
+\caption{In distribution, gastro: VibroFormer per object, on the held-out positions of trained objects}
+\label{tab:id_gastro}
+\begin{tabular}{l!{\vrule width 1.2pt}cccccc!{\vrule width 1.2pt}c}
+\toprule
+ & candle & cube & soap-dispenser & vase & two-cubes & cube-vase & mean \\
+\midrule
+IoU $\uparrow$ & \bfseries 0.844 {\scriptsize $\pm$0.075} & 0.568 {\scriptsize $\pm$0.166} & 0.754 {\scriptsize $\pm$0.111} & 0.802 {\scriptsize $\pm$0.108} & 0.374 {\scriptsize $\pm$0.162} & 0.381 {\scriptsize $\pm$0.124} & 0.621 {\scriptsize $\pm$0.193} \\
+Miss rate $\downarrow$ & \bfseries 0.000 {\scriptsize $\pm$0.000} & 0.007 {\scriptsize $\pm$0.082} & \bfseries 0.000 {\scriptsize $\pm$0.000} & \bfseries 0.000 {\scriptsize $\pm$0.000} & \bfseries 0.000 {\scriptsize $\pm$0.000} & \bfseries 0.000 {\scriptsize $\pm$0.000} & 0.001 {\scriptsize $\pm$0.038} \\
+Centroid error (\% of box) $\downarrow$ & \bfseries 1.1 {\scriptsize $\pm$0.8} & 2.2 {\scriptsize $\pm$1.6} & 1.3 {\scriptsize $\pm$0.7} & 1.2 {\scriptsize $\pm$1.1} & 7.3 {\scriptsize $\pm$5.8} & 8.8 {\scriptsize $\pm$3.6} & 3.6 {\scriptsize $\pm$2.8} \\
+\bottomrule
+\end{tabular}
+\end{table}

@@ -342,6 +342,52 @@ class ModalFormer(nn.Module):
         if y.shape[-2:] != (self.out_h, self.out_w): y = F.interpolate(y, size=(self.out_h, self.out_w), mode="bilinear", align_corners=False)
         return self.head(y), emb, maps
 
+#*** 3a' field decoders (src8, 2026-10-22): the mask as a field over the floor, one small MLP SHARED by every cell
+
+class FieldDecoder(nn.Module):
+    """(B,d_model) embedding, (B,L,d) laser tokens, (B,) box -> (B,H,W) mask logits, (B,H,W) outline logits or None.
+    Every floor cell r runs the same small MLP on its own (row, col) and the box, conditioned on the measurement. The position enters
+    as low-frequency Fourier features (n_freq octaves, the finest 2^(n_freq-2) cycles per box), so the field is smooth in r: an unseen
+    cell is drawn like its neighbours, not from a memorized template (the conv decoder paints trained positions next to an unseen
+    region, never in it: gray-region UNSEEN-POS iou .055). A separate MLP per cell would memorize each cell the same way.
+      field: c = W emb                       the global embedding, the same for every cell (v0, an implicit / CPPN decoder)
+      modes: m_k = mean_l v_k(w_l) z_l       mode k's amplitude, read from the laser tokens z_l through its WALL shape v_k at each
+                                             laser's (row, col) on the wall
+             c(r) = sum_k u_k(r) m_k         and spread over the floor by its FLOOR shape u_k (v1, the modal picture: an object at r
+                                             couples to mode k by u_k(r), laser l reads mode k by v_k(w_l)); u, v: small MLPs of
+                                             Fourier features + the box, so both are smooth and can be plotted
+      logit(r) = MLP(P fourier(r) + box + c(r))  -> mask (+ the outline channel)"""
+    def __init__(self, d_model, d_tok, n_boxes, laser_rc, out_h, out_w, kind="field", width=128, n_freq=5, n_modes=32, edge=False):
+        super().__init__()
+        self.kind, self.out_h, self.out_w, self.n_freq, self.edge = kind, out_h, out_w, n_freq, edge
+        self.register_buffer("cell_rc", grid_coords(out_h, out_w), persistent=False)          # (R,2) floor cell centres
+        self.register_buffer("laser_rc", laser_rc, persistent=False)                          # (L,2) laser spots on the wall grid
+        pos = lambda: nn.Linear(4 * n_freq, width)
+        self.cell_pos, self.box = pos(), nn.Embedding(n_boxes, width)
+        if kind == "field": self.cond = nn.Linear(d_model, width)
+        else:
+            shape = lambda: nn.Sequential(nn.GELU(), nn.Linear(width, width), nn.GELU(), nn.Linear(width, n_modes))
+            self.u_pos, self.u, self.v_pos, self.v = pos(), shape(), pos(), shape()              # floor shapes u_k(r), wall shapes v_k(w)
+            self.cond = nn.Linear(d_tok, width)                                                # per mode: token space -> the cell MLP's
+        self.mlp = nn.Sequential(nn.GELU(), nn.Linear(width, width), nn.GELU(), nn.Linear(width, width), nn.GELU(), nn.Linear(width, 1 + edge))
+
+    def shapes(self, box):
+        """(B,) -> u (B,R,K) floor shapes, v (B,L,K) wall shapes"""
+        b = self.box(box)[:, None]
+        return (self.u(self.u_pos(fourier(self.cell_rc, self.n_freq))[None] + b), self.v(self.v_pos(fourier(self.laser_rc, self.n_freq))[None] + b))
+
+    def forward(self, emb, tokens, keep, box):
+        B = len(emb)
+        h = self.cell_pos(fourier(self.cell_rc, self.n_freq))[None] + self.box(box)[:, None]  # (B,R,w)
+        if self.kind == "field": h = h + self.cond(emb)[:, None]
+        else:
+            u, v = self.shapes(box)
+            v = v * keep.float()[..., None]                                                    # dropped lasers read nothing
+            m = torch.einsum("blk,bld->bkd", v, tokens) / keep.float().sum(1).clamp_min(1)[:, None, None]  # (B,K,d) mode amplitudes
+            h = h + torch.einsum("brk,bkw->brw", u, self.cond(m))                              # (B,R,w): sum_k u_k(r) W m_k
+        y = self.mlp(h).float().view(B, self.out_h, self.out_w, -1)
+        return y[..., 0], (y[..., 1] if self.edge else None)
+
 #*** 3b pose-factored branch (src8): shape in an object-centred frame + a pose, warped to the floor (STN, Jaderberg et al. 2015)
 
 class PoseBranch(nn.Module):
@@ -1040,8 +1086,9 @@ class Boombox(ComposerModel):
                  head: str = "mask", n_rays: int = 36, ray_shape: str = "free", n_harmonics: int = 4, center_radius: float = 1.5, peak_thresh: float = 0.3,
                  slots_aux: bool = False, encoder: str = "conv", decoder: str = "conv", patch_size: int | None = None, pose_branch: bool = False, pose_window: float = 0.35, pose_merge: str = "or", pose_center: str = "com", moment_terms: str = "acs", color_ell: float = 0.0, laser_jitter: float = 0.0, laser_jitter_p: float = 1.0, freq_jitter: float = 0.0,
                  obj_decoder: str = "none", n_queries: int = 5, obj_layers: int = 3, obj_thresh: float = 0.3, obj_pose: bool = False, obj_pix: bool = True, obj_init: str = "learned", obj_pose_merge: str = "sum",
-                 obj_shape: str = "dot", obj_heat_sigma: str = "px", obj_count_floor: bool = False, obj_jitter: float = 0.0, gray: bool = False,
-                 heads: int = 2, freq_layers: int = 2, laser_layers: int = 2, ffn_dim: int | None = None, modal: dict | None = None, color_aug: float = 0.0):
+                 obj_shape: str = "dot", obj_heat_sigma: str = "px", obj_count_floor: bool = False, obj_jitter: float = 0.0, gray: bool = False, gray_joint: bool = False, gray_layers: int = 2, gray_detach: bool = False,
+                 heads: int = 2, freq_layers: int = 2, laser_layers: int = 2, ffn_dim: int | None = None, modal: dict | None = None, color_aug: float = 0.0,
+                 field_width: int = 128, field_freqs: int = 5, field_modes: int = 32):
         super().__init__()
         self.loss_weights = loss_weights or dict(object=0.1, n_objects=0.1, com=1.0, area=0.1, box=0.1)
         # head="polar": PolarHead on the decoder's trunk instead of its mask convs, trained on center + rays + centerness (+ render)
@@ -1052,7 +1099,7 @@ class Boombox(ComposerModel):
         self.slots_aux = slots_aux
         assert head == "mask" or not slots_aux, "slots_aux: the mask head's"
         # encoder="transformer" / decoder="mlp": src's VibrationTransformer (freq + laser transformers, then an MLP to the pixels)
-        assert decoder in ("conv", "query") or (head == "mask" and not self.loss_weights.get("edge")), "the polar head and the outline sit on the conv decoder"
+        assert decoder in ("conv", "query", "field", "modes") or (head == "mask" and not self.loss_weights.get("edge")), "the polar head and the outline sit on the conv decoder"
         assert (decoder == "query") <= (encoder == "modal"), "pixel queries are ModalFormer's"
         assert (encoder == "transformer") == (patch_size is not None), "the transformer reads patches (--patch-size), the conv encoder the raw spectrum"
         assert head == "mask" or not (rgb or self.loss_weights.get("boundary") or self.loss_weights.get("edge")), f"{head} head: no rgb, boundary or edge"
@@ -1075,7 +1122,11 @@ class Boombox(ComposerModel):
         self.freq_jitter = freq_jitter
         self.phase, self.n_freqs = data_info.get("phase", "none"), data_info["n_freqs"]  # old checkpoints' data_info has no "phase"
         self.out_h, self.out_w = out_h, out_w
-        self.decoder = (None if self.slots or (encoder == "modal" and decoder != "conv") else MLPDecoder(d_model, out_h, out_w, rgb) if decoder == "mlp" else
+        # decoder "field" / "modes" (FieldDecoder): one MLP shared by every floor cell, on the ModalFormer's embedding / laser tokens
+        self.field = decoder in ("field", "modes")
+        assert not self.field or (encoder == "modal" and head == "mask" and not (rgb or pose_branch or obj_decoder != "none" or gray)), "--decoder field/modes: the ModalFormer's plain mask head"
+        self.decoder = FieldDecoder(d_model, self.modal.laser_emb.shape[1], len(data_info["boxes"]), grid_coords(data_info["n_laser_rows"], data_info["n_laser_cols"]),
+                                    out_h, out_w, decoder, field_width, field_freqs, field_modes, edge=bool(self.loss_weights.get("edge"))) if self.field else (None if self.slots or (encoder == "modal" and decoder != "conv") else MLPDecoder(d_model, out_h, out_w, rgb) if decoder == "mlp" else
                         Decoder(d_model, out_h, out_w, rgb, edge=bool(self.loss_weights.get("edge")), edge_width=edge_width, head=not self.polar,
                                 n_heat=max(data_info["n_objects"]) - 1 if pose_branch and pose_merge == "slots" else 0))
         self.polar_head = PolarHead(self.decoder.width, ray_shape, n_rays, n_harmonics) if self.polar else None
@@ -1113,14 +1164,23 @@ class Boombox(ComposerModel):
                 b = self.slot_head[-1].bias.view(max_objects, 3 + n_params); b.zero_()
                 for k in range(max_objects): init_ray_bias(b[k, 3:], ray_shape, n_params)
 
-        # gray: the overhead photo in grayscale as an alpha composite, gray = (1 - m) bg[box] + m app: bg a learned per-box floor (a
-        # parameter, no input), app a 2-conv head on the trunk's pixel features, m the predicted mask DETACHED -- the photo loss teaches only
-        # what the object looks like, never where it is, so every mask metric means what it did. Where the mask is off it draws the empty box
-        self.gray = gray
-        assert not gray or (encoder == "modal" and decoder == "conv" and obj_decoder == "none" and not pose_branch and not rgb), "--gray: the hybrid's direct head"
+        # gray: the overhead photo in grayscale as an alpha composite, gray = (1 - m) bg[box] + m app, m the predicted mask DETACHED -- the
+        # photo loss teaches only what the object looks like, never where it is, so every mask metric means what it did. Where the mask is
+        # off it draws the empty box. Both are differences from the empty box, in logits (dataset.gray_prior):
+        #   bg  = sigmoid(floor[box] + d_bg[box])      the box's median train photo + a learned correction (starts at 0)
+        #   app = sigmoid(floor[box] + head(features))  the object's contrast with the floor under it; head's bias starts at the mean contrast
+        # v1 learned both from 0 (a 0.5 gray): at lr 1e-4 Adam moves a logit ~1e-4 per step, so at ep50 the floor was still 0.5 everywhere
+        # gray_joint: the mask is NOT detached, so the photo (sharp object edges) also trains where the object is
+        self.gray, self.gray_joint, self.gray_detach = gray, gray_joint, gray_detach
+        assert not gray or (encoder == "modal" and decoder == "conv" and obj_decoder == "none" and pose_merge != "slots" and not rgb), "--gray: the hybrid's direct head (+ one pose slot)"
         if gray:
+            self.register_buffer("gray_floor", data_info.get("gray_floor", torch.zeros(len(data_info["boxes"]), out_h, out_w)).clone())
             self.gray_bg = nn.Parameter(torch.zeros(len(data_info["boxes"]), out_h, out_w))
-            self.gray_head = nn.Sequential(nn.Conv2d(self.decoder.width, 32, 3, padding=1), nn.ReLU(), nn.Conv2d(32, 1, 3, padding=1))
+            # gray_layers > 2: dilated middle convs (2, 4, ..) so each pixel sees its whole object (where the soap's pump is, which end is up)
+            dil = [1] + [2 ** k for k in range(1, gray_layers - 1)]
+            convs = [l for i, d in enumerate(dil) for l in (nn.Conv2d(self.decoder.width if i == 0 else 32, 32, 3, padding=d, dilation=d), nn.ReLU())]
+            self.gray_head = nn.Sequential(*convs, nn.Conv2d(32, 1, 3, padding=1))
+            nn.init.constant_(self.gray_head[-1].bias, data_info.get("gray_contrast", 0.0))
 
         # loss = mask loss + weighted aux losses (a weight of 0 means that head doesn't train)
         self.mask_loss = partial(LOSS_FN[loss_fn], alpha=alpha) if loss_fn in ("bce-dice", "bce-tversky") else LOSS_FN[loss_fn]
@@ -1291,15 +1351,22 @@ class Boombox(ComposerModel):
     def forward_modal(self, x, batch, explain=False):
         y, emb, maps = self.modal(x, batch["box"], explain)                               # (B,out_c+extra,H,W), (B,d_model)
         if y is None and self.obj_decoder != "none": return self.forward_objects(emb, maps, batch, explain)
+        if y is None and self.field:                                                       # the field decoder: one MLP per floor cell
+            logits, edge = self.decoder(emb, maps["tokens"], maps["keep"], batch["box"])
+            out = dict(mask_logits=logits, mask_pred=logits.sigmoid(), **self.heads(emb))
+            if edge is not None: out["edge_logits"] = edge
+            if explain: out["maps"] = maps
+            return out
         if y is None:                                                                      # hybrid: the conv decoder draws from the embedding
             feats = self.decoder.features(emb)
             logits, edge, *heat = self.decoder.from_features(feats)
             out = dict(mask_logits=logits, mask_pred=logits.sigmoid(), **self.heads(emb))
-            if self.gray:
-                m, bg = out["mask_pred"].detach().float(), self.gray_bg[batch["box"]].sigmoid()  # (B,H,W) each
-                app = self.gray_head(feats)[:, 0].float().sigmoid()
-                out.update(gray_pred=(1 - m) * bg + m * app, gray_bg=bg, gray_app=app)
             if self.pose is not None: out = self.with_pose(out, emb, *heat)
+            if self.gray:                                                                  # after the pose merge: m = the final mask
+                floor = self.gray_floor[batch["box"]]                                                # (B,H,W) logits
+                m, bg = (out["mask_pred"] if self.gray_joint else out["mask_pred"].detach()).float(), (floor + self.gray_bg[batch["box"]]).sigmoid()
+                app = (floor + self.gray_head(feats.detach() if self.gray_detach else feats)[:, 0].float()).sigmoid()
+                out.update(gray_pred=(1 - m) * bg + m * app, gray_bg=bg, gray_app=app)
             if edge is not None: out["edge_logits"] = edge
             if explain: out["maps"] = maps
             return out

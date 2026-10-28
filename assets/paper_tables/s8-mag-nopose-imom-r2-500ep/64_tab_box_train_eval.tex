@@ -1,0 +1,14 @@
+\begin{table}
+\caption{In distribution, per box: train vs eval, all speakers. Best eval box in bold.}
+\label{tab:box_train_eval}
+\begin{tabular}{l!{\vrule width 1.2pt}cc!{\vrule width 1.2pt}cc!{\vrule width 1.2pt}cc}
+\toprule
+ & \multicolumn{2}{c}{IoU $\uparrow$} & \multicolumn{2}{c}{Miss rate $\downarrow$} & \multicolumn{2}{c}{Centroid error (\% of box) $\downarrow$} \\
+ & train & eval & train & eval & train & eval \\
+\midrule
+gastro & 0.901 {\scriptsize $\pm$0.048} & 0.621 {\scriptsize $\pm$0.193} & 0.000 {\scriptsize $\pm$0.019} & 0.001 {\scriptsize $\pm$0.038} & 0.5 {\scriptsize $\pm$1.1} & 3.6 {\scriptsize $\pm$2.8} \\
+plastic & 0.918 {\scriptsize $\pm$0.037} & \bfseries 0.670 {\scriptsize $\pm$0.157} & 0.000 {\scriptsize $\pm$0.000} & \bfseries 0.000 {\scriptsize $\pm$0.000} & 0.4 {\scriptsize $\pm$0.2} & \bfseries 3.6 {\scriptsize $\pm$3.0} \\
+cardboard & 0.899 {\scriptsize $\pm$0.042} & 0.616 {\scriptsize $\pm$0.205} & 0.000 {\scriptsize $\pm$0.000} & 0.004 {\scriptsize $\pm$0.076} & 0.5 {\scriptsize $\pm$0.5} & 3.8 {\scriptsize $\pm$3.5} \\
+\bottomrule
+\end{tabular}
+\end{table}

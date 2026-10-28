@@ -1,0 +1,16 @@
+\begin{table}
+\caption{Out of distribution: miss rate on conditions never seen in training, per box}
+\label{tab:ood_miss}
+\begin{tabular}{l!{\vrule width 1.2pt}ccc!{\vrule width 1.2pt}c}
+\toprule
+ & gastro & plastic & cardboard & all \\
+\midrule
+in distribution & 0.001 {\scriptsize $\pm$0.038} & \bfseries 0.000 {\scriptsize $\pm$0.000} & 0.004 {\scriptsize $\pm$0.076} & 0.002 {\scriptsize $\pm$0.051} \\
+unseen speaker & 0.343 {\scriptsize $\pm$0.482} & \bfseries 0.000 {\scriptsize $\pm$0.000} & 0.200 {\scriptsize $\pm$0.422} & 0.181 {\scriptsize $\pm$0.373} \\
+unseen object & \bfseries 0.000 {\scriptsize $\pm$0.000} & 0.037 {\scriptsize $\pm$0.088} & 0.035 {\scriptsize $\pm$0.184} & 0.031 {\scriptsize $\pm$0.120} \\
+unseen rotation & 0.000 {\scriptsize $\pm$0.000} & 0.000 {\scriptsize $\pm$0.000} & — & 0.000 {\scriptsize $\pm$0.000} \\
+unseen speckles & — & \bfseries 0.016 {\scriptsize $\pm$0.125} & 0.630 {\scriptsize $\pm$0.485} & 0.384 {\scriptsize $\pm$0.492} \\
+lid on & \bfseries 0.583 {\scriptsize $\pm$0.515} & 0.594 {\scriptsize $\pm$0.499} & 0.778 {\scriptsize $\pm$0.422} & 0.652 {\scriptsize $\pm$0.471} \\
+\bottomrule
+\end{tabular}
+\end{table}

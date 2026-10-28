@@ -100,16 +100,32 @@ WEDGE="--dataset gastronorm_plastic_cardboard_wedge"
 run s8-mag-qgauss-w-$TAG      $HYBRID --signal magnitude --modal-order "" $MULTI $WEDGE --obj-decoder queries --obj-shape gauss --microbatch 256
 run s8-best-mag-w-$TAG        $HYBRID --signal magnitude --modal-order "" $BEST $WEDGE
 run s8-mag-queries-w-$TAG     $HYBRID --signal magnitude --modal-order "" $MULTI $WEDGE --obj-decoder queries --microbatch 256
-run s8-mag-centernet-r3-w-$TAG $HYBRID --signal magnitude --modal-order "" $MULTI $WEDGE --obj-decoder centernet --obj-heat-sigma obj --obj-count-floor 1 --obj-jitter 1.5
-run s8-mag-nopose-imom-w-$TAG $HYBRID --signal magnitude --modal-order "" $MULTI $WEDGE
+# 2026-10-21 00:50: gray first (the user's priority), centernet last (r2 under-detected)
 # 2026-10-20 19:50: the simplest model (nopose-imom) also draws the grayscale photo, (1 - mask) floor + mask appearance (mask detached, so
 # its mask metrics stay comparable); losses: whole-image L1 + object L1 on the true mask + gradient L1 near the object (arch.gray_losses)
 run s8-mag-gray-w-$TAG        $HYBRID --signal magnitude --modal-order "" $MULTI $WEDGE --gray 1
+# 2026-10-21 01:30: v1 killed at ep~60 -- its floor and appearance started at 0.5 gray and lr 1e-4 couldn't move them (gray_obj_l1 = the
+# floor's). r2 starts both from the data, as differences from the empty box in logits: floor = median train photo, app = floor + contrast
+run s8-mag-gray-r2-w-$TAG     $HYBRID --signal magnitude --modal-order "" $MULTI $WEDGE --gray 1
+run s8-mag-nopose-imom-w-$TAG $HYBRID --signal magnitude --modal-order "" $MULTI $WEDGE
+# 2026-10-21 02:40: gray-r2-w works (CORE photo L1 .098 < the .13 flat-colour oracle; masks = nopose-imom). Does the photo (sharp
+# object edges) also make a better MASK target? gray-joint: the composite's mask is not detached
+run s8-mag-gray-joint-w-$TAG  $HYBRID --signal magnitude --modal-order "" $MULTI $WEDGE --gray 1 --gray-joint 1
 # moved up from the queue-5 block: the all-attention pixel-query decoder (s8-query crashed at ep50 on a since-fixed recompile bug)
-run s8-mag-query-w-$TAG       $QUERY  --signal magnitude $MULTI $WEDGE
+run s8-mag-query-w-$TAG       $QUERY  --signal magnitude $MULTI $WEDGE --microbatch 256
+# 2026-10-21 04:20: gray-joint = gray-r2 (masks .740 vs .743, photo .097 vs .098): the detached mask stays. The photo is now limited by
+# ORIENTATION (rotated soap photo .17-.18 vs floor .20, masks at 27 deg). best-mag's pose slot gets 17-20 deg: best-mag + --gray
+run s8-best-mag-gray-w-$TAG  $HYBRID --signal magnitude --modal-order "" $BEST $WEDGE --gray 1
+run s8-mag-centernet-r3-w-$TAG $HYBRID --signal magnitude --modal-order "" $MULTI $WEDGE --obj-decoder centernet --obj-heat-sigma obj --obj-count-floor 1 --obj-jitter 1.5
+# 2026-10-21 07:30: best-mag-gray: better masks (19 deg) but NOT a better rotated-soap photo -- the appearance head on the TRUE mask
+# (.174) = the drawn photo, at the flat-colour oracle: it lacks inner detail, not orientation. Its 2 convs see 5 px; an object is
+# 10-15 px. gray-wide: 4 layers, dilations 1,2,4 (17 px), so it can see which end of the object the pump is on
+run s8-mag-gray-wide-w-$TAG   $HYBRID --signal magnitude --modal-order "" $MULTI $WEDGE --gray 1 --gray-layers 4
 # from here on every run is on the wedge split (2026-10-20): the other eval splits are identical, HARD = the old HARD minus the wedge
 COMMON="${COMMON/--dataset gastronorm_plastic_cardboard /--dataset gastronorm_plastic_cardboard_wedge }"
 run s8-mag-slots2-r3-$TAG     $HYBRID --signal magnitude --modal-order "" $BEST --pose-merge slots
+run s8-mag-gray-wide-detach-w-$TAG $HYBRID --signal magnitude --modal-order "" $MULTI $WEDGE --gray 1 --gray-layers 4 --gray-detach 1 --gray-floor median   # wide head on DETACHED features: does the hard-mask drop of gray-wide-w come from the photo loss training the decoder?
+run s8-mag-gray-empty-w-$TAG    $HYBRID --signal magnitude --modal-order "" $MULTI $WEDGE --gray 1 --gray-floor empty   # = gray-r2-w with the floor = each box's first empty-box train photo
 
 # --- the earlier queue-5 work, after the multi-object arms
 probe() { .venv/bin/python src8/shift_probe.py "$@" > runs/shift_probe_$(date +%H%M).log 2>&1 && echo "$(date +%T) shift probe $*" || echo "$(date +%T) shift probe FAILED"; }

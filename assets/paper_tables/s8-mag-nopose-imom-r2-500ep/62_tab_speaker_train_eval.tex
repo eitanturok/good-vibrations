@@ -1,0 +1,25 @@
+\begin{table}
+\caption{In distribution, per speaker and box: train vs eval. Best eval speaker of each box in bold.}
+\label{tab:speaker_train_eval}
+\begin{tabular}{ll!{\vrule width 1.2pt}cc!{\vrule width 1.2pt}cc!{\vrule width 1.2pt}cc}
+\toprule
+ &  & \multicolumn{2}{c}{IoU $\uparrow$} & \multicolumn{2}{c}{Miss rate $\downarrow$} & \multicolumn{2}{c}{Centroid error (\% of box) $\downarrow$} \\
+ &  & train & eval & train & eval & train & eval \\
+\midrule
+\multirow[t]{3}{*}{gastro} & speaker 1 & 0.902 {\scriptsize $\pm$0.045} & 0.622 {\scriptsize $\pm$0.191} & 0.000 {\scriptsize $\pm$0.000} & \bfseries 0.000 {\scriptsize $\pm$0.000} & 0.4 {\scriptsize $\pm$0.3} & 3.5 {\scriptsize $\pm$2.6} \\
+ & speaker 3 & 0.900 {\scriptsize $\pm$0.044} & 0.606 {\scriptsize $\pm$0.202} & 0.000 {\scriptsize $\pm$0.000} & 0.003 {\scriptsize $\pm$0.066} & 0.4 {\scriptsize $\pm$0.3} & 4.0 {\scriptsize $\pm$3.3} \\
+ & speaker 7 & 0.901 {\scriptsize $\pm$0.054} & \bfseries 0.634 {\scriptsize $\pm$0.186} & 0.001 {\scriptsize $\pm$0.033} & \bfseries 0.000 {\scriptsize $\pm$0.000} & 0.5 {\scriptsize $\pm$1.9} & \bfseries 3.3 {\scriptsize $\pm$2.5} \\
+\cline{1-8}
+\multirow[t]{4}{*}{plastic} & speaker 1 & 0.918 {\scriptsize $\pm$0.037} & 0.665 {\scriptsize $\pm$0.164} & 0.000 {\scriptsize $\pm$0.000} & 0.000 {\scriptsize $\pm$0.000} & 0.3 {\scriptsize $\pm$0.2} & 3.5 {\scriptsize $\pm$2.7} \\
+ & speaker 3 & 0.920 {\scriptsize $\pm$0.037} & \bfseries 0.680 {\scriptsize $\pm$0.151} & 0.000 {\scriptsize $\pm$0.000} & 0.000 {\scriptsize $\pm$0.000} & 0.3 {\scriptsize $\pm$0.2} & 3.7 {\scriptsize $\pm$3.4} \\
+ & speaker 5 & 0.919 {\scriptsize $\pm$0.037} & 0.668 {\scriptsize $\pm$0.157} & 0.000 {\scriptsize $\pm$0.000} & 0.000 {\scriptsize $\pm$0.000} & 0.4 {\scriptsize $\pm$0.3} & \bfseries 3.4 {\scriptsize $\pm$2.7} \\
+ & speaker 7 & 0.916 {\scriptsize $\pm$0.038} & 0.667 {\scriptsize $\pm$0.156} & 0.000 {\scriptsize $\pm$0.000} & 0.000 {\scriptsize $\pm$0.000} & 0.4 {\scriptsize $\pm$0.3} & 3.7 {\scriptsize $\pm$3.0} \\
+\cline{1-8}
+\multirow[t]{4}{*}{cardboard} & speaker 1 & 0.905 {\scriptsize $\pm$0.046} & \bfseries 0.633 {\scriptsize $\pm$0.189} & 0.000 {\scriptsize $\pm$0.000} & \bfseries 0.003 {\scriptsize $\pm$0.062} & 0.5 {\scriptsize $\pm$0.6} & \bfseries 3.4 {\scriptsize $\pm$2.9} \\
+ & speaker 3 & 0.896 {\scriptsize $\pm$0.044} & 0.607 {\scriptsize $\pm$0.205} & 0.000 {\scriptsize $\pm$0.000} & \bfseries 0.003 {\scriptsize $\pm$0.062} & 0.5 {\scriptsize $\pm$0.4} & 4.2 {\scriptsize $\pm$3.9} \\
+ & speaker 5 & 0.899 {\scriptsize $\pm$0.039} & 0.608 {\scriptsize $\pm$0.215} & 0.000 {\scriptsize $\pm$0.000} & 0.009 {\scriptsize $\pm$0.107} & 0.5 {\scriptsize $\pm$0.4} & 3.7 {\scriptsize $\pm$3.2} \\
+ & speaker 7 & 0.898 {\scriptsize $\pm$0.041} & 0.614 {\scriptsize $\pm$0.210} & 0.000 {\scriptsize $\pm$0.000} & \bfseries 0.003 {\scriptsize $\pm$0.062} & 0.5 {\scriptsize $\pm$0.4} & 3.9 {\scriptsize $\pm$3.8} \\
+\cline{1-8}
+\bottomrule
+\end{tabular}
+\end{table}

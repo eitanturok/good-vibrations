@@ -853,6 +853,9 @@ class RunData:
     # /api/samples' s.i. A combined run's rows can come from different experiments, each
     # with its own offset, so this can no longer be computed from one shared offset.
     global_ids: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=str))
+    # The drawn grayscale photo per row (src8 --gray runs save `gray_pred`), lazy like
+    # `masks`; None for a run without a photo head.
+    gray: "RunMasks | None" = None
     # Predicted sample ids no longer in any experiment's samples/ (e.g. moved to
     # bad_samples/ after the run started). Dropped from scoring; listed in the header.
     missing: list = field(default_factory=list)
@@ -915,7 +918,7 @@ def epoch_index(name: str, runs_dir: Path, registry: "Registry",
 
 
 def load_epoch(name: str, runs_dir: Path, registry: "Registry", epoch: int,
-               gids: list[str], cells: int) -> np.ndarray:
+               gids: list[str], cells: int, key: str = "mask_pred") -> np.ndarray:
     """Masks (len(gids), cells) fp16 for `gids` at one epoch; NaN where the epoch has no
     prediction. Only the files holding those rows are opened, and only their rows are read."""
     idx, _ = epoch_index(name, runs_dir, registry, epoch)
@@ -927,7 +930,7 @@ def load_epoch(name: str, runs_dir: Path, registry: "Registry", epoch: int,
             ks, rs = by_file.setdefault(f, ([], []))
             ks.append(k); rs.append(r)
     for f, (ks, rs) in by_file.items():
-        masks[ks] = _mmap(f)["mask_pred"][rs].reshape(len(rs), -1).half().numpy()
+        masks[ks] = _mmap(f)[key][rs].reshape(len(rs), -1).half().numpy()
     return masks
 
 
@@ -1093,6 +1096,7 @@ def load_run(name: str, runs_dir: Path, registry: "Registry", family: str = "unk
     """
     outputs = runs_dir / name / config.OUTPUTS_SUBDIR
     ids, masks, splits, boxes, exps, skipped, read = [], [], [], [], [], [], []
+    grays = []   # gray_pred per file (mmapped), or None
     # Per-sample metrics + crosshair geometry, written by training (src6 OutputSaver) since
     # 2026-10-08. None for a file that predates it; then the run is scored here instead.
     saved, geoms = [], []
@@ -1123,6 +1127,7 @@ def load_run(name: str, runs_dir: Path, registry: "Registry", family: str = "unk
                 sid = _info_dirs(obj["info"])
                 ids.append(sid)
                 masks.append(obj["mask_pred"])   # mmapped; rows are read on demand (RunMasks)
+                grays.append(obj.get("gray_pred"))
                 splits += [split] * len(sid)
                 boxes += _as_box_list(obj["info"], len(sid))
                 exps += _as_exp_list(obj["info"], len(sid))
@@ -1261,9 +1266,43 @@ def load_run(name: str, runs_dir: Path, registry: "Registry", family: str = "unk
     local = np.concatenate([np.arange(len(m)) for m in masks])
     print(f"[viz] load_run {name!r}: {_n_files} .pt files, {len(sample_ids)} samples, "
           f"{time.perf_counter() - _t0:.2f}s", flush=True)
+    gray = RunMasks(grays, part[rows], local[rows]) if all(g is not None for g in grays) else None
+    if gray is not None:
+        metrics |= photo_metrics(gray, gi_arr, global_rows, registry, shape)
     return RunData(name, epoch, sample_ids, RunMasks(masks, part[rows], local[rows]), splits,
                    metrics, row_of, skipped, family, shape,
-                   com_pairs=geom, global_ids=global_ids, missing=missing)
+                   com_pairs=geom, global_ids=global_ids, missing=missing, gray=gray)
+
+
+def photo_metrics(gray: RunMasks, gi_arr: np.ndarray, global_rows: np.ndarray, registry: "Registry",
+                  shape: tuple[int, int], chunk: int = 2048) -> dict[str, np.ndarray]:
+    """A --gray run's drawn photo vs the real one, per row (src8/gray_score.py's numbers),
+    NaN on an empty box:
+      photo_loc  L1 over the TRUE object grown by a ring (2 px at 64x64): the object's look
+                 AND whether the drawn object sits there -- one drawn beside it or too big
+                 pays on the ring, one drawn too small or missed pays on the object
+      photo_obj  L1 on the TRUE object pixels only (its look; blind to a spill-over)"""
+    import torch.nn.functional as F
+    from viz import render
+    n = len(global_rows)
+    obj, loc = np.full(n, np.nan), np.full(n, np.nan)
+    r = max(1, round(2 * shape[0] / 64))   # ring width: 2 px at 64x64, about the masks' edge error
+    for gi in np.unique(gi_arr).tolist():
+        idx = np.flatnonzero(gi_arr == gi)
+        local = global_rows[idx] - registry.row_base(gi)
+        real, masks = render.photo_table(gi, *shape), registry.gts[gi].masks_at(shape)
+        if masks is None:
+            continue
+        for s in range(0, len(idx), chunk):
+            i, l = idx[s:s + chunk], local[s:s + chunk]
+            d = np.abs(np.stack([gray[k] for k in i]).reshape(len(i), -1) - real[l].astype(np.float32))
+            o = masks[l] > 0.5
+            near = F.max_pool2d(torch.from_numpy(o[:, None].astype(np.float32)), 2 * r + 1, 1, r)[:, 0].numpy().reshape(len(i), -1) > 0
+            o = o.reshape(len(i), -1)
+            with np.errstate(invalid="ignore"):
+                obj[i] = (d * o).sum(1) / o.sum(1)
+                loc[i] = (d * near).sum(1) / near.sum(1)
+    return {"photo_loc": loc, "photo_obj": obj}
 
 
 # ***** registry *****

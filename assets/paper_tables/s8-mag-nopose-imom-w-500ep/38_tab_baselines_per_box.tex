@@ -1,0 +1,15 @@
+\begin{table}
+\caption{Nearest-neighbour baselines per box, in distribution (mean over test samples)}
+\label{tab:baselines_per_box}
+\begin{tabular}{lrrrrrr}
+\toprule
+ & \multicolumn{2}{c}{IoU $\uparrow$} & \multicolumn{2}{c}{Miss rate $\downarrow$} & \multicolumn{2}{c}{Centroid error (\% of box) $\downarrow$} \\
+method & nn-oracle & nn-vib & nn-oracle & nn-vib & nn-oracle & nn-vib \\
+box &  &  &  &  &  &  \\
+\midrule
+cardboard & 0.604 & 0.298 & 0.000 & 0.160 & 3.738 & 10.055 \\
+gastro & 0.562 & 0.383 & 0.004 & 0.094 & 3.410 & 6.726 \\
+plastic & 0.667 & 0.566 & 0.000 & 0.005 & 2.577 & 4.165 \\
+\bottomrule
+\end{tabular}
+\end{table}

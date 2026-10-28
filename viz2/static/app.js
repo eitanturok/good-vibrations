@@ -860,11 +860,11 @@ function boxGL(M, img) {
 }
 
 // one tile: the photo warped by mode m, normalised to its own peak
-function drawBox(g, w, h, m, bv) {
+function drawBox(g, w, h, m, bv, frame = S.frame) {
   if (!bv.img.complete || !bv.img.naturalWidth) return;
   const M = boxMesh(bv.lv), G = boxGL(M, bv.img), D = boxField(M, m), io = S.modeview === 'inout';
   if (!G) return g.drawImage(bv.img, bv.x, bv.y, bv.w, bv.h, 0, 0, w, h);   // no WebGL: the still photo
-  const t = Math.cos((S.frame / NFRAME) * 2 * Math.PI), cell = M.cell * S.asize;
+  const t = Math.cos((frame / NFRAME) * 2 * Math.PI), cell = M.cell * S.asize;
   const k = io ? 0 : (t * 0.5 * cell) / (D.umax || 1);      // stretch: the biggest shift is half a laser cell at 1x
   const kz = io ? (t * 1.5 * cell) / (D.zmax || 1) : 0;     // in-out: the biggest depth is 1.5 cells
   const { gl, cv, u } = G, dp = devicePixelRatio || 1;
@@ -895,6 +895,41 @@ function drawBox(g, w, h, m, bv) {
     g.stroke();
   });
   g.restore();
+}
+
+/* Right-click a mode tile to save its loop as a GIF. Hovering a tile draws its NFRAME frames
+   into one strip (6 per animation frame, so playback never stalls), the server encodes it, and
+   an invisible <img> of it lies over the canvas -- the browser's own "Save image as". The name
+   records everything that changes the picture, so it is also the cache key. */
+const gifName = (t) => {
+  const s = t.who === 'live' ? S.byId[S.live.sid] : t.who.meta, v = S.modeview;
+  return [s.box, sampleId(s), `F${hz(t.fi).toFixed(1)}Hz`, v,
+    S.ref !== 'none' && `ref-${S.ref}-${S.live.ch}`,
+    S.asize !== 1 && `x${S.asize.toFixed(1)}`,
+    v === 'quiver' && S.fieldbg && 'field',
+    v === 'surface' && `az${Math.round(S.cam.az)}-el${Math.round(S.cam.el)}`,
+  ].filter(Boolean).join('_').replace(/[^\w.-]+/g, '-');
+};
+async function gifFor(f, t) {
+  if (!t?.m) return;
+  const im = f.querySelector('.gifsave'), cv = f.querySelector('canvas'), name = gifName(t), c = (t.m._gif ??= {});
+  im.removeAttribute('src');                    // until it's ready, right-click gets the canvas
+  c[name] ??= (async () => {
+    const w = cv.clientWidth, h = cv.clientHeight, strip = document.createElement('canvas'), g = strip.getContext('2d');
+    strip.width = w; strip.height = h * NFRAME;
+    g.fillStyle = css('--s1'); g.fillRect(0, 0, w, h * NFRAME);   // the card behind the tile
+    for (let i = 0; i < NFRAME; i++) {
+      if (i % 6 === 0) await new Promise(requestAnimationFrame);
+      g.setTransform(1, 0, 0, 1, 0, i * h);
+      drawTile(g, w, h, t, boxView(), i);
+    }
+    const url = `/api/gif/${name}.gif`;
+    const body = await new Promise((r) => strip.toBlob(r, 'image/jpeg', 0.92));
+    return (await fetch(`${url}?n=${NFRAME}`, { method: 'POST', body })).ok && url;
+  })();
+  const url = await c[name];
+  if (!url) delete c[name];                     // failed: try again next hover
+  else if (gifName(t) === name) im.src = url;   // unless the picture changed meanwhile
 }
 
 function drawMode() {
@@ -938,8 +973,8 @@ const maxOf = (sets) => peakOf(sets, (m, r, c) => Math.hypot(m.u[r][c], m.v[r][c
 const zmax = (sets) => peakOf(sets, (m, r, c) => Math.abs(m.z[r][c]));
 
 // `at(r, c)` places each cell's arrow: an abstract grid (cellAt) or a laser's photo spot.
-function arrows(g, sets, at, k, fan) {
-  const t = Math.cos((S.frame / NFRAME) * 2 * Math.PI);
+function arrows(g, sets, at, k, fan, frame = S.frame) {
+  const t = Math.cos((frame / NFRAME) * 2 * Math.PI);
   sets.forEach((s, n) => {
     const a = fan ? (n / sets.length) * 2 * Math.PI : 0;
     const ox = fan * Math.cos(a), oy = fan * Math.sin(a);
@@ -1062,8 +1097,8 @@ function axes3d(g, scr, R, C, zlim, labels) {
    overlaid surface interleaves correctly instead of one being painted flat on top. */
 // k: samples per laser cell. Tiles and busy overlays draw the bare 10x10 grid (k = 1); only
 // the big plot with one or two surfaces is refined, so many surfaces at once stay cheap.
-function surfaces(g, sets, w, h, R, C, max, k = 1) {
-  const t = Math.cos((S.frame / NFRAME) * 2 * Math.PI);
+function surfaces(g, sets, w, h, R, C, max, k = 1, frame = S.frame) {
+  const t = Math.cos((frame / NFRAME) * 2 * Math.PI);
   // Height in camera units, relative to the unit-square footprint. Shared by every set,
   // so an overlay compares amplitudes rather than normalising them apart.
   const zk = (0.55 * S.asize) / (max || 1);
@@ -1241,7 +1276,8 @@ function field(g, w, h, m, R, C, max = peak(m)) {
    cursor, or the cursor on a saved curve (a peak, or any frequency clicked on the
    spectrum) -- with a button to add it to that position's row. Below, one ROW per saved
    position: its three strongest peaks plus any frequency you added, in increasing frequency. Click
-   a tile to show / hide it in the big plot above; that plot overlays every shown tile.
+   a tile's eye to show / hide it in the big plot above (that plot overlays every shown tile),
+   its x to drop it from the row; a click anywhere else on the tile just moves the cursor there.
    Every tile shares the big plot's animation clock, so play moves all of them together. */
 function fieldGrid() {
   const box = $('#fgrid');
@@ -1252,6 +1288,7 @@ function fieldGrid() {
   // the active curve) sits off the row. The cursor's tile is marked (.cur) and shows the
   // hover preview.
   const cur = cursorSet(), act = cur && ownerOf(cur.who);
+  const eye = isBox() ? '' : `<button class="eye" title="show / hide in the big plot">${EYE}</button>`;
   const rows = rowOwners().map((p) => {
     const live = p === S.liveP, d = live ? S.probe : p.data, curFi = p === act ? cur.fi : null;
     const fis = p.row.map((x) => x.fi);
@@ -1262,25 +1299,40 @@ function fieldGrid() {
         : `<i class="sw" style="background:${col(p)}"></i>${sampleLine(p.meta)}` +
           `<span class="an"><button class="link" data-all="${p.id}">all</button>` +
           `<button class="link" data-none="${p.id}">none</button></span>`,
-      tiles: fis.map((fi) => ({
-        who: live ? 'live' : p, fi, c: col(p, 1, rowShade(p, fi)), id: live ? 0 : p.id, t: cap(fi, d),
-        m: fi === curFi ? cur.m : modeAt(p, fi),
-        cls: (p.row.find((x) => x.fi === fi)?.on ? 'on' : 'off') + (fi === curFi ? ' cur' : ''),
-      })),
+      tiles: fis.map((fi) => {
+        const x = p.row.find((r) => r.fi === fi);
+        return {
+          who: live ? 'live' : p, fi, c: col(p, 1, rowShade(p, fi)), id: live ? 0 : p.id,
+          // eye: show / hide in the big plot (the box views have none); x: drop from the row
+          t: cap(fi, d) + `<span class="ftools">${eye}${x ? '<button class="x" title="remove">×</button>' : ''}</span>`,
+          m: fi === curFi ? cur.m : modeAt(p, fi),
+          cls: (x?.on ? 'on' : 'off') + (fi === curFi ? ' cur' : ''),
+        };
+      }),
     };
   });
   const tiles = rows.flatMap((r) => r.tiles);
   if (!tiles.length) { box.innerHTML = ''; box.dataset.sig = ''; return; }
 
   // rebuild only when the tiles change, not every animation frame
+  const bv = boxView();
   const html = `<div class="frows">` + rows.map((r) =>
     `<div class="frow"><div class="frowhd">${r.hd}</div><div class="fgrid-rest">` +
     r.tiles.map((s) => `<figure data-id="${s.id}" class="${s.cls}" style="--c:${s.c}">` +
-      `<canvas width="124" height="124"></canvas><figcaption>${s.t}</figcaption></figure>`).join('') +
+      `<canvas width="124" height="124"></canvas><img class="gifsave" alt=""><figcaption>${s.t}</figcaption></figure>`).join('') +
     `</div></div>`).join('') + `</div>`;
   if (box.dataset.sig !== html) {
     box.dataset.sig = box.innerHTML = html;
-    box.querySelectorAll('figure').forEach((f, i) => (f.onclick = () => pickPeak(tiles[i].who, tiles[i].fi, true)));
+    box.querySelectorAll('figure').forEach((f, i) => {
+      f.onclick = (e) => {
+        const t = box._tiles[i], p = ownerOf(t.who), x = p.row.find((r) => r.fi === t.fi);
+        if (x && e.target.closest('.eye')) x.on = !x.on;
+        else if (e.target.closest('.eye, .x')) toggleMode(p, t.fi);   // cursor tile joins, shown / x drops
+        else return pickPeak(t.who, t.fi);                            // elsewhere: just move the cursor
+        paintAll();
+      };
+      f.onpointerenter = () => gifFor(f, box._tiles[i]);
+    });
     box.querySelector('.fadd')?.addEventListener('click', pin);
     // all / none: every tile of that row into the big plot, or out of it
     box.querySelectorAll('[data-all], [data-none]').forEach((b) => (b.onclick = () => {
@@ -1299,27 +1351,29 @@ function fieldGrid() {
      overlaid plot above is for -- on a shared scale here, a weak mode would collapse into
      invisible arrows and the shape, the only thing these tiles are for, would be lost.
      And each on its OWN laser grid: a probe from another box may not match this one's. */
-  const bv = boxView();
   box.style.setProperty('--ta', bv ? bv.w / bv.h : 1);          // box tiles take the photo crop's shape
   box.querySelectorAll('figure canvas').forEach((cv, i) => {
     const t = tiles[i], [g, w, h] = fit(cv);
-    if (!t.m) return;                           // still loading
-    // a probe from another box has its own photo, not this one
-    if (bv && fitsGrid(t.m) && (t.who === 'live' || t.who.ds === S.info.dataset)) {
-      if (S.modeview === 'inout' && !hasZ([t])) return stale(g, w, h);
-      return drawBox(g, w, h, t.m, bv);
-    }
-    const R = t.m.u.length, C = t.m.u[0].length, cw = w / C, chh = h / R;
-    if (S.modeview === 'surface') {
-      if (!hasZ([t])) return stale(g, w, h);
-      surfaces(g, [t], w, h, R, C, zmax([t]));
-      return;
-    }
-    const max = maxOf([t]);
-    if (S.fieldbg) field(g, w, h, t.m, R, C, max);
-    const k = (Math.min(cw, chh) * 0.42 * S.asize) / (max || 1);
-    arrows(g, [{ m: t.m, c: S.fieldbg ? '#fff' : t.c }], cellAt(cw, chh), k, 0);
+    if (t.m) drawTile(g, w, h, t, bv);          // else still loading
   });
+}
+
+// one mode tile at one frame -- the live tiles and their GIFs (gifFor) both draw through this
+function drawTile(g, w, h, t, bv, frame = S.frame) {
+  // a probe from another box has its own photo, not this one
+  if (bv && fitsGrid(t.m) && (t.who === 'live' || t.who.ds === S.info.dataset)) {
+    if (S.modeview === 'inout' && !hasZ([t])) return stale(g, w, h);
+    return drawBox(g, w, h, t.m, bv, frame);
+  }
+  const R = t.m.u.length, C = t.m.u[0].length, cw = w / C, chh = h / R;
+  if (S.modeview === 'surface') {
+    if (!hasZ([t])) return stale(g, w, h);
+    return surfaces(g, [t], w, h, R, C, zmax([t]), 1, frame);
+  }
+  const max = maxOf([t]);
+  if (S.fieldbg) field(g, w, h, t.m, R, C, max);
+  const k = (Math.min(cw, chh) * 0.42 * S.asize) / (max || 1);
+  arrows(g, [{ m: t.m, c: S.fieldbg ? '#fff' : t.c }], cellAt(cw, chh), k, 0, frame);
 }
 
 /* Recovered-audio small-multiples: same single grid as the mode tiles above. Each
@@ -1709,14 +1763,13 @@ const pkState = (c, i) => {
   const x = ownerOf(c.who).row?.find((r) => r.fi === i);
   return x ? (x.on ? ' pick' : ' in') : '';
 };
-/* Show / hide fi in p's row. A frequency not in the row joins it, shown; hiding one you
-   added drops it again, while the three strongest stay as tiles to switch back on. */
+/* Add fi to p's row, shown, or -- already in it -- drop it; the same for every tile, the
+   three strongest included. Showing / hiding without dropping is the tile's eye. */
 function toggleMode(p, fi) {
   const x = p.row.find((r) => r.fi === fi);
   if (!x && !modeAt(p, fi) && p.ds !== S.info.dataset) return;   // can't be fetched from here
-  if (!x) p.row.push({ fi, on: true, top: false });
-  else if (x.on && !x.top) p.row = p.row.filter((r) => r !== x);
-  else x.on = !x.on;
+  if (!x) p.row.push({ fi, on: true });
+  else p.row = p.row.filter((r) => r !== x);
 }
 /* Arrows over the mode tiles: left/right to the previous / next tile in reading order,
    up/down to the tile straight above / below. Landing on one moves the cursor there. */
@@ -1734,7 +1787,7 @@ function stepTile(dx, dy) {
   if (next) { const s = box._tiles[figs.indexOf(next)]; pickPeak(s.who, s.fi); }
 }
 
-// Space: show / hide the cursor's frequency in its row
+// Space: add the cursor's frequency to its row, or drop it
 function addCursor() {
   const a = activeCol();
   if (a) pickPeak(a.who, a.fi, true);
@@ -2930,7 +2983,7 @@ function newProbe() {
   const live = S.liveP?.row || [];
   p.row = live.some((x) => x.on) ? live.map((x) => ({ ...x }))
     : byMag(S.probe || {}).slice(0, NTOP).map((fi, r) => ({ fi, on: r === 0, top: true }));
-  if (!p.row.length && S.fi != null) p.row = [{ fi: S.fi, on: true, top: false }];
+  if (!p.row.length && S.fi != null) p.row = [{ fi: S.fi, on: true }];
   p.cur = S.fi ?? p.row[0]?.fi;            // the cursor stays where it was
   for (const fi of pk) modeAt(p, fi);     // every peak, so they all still work from another box
   S.probes.push(p);
@@ -3594,7 +3647,7 @@ function wire() {
      moves; double-click resets. A drag that moved doesn't also count as a tile click. */
   let drag = null, rotRaf = 0;
   const onDown = (e) => {
-    if (S.modeview !== 'surface' || !e.target.closest('canvas')) return;
+    if (S.modeview !== 'surface' || !e.target.closest('canvas, .gifsave')) return;
     drag = { x: e.clientX, y: e.clientY, az: S.cam.az, el: S.cam.el, moved: false };
   };
   addEventListener('pointermove', (e) => {
@@ -3605,12 +3658,12 @@ function wire() {
     rotRaf ||= requestAnimationFrame(() => { rotRaf = 0; drawMode(); });
   });
   addEventListener('pointerup', () => {
-    if (drag?.moved) { S.justDragged = true; setTimeout(() => (S.justDragged = false), 0); }
+    if (drag?.moved) { S.justDragged = true; setTimeout(() => (S.justDragged = false), 0); $('#fgrid figure:hover')?.onpointerenter(); }
     drag = null;
   });
   for (const el of [$('#mode'), $('#fgrid')]) {
     el.addEventListener('pointerdown', onDown);
-    el.addEventListener('dblclick', () => { if (S.modeview === 'surface') { S.cam = { az: -60, el: 25 }; drawMode(); } });
+    el.addEventListener('dblclick', () => { if (S.modeview === 'surface') { S.cam = { az: -60, el: 25 }; drawMode(); $('#fgrid figure:hover')?.onpointerenter(); } });
   }
   $('#fgrid').addEventListener('click', (e) => { if (S.justDragged) e.stopPropagation(); }, true);
 

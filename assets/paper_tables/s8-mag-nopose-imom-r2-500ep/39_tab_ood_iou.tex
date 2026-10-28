@@ -1,0 +1,16 @@
+\begin{table}
+\caption{Out of distribution: IoU on conditions never seen in training, per box}
+\label{tab:ood_iou}
+\begin{tabular}{l!{\vrule width 1.2pt}ccc!{\vrule width 1.2pt}c}
+\toprule
+ & gastro & plastic & cardboard & all \\
+\midrule
+in distribution & 0.621 {\scriptsize $\pm$0.193} & \bfseries 0.670 {\scriptsize $\pm$0.157} & 0.616 {\scriptsize $\pm$0.205} & 0.635 {\scriptsize $\pm$0.189} \\
+unseen speaker & 0.124 {\scriptsize $\pm$0.140} & \bfseries 0.598 {\scriptsize $\pm$0.139} & 0.368 {\scriptsize $\pm$0.339} & 0.364 {\scriptsize $\pm$0.281} \\
+unseen object & \bfseries 0.627 {\scriptsize $\pm$0.094} & 0.470 {\scriptsize $\pm$0.152} & 0.551 {\scriptsize $\pm$0.201} & 0.539 {\scriptsize $\pm$0.166} \\
+unseen rotation & 0.450 {\scriptsize $\pm$0.049} & \bfseries 0.538 {\scriptsize $\pm$0.087} & — & 0.494 {\scriptsize $\pm$0.086} \\
+unseen speckles & — & \bfseries 0.403 {\scriptsize $\pm$0.148} & 0.147 {\scriptsize $\pm$0.242} & 0.249 {\scriptsize $\pm$0.245} \\
+lid on & \bfseries 0.100 {\scriptsize $\pm$0.165} & 0.087 {\scriptsize $\pm$0.181} & 0.078 {\scriptsize $\pm$0.190} & 0.088 {\scriptsize $\pm$0.181} \\
+\bottomrule
+\end{tabular}
+\end{table}

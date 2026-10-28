@@ -676,14 +676,14 @@ body.dragging-col .hgrip { cursor: grabbing; }
 /* Target-object marks over the server-rendered GT PNG. Not part of .gtimg, so the cube
    opacity slider fades the mask without fading the annotation on top of it. */
 .gtcoms { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
-/* The mask fills its wrapper, which owns the size and the backdrop. Ground truth is NOT
-   faded by the Prediction slider; over a photo it carries only the server's overlay gain,
-   matching the canvas cells. */
+/* The mask fills its wrapper, which owns the size and the backdrop. The Objects slider
+   fades it like every other object mask; over a photo it also carries the server's
+   overlay gain, matching the canvas cells. */
 .gtimg {
   width: 100%; height: 100%; display: block; border-radius: 3px;
-  image-rendering: pixelated;
+  image-rendering: pixelated; opacity: var(--mask-op);
 }
-.gtwrap.bg .gtimg { opacity: var(--gt-gain); }
+.gtwrap.bg .gtimg { opacity: calc(var(--gt-gain) * var(--mask-op)); }
 
 .gtcell { cursor: pointer; }
 .gtcell:hover .gtwrap { outline: 2px solid var(--accent); outline-offset: 1px; }
@@ -905,6 +905,19 @@ body.nosidebar #focus-head { padding-left: 18px; }
   box-shadow: 0 20px 50px rgba(0,0,0,.3);
 }
 .sheet.wide { width: 1040px; }
+/* The sample popup covers the table only: the sidebar stays live beside it, and its
+   controls restyle the sample shown (paintModalLive). */
+#modal { left: 340px; padding: 12px; }
+body.nosidebar #modal { left: 0; }
+#modal .sheet.wide { width: 100%; height: 100%; }
+/* Side by side (stacked = drawn | real), each shrinking to fit, never taller than 56vh. */
+.mlive { display: flex; gap: 14px; margin-bottom: 14px; }
+.mlive figure { margin: 0; flex: 1 1 0; min-width: 0; max-width: calc(min(56vh, 620px) * var(--ml-asp, 1.3)); }
+.mlive canvas.mask {
+  display: block; width: 100%; height: auto; aspect-ratio: var(--ml-asp, 1.3);
+  border-radius: 4px; image-rendering: pixelated;
+}
+.mlive figcaption { font-size: 11px; color: var(--ink-3); margin-top: 4px; }
 .sheet-head {
   display: flex; align-items: center; justify-content: space-between;
   padding: 13px 16px; border-bottom: 1px solid var(--line); flex: none;

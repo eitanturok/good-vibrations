@@ -1,0 +1,16 @@
+\begin{table}
+\caption{Out of distribution: CoM error (\\% of box) on conditions never seen in training, per box}
+\label{tab:ood_com_err}
+\begin{tabular}{l!{\vrule width 1.2pt}ccc!{\vrule width 1.2pt}c}
+\toprule
+ & gastro & plastic & cardboard & all \\
+\midrule
+in distribution & 3.6 {\scriptsize $\pm$2.8} & \bfseries 3.6 {\scriptsize $\pm$3.0} & 3.8 {\scriptsize $\pm$3.5} & 3.7 {\scriptsize $\pm$3.2} \\
+unseen speaker & 15.0 {\scriptsize $\pm$14.3} & \bfseries 1.9 {\scriptsize $\pm$1.5} & 13.4 {\scriptsize $\pm$15.4} & 10.1 {\scriptsize $\pm$12.2} \\
+unseen object & \bfseries 2.1 {\scriptsize $\pm$1.1} & 3.7 {\scriptsize $\pm$1.8} & 3.4 {\scriptsize $\pm$4.6} & 3.3 {\scriptsize $\pm$2.8} \\
+unseen rotation & \bfseries 1.5 {\scriptsize $\pm$0.8} & 1.6 {\scriptsize $\pm$0.9} & — & 1.5 {\scriptsize $\pm$0.8} \\
+unseen speckles & — & \bfseries 3.3 {\scriptsize $\pm$2.2} & 29.3 {\scriptsize $\pm$22.0} & 18.9 {\scriptsize $\pm$21.2} \\
+lid on & 19.2 {\scriptsize $\pm$24.0} & \bfseries 18.6 {\scriptsize $\pm$13.4} & 34.3 {\scriptsize $\pm$19.5} & 24.1 {\scriptsize $\pm$19.5} \\
+\bottomrule
+\end{tabular}
+\end{table}

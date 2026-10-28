@@ -67,4 +67,74 @@
 | 37 | [See Through Walls with WiFi!](https://doi.org/10.1145/2486001.2486039) (Adib & Katabi SIGCOMM'13) | WiFi | Wave | Active | Motion, count | None | 1 / 2 |
 | 38 | [Person-in-WiFi: Fine-Grained Person Perception Using WiFi](https://openaccess.thecvf.com/content_ICCV_2019/html/Wang_Person-in-WiFi_Fine-Grained_Person_Perception_Using_WiFi_ICCV_2019_paper.html) (Wang+ ICCV'19) | WiFi | Wave | Active | **Image-space** mask + pose | Deep, camera-supervised | 5 / 1 |
 | 39 | [DensePose From WiFi](https://arxiv.org/abs/2301.00250) (Geng+ arXiv'22) | WiFi | Wave | Active | **Image-space** dense UV | Deep, camera-supervised | 5 / 1 |
-| — | *TODO: EIT / diffuse optical tomography with learned priors* | Boundary measurements | Response | Active | Image | Deep | 1 / 5 |
+| 40 | [An Investigation of Acoustic-to-Seismic Coupling to Detect Buried Antitank Landmines](https://ieeexplore.ieee.org/document/927429) (Sabatier & Xiang, IEEE TGRS'01) | Ground vib. / scanning LDV | Response | Active (airborne sound, ~80–300 Hz) | **Vibration image** → mine location | None | 3 / 1, 4 |
+| 41 | [Vibro-acoustography: An Imaging Modality Based on Ultrasound-Stimulated Acoustic Emission](https://pmc.ncbi.nlm.nih.gov/articles/PMC21961) (Fatemi & Greenleaf, PNAS'99; Science'98 original) | Hydrophone, after ultrasound radiation force | Response | Active (localized force) | **Image** | None (scanned) | 1 / 3 |
+| 42 | [Unsupervised Learning for Industrial Defect Detection: A Case Study on Shearographic Data](https://arxiv.org/abs/2511.02541) (Plassmann+ arXiv'25) | Speckle shearography | Response (loaded) | Active (thermal/pressure load) | Defect map | Deep (autoencoders) | 4 / 3 |
+| 43 | [Damage Identification and Health Monitoring of Structural and Mechanical Systems from Changes in Their Vibration Characteristics](https://public.lanl.gov/prime/doebling_svd.pdf) (Doebling, Farrar+ LANL'96) | Structural modes (review) | Response | Active / ambient | Detect → locate → size | Review (model-based) | 3 |
+| 44 | [A Review of Vibration-Based Damage Detection in Civil Structures: From Traditional Methods to ML and DL](https://arxiv.org/abs/2004.04373) (Avci+ MSSP'21) | Structural vib. (review) | Response | Active / ambient | Damage class / location | Review (ML, DL) | 3 |
+| 45 | Can One Hear the Shape of a Drum? (Kac, Amer. Math. Monthly'66) + [One Cannot Hear the Shape of a Drum](https://arxiv.org/abs/math/9207215) (Gordon, Webb, Wolpert, Bull. AMS'92) | Eigenvalue spectrum (theory) | Response | — | Shape identifiability | Theory | 3 / 1 |
+| 46 | [Touch & Activate: Adding Interactivity to Existing Objects using Active Acoustic Sensing](https://www.iplab.cs.tsukuba.ac.jp/en/paper/6151b7ff551fd46e82abdb1b) (Ono+ UIST'13) | Contact speaker + piezo mic | Response | Active sweep | Touch / grasp class | Classical ML (SVM) | 3 |
+| 47 | [Knocker: Vibroacoustic-based Object Recognition with Smartphones](https://nmsl.kaist.ac.kr/projects/knocker) (Gong+ IMWUT'19) | Phone mic + IMU | Source | Impact (knock) | Object class | Classical ML | 3 |
+| 48 | [Vibrosight: Long-Range Vibrometry for Smart Environment Sensing](https://www.figlab.com/research/2018/vibrosight) (Zhang, Laput, Harrison UIST'18) | Laser vibrometer + retroreflective tags | Source | Passive (appliance) | Activity class | Classical ML | 4 / 3 |
+| 49 | [VibroSense: Recognizing Home Activities by Deep Learning Subtle Vibrations … Using Laser Doppler Vibrometry](https://dl.acm.org/doi/10.1145/3411828) (IMWUT'20) | LDV, single point | Source | Passive | Activity class | Deep | 4 / 3 |
+| 50 | [LiquID: A Wireless Liquid IDentifier](https://faculty.cc.gatech.edu/~dhekne/liquid_mobisys2018.pdf) (Dhekne+ MobiSys'18) | UWB radio through container | Wave | Active | Liquid ID (permittivity) | Physics + classifier | 2 |
+| 51 | [Food and Liquid Sensing in Practical Environments using RFIDs](https://www.usenix.org/conference/nsdi20/presentation/ha) (RF-EATS, Ha+ NSDI'20) | RFID on container (near field) | Response | Active | Content class | Deep | 2 |
+| 52 | [Deep Neural Object Analysis by Interactive Auditory Exploration with a Humanoid Robot](https://arxiv.org/abs/1807.01035) (Eppe+ IROS'18) | Robot ears, shaken container | Source | Robot shaking | Material, weight | Deep | 2 / 3 |
+| 53 | [Self-Supervised Moving Vehicle Tracking With Stereo Sound](https://openaccess.thecvf.com/content_ICCV_2019/html/Gan_Self-Supervised_Moving_Vehicle_Tracking_With_Stereo_Sound_ICCV_2019_paper.html) (Gan+ ICCV'19) | Stereo mics | Source | Passive | **Image-space** boxes | Deep, vision teacher → audio student | 5 |
+| 54 | [Semantic Object Prediction and Spatial Sound Super-Resolution with Binaural Sounds](https://arxiv.org/abs/2003.04210) (Vasudevan+ ECCV'20) | 8 binaural mics | Source | Passive | **Image-space** semantic masks + depth | Deep, vision teacher → audio student | 5 |
+| 55 | Seeing through Sounds: Predicting Visual Semantic Segmentation Results from Multichannel Audio Signals (Irie+ ICASSP'19) | Mic array | Source | Passive | **Image-space** person masks | Deep, camera-supervised | 5 |
+| 56 | [Ambient Sound Provides Supervision for Visual Learning](https://arxiv.org/abs/1608.07017) (Owens+ ECCV'16) | Video + audio | — | Passive | Representation | Deep, cross-modal self-sup. | 5 |
+| 57 | [Through Fog High-Resolution Imaging Using Millimeter Wave Radar](https://arxiv.org/abs/1912.09579) (HawkEye, Guan+ CVPR'20) | mmWave heatmaps | Wave | Active | **Depth image** (car shape) | Deep (cGAN), stereo-camera supervised + sim | 5 / 1 |
+| 58 | [Image Reconstruction by Domain-Transform Manifold Learning](https://arxiv.org/abs/1704.08841) (AUTOMAP, Zhu+ Nature'18) | MRI k-space (any sensor domain) | — | Active | **Image** | Deep, direct sensor → image | 5 / 1 |
+| 59 | [Deep D-bar: Real-Time Electrical Impedance Tomography Imaging with Deep Neural Networks](https://ar5iv.arxiv.org/html/1711.03180) (Hamilton & Hauptmann, IEEE TMI'18) | Boundary voltages (EIT) | Response | Active (current injection) | **Conductivity image** | Deep + physics (post-processing) | 5 / 1 |
+| 60 | [OpenFWI: Large-scale Multi-structural Benchmark Datasets for Full Waveform Inversion](https://proceedings.neurips.cc/paper_files/paper/2022/hash/27d3ef263c7cb8d542c4f9815a49b69b-Abstract.html) (Deng+ NeurIPS'22 D&B) | Seismic waveforms (sim) | Wave | Active | **Velocity map** | Deep (InversionNet etc.), benchmark | 5 / 1 |
+| 61 | [Deep Learning Techniques for Inverse Problems in Imaging](https://arxiv.org/abs/2005.06001) (Ongie+ IEEE JSAIT'20) | Review | — | — | Image | Review: taxonomy by forward-model use | 5 |
+| 62 | [Lamphone: Passive Sound Recovery from a Desk Lamp's Light Bulb Vibrations](https://www.usenix.org/conference/usenixsecurity22/presentation/nassi) (Nassi+ USENIX Sec'22) | Photodiode + telescope | Recovery | Passive | Audio | None | 4 |
+| 63 | [Thermal Non-Line-of-Sight Imaging](https://visual.ee.ucla.edu/TNLOS_ICCP19.htm) (Maeda+ ICCP'19) | Long-wave IR camera | Wave (reflection) | Passive (object heat) | 2D shape, 3D location | Physics | 1 / 2 |
+| 64 | [A Survey on Wi-Fi Sensing Generalizability](https://arxiv.org/abs/2503.08008) (IEEE COMST'25) | Wi-Fi (survey) | Wave | Active | — | Survey: domain shift across rooms, devices, people | 1 |
+| 65 | [Characterization and Reduction of Artifacts in Limited Angle Tomography](https://www.math.uni-luebeck.de/veranstaltungen/vortraege/frikel.php) (Frikel & Quinto, Inverse Problems'13 ?) | X-ray CT (theory) | Wave | Active | — | Theory: missing angles → streaks | 1 |
+| 66 | [Experimental Analysis of the Acoustic Field of Air-Coupled Ultrasound](https://opus4.kobv.de/opus4-bam/files/52386/Buehling_et_al_+2021_Experimental_analysis_of_the_acoustic_field.pdf) (Buehling+ BAM'21) | Air-coupled ultrasound | Wave | Active | — | Air/solid impedance mismatch | 1 |
+| 67 | [HPS: X-ray security screening FAQ](https://hps.org/ate_faq/securityscreening/) (Health Physics Society) | X-ray | Wave | Active | — | Shielding / dose regulation (non-paper; replace with a proper cite) | 1 |
+| 68 | [Active Acoustic Contact Sensing for Soft Pneumatic Actuators](https://ieeexplore.ieee.org/document/9196916) (Zöller, Wall, Brock ICRA'20; IJRR'23 ext. [arXiv](https://arxiv.org/abs/2208.10299)) | Embedded speaker + mic | Response | Active sweep | Contact location, force, material | Classical ML (SVM) | 3 |
+| 69 | [See, Hear, and Feel: Smart Sensory Fusion for Robotic Manipulation](https://arxiv.org/abs/2212.03858) (Li+ CoRL'22) | Contact mic + camera + GelSight | Source | Manipulation contact | Policy | Deep (self-attention fusion) | 3 |
+| 70 | [Hearing Touch: Audio-Visual Pretraining for Contact-Rich Manipulation](https://arxiv.org/abs/2405.08576) (Mejia+ ICRA'24) | Contact mic + camera | Source | Manipulation contact | Policy | Deep (AV pretraining) | 3 |
+| 71 | [ManiWAV: Learning Robot Manipulation from In-the-Wild Audio-Visual Data](https://arxiv.org/abs/2406.19464) (Liu+ CoRL'24) | Contact mic in gripper finger | Source | Manipulation contact | Policy | Deep (diffusion policy) | 3 |
+
+## Clusters (finer than sections; row numbers)
+
+| Cluster | What it is | Rows | Gap it leaves for us |
+|---|---|---|---|
+| A. Wave imaging of hidden scenes | RF / mmWave / acoustic / optical NLOS; resolution set by wavelength and aperture | 4, 5, 6, 11, 34, 35, 37, 57 | Needs penetrating waves and an aperture; we use the enclosure's own low-frequency modes |
+| B. Camera-supervised non-visual → image | Camera as teacher, other sensor as student | 2, 7, 8, 9, 38, 39, 53, 54, 55, 56, 57 | All wave or source regime; none in the response regime |
+| C. Sound of impacts / interaction | Object emits its own signature | 12–15, 18, 19, 47, 52 | Needs contact or impact with the *object*; ours never touches it |
+| D. Active response sensing (ubicomp) | Excite a fixed object, classify the perturbation | 16, 17, 46, 51 | Output stays a class |
+| E. Inverse vibration / SHM / mass localization | Modal changes → damage or mass location | 20, 21, 22, 43, 44, 45 | Scalars or locations, mostly sim or model-based; identifiability theory (45) |
+| F. Active excitation + laser/speckle readout (NDT) | Drive with sound or force, scan the surface optically, find the hidden thing | 40, 41, 42 | Closest physical precedent; imaging is a raw vibration map, not learned, and not an object image |
+| G. Optical vibration sensing (recovery) | Recover the signal itself | 24–27, 33, 48, 49, 62 | Goal is the signal or an activity class, not the scene |
+| H. Visual vibrometry / material from motion | Modes from video → material properties | 23, 30, 31, 32, 36 | Properties of the vibrating object, not its contents |
+| I. Through-container content sensing | What's inside a sealed container | 3, 50, 51, 52 | Contents class (liquid, fill); no spatial layout |
+| J. Learned inverse problems / tomography | Learn the sensor → image inverse | 58, 59, 60, 61 | Forward model is known (MRI, EIT, FWI); ours has none, so we learn from camera labels |
+| K. Semantic audio → image | Plausible image, no geometry | 28, 29 | No physical grounding |
+| L. Room acoustics response | Fixed room, person changes the RIR | 10 | Room-scale, location only |
+
+## Narrative options for Related Work
+
+**N1. Taxonomy-led ("by regime")**: wave → source → response, then the empty cell.
+1. *Seeing with waves* (A, B wave rows): time-of-flight imaging works when there are penetrating waves and an aperture.
+2. *Listening to objects* (C, H): impacts and visual vibrometry infer object properties, but need contact or line of sight to the object.
+3. *Sensing by perturbation* (D, E, F, I, L): the object changes a fixed system's response. This is mature for classification and SHM localization; imaging exists only as raw NDT vibration maps.
+4. Close with Table 1 (the regime × output grid): ours is the only response-regime entry with image output.
+- Pros: clean and defensible, and it reuses the existing Regime column. Cons: reads like a survey, and the ML contribution shows up only at the end.
+
+**N2. Sensor → measurement → learning funnel (ML-venue framing)**
+1. *Optical vibration sensing* (G, 4): speckle and LDV now give multi-point kHz vibration cheaply. That is the enabling hardware.
+2. *Vibration as a probe of what's attached* (E, F, H, D, I): decades of SHM, NDT and ubicomp show that the response encodes mass and contact, but outputs are classes, scalars or raw maps. Kichler+ (3) is the nearest: same sensor, class output.
+3. *Learning to map non-visual signals to images* (B, J, K): camera-as-teacher works for RF, echoes and binaural sound, and learned inverse problems work when a forward model exists. We have neither a wave model nor a forward model, so camera supervision is the only inverse.
+- Pros: ends on our contribution, which suits CVPR/NeurIPS. Cons: hidden-scene radar (A) gets squeezed in as a side note.
+
+**N3. Problem-led ("seeing inside a closed box")**
+1. *Penetrate it* (A, I-RF): mmWave, RF and acoustic NLOS image or identify contents, but need wavelength-scale aperture or special hardware, and Wave-Former/GeRaF give 3D but need radar.
+2. *Shake or knock it* (C, I-shaking, 3): contents change the sound or vibration, giving material, fill level or count but not where things are.
+3. *Treat the box as the sensor* (E, F, 45, 40, 41): mass on a plate shifts its modes (Kac: identifiability is not guaranteed). Acoustic-to-seismic LDV and vibro-acoustography already scan a driven surface to find buried things, without learning and without an object image.
+4. *Learn the inverse* (B, J): with no tractable forward model, we borrow cross-modal supervision.
+- Pros: the strongest story. Each paragraph ends with the limitation the next one fixes, and the box-as-sensor idea gets a lineage. Cons: the sections cut across the existing 5-section structure.

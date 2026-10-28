@@ -253,6 +253,8 @@ def api_run(name: str, reload: int = 0):
             "skipped_files": rd.skipped_files, "n": len(rd.sample_ids),
             "missing": rd.missing,
             "epochs": registry.epochs(name),   # drives the epoch slider
+            # The run also draws the grayscale photo (src8 --gray): /api/frames?kind=gray.
+            "gray": rd.gray is not None,
             # Every dataset this run ACTUALLY predicted, read off its loaded rows. The scan's
             # entry.datasets only probes a few files, so a combined run looked single-dataset.
             "datasets": sorted({registry.locate(r)[1].experiment_dir.name for r in rd.row_of}),
@@ -406,7 +408,7 @@ def api_lut():
 
 
 @app.get("/api/frames")
-def api_frames(run: str, sids: str, epoch: str = "latest"):
+def api_frames(run: str, sids: str, epoch: str = "latest", kind: str = "mask"):
     """One epoch's masks for `sids` as fp16 [n_sids][H*W] (NaN = no prediction). Metrics are
     /api/run's (latest) and /api/epoch_metrics' (numbered). "latest" is served from the loaded
     run in memory; a numbered epoch reads only the rows asked for (data.load_epoch)."""
@@ -417,18 +419,36 @@ def api_frames(run: str, sids: str, epoch: str = "latest"):
     if not gids:
         raise HTTPException(400, "no sids")
     cells = entry.shape[0] * entry.shape[1]
+    gray = kind == "gray"   # the drawn photo instead of the mask, same rows, same layout
     if epoch == "latest":
         rd = _run(run)
+        src = rd.gray if gray else rd.masks
+        if src is None:
+            raise HTTPException(404, "run has no photo head")
         masks = np.full((len(gids), cells), np.nan, dtype=np.float16)
         for i, g in enumerate(gids):
             r = _sid(g)
             if r in rd.row_of:
-                masks[i] = rd.masks[rd.row_of[r]].reshape(-1)
+                masks[i] = src[rd.row_of[r]].reshape(-1)
     else:
-        masks = data.load_epoch(run, registry.runs_dir, registry, int(epoch), gids, cells)
+        masks = data.load_epoch(run, registry.runs_dir, registry, int(epoch), gids, cells,
+                                "gray_pred" if gray else "mask_pred")
     # "latest" moves as a run trains, so only numbered epochs are immutable.
     return Response(masks.tobytes(), media_type="application/octet-stream",
                     headers={"Cache-Control": "no-store"} if epoch == "latest" else IMMUTABLE)
+
+
+@app.get("/api/photos")
+def api_photos(sids: str, shape: str):
+    """The real grayscale photos of `sids` at grid `shape` ("64x64") as fp16 [n][H*W], the
+    target a --gray run's drawn photo is compared with (diff, stacked). One request per
+    screen; each photo is decoded once ever (render.photo_at caches it)."""
+    h, w = _parse_shape(shape)
+    rows = [_sid(s.strip()) for s in sids.split(",") if s.strip()]
+    if not rows or h * w > 512 * 512:
+        raise HTTPException(400, "no sids or bad shape")
+    out = np.stack([render.photo_at(r, h, w) for r in rows])
+    return Response(out.tobytes(), media_type="application/octet-stream", headers=IMMUTABLE)
 
 
 @app.get("/api/epoch_metrics")

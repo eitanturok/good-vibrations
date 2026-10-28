@@ -1,0 +1,14 @@
+\begin{table}
+\caption{In distribution, every object and box: VibroFormer vs nearest-neighbour baselines (mean over objects and boxes)}
+\label{tab:baselines}
+\begin{tabular}{l!{\vrule width 1.2pt}cc!{\vrule width 1.2pt}cc!{\vrule width 1.2pt}cc}
+\toprule
+ & \multicolumn{2}{c}{IoU $\uparrow$} & \multicolumn{2}{c}{Miss rate $\downarrow$} & \multicolumn{2}{c}{Centroid error (\% of box) $\downarrow$} \\
+ & train & eval & train & eval & train & eval \\
+\midrule
+VibroFormer (ours) & 0.906 {\scriptsize $\pm$0.043} & \bfseries 0.635 {\scriptsize $\pm$0.189} & 0.000 {\scriptsize $\pm$0.010} & \bfseries 0.002 {\scriptsize $\pm$0.051} & 0.4 {\scriptsize $\pm$0.7} & \bfseries 3.7 {\scriptsize $\pm$3.2} \\
+$f_\text{nn-vib}$ & 1.000 & 0.363 {\scriptsize $\pm$0.258} & 0.000 & 0.107 {\scriptsize $\pm$0.285} & 0.0 & 8.5 {\scriptsize $\pm$7.2} \\
+$f_\text{nn-oracle}$ & 1.000 & 0.519 {\scriptsize $\pm$0.228} & 0.000 & 0.004 {\scriptsize $\pm$0.034} & 0.0 & 5.0 {\scriptsize $\pm$4.0} \\
+\bottomrule
+\end{tabular}
+\end{table}

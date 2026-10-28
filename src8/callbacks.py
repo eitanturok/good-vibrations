@@ -79,6 +79,11 @@ class VisualizeSMask(Callback):
             images = [render(pe[i].numpy(), te[i].numpy(), f"{b['position_id'][i]}-{b['speaker'][i]} edge", aspect=b["crop_w"][i].item() / b["crop_h"][i].item())
                       for i in range(len(pe))]
             logger.log_images(images, name=f"Edge/{state.dataloader_label}", channels_last=True, use_table=False)
+        if "gray_pred" in state.outputs:  # --gray: the drawn photo vs the real one
+            pg, tg = state.outputs["gray_pred"][:self.n].detach().float().clamp(0, 1).cpu(), b["gray"][:self.n].float().cpu()
+            images = [render(pg[i].numpy(), tg[i].numpy(), f"{b['position_id'][i]}-{b['speaker'][i]} L1={(pg[i] - tg[i]).abs().mean():.3f}", aspect=b["crop_w"][i].item() / b["crop_h"][i].item())
+                      for i in range(len(pg))]
+            logger.log_images(images, name=f"Gray/{state.dataloader_label}", channels_last=True, use_table=False)
         if "peak_rays" in state.outputs:  # polar head
             o = {k: state.outputs[k][:self.n].detach().float().cpu() for k in ("center_logits", "centerness_logits", "peak_rc", "peak_rays", "peak_keep", "peak_scores") if k in state.outputs}
             score = o["center_logits"].sigmoid() * o["centerness_logits"].sigmoid() if "center_logits" in o else torch.zeros_like(pred)  # slots: no center map
@@ -233,6 +238,7 @@ class EvalSummary(Callback):
     CORE = ("candle", "cube", "soap-dispenser", "vase")   # the four base objects, every box: the headline (src8)
     HARD = "eval/cardboard/soap-dispenser-rotated"         # the hardest case we care about
     UNSEEN_ANGLE = "eval/cardboard/soap-dispenser-unseen-angle"  # --dataset *_wedge: rotated soap at angles never trained on
+    UNSEEN_POS = "unseen-position"                                # --dataset *_region: base objects in a floor region never trained on, every box
 
     def summarize(self, logger):
         splits, self.splits = self.splits, {}
@@ -240,6 +246,7 @@ class EvalSummary(Callback):
         if core: logger.log_metrics({f"metrics/eval/core/{k}": v for k, v in nanmean(core).items()})
         if self.HARD in splits: logger.log_metrics({f"metrics/eval/hard/{k}": v for k, v in splits[self.HARD].items()})
         if self.UNSEEN_ANGLE in splits: logger.log_metrics({f"metrics/eval/unseen_angle/{k}": v for k, v in splits[self.UNSEEN_ANGLE].items()})
+        if pos := [v for l, v in splits.items() if l.split("/", 2)[-1] == self.UNSEEN_POS]: logger.log_metrics({f"metrics/eval/unseen_position/{k}": v for k, v in nanmean(pos).items()})
         for box, cats in self.categories.items():
             have = {l.split("/", 2)[2]: v for l, v in splits.items() if l.split("/")[1] == box}  # eval/<box>/<split>
             if not have: continue

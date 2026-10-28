@@ -20,16 +20,17 @@ CACHE = ROOT / "runs/_score_truth"
 
 def sample_dir(exp, sid, pos, spk): return EXPERIMENTS / exp / "samples" / (f"{sid:06d}" if sid >= 0 else f"{pos:06d}-{spk}")
 
-def truth(exp, sid, pos, spk, H, W):
-    """(H,W) true mask in [0,1]; a with-lid sample takes the mask of its without-lid twin (process_y). Cached per sample"""
-    f = CACHE / f"{H}x{W}" / exp / f"{sid}_{pos}_{spk}.npy"
+def truth(exp, sid, pos, spk, H, W, gray=False):
+    """(H,W) true mask in [0,1]; a with-lid sample takes the mask of its without-lid twin (process_y). Cached per sample.
+    gray: the overhead photo in grayscale instead (dataset.process_y's gray target)"""
+    f = CACHE / f"{H}x{W}{'_gray' if gray else ''}" / exp / f"{sid}_{pos}_{spk}.npy"
     if f.exists(): return np.load(f)
     d = sample_dir(exp, sid, pos, spk)
     meta = load_meta(d)
     if "without_lid_position_id" in meta: d = sample_dir(exp, -1, meta["without_lid_position_id"], spk)
     if not d.exists():  # numbered dirs (gastro): find the twin by metadata
         d = next(s for s in (EXPERIMENTS / exp / "samples").iterdir() if (m := load_meta(s)).get("position_id") == meta["without_lid_position_id"] and m.get("speaker") == spk)
-    img = Image.open(d / "image/03_smask.png").convert("F")
+    img = Image.open(d / "image/02_cropped_overhead.png").convert("L") if gray else Image.open(d / "image/03_smask.png").convert("F")
     y = np.clip(np.asarray(img.resize((W, H), Image.BOX), dtype=np.float32) / 255.0, 0, 1)
     f.parent.mkdir(parents=True, exist_ok=True); np.save(f, y)
     return y
@@ -146,7 +147,7 @@ def summarize(df, cols):
     sp["category"] = [cat.get(s, "?") for s in sp.split]
     out = {}
     for (b, c), g in sp.groupby(["box", "category"]): out[f"{b}/{c}"] = g[cols].mean()
-    nc = sp[~sp.category.isin(["control", "unseen-angle"])]                            # unseen-angle: WEDGE, on its own (ALL stays comparable)
+    nc = sp[~sp.category.isin(["control", "unseen-angle", "unseen-position"])]         # WEDGE and UNSEEN-POS on their own (ALL stays comparable)
     for b, g in nc.groupby("box"): out[f"{b}/all"] = g[cols].mean()
     core = sp[sp.split.isin(["candle", "cube", "soap-dispenser", "vase"])]
     out["CORE"] = core[cols].mean()                                                    # the four base objects x 3 boxes: headline
@@ -157,6 +158,7 @@ def summarize(df, cols):
     wedge = df.position_id.astype(int).isin(UNSEEN_ANGLE)
     out["WEDGE"] = df[(df.box == "cardboard") & ((df.split == "soap-dispenser-unseen-angle") | rot & wedge)][cols].mean()
     out["HARD-kept"] = df[rot & ~wedge][cols].mean()
+    out["UNSEEN-POS"] = sp[sp.split == "unseen-position"][cols].mean()                # the *_region split: single objects >= half inside dataset.REGION, every box
     out["ALL"] = nc[cols].mean()
     out["ALL-ood"] = nc[nc.category != "id"][cols].mean()
     out["ALL-id"] = nc[nc.category == "id"][cols].mean()
@@ -175,4 +177,4 @@ if __name__ == "__main__":
         t = a.thr[0]
         s, _ = summarize(df, [f"iou@{t}", f"miss@{t}", f"phantom@{t}", f"area_ratio@{t}", f"biou@{t}", f"orient_err@{t}", "iou_auc", f"spk_consistency@{t}"])
         res[f"{run}@{ep}"] = s
-        print(f"\n== {run} ep{ep} ({len(df)} samples)\n" + s.loc[["CORE", "HARD", "HARD-kept", "WEDGE", "ALL", "ALL-ood"] + [k for k in s.index if k.endswith("/all")]].round(4).to_string())
+        print(f"\n== {run} ep{ep} ({len(df)} samples)\n" + s.loc[["CORE", "HARD", "HARD-kept", "WEDGE", "UNSEEN-POS", "ALL", "ALL-ood"] + [k for k in s.index if k.endswith("/all")]].round(4).to_string())

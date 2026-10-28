@@ -601,12 +601,111 @@ ep500, wedge split (compare HARD-kept / WEDGE with the old runs' rows above):
 - Worse everywhere, and on the unseen 30–60° wedge the angle error is 62.7°: it draws the soap at a trained angle, not between them. The explicit angle parameter (doubled-angle v from a Linear on the query) regresses the angle as a lookup, with no interpolation. A dense mask path (best-mag's canonical mask warped by the angle, or the plain direct head) degrades gracefully.
 - So an interpretable shape prior bolted on as a REGRESSED parameter hurts. The fair wedge baselines (best-mag-w, queries-w, nopose-imom-w) are running next.
 
+Fair wedge baselines (ep500, scored 2026-10-21 01:00):
+
+| run | CORE iou / miss | HARD-kept iou / ° | WEDGE iou / ° | ALL | both | union |
+|---|---|---|---|---|---|---|
+| s8-best-mag-w (1 pose slot) | **.743** / .004 | **.626** / **19.7** | **.557** / **23.5** | .408 | .47 | .366 |
+| s8-mag-queries-w (queries, no pose) | .731 / **.003** | .620 / 25.9 | .528 / 28.5 | **.411** | **.69** | **.413** |
+| s8-mag-qgauss-w | .712 / .009 | .583 / 32.4 | .450 / 62.7 | .383 | .68 | .385 |
+
+- Both dense decoders degrade gracefully on unseen angles: 4–11° worse than when the wedge was trained (best-mag 12.6 → 23.5°, queries 24.5 → 28.5°), not the 62.7° of the regressed angle.
+- best-mag still owns rotation (and found both objects in .47 of scenes here vs .36 before: noisy). queries-w is the better multi-object model at the same CORE.
+- nopose-imom-w (the simplest) is next after gray-w.
+
 ### Grayscale photo head (--gray, 2026-10-20)
 - `gray = (1 − m)·bg[box] + m·app`: bg a learned floor per box (a parameter), app a 2-conv head on the trunk's pixel features, m the predicted mask **detached** (the photo loss never moves the mask, so mask metrics stay comparable; the shared trunk still gets the appearance gradient).
 - The object is 2–5% of the image, so the loss is object-focused (`arch.gray_losses`): whole-image L1 of the composite + L1 of app on the TRUE object pixels, averaged over the object's own area (teacher-forced: appearance learns even where the mask is off) + L1 of image gradients within 2 px of the object (contour and inner detail stay sharp).
 - Eval metrics: `gray_l1`, `gray_obj_l1` (composite on the true object pixels), `gray_bg_l1` (the empty floor drawn there: the bar app must beat). The OutputSaver saves gray_pred / gray_app for viz.
 - Data check: floor brightness sd across photos is .003 / .002 / .010 (gastro / plastic / cardboard), so one learned floor per box is enough; objects are +.15–.30 brighter than the floor.
 - Queued: s8-mag-gray-w (nopose-imom + --gray), then s8-mag-query-w (all-attention pixel-query decoder, MULTI recipe, moved up), after nopose-imom-w.
+- **Bars for gray_obj_l1** (64×64, the training crop; scratchpad `gray_baselines.py`): the whole-image L1 is useless as a score (floor alone: .010; the object is 1–3% of pixels). On the object pixels:
+  - floor painted over the object (= gray_bg_l1): .30 average (gastro / plastic .25–.54, cardboard .06–.34: a darker floor, closer to the objects)
+  - oracle = true mask + the (box, object) train-mean brightness: .13 (cube .06–.08, vase .05–.06, candle .13–.16, soap .18–.21, coffee pot .18–.28, charger .25–.38)
+  - so app ≈ .13 means "knows what and where"; below that it draws texture (labels, the charger's print).
+- **s8-mag-gray-w (v1) failed to start learning; killed at ep~60.** At ep50 gray_obj_l1 = gray_bg_l1 on every split, and the drawn photo was 0.43–0.55 everywhere (true floor ≈ .13). Both the floor (a parameter at logit 0) and the appearance head started at a 0.5 gray. AdamW at lr 1e-4 (50 ep warmup, 11 steps / epoch) moves a parameter ~1e-4 per step, and the floor logit needs to reach ~−1.8. The mask head learns fine at that pace because its target is a shape, not an absolute level.
+- **Fix (s8-mag-gray-r2-w): predict differences from the empty box, starting from the data.** `dataset.gray_prior` gives the box's median train photo (the object covers 1–3% at scattered spots, so the median is the empty floor) and the mean object-vs-floor contrast (+1.18 logits). bg = σ(floor + d_bg), d_bg starting at 0; app = σ(floor + head(features)), head bias starting at +1.18. Before any training this already gives floor L1 .007 off the object and .185 on it (vs .25 floor only, .13 oracle). The floor is a buffer (in the checkpoint, kept out of the wandb config).
+- **gray-r2-w at ep50 learns.** The composite beats the floor on the base objects. Object L1 vs floor only: plastic candle .19 vs .45, plastic cube .14 vs .34, plastic vase .11 vs .18, gastro candle .22 vs .45. It's still at the floor on two-cubes, cardboard soap and coffee pot, where the mask is weak. The masks are unharmed: CORE .429 vs .425 for nopose-imom-r2 at ep50 (best-mag-w .347, queries-w .212). The plastic candle is drawn as a bright disc at the right spot and size. The gastro cube is faint, because its mask is soft at ep50.
+- **s8-mag-gray-r2-w at ep500: the first model that draws the photo** (`src8/gray_score.py`; L1 on the true object pixels; floor = the box's median photo, the same bar for every run):
+
+  | | drawn | app (true mask) | floor | brightness err | edge grad L1 |
+  |---|---|---|---|---|---|
+  | CORE | **.098** | .091 | .265 | .045 | .088 |
+  | HARD-kept | .174 | .174 | .198 | .044 | .141 |
+  | WEDGE | .183 | .189 | .192 | .048 | .154 |
+  | ALL | .163 | .159 | .240 | .114 | .109 |
+
+  - CORE .098 beats the .13 flat-colour oracle (true mask + the object's mean brightness), so it draws shape and inner detail. Per split: vase .05–.07, candle .07–.10, cube .09–.14, soap .12–.15, two-cubes .09–.18; coffee pot .18–.28 (unseen object).
+  - Pictures (`runs/gray/gray-r2-w_ep500.png`): trained objects come out at the right place, size and brightness, the soap with its dark pump even at unseen angles. Unseen objects (coffee pot, charger) are a generic light blob at the right spot, which is all the vibrations can tell. The 100 g cylinder is missed (as by the mask).
+  - Masks are unharmed (it is nopose-imom + the head): CORE .743 / miss .004, HARD-kept .608 / 26.9°, WEDGE .518 / 30.8°, ALL .415, both found .77, union .426.
+  - The cardboard soap at rotated angles is close to the floor (.17–.18 vs .19–.20). It's dark on a dark floor, and its masks there are the weakest.
+- **The photo head is free.** Same model without it (s8-mag-nopose-imom-w, ep500) vs gray-r2-w:
+
+  | run | CORE iou / miss | HARD-kept iou / ° | WEDGE iou / ° | ALL | both | union |
+  |---|---|---|---|---|---|---|
+  | nopose-imom-w | .740 / .003 | .609 / 27.4 | .526 / 32.1 | .412 | .74 | .416 |
+  | gray-r2-w | .743 / .004 | .608 / 26.9 | .518 / 30.8 | .415 | .77 | .426 |
+
+  All within noise; the counting columns are slightly better with the photo.
+- Queued next: s8-mag-gray-joint-w (`--gray-joint 1`: the composite's mask is not detached, so the photo's sharp edges also train the mask).
+- **s8-best-mag-gray-w (best-mag + --gray, ep500): better masks, worse photo, and the orientation hypothesis is refuted.**
+
+  | run | CORE iou | HARD-kept iou / ° | WEDGE iou / ° | both | union | photo CORE | photo HARD-kept | photo WEDGE |
+  |---|---|---|---|---|---|---|---|---|
+  | best-mag-gray-w | **.747** | **.625 / 19.1** | **.557 / 22.9** | .26 | .327 | .110 | .182 | .187 |
+  | gray-r2-w | .743 | .608 / 26.9 | .518 / 30.8 | **.77** | **.426** | **.098** | **.174** | **.183** |
+
+  - Its masks equal best-mag-w (the photo head is free here too), with the same weak counting (.26).
+  - The rotated-soap photo is NOT better with 8° better masks. In gray-r2-w the appearance head on the TRUE mask (.174) already equalled the drawn photo, so orientation never limited it. I should have read that column before queuing. The cardboard soap sits at the flat-colour oracle (.176 for cardboard soap): right brightness, no inner detail (pump, label) at the right angle.
+  - So the photo's remaining gap is appearance detail: an oriented texture, not the mask. Candidate: a canonical appearance template per object in the pose slot, warped with the canonical mask (one rotated textured object). This is interpretable, but it adds the pose branch, which costs counting.
+  - Cheaper test first, **s8-mag-gray-wide-w** (`--gray-layers 4`): the appearance head's 2 convs see 5 px, an object spans 10–15 px. With dilations 1, 2, 4 each pixel sees 17 px, enough to know which end of the object it is on. Queued after centernet-r3-w.
+- **s8-mag-centernet-r3-w (ep500): below gray-r2-w.** CORE .716 / miss .010, HARD-kept .553 / 20.7°, WEDGE .498 / 24.5°, ALL .399, both found .485, union .359. Better angles than the hybrid (20.7° vs 26.9°) but −.03 to −.06 iou and much weaker counting. Not pursued.
+- **Retrieval oracle for the photo: the template idea can't help.** For each eval sample, paint its true object pixels with the TRAIN photo of the same (box, object) whose true mask overlaps best (the best real template at the best available pose; scratchpad `gray_retrieval.py` on the 64×64 photos). L1 on the true object, vs gray-r2-w ep500:
+
+  | box / split | gray-r2 obj | app (true mask) | retrieval oracle | floor |
+  |---|---|---|---|---|
+  | cardboard soap | **.146** | .144 | .170 | .188 |
+  | cardboard soap-rotated / unseen-angle | **.174 / .183** | .174 / .189 | .183 / .190 | .198 / .192 |
+  | gastro soap | **.151** | .136 | .212 | .284 |
+  | plastic soap | **.120** | .110 | .158 | .281 |
+  | gastro cube | **.135** | .100 | .144 | .325 |
+  | plastic candle | .102 | .103 | .100 | .452 |
+  | plastic cube-shifted-lasers-2 / 3-backside | .177 / .306 | .151 / .262 | **.129 / .076** | .364 / .333 |
+  | cube-with-lid (gastro / plastic) | .249 / .312 | .271 / .313 | **.053 / .081** | .277 / .334 |
+  | cardboard glass-cup | .093 | .122 | .101 | **.078** |
+
+  - On known objects the drawn photo already beats a pasted real photo at the matching pose, even on the unseen soap angles. The L1 head outputs the conditional median, which is below any single photo's photo-to-photo variation (lighting, registration). The rest of that error is noise no template can remove, so the pose-slot template is dropped.
+  - Where the photo still loses, the cause is not the photo head:
+    - Masks on out-of-distribution inputs: the shifted lasers (plastic backside .306 vs the oracle's .076), and gastro cube with an unseen speaker (.255 vs .120 for the baseline speaker).
+    - Objects whose look it has never seen: cube-with-lid; the transparent glass cup, where the head paints an opaque object and is worse than drawing the floor (.122 vs .078).
+  - So better photos now come from better masks out of distribution, the same problem as the main goal.
+- **s8-mag-gray-wide-w (`--gray-layers 4`, ep500): photo no better, hard masks worse.**
+
+  | run | CORE iou | HARD-kept iou / ° | WEDGE iou / ° | both | union | photo CORE (app) | photo HARD-kept | photo WEDGE |
+  |---|---|---|---|---|---|---|---|---|
+  | gray-wide-w | .735 | .521 / 34.1 | .517 / 32.2 | .71 | .402 | .095 (.084) | .182 | .185 |
+  | gray-r2-w | .743 | .608 / 26.9 | .518 / 30.8 | .77 | .426 | .098 (.091) | .174 | .183 |
+
+  - Correction to "the photo head is free": only the composite's MASK is detached. The appearance head reads the decoder features undetached, so the photo loss trains the shared features. A CPU check gives decoder grad 218 from the photo loss alone. With 2 layers that cost nothing (gray-r2-w = nopose-imom-w); with 4 layers HARD-kept drops .09 with phantoms .10.
+  - Queued **s8-mag-gray-wide-detach-w** (`--gray-detach 1`: the head reads `feats.detach()`; decoder grad from the photo loss is then 0). If the hard masks come back to ~.60, the photo head is a pure read-out of what the mask features know, and can't hurt masks by construction. Pinned to `--gray-floor median` so it changes one thing.
+- **Floor = the first empty-box photo** (user, 10-21): `--gray-floor empty` is now the default. Each box's floor is the photo of its first (lowest-index) empty-box TRAIN sample (gastro 0, plastic 6155, cardboard 11891 in the wedge dataset). Older runs keep `median` (their args.json predates the flag). As a starting point it's equal to the median: eval L1 on the object .2549 vs .2547, off the object .0116 vs .0109 (the single photo carries its own noise, which the learned `gray_bg` absorbs). Queued **s8-mag-gray-empty-w** = gray-r2-w with the empty floor.
+- **Photo metric at the object's location: `loc`** (gray_score column; viz `ph-loc`): L1 over the TRUE object grown by a 2 px ring (5×5 dilation at 64×64). It charges the object's look AND its placement: an object drawn beside or bigger than the real one pays on the ring, one drawn too small or missed pays on the object. ep500 CORE / HARD-kept / WEDGE: gray-r2 .071 / .110 / .117, best-mag-gray .077 / .113 / .116, gray-wide .071 / .114 / .116. Viz shows ph-loc and ph-obj and drops the whole-photo L1 (~97% floor).
+- **s8-mag-query-w (all-attention: pixel-query decoder, d 256, MULTI recipe, ep500): clearly worse than the hybrid.** CORE .618 / miss .018, HARD-kept .462 / 33.2°, WEDGE .411 / 35.6°, ALL .313, both found .40, union .21, phantoms .39. That is about conv-conv (.626) and still above the s7 target (.580), but .125 below the hybrid conv decoder. Attention from pixel queries to the embedding doesn't replace the conv decoder's spatial prior at this data size. Not pursued; its attention maps could still be used for interpretability.
+- **gray-joint-w = gray-r2-w.** Masks CORE .740 / HARD-kept .592 / 27.7° / WEDGE .526 / 30.0°, both .77, union .426. Photo CORE .097 (vs .098). The photo doesn't make a better mask target, so the detached version stays (simpler).
+- The photo is now limited by orientation: on the rotated soap it is .17–.18 vs .20 for the floor, with masks at 27°. Queued **s8-best-mag-gray-w** = best-mag (one pose slot, 17–20°) + `--gray`. The composite is now built after the pose merge (m = the final mask), and `--gray` allows the pose branch (not slots).
+- **s8-mag-slots2-r3 (2 pose slots, DETR matching, BEST recipe, wedge split, ep500): rotation OK, multi-object collapsed.** CORE .731 / miss .009, HARD-kept .603 / 22.2°, WEDGE .535 / 24.1°, ALL .371. Two-object scenes: both found .13, none .39, phantom .84, n_blobs 3.6, union .136 (best-mag-w .47 / .366, gray-r2-w .77 / .426). The second slot fires off-object instead of on the second object. Not pursued: a slot per object doesn't buy counting at this data size.
+- Incident 2026-10-21: queue6 skipped gray-wide-detach-w and gray-empty-w. I inserted them after the running line, bash resumed at a shifted byte offset, ran the queue-5 tail and finished at 16:34; the GPU sat idle until 23:58. Both relaunched as `scripts/modal_src8_queue7.sh` (tmux train). Lesson: put new runs in a NEW queue script, never insert into a running one.
+
+## Unseen floor region: the default split from 2026-10-22
+- Until now no s8 run held out a region: each split's eval positions are a random 20%, within ~3% of the box of a trained position (interpolation). `--dataset paper` has a block, but decided by com: objects are ~0.13 box wide, so 31/79/68 trained positions (gastro/plastic/cardboard) still covered its 0.4–0.6 block and 72/83, 90/91, 95/112 of its eval objects stuck out of it.
+- **`gastronorm_plastic_cardboard_wedge_region`** (now run.py's default): the wedge split + `dataset.REGION` = rows .4–.6, cols .3–.5 (left of centre, the user's choice; lasers on the row-1 wall), decided by the FOOTPRINT (full-res 03_smask, `region_overlap`, cached in runs/_region_cache). Every trained split drops the positions with ANY object pixel in the region (multi-object scenes included; their eval positions are still drawn as before, then dropped, so every other eval split is a subset of the wedge run's). `<box>/unseen-position` = the base objects' single-object positions with ≥ 50% of the footprint inside (median 73–75%).
+- Checked (scratchpad check_region.py): 0 trained positions touch the region; train 11996 → 8984 samples (75%); unseen-position 72 / 64 / 65 positions (216 / 256 / 260 samples) gastro / plastic / cardboard; CORE eval 2330 → 1781 samples, rotated soap 100 → 92, two-cubes 186 → 127.
+- score.py `UNSEEN-POS` row (kept out of ALL, like WEDGE); wandb `metrics/eval/unseen_position/*`; category `unseen-position` in every box (NOT_OOD).
+- Rejected: eval objects fully inside (a 0.2 block fits 1–17 per box; a 0.3 block keeps only 45–65% of training).
+- Queued (scripts/modal_src8_queue8.sh, after gray-wide-detach-w): **s8-mag-gray-region** = gray-r2-w on this split (empty-box floor, the new default). queue7 was stopped before gray-empty-w (redundant: this run uses the empty floor).
+- 2026-10-21 00:50: gray-w moved ahead of nopose-imom-w / centernet-r3-w (the user's priority). wandb now logs `Gray/<split>` panels (drawn | real photo) every image interval.
+- Incident 2026-10-20 21:48: global OOM #3, caused by my 4 parallel candle-physics fits next to training; it killed queue 6 and s8-mag-queries-w at ep300 (kept as `runs/s8-mag-queries-w-500ep-oomkilled-ep300`). Restarted 22:17. Rule: at most one CPU job ≤ 6 GB next to training.
+- The NVIDIA userspace was upgraded on 10-20 (595.91 → 595.99) without a reboot: `nvidia-smi` fails (version mismatch), CUDA in new processes still works.
 
 ## Does the linear modal picture hold? (`src8/linear_physics.py`, nb110 to come; 2026-10-20)
 Theory (first-order Rayleigh): an object adds mass, so each mode's frequency drops by δω_n/ω_n ≈ −½∫ρφ_n², linearly in the mass, and dy ≈ Jρ.
@@ -644,3 +743,34 @@ dy = log power minus the nearest-in-time empty box of the same speaker, in ~7.7 
   - K = 24: .075 / .050
   - Bars: kNN on position .29; kNN in spectrum space .029
   - It underfits (train fve .10). Variants (finer floor basis, contact stiffness/damping) are running.
+  - A measured baseline per session (`--sessions 1`; o8 + contact, K = 24): fve .070 vs .061, localization .045 vs .044, train fve .115. Session drift is not what limits it. Next: L1 (the residuals are heavy-tailed: kurtosis 12–32).
+  - L1 (`--loss l1`, no sessions): worse. fve .030, localization .060, train fve .059. Robustness to outliers isn't the problem either. With train fve ≤ .12 against kNN's held-out .28, a point mass on 24 smooth floor modes can't express how the candle changes the spectrum. Paused in favour of the gray head (the user's priority). The next physics test would be a free per-cell floor field instead of the cosine basis.
+
+
+## Masks only; the unseen region breaks every model (2026-10-22)
+- The user dropped the photo: masks (03_smask) only from here on; the goal is a SIMPLE, intuitive architecture with the performance.
+- **s8-mag-gray-wide-detach-w**: detaching the wide head's features brings the masks back (HARD-kept .602 vs gray-wide-w .521, both .77 vs .71): the photo loss through the shared features was the harm. Moot now.
+- **s8-mag-gray-region (gray-r2-w on the region split): UNSEEN-POS iou .055, miss .53, phantom .57**, vs CORE .731 / HARD-kept .578 / WEDGE .478 / both .71. Not a bug: the mask's com lands a median .10/.14/.16 box (gastro/plastic/cardboard) from the truth, 25-55% of them right of the region and 10-23% left of it: the conv decoder paints TRAINED positions next to the hole, never in it. The regressed com head does better (median error .09/.10/.13, inside the region 53/49/32%), still ~4x its in-distribution error (.02-.03). So the models interpolate a dense position grid; they don't extrapolate 0.1 box into an unseen area.
+- Simple-hybrid ablations (original split, ep500, scored today; vs nopose-imom-r2 .742 / HARD-kept .584 / WEDGE .548 / both .78):
+
+  | run | CORE iou / miss | HARD-kept / ° | WEDGE | ALL | both | union |
+  |---|---|---|---|---|---|---|
+  | hybrid-mag-r2 (plain: mask BCE, default aux heads, no edge/moments/augs) | .659 / .025 | .555 / 29.0 | .475 | .348 | .52 | .349 |
+  | hybrid-nolaser-r2 (no laser blocks) | .647 / .030 | .520 / 30.8 | .435 | .339 | .50 | .336 |
+  | hybrid-nobn-r2 (no box norm) | .615 / .036 | .460 / 35.6 | .414 | .319 | .38 | .290 |
+
+  The recipe (edge + per-instance moments + orientation + laser jitter + colour aug) is worth +.083 CORE and +.26 both-found; box norm +.044; the laser blocks +.012.
+- Queued (scripts/modal_src8_queue9.sh, region split, masks only): nopose-imom-region (baseline), poseonly-region (one canonical shape at a regressed pose: does placing by regression extrapolate?), noaux-region (mask + edge + moments only).- 2026-10-22 15:00 (user): no learned pose / canonical shape, no noaux arm: queue9 stopped after its baseline (nopose-imom-region). Split audit (scratchpad splits_table.py): orig / wedge / region build from the same seeded draw, every eval split is a subset of the previous dataset's, 0 train/eval position overlap in all three; train 12080 / 11996 / 8984 samples. **From now on compare runs only on the region split**; older numbers are references. queue10: s8-s6-region (src8 --encoder conv with default flags = s6's model, s6's losses, hann) and s8-conv-imom-region (s6's arch + today's recipe), vs nopose-imom-region.
+- **Field decoders (arch.FieldDecoder, `--decoder field|modes`, 2026-10-22):** one small MLP (3 layers, width 128) SHARED by every floor cell, fed the cell's low-frequency Fourier features (`--field-freqs 5`: finest 8 cycles per box) + the box, conditioned on the measurement. `field` (v0): + W·embedding, the same for every cell (an implicit / CPPN decoder). `modes` (v1): m_k = mean over lasers of v_k(laser wall position)·z_l (laser tokens), c(r) = Σ_k u_k(r)·W m_k, K=32: learned floor shapes u_k and wall shapes v_k, both small MLPs of Fourier features + box, plottable. Decoder 0.17M / 0.10M params vs conv 14.3M (model 21.4M / 21.3M vs 35.5M). Hypothesis: smooth-in-position decoding fills the unseen region the conv decoder avoids. queue11 (region split, MULTI recipe, microbatch 256): field-region, modes-region, then s6-region and conv-imom-region; queue10 replaced before it started anything.
+
+### queue11 results (region split, 2026-10-25)
+| run | CORE iou/miss | HARD-kept | WEDGE | UNSEEN-POS iou/miss | ALL |
+|---|---|---|---|---|---|
+| s8-mag-nopose-imom-region (hybrid, conv dec) | .728/.009 | .592 | .478 | .055/.52 | .388 |
+| s8-mag-gray-region (same + gray head) | .731/.006 | .578 | .478 | .055/.53 | .389 |
+| s8-s6-region (original src6) | .591/.056 | .332 | .242 | .023/.69 | .286 |
+| s8-field-region | 0/1.0 | 0 | 0 | 0/1.0 | 0 |
+| s8-modes-region | .010/.90 | .002 | .011 | .041/.67 | .018 |
+- field: mask loss stuck at ~.085 (= empty-floor prior BCE) from epoch ~50; predicts nothing. modes: dips to .20 then climbs back; paints at 10% of samples. Both collapsed to the background prior: the per-cell MLP with additive conditioning + 5 low Fourier freqs never localises.
+- conv-imom-region crashed at step 0: KeyError 'orient' (conv encoder has no orient head; MULTI sets orient 1). Needs --orient-weight 0.
+- Best on region split: hybrid nopose-imom (conv decoder). s6 → hybrid: CORE +.14, HARD +.26, UNSEEN-POS .023 → .055. Unseen region still unsolved by every model.

@@ -1,0 +1,61 @@
+\begin{table}
+\caption{Dataset: samples, positions and speakers per split and box}
+\label{tab:dataset}
+\begin{tabular}{ll|ccc|ccc|ccc|c}
+\toprule
+ &  & \multicolumn{3}{c}{gastro} & \multicolumn{3}{c}{plastic} & \multicolumn{3}{c}{cardboard} & all boxes \\
+ &  & samples & positions & speakers & samples & positions & speakers & samples & positions & speakers & samples \\
+question & split &  &  &  &  &  &  &  &  &  &  \\
+\midrule
+\multirow[t]{6}{*}{in distribution} & candle & 780 & 260 & 3 & 1012 & 253 & 4 & 1156 & 289 & 4 & 2948 \\
+ & cube & 738 & 246 & 3 & 1008 & 252 & 4 & 1116 & 279 & 4 & 2862 \\
+ & cube-vase & 147 & 49 & 3 & 196 & 49 & 4 & 400 & 100 & 4 & 743 \\
+ & soap-dispenser & 735 & 245 & 3 & 1182 & 296 & 4 & 1088 & 272 & 4 & 3005 \\
+ & two-cubes & 216 & 72 & 3 & 320 & 80 & 4 & 392 & 98 & 4 & 928 \\
+ & vase & 804 & 268 & 3 & 1024 & 256 & 4 & 1028 & 257 & 4 & 2856 \\
+\cline{1-12}
+\multirow[t]{4}{*}{weight (trained)} & cylinder-1000g & 27 & 9 & 3 & 32 & 8 & 4 & 136 & 34 & 4 & 195 \\
+ & cylinder-100g & 6 & 2 & 3 & 28 & 7 & 4 & 172 & 43 & 4 & 206 \\
+ & cylinder-200g & — & — & — & 36 & 9 & 4 & 196 & 49 & 4 & 232 \\
+ & cylinder-500g & 27 & 9 & 3 & 32 & 8 & 4 & 200 & 50 & 4 & 259 \\
+\cline{1-12}
+\multirow[t]{2}{*}{rotated (trained)} & cube-rotated & — & — & — & — & — & — & 100 & 25 & 4 & 100 \\
+ & soap-dispenser-rotated & — & — & — & — & — & — & 620 & 155 & 4 & 620 \\
+\cline{1-12}
+\multirow[t]{2}{*}{unseen speaker} & cube-unseen-speaker-unseen & 35 & 35 & 1 & 40 & 40 & 1 & — & — & — & 75 \\
+ & vase-unseen-speaker-unseen & — & — & — & — & — & — & 10 & 10 & 1 & 10 \\
+\cline{1-12}
+\multirow[t]{4}{*}{unseen object} & biscoff & — & — & — & — & — & — & 36 & 9 & 4 & 36 \\
+ & coffee-pot & 24 & 8 & 3 & 344 & 86 & 4 & 36 & 9 & 4 & 404 \\
+ & portable-charger & — & — & — & 40 & 10 & 4 & 36 & 9 & 4 & 76 \\
+ & tomato-sauce & — & — & — & — & — & — & 36 & 9 & 4 & 36 \\
+\cline{1-12}
+unseen rotation & soap-dispenser-sideways & 18 & 6 & 3 & 28 & 7 & 4 & — & — & — & 46 \\
+\cline{1-12}
+unseen object + rotation & portable-charger-sideways & — & — & — & — & — & — & 36 & 9 & 4 & 36 \\
+\cline{1-12}
+\multirow[t]{5}{*}{unseen speckles} & cube-shifted-lasers-1 & — & — & — & 32 & 8 & 4 & — & — & — & 32 \\
+ & cube-shifted-lasers-2 & — & — & — & 32 & 8 & 4 & — & — & — & 32 \\
+ & vase-laser-shifted-2 & — & — & — & — & — & — & 36 & 9 & 4 & 36 \\
+ & vase-laser-shifted-3 & — & — & — & — & — & — & 36 & 9 & 4 & 36 \\
+ & vase-laser-shifted-4 & — & — & — & — & — & — & 36 & 9 & 4 & 36 \\
+\cline{1-12}
+\multirow[t]{2}{*}{lid on} & cube-with-lid & 15 & 5 & 3 & 32 & 8 & 4 & — & — & — & 47 \\
+ & vase-with-lid & — & — & — & — & — & — & 36 & 9 & 4 & 36 \\
+\cline{1-12}
+broken object & glass-cup-broken & — & — & — & — & — & — & 60 & 15 & 4 & 60 \\
+\cline{1-12}
+\multirow[t]{5}{*}{control} & cube-unseen-speaker-baseline & 105 & 35 & 3 & 160 & 40 & 4 & — & — & — & 265 \\
+ & cube-without-lid & 15 & 5 & 3 & 32 & 8 & 4 & — & — & — & 47 \\
+ & glass-cup & — & — & — & — & — & — & 60 & 15 & 4 & 60 \\
+ & vase-unseen-speaker-baseline & — & — & — & — & — & — & 40 & 10 & 4 & 40 \\
+ & vase-without-lid & — & — & — & — & — & — & 36 & 9 & 4 & 36 \\
+\cline{1-12}
+empty box & empty-box & 36 & 12 & 3 & 60 & 15 & 4 & 76 & 19 & 4 & 172 \\
+\cline{1-12}
+other (in no table) & cube-shifted-lasers-3-backside & — & — & — & 32 & 8 & 4 & — & — & — & 32 \\
+\cline{1-12}
+total &  & 3728 & 1231 & 4 & 5702 & 1416 & 5 & 7210 & 1800 & 5 & 16640 \\
+\bottomrule
+\end{tabular}
+\end{table}

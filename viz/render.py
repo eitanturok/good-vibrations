@@ -14,6 +14,10 @@ Every `sid` argument in this module is a ROW, not a sample id -- see SPEC.md.
 
 import io
 import os
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from functools import lru_cache
 
 import numpy as np
@@ -458,3 +462,49 @@ def cached_backdrop(sid: int) -> bytes | None:
     tmp.write_bytes(buf.getvalue())
     tmp.replace(dst)   # atomic: a concurrent request sees no file or the whole file
     return buf.getvalue()
+
+
+
+# The real overhead photo in grayscale at a run's grid: what a --gray run's drawn photo is
+# trained against (src8 dataset.process_y: 02_cropped_overhead.png, "L", BOX resize), so
+# diff, stacked and the photo metrics compare like with like. A full capture takes ~20ms to
+# decode, so each experiment's photos are decoded ONCE EVER into one (N, H*W) fp16 table
+# (~8KB a sample at 64x64), memory-mapped after that; rows follow the GtIndex.
+PHOTO = "image/02_cropped_overhead.png"
+_photo_lock = threading.Lock()
+
+
+def _photo_file(d: Path, layout_backdrop: str, h: int, w: int) -> np.ndarray:
+    src = d / PHOTO if (d / PHOTO).exists() else d / layout_backdrop
+    if not src.exists():
+        return np.full(h * w, np.nan, dtype=np.float16)
+    return (np.asarray(Image.open(src).convert("L").resize((w, h), Image.BOX), dtype=np.float32) / 255).astype(np.float16).reshape(-1)
+
+
+@lru_cache(maxsize=None)
+def photo_table(gi: int, h: int, w: int) -> np.ndarray:
+    from viz.app import registry
+    gt = registry.gts[gi]
+    dst = config.CACHE_DIR / "photo" / f"{gt.experiment_dir.name}-{h}x{w}.npy"
+    with _photo_lock:   # one build per table, even when several requests miss at once
+        if dst.exists():
+            t = np.load(dst, mmap_mode="r")
+            if len(t) == len(gt.sample_ids):
+                return t
+        base = registry.row_base(gi)
+        t0 = time.perf_counter()
+        with ThreadPoolExecutor(8) as ex:   # PIL decodes outside the GIL
+            t = np.stack(list(ex.map(lambda k: _photo_file(registry.sample_dir(base + k), gt.layout.backdrop, h, w),
+                                     range(len(gt.sample_ids)))))
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        tmp = dst.with_suffix(f".{os.getpid()}.tmp.npy")
+        np.save(tmp, t)
+        tmp.replace(dst)
+        print(f"[viz] photo table {dst.name}: {len(t)} photos, {time.perf_counter() - t0:.1f}s", flush=True)
+        return np.load(dst, mmap_mode="r")
+
+
+def photo_at(sid: int, h: int, w: int) -> np.ndarray:
+    from viz.app import registry
+    gi, _, local = registry.locate(sid)
+    return photo_table(gi, h, w)[local]

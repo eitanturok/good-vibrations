@@ -1,0 +1,13 @@
+\begin{table}
+\caption{In distribution, plastic: VibroFormer per object, on the held-out positions of trained objects}
+\label{tab:id_plastic}
+\begin{tabular}{l!{\vrule width 1.2pt}cccccc!{\vrule width 1.2pt}c}
+\toprule
+ & candle & cube & soap-dispenser & vase & two-cubes & cube-vase & mean \\
+\midrule
+IoU $\uparrow$ & 0.813 {\scriptsize $\pm$0.105} & 0.665 {\scriptsize $\pm$0.126} & 0.803 {\scriptsize $\pm$0.089} & \bfseries 0.815 {\scriptsize $\pm$0.092} & 0.423 {\scriptsize $\pm$0.157} & 0.458 {\scriptsize $\pm$0.132} & 0.663 {\scriptsize $\pm$0.163} \\
+Miss rate $\downarrow$ & 0.000 {\scriptsize $\pm$0.000} & 0.000 {\scriptsize $\pm$0.000} & 0.000 {\scriptsize $\pm$0.000} & 0.000 {\scriptsize $\pm$0.000} & 0.000 {\scriptsize $\pm$0.000} & 0.000 {\scriptsize $\pm$0.000} & 0.000 {\scriptsize $\pm$0.000} \\
+Centroid error (\% of box) $\downarrow$ & 1.6 {\scriptsize $\pm$1.1} & 1.3 {\scriptsize $\pm$0.8} & \bfseries 1.1 {\scriptsize $\pm$0.7} & 1.2 {\scriptsize $\pm$0.9} & 6.1 {\scriptsize $\pm$5.9} & 10.2 {\scriptsize $\pm$5.3} & 3.6 {\scriptsize $\pm$2.9} \\
+\bottomrule
+\end{tabular}
+\end{table}

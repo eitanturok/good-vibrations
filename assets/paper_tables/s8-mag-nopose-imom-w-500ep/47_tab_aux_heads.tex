@@ -1,0 +1,17 @@
+\begin{table}
+\caption{Auxiliary heads, all boxes}
+\label{tab:aux_heads}
+\begin{tabular}{l!{\vrule width 1.2pt}cccccc}
+\toprule
+ & in distribution & unseen speaker & unseen object & unseen rotation & unseen speckles & lid on \\
+\midrule
+object acc & 0.934 {\scriptsize $\pm$0.161} & 0.410 {\scriptsize $\pm$0.499} & — & 0.915 {\scriptsize $\pm$0.194} & 0.123 {\scriptsize $\pm$0.321} & 0.009 {\scriptsize $\pm$0.112} \\
+object count acc & 0.984 {\scriptsize $\pm$0.082} & 1.000 {\scriptsize $\pm$0.000} & 0.996 {\scriptsize $\pm$0.043} & 0.994 {\scriptsize $\pm$0.114} & 0.758 {\scriptsize $\pm$0.434} & 0.799 {\scriptsize $\pm$0.403} \\
+box acc & 1.000 {\scriptsize $\pm$0.000} & 1.000 {\scriptsize $\pm$0.000} & 1.000 {\scriptsize $\pm$0.000} & 1.000 {\scriptsize $\pm$0.000} & 1.000 {\scriptsize $\pm$0.000} & 1.000 {\scriptsize $\pm$0.000} \\
+CoM head err (\% box) & 4.420 {\scriptsize $\pm$3.676} & 10.996 {\scriptsize $\pm$10.762} & 5.088 {\scriptsize $\pm$3.110} & 3.445 {\scriptsize $\pm$4.034} & 19.378 {\scriptsize $\pm$16.573} & 22.570 {\scriptsize $\pm$12.031} \\
+area rel err & 0.108 {\scriptsize $\pm$0.090} & 0.501 {\scriptsize $\pm$0.336} & 0.313 {\scriptsize $\pm$0.166} & 0.199 {\scriptsize $\pm$0.135} & 0.566 {\scriptsize $\pm$0.353} & 1.099 {\scriptsize $\pm$0.711} \\
+orient err from mask ($^\circ$) & 6.476 {\scriptsize $\pm$7.838} & 20.332 {\scriptsize $\pm$18.352} & 19.583 {\scriptsize $\pm$16.840} & 67.113 {\scriptsize $\pm$30.556} & 28.069 {\scriptsize $\pm$30.903} & 28.911 {\scriptsize $\pm$26.944} \\
+novelty AUROC & — & 0.849 & 0.787 & 0.686 & 0.919 & 0.879 \\
+\bottomrule
+\end{tabular}
+\end{table}

@@ -747,10 +747,21 @@ h2 em.soft { color:var(--ink3); font-weight:400; margin-left:auto; }
    all / none sit flush with the third; tiles scale to the column */
 #fgrid .fgrid-rest { grid-template-columns:repeat(3, minmax(0, 1fr)); }
 #fgrid .fgrid-rest canvas { width:100%; height:auto; aspect-ratio:var(--ta, 1); }
+/* a mode tile's loop as a GIF, invisible over its canvas, so right-click saves the .gif (gifFor) */
+#fgrid figure { position:relative; }
+#fgrid .gifsave { position:absolute; left:0; bottom:0; width:100%; aspect-ratio:var(--ta, 1); opacity:0; }
+#fgrid .gifsave:not([src]) { display:none; }   /* until it's ready, right-click hits the canvas */
 .fadd { font:600 10px var(--sans); padding:1px 8px; border-radius:var(--r);
         border:1px solid var(--accent); background:var(--accent-sf); color:var(--accent); cursor:pointer; }
 .fadd:hover { background:var(--accent); color:#fff; }
 #fgrid figure.on, #fgrid figure.off { cursor:pointer; }
+/* per-tile eye (show in / hide from the big plot) and x (drop from the row) */
+#fgrid .ftools { display:inline-flex; align-items:center; gap:2px; flex:none; }
+#fgrid .ftools button { border:0; background:none; padding:0 1px; cursor:pointer;
+                        color:var(--ink3); font-size:13px; line-height:1; }
+#fgrid .ftools button:hover { color:var(--ink); }
+#fgrid figure.off .eyei .slash { display:block; }
+#fgrid figure.off .eyei .pupil { fill:none; stroke:currentColor; stroke-width:1.4; }
 #fgrid figure.on canvas { outline:2px solid var(--c); outline-offset:1px; }
 #fgrid figure.off canvas { opacity:.4; }
 #fgrid figure.off:hover canvas { opacity:.8; }
@@ -888,8 +899,8 @@ h2 em.soft { color:var(--ink3); font-weight:400; margin-left:auto; }
 .stepmodes .moderight { align-self:stretch; min-height:0; overflow-y:auto; padding:3px; }   /* room for the tile rings */
 
 /* surfaces rotate by dragging (see the S.cam handlers) */
-.surfview #mode, .surfview #fgrid canvas { cursor:grab; touch-action:none; }
-.surfview #mode:active, .surfview #fgrid canvas:active { cursor:grabbing; }
+.surfview #mode, .surfview #fgrid canvas, .surfview #fgrid .gifsave { cursor:grab; touch-action:none; }
+.surfview #mode:active, .surfview #fgrid canvas:active, .surfview #fgrid .gifsave:active { cursor:grabbing; }
 /* stretch / in-out: no big plot (one photo can't overlay several modes), just the grid of
    tiles, three per row like the other views; with nothing to select into, none is faded */
 .boxview .modeleft { display:none; }

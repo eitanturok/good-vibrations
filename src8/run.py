@@ -47,7 +47,7 @@ def get_parser():
     parser.add_argument("--verbose",                    type=int,   default=2, help="If >=2, show torch.compile (TorchDynamo) logs.")
 
     # build data
-    parser.add_argument("--dataset",                    type=str,   default="gastronorm_plastic", choices=tuple(DATASETS))
+    parser.add_argument("--dataset",                    type=str,   default="gastronorm_plastic_cardboard_wedge_region", choices=tuple(DATASETS))
     parser.add_argument("--test-size",                  type=float, default=0.2, help="Fraction of each split's positions held out for eval.")
     parser.add_argument("--speakers",                   type=lambda s: s if s == "all" else int(s), default=[1, 3, 5, 7], nargs="+", help="Speakers to train/eval on, e.g. --speakers 1 3 5 7; 'all' = every speaker, none held out.")
     parser.add_argument("--signal",                     type=str,   default="magnitude", choices=("magnitude", "log_magnitude", "sqrt_magnitude", "power", "log_power"))
@@ -65,6 +65,10 @@ def get_parser():
     parser.add_argument("--out-h",                      type=int,   default=64)
     parser.add_argument("--out-w",                      type=int,   default=64)
     parser.add_argument("--gray",                       type=int,   default=0, choices=(0, 1), help="Also draw the overhead photo in grayscale: (1 - mask) learned floor + mask appearance (mask detached).")
+    parser.add_argument("--gray-joint",                 type=int,   default=0, choices=(0, 1), help="--gray: the photo loss also trains the mask (the composite's mask is not detached).")
+    parser.add_argument("--gray-layers",                type=int,   default=2, help="--gray: conv layers of the appearance head; past 2 they are dilated 2, 4, 8.. (receptive field 5 px at 2, 17 px at 4: an object's whole footprint).")
+    parser.add_argument("--gray-detach",                type=int,   default=0, choices=(0, 1), help="--gray: the appearance head reads detached decoder features, so the photo loss can't change the masks (a pure read-out).")
+    parser.add_argument("--gray-floor",                 type=str,   default="empty", choices=("empty", "median"), help="--gray: the floor each box starts from: its first empty-box train photo, or its median train photo (runs before 2026-10-21).")
     parser.add_argument("--gray-weight",                type=float, default=1.0, help="Weight of each grayscale photo loss: whole-image L1, object L1 (true mask), gradient L1 near the object.")
     parser.add_argument("--rgb",                        type=int,   default=0, choices=(0, 1), help="Predict the overhead photo instead of the mask.")
     parser.add_argument("--num-workers",                type=int,   default=4)
@@ -107,7 +111,10 @@ def get_parser():
     # model
     parser.add_argument("--d-model",                    type=int,   default=1024, help="Size of the embedding between encoder and decoder.")
     parser.add_argument("--encoder",                    type=str,   default="conv", choices=("conv", "transformer", "modal"), help="modal = src8's ModalFormer (axial laser x band transformer + pixel-query decoder, its own decoder). ""conv = boombox's freq convs + laser-grid convs; transformer = src's VibrationTransformer encoder (freq transformer per laser, then a laser transformer), needs --patch-size.")
-    parser.add_argument("--decoder",                    type=str,   default=None, choices=("conv", "mlp", "query"), help="conv = boombox's upsampling decoder; mlp = src's default MLP decoder (d_model -> 256 -> every pixel); query = ModalFormer's pixel queries. Default: query for --encoder modal, else conv.")
+    parser.add_argument("--decoder",                    type=str,   default=None, choices=("conv", "mlp", "query", "field", "modes"), help="field / modes = arch.FieldDecoder (one MLP shared by every floor cell; modes: through learned floor x wall mode shapes); conv = boombox's upsampling decoder; mlp = src's default MLP decoder (d_model -> 256 -> every pixel); query = ModalFormer's pixel queries. Default: query for --encoder modal, else conv.")
+    parser.add_argument("--field-width",                type=int,   default=128, help="--decoder field/modes: the cell MLP's width.")
+    parser.add_argument("--field-freqs",                type=int,   default=5, help="--decoder field/modes: Fourier octaves of a position (finest 2^(n-2) cycles per box): fewer = smoother in position.")
+    parser.add_argument("--field-modes",                type=int,   default=32, help="--decoder modes: how many floor x wall mode shapes.")
     parser.add_argument("--heads",                      type=int,   default=2, help="--encoder transformer: attention heads.")
     parser.add_argument("--freq-layers",                type=int,   default=2, help="--encoder transformer: layers of the per-laser freq transformer.")
     parser.add_argument("--laser-layers",               type=int,   default=2, help="--encoder transformer: layers of the laser transformer.")
@@ -197,11 +204,11 @@ def build_model(args, data_info):
                     freq_gain=bool(args.freq_gain), freq_coord=bool(args.freq_coord), freq_pool=args.freq_pool,
                     head=args.head, n_rays=args.n_rays, ray_shape=args.ray_shape, n_harmonics=args.n_harmonics, center_radius=args.center_radius, peak_thresh=args.peak_thresh,
                     slots_aux=args.slots_aux_weight > 0, encoder=args.encoder, decoder=args.decoder, patch_size=args.patch_size,
-                    heads=args.heads, freq_layers=args.freq_layers, laser_layers=args.laser_layers, ffn_dim=args.ffn_dim, color_aug=args.color_aug,
+                    heads=args.heads, freq_layers=args.freq_layers, laser_layers=args.laser_layers, ffn_dim=args.ffn_dim, color_aug=args.color_aug, field_width=getattr(args, "field_width", 128), field_freqs=getattr(args, "field_freqs", 5), field_modes=getattr(args, "field_modes", 32),
                     pose_branch=bool(getattr(args, "pose_branch", 0)), pose_window=getattr(args, "pose_window", 0.35), pose_merge=getattr(args, "pose_merge", "or"), pose_center=getattr(args, "pose_center", "com"), moment_terms=getattr(args, "moment_terms", "acs"),
                     color_ell=getattr(args, "color_ell", 0.0), laser_jitter=getattr(args, "laser_jitter", 0.0), laser_jitter_p=getattr(args, "laser_jitter_p", 1.0), freq_jitter=getattr(args, "freq_jitter", 0.0),
                     obj_decoder=getattr(args, "obj_decoder", "none"), n_queries=getattr(args, "n_queries", 5), obj_layers=getattr(args, "obj_layers", 3), obj_thresh=getattr(args, "obj_thresh", 0.3), obj_pose=bool(getattr(args, "obj_pose", 0)), obj_pix=bool(getattr(args, "obj_pix", 0)), obj_init=getattr(args, "obj_init", "learned"), obj_pose_merge=getattr(args, "obj_pose_merge", "sum"),
-                    obj_shape=getattr(args, "obj_shape", "dot"), obj_heat_sigma=getattr(args, "obj_heat_sigma", "px"), obj_count_floor=bool(getattr(args, "obj_count_floor", 0)), obj_jitter=getattr(args, "obj_jitter", 0.0), gray=bool(getattr(args, "gray", 0)),
+                    obj_shape=getattr(args, "obj_shape", "dot"), obj_heat_sigma=getattr(args, "obj_heat_sigma", "px"), obj_count_floor=bool(getattr(args, "obj_count_floor", 0)), obj_jitter=getattr(args, "obj_jitter", 0.0), gray=bool(getattr(args, "gray", 0)), gray_joint=bool(getattr(args, "gray_joint", 0)), gray_layers=getattr(args, "gray_layers", 2), gray_detach=bool(getattr(args, "gray_detach", 0)),
                     modal=dict(d=args.modal_d, heads=args.modal_heads, order=args.modal_order, laser_layers=args.modal_laser_layers,
                                dec_layers=args.modal_dec_layers, grid=args.modal_grid, geo=bool(args.geo), laser_drop=args.laser_drop, band_drop=getattr(args, "band_drop", 0.0), lin_skip=args.lin_skip,
                                box_norm=bool(getattr(args, "box_norm", 1)), box_film=bool(getattr(args, "box_film", 0))))
@@ -238,7 +245,7 @@ def run(**kwargs):
 
     # build dataset
     train_dl, eval_dl, data_info = build_dataset(args.dataset, test_size=args.test_size, speakers=None if "all" in args.speakers else args.speakers, signal=args.signal, laser_center=bool(args.laser_center), norm=args.norm, patch_size=args.patch_size, window=args.window, gate_ms=args.gate_ms, laser_norm=bool(args.laser_norm),
-        phase=args.phase, phase_ref=args.phase_ref, out_h=args.out_h, out_w=args.out_w, rgb=bool(args.rgb), gray=bool(getattr(args, "gray", 0)), batch_size=args.batch_size, eval_batch_size=args.eval_batch_size,
+        phase=args.phase, phase_ref=args.phase_ref, out_h=args.out_h, out_w=args.out_w, rgb=bool(args.rgb), gray=bool(getattr(args, "gray", 0)), gray_floor=getattr(args, "gray_floor", "median"), batch_size=args.batch_size, eval_batch_size=args.eval_batch_size,
         num_workers=args.num_workers, multi_oversample=getattr(args, "multi_oversample", 1))
     train_eval = Evaluator(label="train", dataloader=DataLoader(train_dl.unique_dataset, batch_size=args.eval_batch_size, num_workers=0))  # no workers: see build_dataset
 
@@ -250,7 +257,7 @@ def run(**kwargs):
     # loggers
     loggers = [FileLogger("runs/{run_name}/logs-rank{rank}.txt")]
     if args.wandb and not args.eval_only:
-        config = args.__dict__ | data_info | dict(gpu_name=torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu",
+        config = args.__dict__ | {k: v for k, v in data_info.items() if k != "gray_floor"} | dict(gpu_name=torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu",
                                                   num_parameters=sum(p.numel() for p in model.parameters()))
         loggers.append(WandBLogger("better-tsa", group=args.wandb_group, name=args.run_name,
                                    init_kwargs={"config": config, "id": args.run_name, "resume": "allow", "save_code": True}))

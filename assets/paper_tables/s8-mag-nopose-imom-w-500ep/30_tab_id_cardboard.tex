@@ -1,0 +1,13 @@
+\begin{table}
+\caption{In distribution, cardboard: VibroFormer per object, on the held-out positions of trained objects}
+\label{tab:id_cardboard}
+\begin{tabular}{l!{\vrule width 1.2pt}cccccc!{\vrule width 1.2pt}c}
+\toprule
+ & candle & cube & soap-dispenser & vase & two-cubes & cube-vase & mean \\
+\midrule
+IoU $\uparrow$ & \bfseries 0.831 {\scriptsize $\pm$0.074} & 0.542 {\scriptsize $\pm$0.218} & 0.699 {\scriptsize $\pm$0.131} & 0.780 {\scriptsize $\pm$0.103} & 0.382 {\scriptsize $\pm$0.174} & 0.476 {\scriptsize $\pm$0.165} & 0.618 {\scriptsize $\pm$0.207} \\
+Miss rate $\downarrow$ & \bfseries 0.000 {\scriptsize $\pm$0.000} & 0.031 {\scriptsize $\pm$0.174} & \bfseries 0.000 {\scriptsize $\pm$0.000} & \bfseries 0.000 {\scriptsize $\pm$0.000} & \bfseries 0.000 {\scriptsize $\pm$0.000} & \bfseries 0.000 {\scriptsize $\pm$0.000} & 0.005 {\scriptsize $\pm$0.082} \\
+Centroid error (\% of box) $\downarrow$ & \bfseries 1.5 {\scriptsize $\pm$0.9} & 3.1 {\scriptsize $\pm$2.7} & 2.1 {\scriptsize $\pm$1.4} & 1.6 {\scriptsize $\pm$1.1} & 5.2 {\scriptsize $\pm$4.5} & 10.2 {\scriptsize $\pm$8.0} & 3.9 {\scriptsize $\pm$3.8} \\
+\bottomrule
+\end{tabular}
+\end{table}

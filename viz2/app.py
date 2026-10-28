@@ -1,6 +1,7 @@
 """Routes. The server does numpy; the browser draws."""
 
 import hashlib
+import io
 import re
 import os
 import threading
@@ -10,7 +11,8 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-from fastapi import FastAPI, HTTPException, Response
+from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from PIL import Image
@@ -122,6 +124,36 @@ def laser_view_photo(name: str):
     if name not in data.LASER_VIEWS:
         raise HTTPException(404, "unknown box")
     return FileResponse(data.REPO / f"assets/{name}_laser_view.jpg", headers=CACHE)
+
+
+# The mode tiles' loops as GIFs (app.js gifFor), the newest 64, by name.
+GIFS = {}
+
+
+def _gif(b: bytes, n: int) -> bytes:
+    # one palette for the whole strip: a single quantize, and no colour flicker between frames
+    q = Image.open(io.BytesIO(b)).convert("RGB").quantize(256, method=Image.Quantize.FASTOCTREE)
+    w, h = q.width, q.height // n
+    fr = [q.crop((0, i * h, w, (i + 1) * h)) for i in range(n)]
+    out = io.BytesIO()
+    fr[0].save(out, "GIF", save_all=True, append_images=fr[1:], duration=33, loop=0)
+    return out.getvalue()
+
+
+@app.post("/api/gif/{name}.gif")
+async def gif_put(name: str, request: Request, n: int = 60):
+    """A tile's n frames, stacked in one JPEG -> the GIF served back at this same URL, whose
+    last segment is the name, so "Save image as" offers {name}.gif."""
+    GIFS[name] = await run_in_threadpool(_gif, await request.body(), n)
+    if len(GIFS) > 64:
+        GIFS.pop(next(iter(GIFS)))
+
+
+@app.get("/api/gif/{name}.gif")
+def gif_get(name: str):
+    if name not in GIFS:
+        raise HTTPException(404, "gone")
+    return Response(GIFS[name], media_type="image/gif")
 
 
 def _hex(c: str) -> str:

@@ -58,6 +58,10 @@ const METRICS = [
   { key: "fill",     label: "Fill",    short: "fill", worst: "low"  },  // mean prob inside the object
   { key: "miss",     label: "Miss",    short: "miss", worst: "high" },  // 1 = no pixel > 0.5 on the object
   { key: "com_err",  label: "COM err", short: "com",  worst: "high" },  // com head, fraction of the box
+  // --gray runs (src8): the drawn photo vs the real one, L1 at the TRUE object's location:
+  // ph-loc = the object + a 2px ring (look and placement), ph-obj = the object pixels only
+  { key: "photo_loc", label: "Photo L1 (object + ring)", short: "ph-loc", worst: "high" },
+  { key: "photo_obj", label: "Photo L1 (object)",        short: "ph-obj", worst: "high" },
 ];
 
 const S = {
@@ -79,7 +83,7 @@ const S = {
   // under which two cells mean the same thing, which is the point of a comparison table.
   // background is an on/off switch (the "b" key, the checkbox); bgOp is the level it
   // returns to when switched back on, so the two are stored separately. maskOp is the
-  // Prediction slider: it fades predicted masks only (never ground truth), applied as a
+  // Objects slider: it fades every object mask, predicted and ground truth, applied as a
   // per-layer canvas alpha rather than to the cell, whose backdrop must not move with it.
   // rowMode "linked" (default): like "dataset", but runs whose dataset sets OVERLAP share one
   // group (sortGroupOf), so a combined gastro+plastic+cardboard column and a cardboard-only
@@ -88,7 +92,7 @@ const S = {
   // it was trained on and independently resolves its own row content -- see computeGroups
   // and S.groups, below. "single": today's original behaviour, one shared sample per row
   // across every column, via the flat S.order.
-  view: { mode: "pred", rowMode: "linked", background: true, relative: false, coms: false, bgOp: 1, maskOp: 1 },
+  view: { mode: "pred", rowMode: "linked", background: true, relative: false, coms: false, bgOp: 1, maskOp: 1, photo: false },
   groups: null,   // computed in applyFilters() unless rowMode is "single" -- see computeGroups
   domain: {}, positions: [], activePos: -1, modalRow: -1,
   hidden: new Map(),  // filter key -> samples that ONLY that filter is holding back
@@ -101,6 +105,7 @@ const S = {
   epochMetrics: {},   // run -> {epoch: {saved, samples: {sid: {metric: value}}} | null while in flight}
   frameData: {},      // run -> {epoch | "latest": Map sid -> {m: fp16 mask}}
   truthCache: {},     // sid -> ground-truth values, for client-side diff
+  photoCache: {},     // truthKey -> the real grayscale photo at that grid (Float32Array)
 };
 
 const fmt = (v, n = 4) => (v == null || !isFinite(v) ? "–" : v.toFixed(n));
@@ -1259,7 +1264,9 @@ function paintRunCell(c, name, cs, mixed) {
   sizeMaskCanvas(m, rw, rh);
   m.dataset.run = name; m.dataset.sid = cs.i;
   m.onclick = () => openNeighbors(name, cs.i);
-  m.className = "mask predmask" + (S.view.background ? " bg" : " nobg");
+  // Photo view: the drawn photo is opaque, so no backdrop behind it (a faded edge would
+  // show the real photo through and read as a second object).
+  m.className = "mask predmask" + (S.view.background && !isPhoto(name) ? " bg" : " nobg");
   setBackdrop(m, cs.i);
   paintCanvas(m, name, cs.i, epochFor(name));
 
@@ -1269,16 +1276,29 @@ function paintRunCell(c, name, cs, mixed) {
   const tm = tmBox.querySelector(".mask");
   tmBox.hidden = S.view.mode !== "stacked";
   if (!tmBox.hidden) {
-    tm.className = "mask truthmask" + (S.view.background ? " bg" : " nobg");
-    setBackdrop(tm, cs.i);
-    sizeMaskCanvas(tm, rw, rh);
     tmBox.querySelector(".shapelabel").textContent = shape;
-    const truth = S.truthCache[truthKey(cs.i, rh, rw)];
-    // The stacked target half shows the target's own objects and nothing else: the
-    // prediction marks and the connecting lines belong on the prediction above it.
-    if (truth) drawMask(tm, truth, "truth", null, [rh, rw], comsFor(name, cs.i), true);
-    else ensureTruth(cs.i, rh, rw);
+    paintTruthHalf(tm, name, cs.i, rh, rw);
   }
+}
+
+/* The stacked target half of a cell (table or sample popup): the target mask, or in photo
+   view the real photo at the run's grid. */
+function paintTruthHalf(tm, name, sid, rh, rw) {
+  tm.className = "mask truthmask" + (S.view.background && !isPhoto(name) ? " bg" : " nobg");
+  setBackdrop(tm, sid);
+  sizeMaskCanvas(tm, rw, rh);
+  if (isPhoto(name)) {
+    // Photo view: the real photo at the run's grid under the drawn one.
+    const ph = S.photoCache[truthKey(sid, rh, rw)];
+    if (ph) drawPhoto(tm, ph, null, [rh, rw], comsFor(name, sid), true);
+    else { tm.getContext("2d").clearRect(0, 0, tm.width, tm.height); ensurePhoto(sid, rh, rw); }
+    return;
+  }
+  const truth = S.truthCache[truthKey(sid, rh, rw)];
+  // The stacked target half shows the target's own objects and nothing else: the
+  // prediction marks and the connecting lines belong on the prediction above it.
+  if (truth) drawMask(tm, truth, "truth", null, [rh, rw], comsFor(name, sid), true);
+  else ensureTruth(sid, rh, rw);
 }
 
 /* Which rows are on screen. Row k occupies [hh + k*rowH(), hh + (k+1)*rowH()) in scroll
@@ -1349,6 +1369,9 @@ function renderFocus() {
    everything else -- new data, a setting, a re-sort -- repaints every visible row. */
 const pool = [];
 function renderVisible(moved = false) {
+  // Every control that restyles the table repaints through here, so the sample popup
+  // follows them too.
+  paintModalLive();
   // The focus view covers the table, and both share one frame store per run: painting
   // the hidden table too would have each view evict the other's window forever.
   if (S.focus) { renderFocus(); return; }
@@ -1823,17 +1846,22 @@ function syncSliders() {
    time; the server reads only those rows, so a slider step is one small request. */
 
 /* One epoch's frames for `sids`, as Map sid -> {m: fp16 mask}. Body: see app.py api_frames. */
-async function fetchFrames(run, sids, ep) {
+async function fetchFrames(run, sids, ep, kind = "mask") {
   const r = await fetch(`/api/frames?run=${encodeURIComponent(run)}&sids=${sids.join(",")}` +
-    `&epoch=${ep}&v=${S.renderVersion}`);
+    `&epoch=${ep}&kind=${kind}&v=${S.renderVersion}`);
   if (!r.ok) throw new Error("frames");
   const masks = new Uint16Array(await r.arrayBuffer());
   const cells = runShape(run)[0] * runShape(run)[1];
   return new Map(sids.map((s, i) => [s, { m: masks.subarray(i * cells, (i + 1) * cells) }]));
 }
 
+/* Photo view: a run with a photo head (src8 --gray) shows its drawn grayscale photo in
+   place of the mask. Its frames sit in the same store under "g:"-prefixed epoch keys. */
+const isPhoto = (run) => S.view.photo && !!(S.runs[run] && S.runs[run].gray);
+const frameKey = (run, ep) => (isPhoto(run) ? "g:" : "") + (ep ?? "latest");
+
 const frameFor = (run, ep, sid) => {
-  const st = S.frameData[run] && S.frameData[run][ep ?? "latest"];
+  const st = S.frameData[run] && S.frameData[run][frameKey(run, ep)];
   return st && st.get(sid);
 };
 
@@ -1979,12 +2007,12 @@ function drawMask(canvas, values, mode, truth, shape, coms, gtOnly) {
   // Overlay draws the target underneath and the prediction over it, in one box; stacked
   // draws them as two boxes (handled by the caller, which paints each half).
   const soloLut = mode === "diff" ? S.lut.diff : mode === "truth" ? S.lut.truth : S.lut.pred;
-  // `op`: the Prediction slider fades predicted layers only -- the target stays at full
-  // strength, so a faded prediction reads against an unchanged truth.
+  // `op`: the Objects slider fades every mask layer, predicted and target alike, so turning
+  // it down shows what is underneath both.
   const predOp = S.view.maskOp;
   const layers = mode === "overlay"
-    ? [{ v: truth, lut: S.lut.truth, k: 0.72, op: 1 }, { v: values, lut: S.lut.pred, k: 0.82, op: predOp }]
-    : [{ v: values, lut: soloLut, k: gain, op: mode === "truth" ? 1 : predOp }];
+    ? [{ v: truth, lut: S.lut.truth, k: 0.72, op: predOp }, { v: values, lut: S.lut.pred, k: 0.82, op: predOp }]
+    : [{ v: values, lut: soloLut, k: gain, op: predOp }];
 
   ctx.clearRect(0, 0, CW, CH);
   // Off: the mask must stay hard-edged blocks. This is the same rendering CSS's
@@ -2072,6 +2100,21 @@ function paintCanvas(cv, run, sid, epoch) {
   const buf = scratchFor(cells);
   for (let i = 0; i < cells; i++) buf[i] = half(raw[i]);
   if (Number.isNaN(buf[0])) { blank("unsaved"); return; }
+  if (isPhoto(run)) {
+    // pred/stacked: the drawn photo; overlay: + the true object tinted on it; diff: drawn
+    // minus the real photo, on the mask diff ramp (the real one sits in the stacked half).
+    const m = S.view.mode, tk = truthKey(sid, rh, rw);
+    const aux = m === "overlay" ? S.truthCache[tk] : m === "diff" ? S.photoCache[tk] : null;
+    if ((m === "overlay" || m === "diff") && !aux) {
+      blank("loading");
+      if (m === "overlay") ensureTruth(sid, rh, rw); else ensurePhoto(sid, rh, rw);
+      return;
+    }
+    cv.parentElement.dataset.state = "";
+    cv._drawn = `${run}|${sid}`;
+    drawPhoto(cv, buf, m === "overlay" ? aux : null, [rh, rw], comsFor(run, sid), false, m === "diff" ? aux : null);
+    return;
+  }
   // In stacked mode this canvas is the prediction half only -- the target is drawn into
   // its own canvas below, so it needs no truth here.
   const mode = S.view.mode === "stacked" ? "pred" : S.view.mode;
@@ -2102,12 +2145,14 @@ async function ensureFrames(run) {
       const f = S.focus === run;
       const { first, last } = f ? focusRange() : visibleRange();
       const sids = (f ? S.focusList : orderFor(run)).slice(first, 2 * last - first).filter(Boolean).map((s) => s.i);
+      const ms = modalSid(run);   // the sample popup's, which arrows can move off screen
+      if (ms != null) sids.push(ms);
       const store = S.frameData[run] || (S.frameData[run] = {});
-      const ep = epochFor(run) ?? "latest";
-      const have = store[ep] || (store[ep] = new Map());
+      const ep = epochFor(run) ?? "latest", key = frameKey(run, ep);
+      const have = store[key] || (store[key] = new Map());
       const need = sids.filter((i) => !have.has(i));
       if (!need.length) continue;
-      for (const [sid, fr] of await fetchFrames(run, need, ep)) have.set(sid, fr);
+      for (const [sid, fr] of await fetchFrames(run, need, ep, isPhoto(run) ? "gray" : "mask")) have.set(sid, fr);
       renderVisible();
     } while (framesStale.has(run));
   } finally {
@@ -2131,6 +2176,81 @@ async function ensureTruth(sid, h, w) {
   } finally {
     truthPending.delete(key);
   }
+}
+
+/* Real photos for the photo view, batched: every cell that misses in one frame queues its
+   sid, and one /api/photos request per grid fetches them all. */
+const photoQueue = new Map();   // "HxW" -> Set of sids
+const photoPending = new Set();
+function ensurePhoto(sid, h, w) {
+  const key = truthKey(sid, h, w);
+  if (photoPending.has(key)) return;
+  photoPending.add(key);
+  const g = `${h}x${w}`;
+  if (!photoQueue.size) requestAnimationFrame(flushPhotos);
+  (photoQueue.get(g) || photoQueue.set(g, new Set()).get(g)).add(sid);
+}
+async function flushPhotos() {
+  const jobs = [...photoQueue]; photoQueue.clear();
+  await Promise.all(jobs.map(async ([g, set]) => {
+    const sids = [...set], [h, w] = g.split("x").map(Number), n = h * w;
+    try {
+      const r = await fetch(`/api/photos?sids=${sids.join(",")}&shape=${g}&v=${S.renderVersion}`);
+      if (!r.ok) throw new Error("photos");
+      const raw = new Uint16Array(await r.arrayBuffer());
+      sids.forEach((sid, i) => {
+        const v = new Float32Array(n);
+        for (let k = 0; k < n; k++) v[k] = half(raw[i * n + k]);
+        S.photoCache[truthKey(sid, h, w)] = v;
+      });
+    } finally {
+      for (const sid of sids) photoPending.delete(truthKey(sid, h, w));
+    }
+  }));
+  renderVisible();
+}
+
+/* A grayscale photo, always opaque, with no backdrop behind it. `objMask`
+   (overlay) tints the TRUE object over it in the target colour, so where the run drew the
+   object and where it really is read in one box. */
+function drawPhoto(canvas, values, objMask, shape, coms, gtOnly, real) {
+  const [h, w] = shape, n = h * w;
+  const ctx = canvas.getContext("2d");
+  sizeMaskCanvas(canvas, w, h);
+  const CW = canvas.width, CH = canvas.height;
+  const off = drawPhoto._off || (drawPhoto._off = document.createElement("canvas"));
+  if (off.width !== w || off.height !== h) { off.width = w; off.height = h; }
+  const octx = off.getContext("2d");
+  const img = drawPhoto._img && drawPhoto._img.width === w && drawPhoto._img.height === h
+    ? drawPhoto._img : (drawPhoto._img = octx.createImageData(w, h));
+  const px = img.data;
+  const tl = S.lut.truth, tc = tl[tl.length - 1] || [0, 200, 120];
+  if (real) {
+    // Diff: drawn minus real on the diverging ramp, opaque (a photo has no "empty" cells to
+    // see through). Full scale is +-0.5 of the [0,1] photo; "Color per sample" rescales.
+    const dl = S.lut.diff, dom = S.view.relative ? sampleDomain(values, real, "diff", n) : null;
+    const span = dom ? dom.span : 0.5;
+    for (let i = 0; i < n; i++) {
+      const d = Math.max(-1, Math.min(1, (values[i] - real[i]) / span));
+      const t = 0.5 + 0.5 * Math.sign(d) * Math.pow(Math.abs(d), S.lut.gamma);
+      const c = dl[Math.round(t * (dl.length - 1))] || [0, 0, 0];
+      px[i * 4] = c[0]; px[i * 4 + 1] = c[1]; px[i * 4 + 2] = c[2]; px[i * 4 + 3] = 255;
+    }
+  } else
+  for (let i = 0; i < n; i++) {
+    let g = Math.round(Math.max(0, Math.min(1, values[i])) * 255), r = g, b = g;
+    if (objMask) {
+      const a = 0.75 * S.view.maskOp * Math.max(0, Math.min(1, objMask[i]));
+      r = r * (1 - a) + tc[0] * a; g = g * (1 - a) + tc[1] * a; b = b * (1 - a) + tc[2] * a;
+    }
+    px[i * 4] = r; px[i * 4 + 1] = g; px[i * 4 + 2] = b; px[i * 4 + 3] = 255;
+  }
+  octx.putImageData(img, 0, 0);
+  ctx.clearRect(0, 0, CW, CH);
+  ctx.imageSmoothingEnabled = false;
+  ctx.drawImage(off, 0, 0, CW, CH);   // opaque: a photo, not an object mask (the Objects slider fades only the tint)
+  ctx.imageSmoothingEnabled = true;
+  drawComs(ctx, CW, CH, coms, gtOnly);
 }
 
 /* ***** epoch slider + playback *****
@@ -2334,7 +2454,7 @@ async function poll() {
 
   if (advanced.length) {
     // Only "latest" moved; numbered epochs are immutable, so their frames stay.
-    for (const name of advanced) if (S.frameData[name]) delete S.frameData[name].latest;
+    for (const name of advanced) if (S.frameData[name]) { delete S.frameData[name].latest; delete S.frameData[name]["g:latest"]; }
     invalidateEpochs();
     if (followNewest && !S.playing) S.epochIdx = null;   // null = each run's latest
     // New metrics can reorder a sorted table. Keep whichever sample is at the top of the
@@ -2680,14 +2800,10 @@ async function openNeighbors(run, sid) {
   $("#m-title").innerHTML = `Sample ${d.sample_id} — <span class="mrun">${run}</span>`;
   $("#m-body").innerHTML = `
     <div class="msec">
-      <h3>This prediction</h3>
-      <div class="nbviews">
-        <figure data-coms="pred"><img src="/api/mask.png?run=${encodeURIComponent(run)}&sid=${sid}&mode=pred&bg=1&rel=${rel}&${v}${ep}" alt="">
-          <figcaption>predicted</figcaption></figure>
-        <figure data-coms="gt"><img src="/api/gt_mask.png?sid=${sid}&bg=1&rel=${rel}&shape=${d.shape[0]}x${d.shape[1]}&${v}" alt="">
-          <figcaption>ground truth</figcaption></figure>
-        <figure data-coms="pred"><img src="/api/mask.png?run=${encodeURIComponent(run)}&sid=${sid}&mode=diff&bg=1&rel=${rel}&${v}${ep}" alt="">
-          <figcaption>difference</figcaption></figure>
+      <h3>This prediction — as displayed (the sidebar's controls apply)</h3>
+      <div class="mlive">
+        <figure><canvas class="mask predmask"></canvas><figcaption class="mlcap"></figcaption></figure>
+        <figure hidden><canvas class="mask truthmask"></canvas><figcaption class="mlcap2"></figcaption></figure>
       </div>
       <div class="nbhead">
         <div><span class="k">predicted com</span><b>${dc(d.pred_com[0], d.pred_com[1])}</b></div>
@@ -2707,15 +2823,11 @@ async function openNeighbors(run, sid) {
       <div class="msec"><h3>Most similar to the prediction</h3><ul class="nblist">${list(d.most_similar, "near")}</ul></div>
       <div class="msec"><h3>Least similar</h3><ul class="nblist">${list(d.least_similar, "far")}</ul></div>
     </div>`;
-  // The modal shows ONE sample, so its panels take that sample's own box aspect rather
-  // than --mask-w, which is sized to the widest box loaded.
+  // The popup shows ONE sample, so its panels take that sample's own box aspect.
   {
-    const nb = $(".nbviews"), smp = S.samples.find((x) => x.i === sid);
-    if (nb && smp && smp.aspect > 0)
-      nb.style.setProperty("--row-mask-w", `${Math.round(cssPx("--mask-h", 168) * smp.aspect)}px`);
+    const smp = S.samples.find((x) => x.i === sid), asp = smp && smp.aspect > 0 ? smp.aspect : 1.3;
+    $(".mlive").style.setProperty("--ml-asp", String(asp));
   }
-  // After layout, so each overlay canvas can size itself from its rendered panel.
-  requestAnimationFrame(syncModalComs);
 
   // Each neighbour opens its own ground-truth detail, if it is on screen.
   $("#m-body").querySelectorAll(".nb").forEach((li) => {
@@ -2733,7 +2845,33 @@ async function openNeighbors(run, sid) {
   $("#m-prev").hidden = $("#m-next").hidden = S.modalNav.k < 0;
   $("#m-prev").disabled = S.modalNav.k <= 0;
   $("#m-next").disabled = S.modalNav.k >= ids.length - 1;
+  S.modalNav.sid = sid;
   $("#modal").hidden = false;
+  paintModalLive();
+}
+
+const modalSid = (run) => (S.modalNav && S.modalNav.run === run && !$("#modal").hidden ? S.modalNav.sid : null);
+
+/* The popup's live panels: the same painters as a table cell, so mode, photo view,
+   backdrop, the Objects slider, COMs and the epoch all match the table. */
+function paintModalLive() {
+  const nav = S.modalNav, box = document.querySelector(".mlive");
+  if (!nav || !box || $("#modal").hidden || !S.runs[nav.run]) return;
+  const run = nav.run, sid = nav.sid, [rh, rw] = runShape(run);
+  const [cv, tv] = box.querySelectorAll("canvas");
+  cv.className = "mask predmask" + (S.view.background && !isPhoto(run) ? " bg" : " nobg");
+  cv.dataset.run = run; cv.dataset.sid = sid;
+  setBackdrop(cv, sid);
+  sizeMaskCanvas(cv, rw, rh);
+  paintCanvas(cv, run, sid, epochFor(run));
+  const what = isPhoto(run) ? "drawn photo" : "predicted mask";
+  box.querySelector(".mlcap").textContent = `${what} · ${S.view.mode} · ep ${epochFor(run) ?? S.runs[run].epoch}`;
+  const stacked = S.view.mode === "stacked";
+  tv.parentElement.hidden = !stacked;
+  if (stacked) {
+    paintTruthHalf(tv, run, sid, rh, rw);
+    box.querySelector(".mlcap2").textContent = isPhoto(run) ? "real photo" : "ground truth";
+  }
 }
 
 function stepModal(delta) {
@@ -2832,6 +2970,16 @@ function bindUI() {
   opacity("#mask-opacity", "maskOp", "--mask-op", true);
   try { if (localStorage.getItem("viz.bg") === "0") setBackground(false); } catch (_) {}
   $("#rel-toggle").onchange = (e) => { S.view.relative = e.target.checked; renderVisible(); };
+  // Photo view (P): runs with a photo head draw it instead of their mask.
+  const setPhoto = (on) => {
+    S.view.photo = !!on;
+    $("#photo-toggle").checked = S.view.photo;
+    try { localStorage.setItem("viz.photo", on ? "1" : "0"); } catch (_) {}
+    renderVisible();
+  };
+  window.setPhoto = setPhoto;
+  $("#photo-toggle").onchange = (e) => setPhoto(e.target.checked);
+  try { if (localStorage.getItem("viz.photo") === "1") { S.view.photo = true; $("#photo-toggle").checked = true; } } catch (_) {}
   $("#com-toggle").onchange = (e) => setComs(e.target.checked);
 
   $("#epoch-slider").oninput = (e) => setEpochIdx(+e.target.value);
@@ -2900,17 +3048,10 @@ function bindUI() {
     if (e.key === "Escape" && S.focus && $("#modal").hidden && !pickerOpen()) { setFocus(null); return; }
     if (e.key === "Escape") { document.querySelectorAll(".overlay").forEach((o) => (o.hidden = true)); closePicker(); }
     if (!$("#modal").hidden) {
-      if (e.key === "ArrowLeft") { e.preventDefault(); stepModal(-1); }
-      if (e.key === "ArrowRight") { e.preventDefault(); stepModal(1); }
-      // "c" works in here too: the modal DRAWS the object marks, so a switch that only
-      // reached the table underneath would look broken exactly where the marks are
-      // biggest. The sidebar checkbox is behind the overlay, so this is the only way to
-      // reach it without closing the modal first.
-      if (e.key === "c" && !e.ctrlKey && !e.metaKey && !e.altKey) {
-        e.preventDefault();
-        setComs(!S.view.coms);
-      }
-      return;
+      if (e.key === "ArrowLeft") { e.preventDefault(); stepModal(-1); return; }
+      if (e.key === "ArrowRight") { e.preventDefault(); stepModal(1); return; }
+      // Every other shortcut (c, b, p, f, g) falls through: the popup leaves the sidebar
+      // live and repaints with the table, so they restyle the sample it shows.
     }
     // Bare "f" toggles the filter panel -- but not while typing in the id searches, and
     // not when it is a browser/OS chord.
@@ -2935,6 +3076,11 @@ function bindUI() {
     if (e.key === "c" && !typing && !e.ctrlKey && !e.metaKey && !e.altKey) {
       e.preventDefault();
       setComs(!S.view.coms);
+    }
+    // Bare "p" toggles the photo view, same terms again.
+    if (e.key === "p" && !typing && !e.ctrlKey && !e.metaKey && !e.altKey) {
+      e.preventDefault();
+      window.setPhoto(!S.view.photo);
     }
     // Bare "g" collapses/restores the ground-truth column, same terms again.
     if (e.key === "g" && !typing && !e.ctrlKey && !e.metaKey && !e.altKey) {
