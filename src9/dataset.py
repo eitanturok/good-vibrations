@@ -286,8 +286,29 @@ def build_dataset(window="tukey", batch_size=1024, eval_batch_size=108, num_work
     mds = Path(tempfile.mkdtemp(prefix=f"{window}_", dir=MDS))
     atexit.register(shutil.rmtree, mds, ignore_errors=True)
     cols = {"X": "ndarray:float32", "y": "ndarray:float32", "inst": "ndarray:float32", "object": "int", "box": "int", "coms": "ndarray:float32", "experiment": "str", "position_id": "int"}
+    nb = len(info["boxes"])
+    train_set = set(idxs["train"])
+    box_idx = {b: i for i, b in enumerate(info["boxes"])}
+    x_sum, x_sq = np.zeros((nb, L, F, C), np.float32), np.zeros((nb, L, F, C), np.float32)  # per-box train-only sums -> normalization stats
+    n_train = np.zeros(nb, np.float32)
+    e_sum, e_sq, n_empty = np.zeros((nb, L, F, C), np.float64), np.zeros((nb, L, F, C), np.float64), np.zeros(nb)  # per-box empty-box train scans -> calibration
     with MDSWriter(out=str(mds), columns=cols, size_limit="200MB") as w:
-        for m, X, y in zip(metas, process_x(samples, window), ys): w.write({"X": X, **y, "experiment": m["experiment"], "position_id": int(m["position_id"])})
+        for i, (m, X, y) in enumerate(zip(metas, process_x(samples, window), ys)):
+            w.write({"X": X, **y, "experiment": m["experiment"], "position_id": int(m["position_id"])})
+            if i in train_set: b = box_idx[m["box"]]; x_sum[b] += X; x_sq[b] += X * X; n_train[b] += 1
+            if i in train_set and m["n_objects"] == 0: e_sum[b] += X; e_sq[b] += X * X; n_empty[b] += 1
+
+    assert (n_empty > 0).all(), f"a box has no empty-box train scans: {n_empty}"
+    e_mean = e_sum / n_empty[:, None, None, None]                                    # (nb,L,F,C)
+    e_var = (e_sq / n_empty[:, None, None, None] - e_mean ** 2).mean(1).clip(1e-6)  # (nb,F,C): spread around each laser's own mean, pooled over lasers and scans
+    info["empty_mean"], info["empty_std"] = torch.from_numpy(e_mean).float(), torch.from_numpy(np.sqrt(e_var)).float()
+    info["n_empty"] = n_empty.tolist()
+
+    n = n_train[:, None, None, None]                                                 # (nb,1,1,1): same stats at every laser
+    mean = x_sum / np.maximum(n, 1)
+    cum_mean = torch.from_numpy(mean)
+    cum_var = torch.from_numpy(np.where(n > 0, np.maximum(x_sq / np.maximum(n, 1) - mean * mean, 1e-6), 1.0))
+    info["cum_mean"], info["cum_var"] = cum_mean, cum_var
 
     train_pos = {key(metas[i]) for i in idxs["train"]}
     eval_pos = {key(metas[i]) for n, ids in idxs.items() if n != "train" for i in ids}

@@ -27,14 +27,16 @@ from callbacks import VisualizeSMask, OutputSaver, PositionLogger, EvalSummary
 from arch.boombox import Boombox
 from arch.hybrid import Hybrid
 from arch.transformer import Transformer
+from arch.transformer_calib import TransformerCalib
 
 # boombox: s6-gastro-plastic-cardboard-3k (hann 04_ffts, 3000 ep, 100 ep warmup). hybrid: s8-mag-nopose-imom-region-500ep (tukey, 500 ep, 50 ep warmup, microbatch 512)
 COMMON = dict(seed=42, batch_size=1024, microbatch=0, lr=1e-4, weight_decay=0.01, eval_batch_size=108, eval_interval="50ep", image_interval="100ep",
               num_workers=4, compile=1, wandb=1, wandb_group="src9")
 AUGS = dict(speaker_gain=0.35, speaker_gain_hz=20.0, laser_jitter=0.5)  # train-time augs (utils.py): log-gain sd, knot spacing in Hz, max laser shift in cells
-DEFAULTS = {"boombox": COMMON | dict(window="hann", t_warmup="100ep", max_duration="3000ep", checkpoint_interval="500ep"),
+DEFAULTS = {"boombox": COMMON | dict(window="hann", t_warmup="100ep", max_duration="3000ep", checkpoint_interval="500ep", microbatch=256),
             "hybrid":  COMMON | dict(window="tukey", t_warmup="50ep", max_duration="500ep", checkpoint_interval="250ep", microbatch=512, **AUGS),
             "transformer": COMMON | dict(window="tukey", t_warmup="50ep", max_duration="500ep", checkpoint_interval="250ep", microbatch=256, **AUGS)}
+DEFAULTS["transformer_calib"] = DEFAULTS["transformer"]  # transformer with empty-box calibration instead of per-box stats, bce + dice
 
 def run():
     p = argparse.ArgumentParser()
@@ -54,7 +56,7 @@ def run():
 
     train_dl, eval_dl, train_eval, info = build_dataset(args.window, batch_size=args.batch_size, eval_batch_size=args.eval_batch_size, num_workers=args.num_workers)
     augs = {} if args.model == "boombox" else {k: getattr(args, k) for k in AUGS}
-    model = {"boombox": Boombox, "hybrid": Hybrid, "transformer": Transformer}[args.model](info, **augs)
+    model = {"boombox": Boombox, "hybrid": Hybrid, "transformer": Transformer, "transformer_calib": TransformerCalib}[args.model](info, **augs)
     n_params = sum(p.numel() for p in model.parameters())
     print(f"{args.model}: {n_params:,} parameters")
     if args.run_name: Path(f"runs/{args.run_name}").mkdir(parents=True, exist_ok=True); Path(f"runs/{args.run_name}/args.json").write_text(json.dumps(vars(args), indent=1))
@@ -62,7 +64,7 @@ def run():
     loggers = [FileLogger("runs/{run_name}/logs-rank{rank}.txt")]
     if args.wandb and not args.eval_only:
         loggers.append(WandBLogger("better-tsa", group=args.wandb_group, name=args.run_name,
-                                   init_kwargs={"config": vars(args) | info | dict(num_parameters=n_params), "id": args.run_name, "resume": "allow"}))
+                                   init_kwargs={"config": vars(args) | {k: v for k, v in info.items() if not isinstance(v, torch.Tensor)} | dict(num_parameters=n_params), "id": args.run_name, "resume": "allow"}))
     callbacks = [LRMonitor(), SpeedMonitor(), RuntimeEstimator(skip_batches=64, time_unit="minutes"), NaNMonitor(), OptimizerMonitor(batch_log_interval=10),
                  VisualizeSMask(args.image_interval), OutputSaver(args.eval_interval, info["objects"]), PositionLogger(), EvalSummary(CATEGORIES, NOT_OOD)]
 

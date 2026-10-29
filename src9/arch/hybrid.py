@@ -59,14 +59,13 @@ class Block(nn.Module):
 
 #*** 2 encoder
 
-class ModalEncoder(nn.Module):
+class Encoder(nn.Module):
     """(B,L,F,C) spectrum + (B,) box -> (B,d_model)"""
-    def __init__(self, n_channels, freqs, rows, cols, n_boxes, d_model, d=128, heads=4, layers=2):
+    def __init__(self, n_channels, freqs, rows, cols, n_boxes, d_model, cum_mean, cum_var, d=128, heads=4, layers=2):
         super().__init__()
         L, F_ = rows * cols, len(freqs)
-        self.register_buffer("in_mean", torch.zeros(n_boxes, L, F_, n_channels))
-        self.register_buffer("in_sq", torch.ones(n_boxes, L, F_, n_channels))
-        self.register_buffer("in_n", torch.zeros(n_boxes))
+        self.register_buffer("cum_mean", cum_mean)                                   # (n_boxes,L,F,C) precomputed train stats
+        self.register_buffer("cum_std", cum_var.rsqrt())
         self.register_buffer("logf", torch.log10(torch.as_tensor(freqs, dtype=torch.float32)) - 2.5, persistent=False)  # (F,) 100-1000 Hz -> -.5...5
         self.conv1 = ConvBlock(n_channels + 1, 32, kernel=(1, 7), stride=(1, 4), padding=(0, 3))
         self.conv2 = ConvBlock(32, 64, kernel=(1, 5), stride=(1, 4), padding=(0, 2))
@@ -87,31 +86,24 @@ class ModalEncoder(nn.Module):
         self.to_emb = nn.Sequential(nn.LayerNorm(d), nn.Flatten(1), nn.Linear(L * d, d_model))
 
     def normalize(self, x, box):
-        """per-box standardization; in training, update the running per-box mean / mean square first (cumulative, then EMA .01)"""
-        if self.training:
-            with torch.no_grad():
-                oh = F.one_hot(box, len(self.in_n)).float()                          # (B,nb)
-                cnt, xf = oh.sum(0), x.float()
-                m1 = torch.einsum("bn,blfc->nlfc", oh, xf) / cnt.clamp_min(1)[:, None, None, None]
-                m2 = torch.einsum("bn,blfc->nlfc", oh, xf * xf) / cnt.clamp_min(1)[:, None, None, None]
-                w = torch.where(cnt > 0, (cnt / (self.in_n + cnt).clamp_min(1)).clamp_min(0.01), torch.zeros_like(cnt))[:, None, None, None]
-                self.in_mean.lerp_(m1, w); self.in_sq.lerp_(m2, w); self.in_n.add_(cnt)
-        mean, sq = self.in_mean[box], self.in_sq[box]
-        return ((x - mean) * (sq - mean ** 2).clamp_min(1e-6).rsqrt()).to(x.dtype)
+        """per-box standardization with precomputed train-set stats"""
+        return ((x - self.cum_mean[box]) * self.cum_std[box]).to(x.dtype)
 
     def forward(self, x, box):
         B, L, F_, C = x.shape
-        x = self.normalize(x, box)
-        x = torch.cat([x, self.logf[:, None].expand(B, L, F_, 1)], -1).permute(0, 3, 1, 2)  # (B,C+1,L,F)
-        x = self.conv3(self.conv2(self.conv1(x)))                                     # (B,128,L,P)
+        x = self.normalize(x, box)                                                     # (B,L,F,C) -> (B,L,F,C)
+        x = torch.cat([x, self.logf[:, None].expand(B, L, F_, 1)], -1).permute(0, 3, 1, 2)  # (B,L,F,C+1) -> (B,C+1,L,F)
+        x = self.conv1(x)                                                              # (B,C+1,L,F) -> (B,32,L,F/4)
+        x = self.conv2(x)                                                              # (B,32,L,F/4) -> (B,64,L,F/16)
+        x = self.conv3(x)                                                              # (B,64,L,F/16) -> (B,128,L,F/64)
         P = x.shape[-1]
-        x = self.embed(x.permute(0, 2, 3, 1))                                         # (B,L,P,d)
-        x = x + (self.laser_emb + self.laser_pos(self.laser_fourier))[None, :, None] + self.band_emb(self.band_logf[:, None])[None, None] + self.box_emb(box)[:, None, None]
-        k = self.pool_k(self.pool_norm(x)).view(B, L, P, self.heads, -1)             # (B,L,P,H,d/H)
-        a = (torch.einsum("blphe,he->blhp", k, self.pool_q) / math.sqrt(k.shape[-1])).softmax(-1)  # (B,L,H,P) which bands each laser reads
-        x = self.pool_o((x * a.mean(2)[..., None] * P).reshape(B, L, -1))            # gated bands, concatenated -> (B,L,d)
-        for block in self.lasers: x = block(x)                                        # over the lasers
-        return self.to_emb(x)                                                          # (B,L,d) -> (B,d_model)
+        x = self.embed(x.permute(0, 2, 3, 1))                                          # (B,128,L,P) -> (B,L,P,128) -> (B,L,P,d)
+        x = x + (self.laser_emb + self.laser_pos(self.laser_fourier))[None, :, None] + self.band_emb(self.band_logf[:, None])[None, None] + self.box_emb(box)[:, None, None]  # (B,L,P,d)
+        k = self.pool_k(self.pool_norm(x)).view(B, L, P, self.heads, -1)               # (B,L,P,d) -> (B,L,P,H,d/H)
+        a = (torch.einsum("blphe,he->blhp", k, self.pool_q) / math.sqrt(k.shape[-1])).softmax(-1)  # (B,L,P,H,d/H),(H,d/H) -> (B,L,H,P)
+        x = self.pool_o((x * a.mean(2)[..., None] * P).reshape(B, L, -1))              # (B,L,P,d) -> (B,L,P*d) -> (B,L,d)
+        for block in self.lasers: x = block(x)                                         # (B,L,d) -> (B,L,d)
+        return self.to_emb(x)                                                          # (B,L,d) -> (B,L,d_model) -> (B,d_model)
 
 #*** 3 decoder
 
@@ -162,7 +154,7 @@ class Hybrid(ComposerModel):
         super().__init__()
         self.freq_hz, self.grid_rc = data_info["freq_range"], (data_info["n_laser_rows"], data_info["n_laser_cols"])
         freqs = torch.linspace(*self.freq_hz, data_info["n_freqs"])                    # (F,) Hz, evenly spaced bins
-        self.encoder = ModalEncoder(data_info["n_channels"], freqs, *self.grid_rc, len(data_info["boxes"]), d_model)
+        self.encoder = Encoder(data_info["n_channels"], freqs, *self.grid_rc, len(data_info["boxes"]), d_model, data_info["cum_mean"], data_info["cum_var"])
         self.decoder = Decoder(d_model, out_c=2)                                       # channels: mask, outline
         self.aux = AuxHeads(d_model, data_info)
         self.orient_head = mlp(d_model, 2)                                             # ecc * (cos 2θ, sin 2θ) of a single object
