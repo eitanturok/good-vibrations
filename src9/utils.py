@@ -71,10 +71,10 @@ def aux_losses(out, batch, n_known):
                 area=F.l1_loss(out["log_area"], batch["mask_true"].flatten(1).sum(1).log1p()),
                 box=F.cross_entropy(out["box_logits"], batch["box"]))
 
-def bce_dice(logits, true):
+def bce_dice(logits, true, dice_w=0.5):
     p = logits.sigmoid()
     dice = 1 - (2 * (p * true).flatten(1).sum(1) + 1e-6).div((p + true).flatten(1).sum(1) + 1e-6).mean()
-    return 0.5 * F.binary_cross_entropy_with_logits(logits, true) + 0.5 * dice
+    return (1 - dice_w) * F.binary_cross_entropy_with_logits(logits, true) + dice_w * dice
 
 def instance_moment_loss(pred, inst):
     """per object: each pixel goes to the true object nearest in Mahalanobis distance (+ log det), and the predicted mask in each

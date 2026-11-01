@@ -2,6 +2,7 @@
   .venv/bin/python src9/run.py --model hybrid --run-name s9-hybrid-500ep
   .venv/bin/python src9/run.py --model boombox --run-name s9-boombox-3k
   .venv/bin/python src9/run.py --model transformer --run-name s9-transformer-500ep
+  .venv/bin/python src9/run.py --model transformer3 --run-name std-samplez-v2
 every default is the model's own (DEFAULTS); any can be overridden, e.g. --max-duration 500ep"""
 import os, subprocess, sys
 if os.environ.get("PYTHONUTF8") != "1": sys.exit(subprocess.run([sys.executable] + sys.argv, env=dict(os.environ, PYTHONUTF8="1")).returncode)
@@ -27,6 +28,8 @@ from callbacks import VisualizeSMask, OutputSaver, PositionLogger, EvalSummary
 from arch.boombox import Boombox
 from arch.hybrid import Hybrid
 from arch.transformer import Transformer
+from arch.transformer2 import Transformer2
+from arch.transformer3 import Transformer3
 from arch.transformer_calib import TransformerCalib
 
 # boombox: s6-gastro-plastic-cardboard-3k (hann 04_ffts, 3000 ep, 100 ep warmup). hybrid: s8-mag-nopose-imom-region-500ep (tukey, 500 ep, 50 ep warmup, microbatch 512)
@@ -35,28 +38,41 @@ COMMON = dict(seed=42, batch_size=1024, microbatch=0, lr=1e-4, weight_decay=0.01
 AUGS = dict(speaker_gain=0.35, speaker_gain_hz=20.0, laser_jitter=0.5)  # train-time augs (utils.py): log-gain sd, knot spacing in Hz, max laser shift in cells
 DEFAULTS = {"boombox": COMMON | dict(window="hann", t_warmup="100ep", max_duration="3000ep", checkpoint_interval="500ep", microbatch=256),
             "hybrid":  COMMON | dict(window="tukey", t_warmup="50ep", max_duration="500ep", checkpoint_interval="250ep", microbatch=512, **AUGS),
-            "transformer": COMMON | dict(window="tukey", t_warmup="50ep", max_duration="500ep", checkpoint_interval="250ep", microbatch=256, **AUGS)}
+            "transformer": COMMON | dict(window="tukey", t_warmup="50ep", max_duration="500ep", checkpoint_interval="250ep", microbatch=256, **AUGS),
+            "transformer2": COMMON | dict(window="tukey", t_warmup="50ep", max_duration="200ep", checkpoint_interval="100ep", microbatch=256, **AUGS,
+                                          height=64, width=64, freq_cls=0, laser_cls=0, freq_layers=2, band_proj=0, laser_proj=0, band_v=0, laser_v=0, laser_layers=2, rope=0, heads=4, readout="ref", latent_dim=128, d=128, norm="box", box_emb=1, pos="add", laser_drop=0.0, band_drop=0.0, outline=1, aux="all", loss="full", dice_w=0.5, area_w=0.0, tversky=0, tv_alpha=0.3, tv_beta=0.7, ms_dice=0, edge_w=0.0)}  # [cls] token instead of gated bands (freq) / the flatten (laser)
+DEFAULTS["transformer3"] = COMMON | dict(window="tukey", t_warmup="50ep", max_duration="200ep", checkpoint_interval="100ep", microbatch=128, **AUGS,  # = std-samplez-v1
+                                        height=64, width=64, bins_per_band=65, d=128, heads=4, freq_layers=4, laser_layers=4, latent_dim=256, laser_drop=0.05, band_drop=0.05, dice_w=0.5)
 DEFAULTS["transformer_calib"] = DEFAULTS["transformer"]  # transformer with empty-box calibration instead of per-box stats, bce + dice
 
 def run():
+    pre = argparse.ArgumentParser(add_help=False); pre.add_argument("--model", choices=tuple(DEFAULTS))
+    model_name = pre.parse_known_args()[0].model                                     # only this model's knobs are flags (--help lists them)
     p = argparse.ArgumentParser()
     p.add_argument("--model", choices=tuple(DEFAULTS), required=True)
     p.add_argument("--run-name", default=None)
     p.add_argument("--eval-only", type=int, default=0)
     p.add_argument("--checkpoint-path", default=None)
-    for k, v in DEFAULTS["hybrid"].items(): p.add_argument(f"--{k.replace('_', '-')}", type=type(v), default=None)  # None = the model's default
+    for k, v in DEFAULTS.get(model_name, {}).items(): p.add_argument(f"--{k.replace('_', '-')}", type=(lambda s: s if s == "auto" else int(s)) if k == "microbatch" else type(v), default=None)  # None = the model's default; microbatch: int or "auto"
     args = p.parse_args()
     for k, v in DEFAULTS[args.model].items():
         if getattr(args, k) is None: setattr(args, k, v)
     assert not args.eval_only or args.checkpoint_path, "--eval-only needs --checkpoint-path"
+    T2 = ("height", "width", "freq_cls", "laser_cls", "freq_layers", "band_proj", "laser_proj", "band_v", "laser_v", "laser_layers", "rope", "heads", "readout", "latent_dim", "d", "norm", "box_emb", "pos", "laser_drop", "band_drop", "outline", "aux", "loss", "dice_w", "area_w", "tversky", "tv_alpha", "tv_beta", "ms_dice", "edge_w")  # transformer2-only knobs
+    T3 = ("height", "width", "bins_per_band", "d", "heads", "freq_layers", "laser_layers", "latent_dim", "laser_drop", "band_drop", "dice_w")  # transformer3 knobs
+    own = {"transformer2": T2, "transformer3": T3}.get(args.model, ())
 
     seed_all(args.seed)
     device = "gpu" if torch.cuda.is_available() else "cpu"
     if device == "gpu": torch.set_float32_matmul_precision("high"); torch.backends.cudnn.benchmark = True
 
-    train_dl, eval_dl, train_eval, info = build_dataset(args.window, batch_size=args.batch_size, eval_batch_size=args.eval_batch_size, num_workers=args.num_workers)
+    train_dl, eval_dl, train_eval, info = build_dataset(args.window, batch_size=args.batch_size, eval_batch_size=args.eval_batch_size, num_workers=args.num_workers,
+                                                        height=getattr(args, "height", None) or 64, width=getattr(args, "width", None) or 64, eval_microbatch="auto" if args.microbatch == "auto" else None)
+
     augs = {} if args.model == "boombox" else {k: getattr(args, k) for k in AUGS}
-    model = {"boombox": Boombox, "hybrid": Hybrid, "transformer": Transformer, "transformer_calib": TransformerCalib}[args.model](info, **augs)
+    augs |= {k: getattr(args, k) for k in own}
+
+    model = {"boombox": Boombox, "hybrid": Hybrid, "transformer": Transformer, "transformer_calib": TransformerCalib, "transformer2": Transformer2, "transformer3": Transformer3}[args.model](info, **augs)
     n_params = sum(p.numel() for p in model.parameters())
     print(f"{args.model}: {n_params:,} parameters")
     if args.run_name: Path(f"runs/{args.run_name}").mkdir(parents=True, exist_ok=True); Path(f"runs/{args.run_name}/args.json").write_text(json.dumps(vars(args), indent=1))
@@ -71,7 +87,7 @@ def run():
     trainer = Trainer(
         run_name=args.run_name, model=model, optimizers=torch.optim.AdamW(model.parameters(), args.lr, weight_decay=args.weight_decay),
         schedulers=None if args.eval_only else CosineAnnealingWithWarmupScheduler(t_warmup=args.t_warmup),
-        device_train_microbatch_size=args.microbatch or None, train_dataloader=train_dl, eval_dataloader=eval_dl, eval_interval=args.eval_interval,
+        device_train_microbatch_size=args.microbatch if args.microbatch == "auto" else int(args.microbatch) or None, train_dataloader=train_dl, eval_dataloader=eval_dl, eval_interval=args.eval_interval,
         max_duration=None if args.eval_only else args.max_duration, seed=args.seed, device=device, precision="amp_bf16" if device == "gpu" else "fp32",
         loggers=loggers, callbacks=callbacks, progress_bar=False, log_to_console=True,
         load_path=args.checkpoint_path, load_weights_only=bool(args.eval_only), autoresume=bool(args.run_name) and not args.eval_only,

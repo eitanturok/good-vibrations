@@ -1034,6 +1034,21 @@ def _loadable(path) -> bool:
     return _loadable_at(path, st.st_mtime, st.st_size)
 
 
+def thr_metrics(pred: torch.Tensor, true: torch.Tensor, thr: float = 0.08) -> dict[str, np.ndarray]:
+    """src9's miss08 (no pixel > thr on the object) and com_px: distance in grid pixels between the
+    centres of mass of pred > thr and the true mask (NaN on a miss); both NaN on an empty box."""
+    b, o = (pred > thr).float(), (true > 0.5).float()
+    has = o.flatten(1).any(1)
+    miss = ~(b * o).flatten(1).any(1)
+    r, c = torch.arange(b.shape[1]).float(), torch.arange(b.shape[2]).float()
+    def com(m):
+        a = m.flatten(1).sum(1).clamp_min(1)
+        return torch.stack([(m.sum(2) * r).sum(1) / a, (m.sum(1) * c).sum(1) / a], -1)
+    d = (com(b) - com(o)).norm(dim=-1)
+    nan = torch.full_like(d, float("nan"))
+    return {"miss08": miss.float().where(has, nan).numpy(), "com_px": d.where(has & ~miss, nan).numpy()}
+
+
 def _score(name: str, read: list[str], masks: list, rows: np.ndarray,
            truth: np.ndarray) -> tuple[dict, list]:
     """Metrics + crosshair geometry for a run training did not score (saved before
@@ -1045,6 +1060,7 @@ def _score(name: str, read: list[str], masks: list, rows: np.ndarray,
     h.update(pickle.dumps((read, _stamp(read))))
     h.update(rows.tobytes())
     h.update(truth.tobytes())
+    h.update(b"miss08+com_px")   # bump when the metric set changes, so cached scores are redone
     key = h.hexdigest()
     cache = config.CACHE_DIR / "scores" / f"{name}.pkl"
     try:
@@ -1064,6 +1080,7 @@ def _score(name: str, read: list[str], masks: list, rows: np.ndarray,
         'localization_raw': loc['localization_raw'].numpy(),
         'iou': soft_iou(pred, truth_t).numpy(),
         'contour': contour_f(pred, truth_t).numpy(),
+        **thr_metrics(pred, truth_t),
     }
     try:
         cache.parent.mkdir(parents=True, exist_ok=True)

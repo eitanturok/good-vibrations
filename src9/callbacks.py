@@ -81,18 +81,28 @@ def nanmean(vs): return {k: float(np.nanmean([v[k] for v in vs])) for k in vs[0]
 
 class EvalSummary(Callback):
     """means over eval splits (each split once): core (4 base objects x 3 boxes), hard (cardboard rotated soap), unseen_angle,
-    unseen_position, and per box id / ood / cat/<category>, as metrics/eval/<group>/<metric>"""
+    unseen_position, and per box id / ood / cat/<category>, as metrics/eval/<group>/<metric>.
+    + nb113's metrics/eval/id/iou08 and metrics/eval/ood/iou08: per-sample means pooled over every box's id+multiple / ood splits"""
     CORE, HARD, ANGLE, POS = ("candle", "cube", "soap-dispenser", "vase"), "cardboard/soap-dispenser-rotated", "cardboard/soap-dispenser-unseen-angle", "unseen-position"
+    ID, OOD = ("id", "multiple"), ("rotated", "cylinder", "unseen-object", "unseen-speaker", "unseen-laser", "lid")  # = nb113's ID_CATS, OOD_CATS
 
-    def __init__(self, categories, not_ood): self.categories, self.not_ood, self.splits = categories, not_ood, {}
+    def __init__(self, categories, not_ood): self.categories, self.not_ood, self.splits, self.sums = categories, not_ood, {}, {}
 
     def eval_end(self, state, logger):
         label = state.dataloader_label
-        if label.startswith("eval/"): self.splits[label[5:]] = {k: m.compute().item() for k, m in state.eval_metrics[label].items()}
+        if not label.startswith("eval/"): return
+        self.splits[label[5:]] = {k: m.compute().item() for k, m in state.eval_metrics[label].items()}
+        m = state.eval_metrics[label]["iou08"]
+        self.sums[label[5:]] = (m.mean_value.item(), m.weight.item())  # MeanMetric: iou08 sum, n samples
 
     def summarize(self, logger):
-        splits, self.splits = self.splits, {}
+        splits, self.splits, sums, self.sums = self.splits, {}, self.sums, {}
         if not splits: return
+        cat = {f"{b}/{s}": c for b, cs in self.categories.items() for c, ss in cs.items() for s in ss}  # "<box>/<split>" -> category
+        for g, cats in (("id", self.ID), ("ood", self.OOD)):
+            if vs := [v for s, v in sums.items() if cat.get(s) in cats]:
+                n = sum(w for _, w in vs)
+                logger.log_metrics({f"metrics/eval/{g}/iou08": sum(t for t, _ in vs) / n if n else float("nan")})
         groups = {"core": [v for s, v in splits.items() if s.split("/")[1] in self.CORE],
                   "hard": [splits[self.HARD]] if self.HARD in splits else [], "unseen_angle": [splits[self.ANGLE]] if self.ANGLE in splits else [],
                   "unseen_position": [v for s, v in splits.items() if s.split("/")[1] == self.POS]}

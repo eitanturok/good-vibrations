@@ -272,7 +272,7 @@ class VibrationDataset(StreamingDataset):
                     experiment=m["experiment"], position_id=m["position_id"], speaker=m["speaker"], sample_id=m["sample_id"],
                     n_objects=m["n_objects"], layout=m["layout"], crop_h=m["crop_overhead_shape"][0], crop_w=m["crop_overhead_shape"][1])
 
-def build_dataset(window="tukey", batch_size=1024, eval_batch_size=108, num_workers=4):
+def build_dataset(window="tukey", batch_size=1024, eval_batch_size=108, num_workers=4, height=64, width=64, eval_microbatch=None):
     samples, idxs = load_splits()
     metas = list(samples.values())
     L, F, C = load_fft(next(iter(samples)), metas[0], "hann").shape
@@ -280,7 +280,7 @@ def build_dataset(window="tukey", batch_size=1024, eval_batch_size=108, num_work
                 freq_range=(float(metas[0]["min_freq"]), float(metas[0]["max_freq"])),
                 objects=sorted({"+".join(sorted(metas[i]["objects"])) for i in idxs["train"]}) + ["unseen"],  # combos seen in train + "unseen"
                 n_objects=sorted({m["n_objects"] for m in metas}), boxes=sorted({m["box"] for m in metas}))
-    ys = process_y(samples, info["objects"], info["boxes"], max(info["n_objects"]), 64, 64)
+    ys = process_y(samples, info["objects"], info["boxes"], max(info["n_objects"]), height, width)
 
     MDS.mkdir(exist_ok=True)
     mds = Path(tempfile.mkdtemp(prefix=f"{window}_", dir=MDS))
@@ -291,18 +291,27 @@ def build_dataset(window="tukey", batch_size=1024, eval_batch_size=108, num_work
     box_idx = {b: i for i, b in enumerate(info["boxes"])}
     x_sum, x_sq = np.zeros((nb, L, F, C), np.float32), np.zeros((nb, L, F, C), np.float32)  # per-box train-only sums -> normalization stats
     n_train = np.zeros(nb, np.float32)
-    e_sum, e_sq, n_empty = np.zeros((nb, L, F, C), np.float64), np.zeros((nb, L, F, C), np.float64), np.zeros(nb)  # per-box empty-box train scans -> calibration
+    e_sum, e_sq, n_empty = np.zeros((nb, L, F, C), np.float32), np.zeros((nb, L, F, C), np.float32), np.zeros(nb, np.float32)  # per-box empty-box train scans -> calibration
+    empty_tr = {b: sorted(i for i in idxs["train"] if metas[i]["n_objects"] == 0 and box_idx[metas[i]["box"]] == b) for b in range(nb)}
+    empty5 = {b: sorted(np.random.default_rng(0).choice(ids, min(5, len(ids)), replace=False).tolist()) for b, ids in empty_tr.items()}  # norm="empty5": 5 fixed-seed empty train scans per box
+    e5_sum, e5_sq = np.zeros((nb, L, F, C), np.float32), np.zeros((nb, L, F, C), np.float32)
     with MDSWriter(out=str(mds), columns=cols, size_limit="200MB") as w:
         for i, (m, X, y) in enumerate(zip(metas, process_x(samples, window), ys)):
             w.write({"X": X, **y, "experiment": m["experiment"], "position_id": int(m["position_id"])})
             if i in train_set: b = box_idx[m["box"]]; x_sum[b] += X; x_sq[b] += X * X; n_train[b] += 1
             if i in train_set and m["n_objects"] == 0: e_sum[b] += X; e_sq[b] += X * X; n_empty[b] += 1
+            if i in train_set and i in empty5[b]: e5_sum[b] += X; e5_sq[b] += X * X
 
     assert (n_empty > 0).all(), f"a box has no empty-box train scans: {n_empty}"
     e_mean = e_sum / n_empty[:, None, None, None]                                    # (nb,L,F,C)
     e_var = (e_sq / n_empty[:, None, None, None] - e_mean ** 2).mean(1).clip(1e-6)  # (nb,F,C): spread around each laser's own mean, pooled over lasers and scans
     info["empty_mean"], info["empty_std"] = torch.from_numpy(e_mean).float(), torch.from_numpy(np.sqrt(e_var)).float()
     info["n_empty"] = n_empty.tolist()
+    n5 = np.array([len(empty5[b]) for b in range(nb)], np.float32)[:, None, None, None]
+    e5_mean = e5_sum / n5
+    e5_std = np.sqrt(np.maximum(e5_sq / n5 - e5_mean ** 2, 0))                         # (nb,L,F,C) per (box, laser, bin, channel) from 5 scans
+    e5_std = np.maximum(e5_std, 0.1 * np.median(e5_std.reshape(nb, -1), 1)[:, None, None, None])  # floor: 0.1 x the box's median std, so a ~0 std from 5 scans can't explode
+    info["empty5_mean"], info["empty5_std"], info["empty5_idx"] = torch.from_numpy(e5_mean).float(), torch.from_numpy(e5_std).float(), {info["boxes"][b]: v for b, v in empty5.items()}
 
     n = n_train[:, None, None, None]                                                 # (nb,1,1,1): same stats at every laser
     mean = x_sum / np.maximum(n, 1)
@@ -316,6 +325,6 @@ def build_dataset(window="tukey", batch_size=1024, eval_batch_size=108, num_work
     # eval: no workers (~70 eval splits x persistent workers ran the machine out of files and RAM)
     train_dl = DataLoader(Subset(train_ds, idxs["train"]), batch_size=batch_size, shuffle=True, drop_last=True, num_workers=num_workers,
                           pin_memory=True, persistent_workers=num_workers > 0)
-    eval_dl = [Evaluator(label=n, dataloader=DataLoader(Subset(eval_ds, ids), batch_size=eval_batch_size)) for n, ids in idxs.items() if n != "train"]
-    train_eval = Evaluator(label="train", dataloader=DataLoader(Subset(train_ds, idxs["train"]), batch_size=eval_batch_size))
+    eval_dl = [Evaluator(label=n, dataloader=DataLoader(Subset(eval_ds, ids), batch_size=eval_batch_size), device_eval_microbatch_size=eval_microbatch) for n, ids in idxs.items() if n != "train"]
+    train_eval = Evaluator(label="train", dataloader=DataLoader(Subset(train_ds, idxs["train"]), batch_size=eval_batch_size), device_eval_microbatch_size=eval_microbatch)  # None = whole batch, "auto" = halve on OOM
     return train_dl, eval_dl, train_eval, info

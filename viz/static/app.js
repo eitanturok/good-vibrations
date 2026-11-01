@@ -58,6 +58,10 @@ const METRICS = [
   { key: "fill",     label: "Fill",    short: "fill", worst: "low"  },  // mean prob inside the object
   { key: "miss",     label: "Miss",    short: "miss", worst: "high" },  // 1 = no pixel > 0.5 on the object
   { key: "com_err",  label: "COM err", short: "com",  worst: "high" },  // com head, fraction of the box
+  // src9 runs (scored by viz): miss08 = no pixel > 0.08 on the object (training's miss08),
+  // com_px = pred > 0.08 vs true mask centre of mass, grid pixels, NaN on a miss
+  { key: "miss08",   label: "Miss @0.08",    short: "miss08", worst: "high" },
+  { key: "com_px",   label: "COM dist (px)", short: "com px", worst: "high" },
   // --gray runs (src8): the drawn photo vs the real one, L1 at the TRUE object's location:
   // ph-loc = the object + a 2px ring (look and placement), ph-obj = the object pixels only
   { key: "photo_loc", label: "Photo L1 (object + ring)", short: "ph-loc", worst: "high" },
