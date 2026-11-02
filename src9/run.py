@@ -24,7 +24,7 @@ from composer.optim import CosineAnnealingWithWarmupScheduler
 from composer.utils.reproducibility import seed_all
 
 from dataset import CATEGORIES, NOT_OOD, build_dataset
-from callbacks import VisualizeSMask, OutputSaver, PositionLogger, EvalSummary
+from callbacks import VisualizeSMask, OutputSaver, PositionLogger, EvalSummary, SetEpoch
 from arch.boombox import Boombox
 from arch.hybrid import Hybrid
 from arch.transformer import Transformer
@@ -41,8 +41,9 @@ DEFAULTS = {"boombox": COMMON | dict(window="hann", t_warmup="100ep", max_durati
             "transformer": COMMON | dict(window="tukey", t_warmup="50ep", max_duration="500ep", checkpoint_interval="250ep", microbatch=256, **AUGS),
             "transformer2": COMMON | dict(window="tukey", t_warmup="50ep", max_duration="200ep", checkpoint_interval="100ep", microbatch=256, **AUGS,
                                           height=64, width=64, freq_cls=0, laser_cls=0, freq_layers=2, band_proj=0, laser_proj=0, band_v=0, laser_v=0, laser_layers=2, rope=0, heads=4, readout="ref", latent_dim=128, d=128, norm="box", box_emb=1, pos="add", laser_drop=0.0, band_drop=0.0, outline=1, aux="all", loss="full", dice_w=0.5, area_w=0.0, tversky=0, tv_alpha=0.3, tv_beta=0.7, ms_dice=0, edge_w=0.0)}  # [cls] token instead of gated bands (freq) / the flatten (laser)
-DEFAULTS["transformer3"] = COMMON | dict(window="tukey", t_warmup="50ep", max_duration="200ep", checkpoint_interval="100ep", microbatch=128, **AUGS,  # = std-samplez-v1
-                                        height=64, width=64, bins_per_band=65, d=128, heads=4, freq_layers=4, laser_layers=4, latent_dim=256, laser_drop=0.05, band_drop=0.05, dice_w=0.5)
+DEFAULTS["transformer3"] = COMMON | dict(window="tukey", t_warmup="50ep", max_duration="300ep", checkpoint_interval="100ep", microbatch=128, **AUGS,  # = big-drop20-v1 at 300 ep
+                                        height=64, width=64, bins_per_band=65, d=256, heads=8, freq_layers=4, laser_layers=8, latent_dim=512, laser_drop=0.2, band_drop=0.2, dice_w=0.5, objrecall_w=0.0, boundary_w=0.0,
+                                        mask_loss="bce_dice", maskae="", readout="per", heatmap_w=0.0, laser_jitter_p=1.0, speaker_gain_p=1.0, gan_w=0.0)
 DEFAULTS["transformer_calib"] = DEFAULTS["transformer"]  # transformer with empty-box calibration instead of per-box stats, bce + dice
 
 def run():
@@ -59,7 +60,7 @@ def run():
         if getattr(args, k) is None: setattr(args, k, v)
     assert not args.eval_only or args.checkpoint_path, "--eval-only needs --checkpoint-path"
     T2 = ("height", "width", "freq_cls", "laser_cls", "freq_layers", "band_proj", "laser_proj", "band_v", "laser_v", "laser_layers", "rope", "heads", "readout", "latent_dim", "d", "norm", "box_emb", "pos", "laser_drop", "band_drop", "outline", "aux", "loss", "dice_w", "area_w", "tversky", "tv_alpha", "tv_beta", "ms_dice", "edge_w")  # transformer2-only knobs
-    T3 = ("height", "width", "bins_per_band", "d", "heads", "freq_layers", "laser_layers", "latent_dim", "laser_drop", "band_drop", "dice_w")  # transformer3 knobs
+    T3 = ("height", "width", "bins_per_band", "d", "heads", "freq_layers", "laser_layers", "latent_dim", "laser_drop", "band_drop", "dice_w", "objrecall_w", "boundary_w", "mask_loss", "maskae", "readout", "heatmap_w", "laser_jitter_p", "speaker_gain_p", "gan_w")  # transformer3 knobs
     own = {"transformer2": T2, "transformer3": T3}.get(args.model, ())
 
     seed_all(args.seed)
@@ -82,10 +83,10 @@ def run():
         loggers.append(WandBLogger("better-tsa", group=args.wandb_group, name=args.run_name,
                                    init_kwargs={"config": vars(args) | {k: v for k, v in info.items() if not isinstance(v, torch.Tensor)} | dict(num_parameters=n_params), "id": args.run_name, "resume": "allow"}))
     callbacks = [LRMonitor(), SpeedMonitor(), RuntimeEstimator(skip_batches=64, time_unit="minutes"), NaNMonitor(), OptimizerMonitor(batch_log_interval=10),
-                 VisualizeSMask(args.image_interval), OutputSaver(args.eval_interval, info["objects"]), PositionLogger(), EvalSummary(CATEGORIES, NOT_OOD)]
+                 VisualizeSMask(args.image_interval), OutputSaver(args.eval_interval, info["objects"]), PositionLogger(), EvalSummary(CATEGORIES, NOT_OOD), SetEpoch()]
 
     trainer = Trainer(
-        run_name=args.run_name, model=model, optimizers=torch.optim.AdamW(model.parameters(), args.lr, weight_decay=args.weight_decay),
+        run_name=args.run_name, model=model, optimizers=torch.optim.AdamW([q for n, q in model.named_parameters() if not n.startswith("disc.")], args.lr, weight_decay=args.weight_decay),
         schedulers=None if args.eval_only else CosineAnnealingWithWarmupScheduler(t_warmup=args.t_warmup),
         device_train_microbatch_size=args.microbatch if args.microbatch == "auto" else int(args.microbatch) or None, train_dataloader=train_dl, eval_dataloader=eval_dl, eval_interval=args.eval_interval,
         max_duration=None if args.eval_only else args.max_duration, seed=args.seed, device=device, precision="amp_bf16" if device == "gpu" else "fp32",
@@ -94,10 +95,12 @@ def run():
         save_folder=None if args.eval_only else "runs/{run_name}/checkpoints", save_interval=args.checkpoint_interval,
         compile_config={"mode": "default"} if args.compile else None,
     )
+    # eval runs eager: inductor's no_grad graph (torch 2.11) gives wrong masks that change from run to run once a 2nd batch size is seen (|dp| ~1)
+    if args.compile: model.eval_forward = lambda batch, outputs=None: type(model).forward(model, batch)
     trainer.eval(eval_dl + [train_eval])
     if not args.eval_only:
-        trainer.fit()
-        trainer.eval(eval_dl + [train_eval])
+        trainer.fit()                    # fit already evals eval_dl at the end (last eval_interval or FIT_END): only train left
+        trainer.eval([train_eval])
 
 if __name__ == "__main__":
     run()

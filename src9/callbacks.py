@@ -116,3 +116,7 @@ class EvalSummary(Callback):
 
     def eval_after_all(self, state, logger): self.summarize(logger)
     def eval_standalone_end(self, state, logger): self.summarize(logger)
+
+class SetEpoch(Callback):
+    """model.epoch = the current epoch, for epoch-scheduled losses (transformer3's boundary ramp)"""
+    def epoch_start(self, state, logger): state.model.epoch = state.timestamp.epoch.value

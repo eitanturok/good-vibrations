@@ -1,9 +1,10 @@
-import atexit, csv, json, random, shutil, tempfile
+import atexit, csv, hashlib, json, random, shutil, tempfile
 from pathlib import Path
 
 import numpy as np
 import torch
 from PIL import Image
+from scipy import ndimage
 from scipy.signal import butter, sosfiltfilt
 from scipy.signal.windows import tukey
 from tqdm import tqdm
@@ -15,7 +16,8 @@ from streaming import StreamingDataset, MDSWriter
 ROOT = Path(__file__).resolve().parents[1]
 EXPERIMENTS = ROOT / "experiments"
 CACHE = ROOT / "runs/_src9_cache"   # footprint-overlap cache
-MDS = EXPERIMENTS / "mds_src9"      # per-run temp MDS copies (~15 GB each, deleted at exit)
+MDS = EXPERIMENTS / "mds_src9"      # MDS caches (~15 GB each), one per (window, size, samples, split); a new one is built in a temp dir and renamed when done
+MDS_VERSION = 1                     # bump when process_x / process_y / write_mds change
 EXCLUDE = Path(__file__).parent / "exclude.csv"  # FFT outliers (nb96 re-run): mistimed chirps (|lag| >= 40 ms) + 2 broadband-noise captures
 
 # the held-out floor region: (row0, row1, col0, col1) as box fractions, lasers on the row-1 wall (src8's, left of centre). Held out for
@@ -268,23 +270,20 @@ class VibrationDataset(StreamingDataset):
         row, m = super().__getitem__(i), self.metas[i]
         assert (row["experiment"], row["position_id"]) == key(m) and key(m) not in self.banned, f"bad row {i}: {key(m)}"
         t = lambda k: torch.from_numpy(row[k].copy())
-        return dict(fft=t("X"), mask_true=t("y"), inst=t("inst"), object=row["object"], box=row["box"], coms=t("coms"),
+        o = row["y"] > 0.5
+        lab, n = ndimage.label(o)                                                    # objects never touch: components = objects (= n_objects on every position, no spurious ones; cylinder-100g is 2-4 px)
+        assert n <= len(row["inst"]), (key(m), n)
+        objs = lab[None] == np.arange(1, len(row["inst"]) + 1)[:, None, None]          # (max_objects,H,W), zero-padded
+        sdf = (ndimage.distance_transform_edt(~o) - ndimage.distance_transform_edt(o)) / o.shape[0] if n else np.zeros(o.shape)  # signed distance to the edge in image heights, < 0 inside; empty -> 0
+        return dict(fft=t("X"), mask_true=t("y"), inst=t("inst"), objs=torch.from_numpy(objs).float(), sdf=torch.from_numpy(sdf).float(), object=row["object"], box=row["box"], coms=t("coms"),
                     experiment=m["experiment"], position_id=m["position_id"], speaker=m["speaker"], sample_id=m["sample_id"],
                     n_objects=m["n_objects"], layout=m["layout"], crop_h=m["crop_overhead_shape"][0], crop_w=m["crop_overhead_shape"][1])
 
-def build_dataset(window="tukey", batch_size=1024, eval_batch_size=108, num_workers=4, height=64, width=64, eval_microbatch=None):
-    samples, idxs = load_splits()
-    metas = list(samples.values())
+def write_mds(mds, samples, idxs, info, window, height, width):
+    """every sample's spectrum + targets -> an MDS dir; -> the train-only stats (per-box normalization, empty-box calibration)"""
+    metas, stats = list(samples.values()), {}
     L, F, C = load_fft(next(iter(samples)), metas[0], "hann").shape
-    info = dict(n_laser_rows=metas[0]["n_rows"], n_laser_cols=metas[0]["n_cols"], n_freqs=F, n_channels=C,
-                freq_range=(float(metas[0]["min_freq"]), float(metas[0]["max_freq"])),
-                objects=sorted({"+".join(sorted(metas[i]["objects"])) for i in idxs["train"]}) + ["unseen"],  # combos seen in train + "unseen"
-                n_objects=sorted({m["n_objects"] for m in metas}), boxes=sorted({m["box"] for m in metas}))
     ys = process_y(samples, info["objects"], info["boxes"], max(info["n_objects"]), height, width)
-
-    MDS.mkdir(exist_ok=True)
-    mds = Path(tempfile.mkdtemp(prefix=f"{window}_", dir=MDS))
-    atexit.register(shutil.rmtree, mds, ignore_errors=True)
     cols = {"X": "ndarray:float32", "y": "ndarray:float32", "inst": "ndarray:float32", "object": "int", "box": "int", "coms": "ndarray:float32", "experiment": "str", "position_id": "int"}
     nb = len(info["boxes"])
     train_set = set(idxs["train"])
@@ -305,19 +304,39 @@ def build_dataset(window="tukey", batch_size=1024, eval_batch_size=108, num_work
     assert (n_empty > 0).all(), f"a box has no empty-box train scans: {n_empty}"
     e_mean = e_sum / n_empty[:, None, None, None]                                    # (nb,L,F,C)
     e_var = (e_sq / n_empty[:, None, None, None] - e_mean ** 2).mean(1).clip(1e-6)  # (nb,F,C): spread around each laser's own mean, pooled over lasers and scans
-    info["empty_mean"], info["empty_std"] = torch.from_numpy(e_mean).float(), torch.from_numpy(np.sqrt(e_var)).float()
-    info["n_empty"] = n_empty.tolist()
+    stats["empty_mean"], stats["empty_std"] = torch.from_numpy(e_mean).float(), torch.from_numpy(np.sqrt(e_var)).float()
+    stats["n_empty"] = n_empty.tolist()
     n5 = np.array([len(empty5[b]) for b in range(nb)], np.float32)[:, None, None, None]
     e5_mean = e5_sum / n5
     e5_std = np.sqrt(np.maximum(e5_sq / n5 - e5_mean ** 2, 0))                         # (nb,L,F,C) per (box, laser, bin, channel) from 5 scans
     e5_std = np.maximum(e5_std, 0.1 * np.median(e5_std.reshape(nb, -1), 1)[:, None, None, None])  # floor: 0.1 x the box's median std, so a ~0 std from 5 scans can't explode
-    info["empty5_mean"], info["empty5_std"], info["empty5_idx"] = torch.from_numpy(e5_mean).float(), torch.from_numpy(e5_std).float(), {info["boxes"][b]: v for b, v in empty5.items()}
+    stats["empty5_mean"], stats["empty5_std"], stats["empty5_idx"] = torch.from_numpy(e5_mean).float(), torch.from_numpy(e5_std).float(), {info["boxes"][b]: v for b, v in empty5.items()}
 
     n = n_train[:, None, None, None]                                                 # (nb,1,1,1): same stats at every laser
     mean = x_sum / np.maximum(n, 1)
     cum_mean = torch.from_numpy(mean)
     cum_var = torch.from_numpy(np.where(n > 0, np.maximum(x_sq / np.maximum(n, 1) - mean * mean, 1e-6), 1.0))
-    info["cum_mean"], info["cum_var"] = cum_mean, cum_var
+    stats["cum_mean"], stats["cum_var"] = cum_mean, cum_var
+
+    return stats
+
+def build_dataset(window="tukey", batch_size=1024, eval_batch_size=108, num_workers=4, height=64, width=64, eval_microbatch=None):
+    samples, idxs = load_splits()
+    metas = list(samples.values())
+    L, F, C = load_fft(next(iter(samples)), metas[0], "hann").shape
+    info = dict(n_laser_rows=metas[0]["n_rows"], n_laser_cols=metas[0]["n_cols"], n_freqs=F, n_channels=C,
+                freq_range=(float(metas[0]["min_freq"]), float(metas[0]["max_freq"])),
+                objects=sorted({"+".join(sorted(metas[i]["objects"])) for i in idxs["train"]}) + ["unseen"],  # combos seen in train + "unseen"
+                n_objects=sorted({m["n_objects"] for m in metas}), boxes=sorted({m["box"] for m in metas}))
+    MDS.mkdir(exist_ok=True)
+    h = hashlib.sha1(repr((MDS_VERSION, window, height, width, [str(d) for d in samples], idxs)).encode()).hexdigest()[:12]
+    mds = MDS / f"cache_{window}_{height}x{width}_{h}"                              # the processed spectra + targets + train stats, kept across runs
+    if not (mds / "stats.pt").exists():
+        tmp = Path(tempfile.mkdtemp(prefix=f"{window}_", dir=MDS))
+        atexit.register(shutil.rmtree, tmp, ignore_errors=True)
+        torch.save(write_mds(tmp, samples, idxs, info, window, height, width), tmp / "stats.pt")
+        tmp.rename(mds)                                                               # complete caches only
+    info |= torch.load(mds / "stats.pt")
 
     train_pos = {key(metas[i]) for i in idxs["train"]}
     eval_pos = {key(metas[i]) for n, ids in idxs.items() if n != "train" for i in ids}
