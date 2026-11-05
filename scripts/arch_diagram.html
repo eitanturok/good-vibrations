@@ -1,0 +1,479 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>__TITLE__</title>
+<style>
+:root {
+  --bg: #ffffff; --card: #ffffff; --frame: #f5f5f7; --head: rgba(0,0,0,.04); --ink: #1d1d1f; --muted: #86868b; --hair: #d2d2d7; --edge: #b0b0b6; --accent: #0071e3; --scrim: rgba(0,0,0,.18);
+  color-scheme: light;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) { --bg: #000; --card: #1c1c1e; --frame: #111113; --head: rgba(255,255,255,.05); --ink: #f5f5f7; --muted: #8e8e93; --hair: #38383a; --edge: #5f5f64; --accent: #2997ff; --scrim: rgba(0,0,0,.6); color-scheme: dark; }
+}
+:root[data-theme="dark"] { --bg: #000; --card: #1c1c1e; --frame: #111113; --head: rgba(255,255,255,.05); --ink: #f5f5f7; --muted: #8e8e93; --hair: #38383a; --edge: #5f5f64; --accent: #2997ff; --scrim: rgba(0,0,0,.6); color-scheme: dark; }
+* { box-sizing: border-box; }
+html, body { margin: 0; background: var(--bg); color: var(--ink); font: 15px/1.4 system-ui, -apple-system, "SF Pro Text", "Helvetica Neue", Inter, sans-serif; -webkit-font-smoothing: antialiased; }
+body { min-height: 100vh; display: flex; flex-direction: column; }
+header { width: 100%; max-width: 1400px; margin: 0 auto; padding: 18px 32px 0; display: flex; align-items: flex-end; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
+h1 { margin: 0; font-size: 26px; font-weight: 600; letter-spacing: -0.02em; }
+.meta { color: var(--muted); font-size: 13px; margin-top: 2px; }
+.ctl { display: flex; gap: 10px; }
+.seg { display: inline-flex; border: 1px solid var(--hair); border-radius: 999px; padding: 2px; }
+.seg button { font: inherit; font-size: 12.5px; color: var(--muted); background: none; border: 0; border-radius: 999px; padding: 4px 12px; cursor: pointer; }
+.seg button[aria-pressed="true"] { background: var(--ink); color: var(--bg); }
+#canvas { flex: 1; min-height: 0; display: flex; justify-content: center; align-items: center; padding: 8px 24px 0; }
+#canvas svg { display: block; width: 100%; max-width: 1400px; height: auto; max-height: calc(100vh - 122px); }
+body.stack #canvas { overflow-x: auto; }
+body.stack #canvas svg { max-height: none; width: auto; max-width: none; }
+footer { padding: 4px 24px 12px; color: var(--muted); font-size: 12px; text-align: center; }
+#tip { position: fixed; pointer-events: none; z-index: 10; max-width: 340px; background: var(--card); border: 1px solid var(--hair); border-radius: 12px; box-shadow: 0 8px 28px rgba(0,0,0,.08); padding: 10px 12px; font-size: 12.5px; display: none; }
+#tip b { font-weight: 600; } #tip div { color: var(--muted); margin-top: 2px; } #tip code { font: 11.5px ui-monospace, "SF Mono", Menlo, monospace; }
+.err { max-width: 980px; margin: 24px auto; padding: 0 24px; } .err pre { font: 12px ui-monospace, "SF Mono", Menlo, monospace; color: var(--muted); white-space: pre-wrap; border-top: 1px solid var(--hair); padding-top: 16px; }
+
+svg text { fill: var(--ink); font-family: system-ui, -apple-system, "SF Pro Text", "Helvetica Neue", Inter, sans-serif; }
+.sec .st { font-size: 13px; font-weight: 600; letter-spacing: .02em; }
+.sec .sw { font-size: 12.5px; fill: var(--muted); }
+.sec line { stroke: var(--hair); }
+.card rect.c { fill: var(--card); stroke: var(--hair); }
+.card.go { cursor: pointer; }
+.card.go:hover rect.c { stroke: var(--accent); }
+.card .t { font-size: 15px; font-weight: 600; letter-spacing: -0.01em; }
+.card.small .t { font-size: 13px; }
+.card .w { font-size: 12px; fill: var(--muted); }
+.card.small .w { font-size: 11.5px; }
+.card .p { font-size: 10.5px; fill: var(--muted); }
+.rail rect { fill: var(--card); stroke: var(--hair); } .rail { cursor: pointer; } .rail:hover rect { stroke: var(--accent); }
+.rail text { font-size: 12px; font-weight: 500; }
+.sec .st.on { fill: var(--accent); }
+.frame .back { font-size: 12px; fill: var(--accent); cursor: pointer; }
+.frame.focus rect.f { fill: var(--bg); stroke: var(--hair); }
+#back { font: inherit; font-size: 13px; color: var(--accent); background: none; border: 0; padding: 0; cursor: pointer; margin-left: 10px; }
+#canvas svg { animation: appear .2s ease; transform-origin: 50% 40%; }
+@keyframes appear { from { opacity: .35; transform: scale(.985); } }
+.card .hdr { fill: var(--head); }
+.card .sep { stroke: var(--hair); }
+.card .spine { stroke: var(--hair); }
+.card .dot { fill: var(--muted); }
+.card .rt { font-size: 11.5px; font-weight: 600; }
+.card .rw { font-size: 11px; fill: var(--muted); }
+.chev { fill: none; stroke: var(--muted); stroke-width: 1.4; stroke-linecap: round; stroke-linejoin: round; }
+.card.go:hover .chev { stroke: var(--accent); }
+.lat rect { fill: var(--card); stroke: var(--ink); stroke-width: 1.2; }
+.lat .t { font-size: 13px; font-weight: 600; }
+.lat .d { font: 12px ui-monospace, "SF Mono", Menlo, monospace; fill: var(--muted); }
+.lat .w { font-size: 11.5px; fill: var(--muted); }
+.frame rect.f { fill: var(--frame); }
+.frame path.hd { fill: var(--head); }
+.frame .fh { cursor: pointer; }
+.frame .t { font-size: 14px; font-weight: 600; }
+.frame .w { font-size: 12px; fill: var(--muted); }
+.frame .fh:hover .t { fill: var(--accent); }
+.op rect, .op circle { fill: var(--card); stroke: var(--hair); }
+.op text { font-size: 11.5px; fill: var(--muted); }
+.op .sym { font-size: 14px; }
+.par text { font-size: 11px; fill: var(--muted); }
+.par rect { fill: none; stroke: var(--hair); stroke-dasharray: 2 2; }
+.io .t { font-size: 13.5px; font-weight: 600; }
+.io .w { font-size: 10.5px; fill: var(--muted); letter-spacing: .06em; }
+.edge { fill: none; stroke: var(--edge); stroke-width: 1.1; stroke-linejoin: round; }
+.arrow { fill: var(--edge); }
+.lab { font: 11px ui-monospace, "SF Mono", Menlo, monospace; fill: var(--muted); paint-order: stroke; stroke: var(--bg); stroke-width: 4px; stroke-linejoin: round; }
+.panel .lab { stroke: var(--card); }
+.lab.inf { stroke: var(--frame); }
+</style>
+</head>
+<body>
+<header id="hdr"></header>
+<div id="canvas"></div>
+<footer id="foot"></footer>
+<div id="tip"></div>
+<script>
+const DATA = /*__DATA__*/null;
+(function () {
+const $ = s => document.querySelector(s);
+const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+const fmtN = n => n >= 1e6 ? (n / 1e6).toFixed(n >= 1e7 ? 1 : 2) + "M" : n >= 1e3 ? (n / 1e3).toFixed(n >= 1e4 ? 0 : 1) + "k" : String(n);
+if (!DATA || DATA.error) {
+  $("#hdr").innerHTML = `<div><h1>Could not trace the model</h1><div class="meta">${esc(DATA?.meta?.arch)} · ${esc(DATA?.meta?.time)}</div></div>`;
+  $("#canvas").innerHTML = `<div class="err"><pre>${esc(DATA ? DATA.error : "no data")}</pre></div>`;
+  return;
+}
+const M = DATA.meta, N = DATA.nodes, ROOT = String(DATA.root), DIMS = DATA.dims, DL = DATA.dimlist, B = M.B;
+const node = id => N[String(id)];
+const st = { open: {}, detail: false, letters: true, focus: null };
+const sh = t => esc(t).replace(/\b([A-Z])_([a-z])\b/g, '$1<tspan baseline-shift="sub" font-size="75%">$2</tspan>');   // D_l -> D with a subscript l
+
+// ---------- shapes: no batch dim; letters or numbers ----------
+const used = new Set();
+const shapeStr = s => {
+  if (!s) return "";
+  let a = s.slice();
+  if (a[0] === B) a = a.slice(1); else if (a[0] === B * DL.L) a[0] = DL.L;          // B·L tokens: per sample they are just L
+  if (!a.length) return "scalar";
+  return a.map(v => {
+    let nm = DIMS[String(v)];
+    if (nm && (nm.includes("/") || (v < 8 && !/^(H|C)$/.test(nm)) || nm === "B" || nm === "B·L")) nm = null;
+    if (nm === "C" && v < 8) nm = null;
+    if (nm) used.add(nm);
+    return st.letters && nm ? nm : v;
+  }).join(" × ");
+};
+
+// ---------- text ----------
+const ctx = document.createElement("canvas").getContext("2d");
+const SANS = 'system-ui, -apple-system, "SF Pro Text", "Helvetica Neue", Inter, sans-serif', MONO = 'ui-monospace, "SF Mono", Menlo, monospace';
+const tw = (s, f) => { ctx.font = f; return ctx.measureText(s).width; };
+const wrap = (s, f, w, max = 2) => {
+  const words = String(s || "").split(/\s+/).filter(Boolean), lines = [""];
+  for (const x of words) { const t = lines[lines.length - 1] ? lines[lines.length - 1] + " " + x : x;
+    if (tw(t, f) > w && lines[lines.length - 1]) { if (lines.length === max) { lines[max - 1] += "…"; break; } lines.push(x); } else lines[lines.length - 1] = t; }
+  return lines.filter(Boolean);
+};
+const chev = (x, y) => `<path class="chev" d="M${x - 2},${y - 4} L${x + 2},${y} L${x - 2},${y + 4}"/>`;
+const titleOf = n => n.t === "rep" ? `${n.label.replace(/\[.*\]$/, "")} ×${n.n}` : n.label;
+function rr(pts, r = 7) {
+  let d = `M${pts[0][0]},${pts[0][1]}`;
+  for (let i = 1; i < pts.length - 1; i++) {
+    const [x0, y0] = pts[i - 1], [x1, y1] = pts[i], [x2, y2] = pts[i + 1], d1 = Math.hypot(x1 - x0, y1 - y0), d2 = Math.hypot(x2 - x1, y2 - y1), q = Math.min(r, d1 / 2, d2 / 2);
+    if (q < 0.5) { d += ` L${x1},${y1}`; continue; }
+    d += ` L${x1 - (x1 - x0) / d1 * q},${y1 - (y1 - y0) / d1 * q} Q${x1},${y1} ${x1 + (x2 - x1) / d2 * q},${y1 + (y2 - y1) / d2 * q}`;
+  }
+  const l = pts[pts.length - 1]; return d + ` L${l[0]},${l[1]}`;
+}
+const defs = `<defs><marker id="ah" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6" markerHeight="6" orient="auto"><path class="arrow" d="M0.5,1 L7.5,4 L0.5,7 z"/></marker></defs>`;
+function labeler(cls) {
+  const placed = [];
+  return (x, y, t, anchor) => { const w = tw(t, `11px ${MONO}`) + 6, x0 = anchor === "middle" ? x - w / 2 : anchor === "end" ? x - w : x, r = [x0, y - 11, x0 + w, y + 3];
+    if (placed.some(q => r[0] < q[2] && r[2] > q[0] && r[1] < q[3] && r[3] > q[1])) return ""; placed.push(r);
+    return `<text class="${cls}" x="${x}" y="${y}"${anchor ? ` text-anchor="${anchor}"` : ""}>${sh(t)}</text>`; };
+}
+
+// ---------- cards ----------
+// Detail on the main page: a stage card lists its sub-blocks, one level down
+function subRows(n) {
+  if (!st.detail || n.t !== "stage") return [];
+  const its = body(n).items.map(node);
+  const rows = its.filter(c => c.t === "mod" || c.t === "rep" || (c.t === "fn" && (c.semantic || st.detail)) || (c.t === "op" && c.name === "scaled_dot_product_attention"))
+                  .map(c => ({ t: titleOf(c), w: c.t === "op" ? "softmax(q·kᵀ / √D_h) · v" : c.what || "" }));
+  if (!rows.length) { const ops = its.filter(c => c.t === "op").map(c => c.label); if (ops.length) rows.push({ t: ops.join("  "), w: "tensor ops" }); }
+  return rows;
+}
+const ROWH = 17;
+function card(n, x, y, w, small) {
+  const go = ["stage", "mod", "rep", "fn"].includes(n.t) && openable(n);
+  const tf = small ? `600 13px ${SANS}` : `600 15px ${SANS}`, wf = small ? `11.5px ${SANS}` : `12px ${SANS}`;
+  const lines = wrap(n.what, wf, w - 44), sub = subRows(n), hh = (small ? 40 : 46) + lines.length * 16, h = hh + (sub.length ? sub.length * ROWH + 12 : 0);
+  let s = `<g class="card ${small ? "small" : ""} ${go ? "go" : ""}" data-id="${n.id}" ${go ? `data-open="${n.id}"` : ""}><rect class="c" x="${x}" y="${y}" width="${w}" height="${h}" rx="${small ? 12 : 14}"/>`;
+  if (sub.length) {                                                   // tinted header strip over the sub-block list
+    const r = small ? 12 : 14, yb = y + hh - 4;
+    s += `<path class="hdr" d="M${x + 0.5},${yb} L${x + 0.5},${y + r} Q${x + 0.5},${y + 0.5} ${x + r},${y + 0.5} L${x + w - r},${y + 0.5} Q${x + w - 0.5},${y + 0.5} ${x + w - 0.5},${y + r} L${x + w - 0.5},${yb} Z"/>`;
+    s += `<line class="sep" x1="${x}" y1="${yb}" x2="${x + w}" y2="${yb}"/><line class="spine" x1="${x + 21}" y1="${yb + 10}" x2="${x + 21}" y2="${yb + 4 + sub.length * ROWH - 6}"/>`;
+    sub.forEach((r2, i) => { const ry = yb + 6 + (i + 1) * ROWH - 4, tw2 = tw(r2.t, `600 11.5px ${SANS}`);
+      s += `<circle class="dot" cx="${x + 21}" cy="${ry - 4}" r="2"/><text class="rt" x="${x + 30}" y="${ry}">${esc(r2.t)}</text>`;
+      const rest = wrap(r2.w, `11px ${SANS}`, w - 50 - tw2, 1)[0]; if (rest) s += `<text class="rw" x="${x + 38 + tw2}" y="${ry}">${sh(rest)}</text>`; });
+  }
+  s += `<text class="t" x="${x + 18}" y="${y + (small ? 24 : 28)}">${esc(titleOf(n))}</text>`;
+  lines.forEach((l, i) => s += `<text class="w" x="${x + 18}" y="${y + (small ? 41 : 47) + i * 16}">${sh(l)}</text>`);
+  if (n.params && tw(titleOf(n), tf) + tw(fmtN(n.params), `10.5px ${SANS}`) + 60 < w) s += `<text class="p" x="${x + w - (go ? 30 : 16)}" y="${y + (small ? 23 : 27)}" text-anchor="end">${fmtN(n.params)}</text>`;
+  if (go) s += chev(x + w - 16, y + (small ? 19 : 23));
+  return { svg: s + `</g>`, h };
+}
+const cardH = (n, w, small) => { const k = subRows(n).length; return (small ? 40 : 46) + wrap(n.what, small ? `11.5px ${SANS}` : `12px ${SANS}`, w - 44).length * 16 + (k ? k * ROWH + 12 : 0); };
+
+// =============== main view: section columns, left -> right; one stage can be expanded in place ===============
+function mainView() {
+  const R = node(ROOT), secs = DATA.sections, F = st.focus, PAD = 8, VG = 30, RAILW = 156, CW = 236;
+  const edges = (R.edges || []).map(e => ({ f: String(e[0]), t: String(e[1]), shape: e[2] }));
+  const colOf = {}; secs.forEach((s, k) => s.items.forEach(i => colOf[String(i)] = k));
+  const fcol = F ? colOf[F] : -1, mode = k => !F ? "normal" : k === fcol ? "focus" : "rail", GUT = F ? 96 : 150;
+  const outs = R.items.map(String).filter(i => node(i).t === "out");
+  const mainOut = outs.filter(i => /mask/i.test(node(i).label)); const mains = new Set();
+  const back = i => { if (mains.has(i)) return; mains.add(i); edges.filter(e => e.t === i).forEach(e => back(e.f)); };
+  (mainOut.length ? mainOut : outs.slice(0, 1)).forEach(back);
+  const fsz = F ? layout(F, false, st.detail ? 700 : 820) : null;                       // the expanded stage: its sub-blocks, folded into columns if tall
+  const colW = secs.map((s, k) => mode(k) === "rail" ? RAILW : mode(k) === "focus" ? Math.max(CW, fsz.w) : CW);
+  const colX = k => PAD + colW.slice(0, k).reduce((a, v) => a + v + GUT, 0);
+  const swf = `12.5px ${SANS}`, headLines = secs.map((s, k) => mode(k) === "rail" ? [] : wrap(s.what, swf, colW[k] + (mode(k) === "focus" ? 0 : 20), 4));
+  const HEAD = 30 + Math.max(1, ...headLines.map(l => l.length)) * 17 + 26;
+  const pos = {};
+  const size = (i, k) => { const n = node(i), m = mode(k);
+    if (m === "rail") return n.t === "in" || n.t === "out" ? { w: Math.max(tw(n.label, `500 12px ${SANS}`) + 8, 40), h: 18, io: true } : { w: RAILW - 8, h: 30, rail: true };
+    if (i === F) return { w: fsz.w, h: fsz.h, frame: true, ay: 22 };
+    if (n.t === "in" || n.t === "out") return { w: Math.max(tw(n.label, `600 13.5px ${SANS}`) + 8, 60), h: 34 };
+    if (n.t === "latent") return { w: tw(n.label, `600 13px ${SANS}`) + tw(shapeStr(n.outs[0]), `12px ${MONO}`) + 44, h: 32 };
+    const small = !mains.has(i); return { w: small ? 190 : CW, h: cardH(n, small ? 190 : CW, small), small }; };
+  let bottom = 0;
+  secs.forEach((s, k) => {
+    const items = s.items.map(String), m = mode(k), cw = colW[k];
+    const main = m === "rail" ? items.filter(i => node(i).t !== "out") : items.filter(i => mains.has(i) || node(i).t === "in"), side = m === "rail" ? [] : items.filter(i => !main.includes(i));
+    const placeGroup = (list, y0) => {
+      let yy = y0;
+      for (let a = 0; a < list.length;) {
+        const n = node(list[a]);
+        if (n.t === "out" && m !== "rail") { let b = a; while (b < list.length && node(list[b]).t === "out") b++;
+          const row = list.slice(a, b), ws = row.map(i => size(i, k).w), tot = ws.reduce((p, v) => p + v, 0) + 26 * (row.length - 1);
+          let x = colX(k) + cw / 2 - tot / 2; row.forEach((i, j) => { pos[i] = { x, y: yy, ...size(i, k) }; x += ws[j] + 26; }); yy += 34 + VG; a = b; }
+        else { const z = size(list[a], k); pos[list[a]] = { x: colX(k) + (cw - z.w) / 2, y: yy, ...z }; yy += z.h + (m === "rail" ? 22 : VG); a++; }
+      }
+      return yy - (m === "rail" ? 22 : VG);
+    };
+    const yEnd = placeGroup(main, HEAD);
+    bottom = Math.max(bottom, side.length ? placeGroup(side, yEnd + 34) : yEnd);
+  });
+  const W = colX(secs.length - 1) + colW[secs.length - 1] + PAD + 24, H = bottom + 6;
+  let svg = "";
+  secs.forEach((s, k) => { const x = colX(k), on = mode(k) === "focus";
+    svg += `<g class="sec"><text class="st ${on ? "on" : ""}" x="${x}" y="16">${esc(s.title)}</text>`;
+    headLines[k].forEach((l, i) => svg += `<text class="sw" x="${x}" y="${38 + i * 17}">${esc(l)}</text>`);
+    svg += `</g>`; });
+  const put = labeler("lab"), bySrc = {}; edges.forEach(e => (bySrc[e.f] = bySrc[e.f] || []).push(e));
+  let es = "", labs = "";
+  for (const e of edges) {
+    const a = pos[e.f], b = pos[e.t]; if (!a || !b) continue;
+    const src = node(e.f), tgt = node(e.t), so = src.outs && src.outs.find(o => o.reduce((p, v) => p * v, 1) === e.shape.reduce((p, v) => p * v, 1));
+    const txt = shapeStr(so && so[0] === B ? so : e.shape);
+    const quiet = src.t === "latent" || tgt.t === "latent" || a.io || b.io || (a.rail && b.rail);
+    const sib = bySrc[e.f];
+    if (colOf[e.f] === colOf[e.t]) {
+      const sx = a.x + a.w / 2, sy = a.y + a.h, tx = b.x + b.w / 2, ty = b.y;
+      if (b.y < a.y) continue;
+      const d = Math.abs(sx - tx) < 1 ? `M${sx},${sy} L${tx},${ty}` : rr([[sx, sy], [sx, sy + (ty - sy) / 2], [tx, sy + (ty - sy) / 2], [tx, ty]]);
+      es += `<path class="edge" d="${d}" marker-end="url(#ah)"/>`;
+      const sameFan = sib.every(o => JSON.stringify(o.shape) === JSON.stringify(e.shape));
+      if (!quiet && !(a.rail || b.rail) && (!sameFan || sib[0] === e)) labs += Math.abs(sx - tx) < 1 ? put(sx + 8, (sy + ty) / 2 + 4, txt) : sameFan ? put(sx + 8, sy + 12, txt) : put(tx + 6, sy + (ty - sy) / 2 - 4, txt);
+    } else {                                                          // across columns: right side -> left side (a frame connects at its header)
+      const sx = a.x + a.w, sy = a.y + (a.ay ?? a.h / 2), tx = b.x, ty = b.y + (b.ay ?? b.h / 2);
+      const lw = tw(txt, `11px ${MONO}`);
+      if (Math.abs(sy - ty) < 1) { es += `<path class="edge" d="M${sx},${sy} L${tx},${ty}" marker-end="url(#ah)"/>`; if (!quiet && lw < tx - sx - 12) labs += put((sx + tx) / 2, sy - 8, txt, "middle"); }
+      else { const gx = b.x - 18; es += `<path class="edge" d="${rr([[sx, sy], [gx, sy], [gx, ty], [tx, ty]], 9)}" marker-end="url(#ah)"/>`; if (!quiet && lw < gx - sx - 12) labs += put((sx + gx) / 2, sy - 8, txt, "middle"); }
+    }
+  }
+  let ns = "";
+  for (const i in pos) { const n = node(i), p = pos[i];
+    if (p.frame) ns += nodeSvg(i, p.x, p.y, false);
+    else if (p.io) ns += `<g class="io" data-id="${i}"><text class="w" x="${p.x + p.w / 2}" y="${p.y + 13}" text-anchor="middle" style="font-size:12px;letter-spacing:0;fill:var(--muted)">${esc(n.label)}</text></g>`;
+    else if (p.rail) ns += `<g class="rail" data-id="${i}" data-focus="${i}"><rect x="${p.x}" y="${p.y}" width="${p.w}" height="${p.h}" rx="${n.t === "latent" ? p.h / 2 : 8}"/><text x="${p.x + 12}" y="${p.y + 19}">${esc(wrap(titleOf(n), `500 12px ${SANS}`, p.w - 20, 1)[0])}</text></g>`;
+    else if (n.t === "in" || n.t === "out") ns += `<g class="io" data-id="${i}"><text class="w" x="${p.x + p.w / 2}" y="${p.y + 10}" text-anchor="middle">${n.t === "in" ? "INPUT" : "OUTPUT"}</text><text class="t" x="${p.x + p.w / 2}" y="${p.y + 28}" text-anchor="middle">${esc(n.label)}</text></g>`;
+    else if (n.t === "latent") { const lw = tw(n.label, `600 13px ${SANS}`);
+      ns += `<g class="lat" data-id="${i}"><rect x="${p.x}" y="${p.y}" width="${p.w}" height="${p.h}" rx="${p.h / 2}"/><text class="t" x="${p.x + 18}" y="${p.y + 21}">${esc(n.label)}</text><text class="d" x="${p.x + 30 + lw}" y="${p.y + 21}">${sh(shapeStr(n.outs[0]))}</text>`;
+      wrap(n.what, `11.5px ${SANS}`, CW, 2).forEach((l, j) => ns += `<text class="w" x="${p.x + p.w / 2}" y="${p.y + p.h + 16 + j * 15}" text-anchor="middle">${esc(l)}</text>`);
+      ns += `</g>`; }
+    else ns += card(n, p.x, p.y, p.w, p.small).svg.replace(`data-open="${i}"`, `data-focus="${i}"`); }
+  const Hh = Math.max(H, ...Object.entries(pos).filter(([i, p]) => node(i).t === "latent" && !p.rail).map(([, p]) => p.y + p.h + 40));
+  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="-2 -2 ${W + 4} ${Hh + 4}" role="img" aria-label="${esc(M.cls)}: input, frequency encoder, laser encoder and decoder, left to right, with the tensor shape on every arrow">${defs}${svg}${es}${labs}${ns}</svg>`;
+}
+
+// =============== sheet / stacked view: layered layout, top -> bottom ===============
+const SEMANTIC = new Set(["scaled_dot_product_attention"]);
+const hidden = n => !st.detail && ((n.t === "op" && !SEMANTIC.has(n.name)) || (n.t === "fn" && !n.semantic) || n.t === "param");
+const body = n => n.t === "rep" ? node(n.tpl) : (n.t === "stage" && n.n ? node(node(n.rep).tpl) : n);
+const kids = n => body(n).items.map(String).filter(c => !hidden(node(c)));
+function openable(n) { return ["stage", "mod", "rep", "fn"].includes(n.t) && body(n).items.length > 0 && kids(n).length > 0; }
+function visEdges(n) {
+  const b = body(n), items = new Set(b.items.map(String)), E = (b.edges || []).map(e => ({ f: String(e[0]), t: String(e[1]), shape: e[2] }));
+  const preds = {}; for (const e of E) (preds[e.t] = preds[e.t] || []).push(e);
+  const hid = c => items.has(c) && hidden(node(c));
+  const srcs = (f, seen = new Set()) => { if (!hid(f)) return [f]; if (seen.has(f)) return []; seen.add(f); return (preds[f] || []).flatMap(p => srcs(p.f, seen)); };
+  const out = [], key = new Set();
+  for (const e of E) { if (hid(e.t)) continue;
+    for (const f of srcs(e.f)) { if (f === e.t) continue; const k = f + ">" + e.t; if (key.has(k)) continue; key.add(k); out.push({ f, t: e.t, shape: e.shape }); } }
+  return out;
+}
+const GX = 26, GY = 54, PADX = 26, HEAD = 46, LANE = 14;
+function leafSize(n) {
+  if (n.t === "op") return n.sym || n.label.length < 2 ? { w: 26, h: 26 } : { w: tw(n.label, `11.5px ${SANS}`) + 22, h: 26 };
+  if (n.t === "param") return { w: tw(n.label + "  " + shapeStr(n.outs[0]), `11px ${SANS}`) + 18, h: 24 };
+  if (n.t === "in" || n.t === "out" || n.t === "latent") return { w: Math.max(tw(n.label, `600 13.5px ${SANS}`), 50) + 8, h: 34 };
+  return { w: 236, h: cardH(n, 236, true) };
+}
+function layout(id, isRoot, budget) {
+  const n = node(id);
+  if (!isRoot && !(openable(n) && st.open[id])) { n._L = null; return leafSize(n); }
+  const items = kids(n), set = new Set(items), sz = {};
+  const edges = visEdges(n).filter(e => (set.has(e.f) || e.f === "IN") && (set.has(e.t) || e.t === "OUT"));
+  for (const c of items.slice()) {                                    // a parameter used twice: one pill beside each consumer (no long wires)
+    const es = edges.filter(e => e.f === c);
+    if (node(c).t !== "param" || es.length < 2) continue;
+    items.splice(items.indexOf(c), 1);
+    for (const e of es) { const cid = c + "~" + e.t; N[cid] = Object.assign({}, node(c), { id: cid }); items.push(cid); set.add(cid); e.f = cid; }
+  }
+  for (const c of items) sz[c] = layout(c, false);
+  const inner = edges.filter(e => set.has(e.f) && set.has(e.t));
+  const Lr = {}; items.forEach(c => Lr[c] = 0);
+  for (let p = 0; p < items.length; p++) { let ch = false; for (const e of inner) if (Lr[e.t] < Lr[e.f] + 1) { Lr[e.t] = Lr[e.f] + 1; ch = true; } if (!ch) break; }
+  const pOf = {};                                                     // a parameter sits beside its (first) consumer, same row
+  for (const c of items) if (node(c).t === "param") { const ts = inner.filter(e => e.f === c).map(e => e.t).sort((a, b2) => Lr[a] - Lr[b2]); if (ts.length) { Lr[c] = Lr[ts[0]]; pOf[c] = ts[0]; } }
+  let rows = []; items.forEach(c => (rows[Lr[c]] = rows[Lr[c]] || []).push(c)); rows = rows.filter(Boolean);
+  const rh = r => Math.max(...r.map(c => sz[c].h));
+  // fold: consecutive rows into segments no taller than the budget, segments side by side
+  let segs = [rows.map((_, i) => i)];
+  if (budget) { segs = []; let cur = [], hs = 0;
+    rows.forEach((r, i) => { if (cur.length && hs + rh(r) > budget) { segs.push(cur); cur = []; hs = 0; } cur.push(i); hs += rh(r) + GY; }); segs.push(cur); }
+  const segOf = {}; segs.forEach((sg, k) => sg.forEach(i => rows[i].forEach(c => segOf[c] = k)));
+  const SG = 64, folded = segs.length > 1, top = (isRoot ? 34 : HEAD + 18) + (folded ? 18 : 0), pos = {};
+  let segL = [], segR = [], allow = segs.map(() => 0);
+  const place = () => { let x0 = PADX, bottom = 0; segL = []; segR = [];
+    segs.forEach((sg, k) => { let y = top, cw = 0;
+      for (const i of sg) cw = Math.max(cw, rows[i].reduce((a, c) => a + sz[c].w, 0) + GX * (rows[i].length - 1));
+      for (const i of sg) { const r = rows[i], rw = r.reduce((a, c) => a + sz[c].w, 0) + GX * (r.length - 1), h = rh(r);
+        let x = x0 + (cw - rw) / 2; for (const c of r) { pos[c] = { x, y, w: sz[c].w, h: sz[c].h, rb: y + h }; x += sz[c].w + GX; } y += h + GY; }
+      segL.push(x0); segR.push(x0 + cw); bottom = Math.max(bottom, y - GY); x0 += cw + allow[k] + SG; });
+    return { right: x0 - SG, bottom }; };
+  place();
+  for (let it = 0; it < 3; it++) { for (const r of rows) { const k = {};
+    r.forEach(c => { const ps = inner.filter(e => e.t === c && Lr[e.f] < Lr[c] && segOf[e.f] === segOf[c]).map(e => pos[e.f].x + pos[e.f].w / 2); k[c] = ps.length ? ps.reduce((a, v) => a + v, 0) / ps.length : pos[c].x; });
+    const ps = r.filter(c => pOf[c] !== undefined), rest = r.filter(c => pOf[c] === undefined).sort((a, b2) => k[a] - k[b2]);
+    for (const p of ps) { const j = rest.indexOf(pOf[p]); rest.splice(j < 0 ? 0 : j, 0, p); }   // each parameter right before its consumer
+    r.splice(0, r.length, ...rest); } place(); }
+  let geo, W, H;
+  const route = () => {
+    const { right, bottom } = place(), W0 = right + PADX; H = bottom + (isRoot ? 8 : 28);
+    const cx = c => pos[c].x + pos[c].w / 2;
+    const blocked = (x1, y1, x2, y2, skip) => items.some(c => { if (skip.includes(c)) return false; const p = pos[c];
+      if (p.y + p.h <= y1 + 1 || p.y >= y2 - 1) return false; return [x1, x2].some(x => x > p.x - 6 && x < p.x + p.w + 6) || (Math.min(x1, x2) < p.x && Math.max(x1, x2) > p.x + p.w && p.y < (y1 + y2) / 2 + 2 && p.y + p.h > (y1 + y2) / 2 - 2); });
+    geo = []; let cross = 0;
+    const inX = (segR[0] + segL[0]) / 2, busY = top - 12;
+    for (const e of edges) {
+      if (e.f === "IN" && e.t === "OUT") continue;
+      if (pOf[e.f] === e.t && pos[e.f].y === pos[e.t].y) { const ym = pos[e.t].y + pos[e.t].h / 2; geo.push({ e, side: true, sx: pos[e.f].x + pos[e.f].w, sy: ym, tx: pos[e.t].x, ty: ym }); continue; }
+      const fs = e.f === "IN" ? 0 : segOf[e.f], ts = e.t === "OUT" ? fs : segOf[e.t];
+      const sx = e.f === "IN" ? inX : cx(e.f), sy = e.f === "IN" ? (isRoot ? 2 : HEAD) : pos[e.f].y + pos[e.f].h;
+      if (ts !== fs) {                                                   // into a later segment: over the top bus, down that segment's left gutter
+        const o = 5 * cross++, rb = e.f === "IN" ? sy : pos[e.f].rb, t = pos[e.t], first = segs[ts].includes(rows.indexOf(rows.find(r => r.includes(e.t)))) && rows.indexOf(rows.find(r => r.includes(e.t))) === segs[ts][0];
+        const gx = segR[fs] + allow[fs] + SG / 2 + o, by = busY - o;
+        const pts = e.f === "IN" ? [[sx, sy], [sx, by]] : [[sx, sy], [sx, rb + GY / 2 - 6], [gx, rb + GY / 2 - 6], [gx, by]];
+        if (first) pts.push([cx(e.t), by], [cx(e.t), t.y]); else { const lx = segL[ts] - SG / 2 + o; pts.push([lx, by], [lx, t.y + t.h / 2], [t.x, t.y + t.h / 2]); }
+        geo.push({ e, pts }); continue; }
+      const tx = e.t === "OUT" ? (segs.length > 1 ? sx : W0 / 2) : cx(e.t), ty = e.t === "OUT" ? H - 4 : pos[e.t].y;
+      const rb = e.f === "IN" ? sy : pos[e.f].rb;
+      geo.push({ e, sx, sy, tx, ty, rb, seg: fs, long: ty - rb > GY + 4 && blocked(sx, rb, tx, ty, [e.f, e.t]) });
+    }
+    const cnt = segs.map(() => 0);
+    geo.filter(g => g.long).sort((a, b2) => (a.ty - a.sy) - (b2.ty - b2.sy)).forEach(g => { g.lx = segR[g.seg] + 12 + LANE * cnt[g.seg]++;
+      if (g.e.t !== "OUT") { g.tyMid = pos[g.e.t].y + pos[g.e.t].h / 2; g.txR = pos[g.e.t].x + pos[g.e.t].w; } });
+    W = Math.max(W0, ...segR.map((r, k) => r + (cnt[k] ? LANE * cnt[k] + 6 : 0) + PADX));
+    return cnt;
+  };
+  const cnt = route();
+  if (cnt.some(c => c) && folded) { allow = cnt.map(c => c ? LANE * c + 6 : 0); route(); }
+  if (String(id) === String(st.focus)) {                              // the expanded stage: wide enough for its header line, contents centred
+    const minW = tw(titleOf(n), `600 14px ${SANS}`) + (n.what ? tw(n.what, `12px ${SANS}`) : 0) + 240;
+    if (W < minW) { const dx = (minW - W) / 2; for (const c in pos) pos[c].x += dx;
+      for (const g of geo) { for (const k of ["sx", "tx", "lx", "txR"]) if (g[k] !== undefined) g[k] += dx; if (g.pts) g.pts = g.pts.map(([a, b2]) => [a + dx, b2]); }
+      W = minW; }
+  }
+  n._L = { pos, geo, W, H };
+  return { w: W, h: H };
+}
+function edgesSvg(n, ox, oy, cls) {
+  let s = "", labs = ""; const put = labeler(cls), bySrc = {};
+  for (const g of n._L.geo) (bySrc[g.e.f] = bySrc[g.e.f] || []).push(g);
+  for (const g of n._L.geo) {
+    const sx = g.sx + ox, sy = g.sy + oy, tx = g.tx + ox, ty = g.ty + oy; let d;
+    if (g.pts) { s += `<path class="edge" d="${rr(g.pts.map(([a, b2]) => [a + ox, b2 + oy]))}" marker-end="url(#ah)"/>`; continue; }
+    if (g.side) d = `M${sx},${sy} L${tx},${ty}`;
+    else if (g.long) { const lx = g.lx + ox;                          // residual / skip: out along a lane, into the target's right side
+      d = g.tyMid !== undefined ? rr([[sx, sy], [sx, sy + 12], [lx, sy + 12], [lx, g.tyMid + oy], [g.txR + ox, g.tyMid + oy]]) : rr([[sx, sy], [sx, sy + 12], [lx, sy + 12], [lx, ty - 12], [tx, ty - 12], [tx, ty]]); }
+    else if (Math.abs(sx - tx) < 1) d = `M${sx},${sy} L${tx},${ty}`;
+    else { const my = g.rb + oy + Math.round((ty - g.rb - oy) / 2); d = rr([[sx, sy], [sx, my], [tx, my], [tx, ty]]); }
+    s += `<path class="edge" d="${d}" marker-end="url(#ah)"/>`;
+    const src = node(g.e.f);
+    if ((src && src.t === "param") || g.e.f === "IN" || g.e.t === "OUT" || g.long) continue;
+    const sib = bySrc[g.e.f], same = sib.every(o => JSON.stringify(o.e.shape) === JSON.stringify(g.e.shape));
+    if (same && sib.length > 1 && sib[0] !== g) continue;
+    const txt = shapeStr(g.e.shape);
+    labs += Math.abs(sx - tx) < 1 ? put(tx + 8, (sy + ty) / 2 + 4, txt) : put(tx + 8, ty - 8, txt);
+  }
+  return s + labs;
+}
+function nodeSvg(id, x, y, isRoot) {
+  const n = node(id);
+  if (n._L) {
+    const { pos, W, H } = n._L; let s = "";
+    if (!isRoot) {
+      const isF = String(id) === String(st.focus);
+      s += `<g class="frame ${isF ? "focus" : ""}" data-id="${id}"><rect class="f" x="${x}" y="${y}" width="${W}" height="${H}" rx="14"/>`;
+      s += `<path class="hd" d="M${x},${y + HEAD - 6} L${x},${y + 14} Q${x},${y} ${x + 14},${y} L${x + W - 14},${y} Q${x + W},${y} ${x + W},${y + 14} L${x + W},${y + HEAD - 6} Z"/>`;
+      s += `<g class="fh" ${isF ? "data-unfocus=\"1\"" : `data-toggle="${id}"`}><rect x="${x}" y="${y}" width="${W}" height="${HEAD - 6}" fill="transparent"/><path class="chev" d="M${x + 14},${y + 18} L${x + 18},${y + 22} L${x + 22},${y + 18}"/>`;
+      if (isF) s += `<text class="back" x="${x + W - 14}" y="${y + 25}" text-anchor="end">‹ back to overview</text>`;
+      s += `<text class="t" x="${x + 30}" y="${y + 25}">${esc(titleOf(n))}</text>`;
+      const tW = tw(titleOf(n), `600 14px ${SANS}`);
+      if (n.what) s += `<text class="w" x="${x + 40 + tW}" y="${y + 25}">${esc(wrap(n.what, `12px ${SANS}`, W - tW - (isF ? 190 : 60), 1)[0] || "")}</text>`;
+      s += `</g></g>`;
+    }
+    s += edgesSvg(n, x, y, isRoot ? "lab" : "lab inf");
+    for (const c in pos) s += nodeSvg(c, x + pos[c].x, y + pos[c].y, false);
+    return s;
+  }
+  const { w, h } = leafSize(n);
+  if (n.t === "op") return n.sym || n.label.length < 2
+    ? `<g class="op" data-id="${id}"><circle cx="${x + 13}" cy="${y + 13}" r="12.5"/><text class="sym" x="${x + 13}" y="${y + 18}" text-anchor="middle">${esc(n.label)}</text></g>`
+    : `<g class="op" data-id="${id}"><rect x="${x}" y="${y}" width="${w}" height="${h}" rx="13"/><text x="${x + w / 2}" y="${y + 17}" text-anchor="middle">${esc(n.label)}</text></g>`;
+  if (n.t === "param") return `<g class="par" data-id="${id}"><rect x="${x}" y="${y}" width="${w}" height="${h}" rx="6"/><text x="${x + 9}" y="${y + 16}">${esc(n.label)}  ${sh(shapeStr(n.outs[0]))}</text></g>`;
+  if (n.t === "in" || n.t === "out" || n.t === "latent") return `<g class="io" data-id="${id}"><text class="w" x="${x + w / 2}" y="${y + 10}" text-anchor="middle">${n.t === "in" ? "INPUT" : n.t === "out" ? "OUTPUT" : "LATENT"}</text><text class="t" x="${x + w / 2}" y="${y + 28}" text-anchor="middle">${esc(n.label)}</text></g>`;
+  const c = card(n, x, y, w, true); return c.svg.replace(`data-open="${id}"`, n.t === "stage" ? `data-focus="${id}"` : `data-toggle="${id}"`);
+}
+function layered(id, isRoot) {
+  const { w, h } = layout(id, isRoot);
+  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="-2 -2 ${w + 4} ${h + 4}" width="${w + 4}" height="${h + 4}">${defs}${nodeSvg(id, 0, 0, isRoot)}</svg>`;
+}
+
+// =============== page ===============
+const DESC = { L: "lasers", F: "frequency bins", C: "channels", n_bands: "frequency bands", BINS: "bins per band", "BINS·C": "values in one band (bins × channels)", D: "hidden dim",
+  D_l: "latent dim", H: "attention heads", "L+n_bands": "laser mask + band mask", D_h: "head dim (D / H)", mask_h: "mask height", mask_w: "mask width", n_queries: "queries" };
+const ORDER = ["L", "F", "C", "n_bands", "BINS", "BINS·C", "D", "H", "D_h", "D_l", "L+n_bands"];
+function draw() {
+  used.clear();
+  const stack = innerWidth < 900;
+  document.body.classList.toggle("stack", stack);
+  $("#canvas").innerHTML = stack ? layered(ROOT, true) : mainView();
+  for (const k of ["H", "D_h"]) if (DL[k] !== undefined) used.add(k);
+  const names = [...used].sort((a, b2) => (ORDER.indexOf(a) + 1 || 99) - (ORDER.indexOf(b2) + 1 || 99));
+  const hs = t => esc(t).replace(/\b([A-Z])_([a-z])\b/g, "$1<sub>$2</sub>");
+  $("#foot").innerHTML = names.map(k => hs(`${k} = ${DL[k] ?? ""} ${DESC[k] || ""}`.trim())).join("&nbsp;&nbsp;·&nbsp;&nbsp;");
+  $("#back").style.display = st.focus ? "" : "none";
+}
+// depth of an expanded stage: Stages = one level (no tensor ops), Detail = everything, ops included
+function openAll(id) { for (const c of kids(node(id))) if (openable(node(c)) && node(c).t !== "fn") { st.open[c] = true; openAll(c); } }   // helper fns stay cards (click to open)
+const focus = id => { st.focus = id; st.open = {}; if (id) { st.open[id] = true; if (st.detail) openAll(id); } draw(); };
+$("#hdr").innerHTML = `<div><h1>${esc(M.cls)}</h1><div class="meta">${fmtN(M.params)} parameters · ${esc(M.arch)}<button id="back">‹ back to overview</button></div></div>
+  <div class="ctl"><div class="seg" role="group" aria-label="Shape labels"><button id="b-let" aria-pressed="true">L × D</button><button id="b-num" aria-pressed="false">100 × ${DL.D ?? 256}</button></div>
+  <div class="seg" role="group" aria-label="Level of detail"><button id="b-stages" aria-pressed="true">Stages</button><button id="b-detail" aria-pressed="false">Detail</button></div></div>`;
+const press = (a, b2, on) => { $(a).setAttribute("aria-pressed", on); $(b2).setAttribute("aria-pressed", !on); };
+$("#b-let").onclick = () => { st.letters = true; press("#b-let", "#b-num", true); draw(); };
+$("#b-num").onclick = () => { st.letters = false; press("#b-let", "#b-num", false); draw(); };
+const setDetail = on => { st.detail = on; press("#b-stages", "#b-detail", !on); focus(st.focus); };   // overview cards list sub-blocks; an expanded stage opens fully
+$("#b-stages").onclick = () => setDetail(false);
+$("#b-detail").onclick = () => setDetail(true);
+$("#back").onclick = () => focus(null);
+document.addEventListener("click", ev => {
+  if (ev.target.closest("[data-unfocus]")) { focus(null); return; }
+  const f = ev.target.closest("[data-focus]");
+  if (f) { if (document.body.classList.contains("stack")) { st.open[f.dataset.focus] = !st.open[f.dataset.focus]; draw(); } else focus(f.dataset.focus === st.focus ? null : f.dataset.focus); return; }
+  const t = ev.target.closest("#canvas [data-toggle]"); if (t) { st.open[t.dataset.toggle] = !st.open[t.dataset.toggle]; draw(); }
+});
+document.addEventListener("keydown", ev => { if (ev.key === "Escape" && st.focus) focus(null); });
+addEventListener("resize", () => draw());
+
+const tip = $("#tip");
+document.addEventListener("mousemove", ev => {
+  const g = ev.target.closest("[data-id]"); if (!g) { tip.style.display = "none"; return; }
+  const n = node(g.dataset.id); let h = `<b>${esc(titleOf(n))}</b>`;
+  if (n.what && !["stage", "latent"].includes(n.t)) h += `<div>${esc(n.what)}</div>`;
+  if (n.params) h += `<div>${n.params.toLocaleString()} parameters${n.pct ? ` · ${n.pct.toFixed(1)}% of the model` : ""}</div>`;
+  if (n.mod) h += `<div><code>${esc(n.mod)}</code>${n.cls ? " · " + esc(n.cls) : ""}</div>`;
+  if (n.t === "op" && n.detail) h += `<div><code>${esc(n.name)}(${esc(n.detail)})</code></div>`;
+  if (n.outs && n.outs.length) h += `<div>out <code>${esc(shapeStr(n.outs[0]))}</code></div>`;
+  if (n.t === "latent" && n.returned) h += `<div>also returned as out["${esc(n.label)}"]</div>`;
+  tip.innerHTML = h; tip.style.display = "block";
+  const r = tip.getBoundingClientRect(); let tx = ev.clientX + 16, ty = ev.clientY + 16;
+  if (tx + r.width > innerWidth - 8) tx = ev.clientX - r.width - 16; if (ty + r.height > innerHeight - 8) ty = innerHeight - r.height - 8;
+  tip.style.left = tx + "px"; tip.style.top = ty + "px";
+});
+draw();
+})();
+</script>
+</body>
+</html>

@@ -90,9 +90,10 @@ def lovasz_hinge(logits, true):
     grad = torch.cat([jac[:, :1], jac[:, 1:] - jac[:, :-1]], 1)
     return (F.relu(err) * grad).sum(1).mean()
 
-def instance_moment_loss(pred, inst):
+def instance_moment_loss(pred, inst, scale=False):
     """per object: each pixel goes to the true object nearest in Mahalanobis distance (+ log det), and the predicted mask in each
-    object's cell is matched to that object's log area / 10, centroid and 100 x covariance (L1). One object: the whole image"""
+    object's cell is matched to that object's log area / 10, centroid and 100 x covariance (L1). One object: the whole image.
+    scale: scale-invariant, no constants: |log area ratio| + L1 centroid / s + L1 covariance / s^2, s = sqrt(true area) (box fractions, as moments)"""
     B, N, H, W = inst.shape
     real = inst.flatten(2).sum(-1) > 0                                                # (B,N)
     if not real.any(): return pred.sum() * 0
@@ -103,6 +104,9 @@ def instance_moment_loss(pred, inst):
     md = torch.einsum("bnpi,bnij,bnpj->bnp", d, torch.linalg.inv(S), d) + torch.logdet(S)[..., None]
     cell = F.one_hot(md.masked_fill(~real[..., None], float("inf")).argmin(1), N).permute(0, 2, 1).float().view(B, N, H, W)
     (ap, mp, cp), (at, mt_, ct_) = moments((pred.float()[:, None] * cell)[real]), moments(inst[real])
+    if scale:
+        s2 = at / (H * W)                                                             # (object size)^2 in box fractions^2
+        return ((ap.log() - at.log()).abs() + (mp - mt_).abs().sum(-1) / s2.sqrt() + (cp - ct_).abs().sum(-1) / s2).mean()
     return (0.1 * (ap.log() - at.log()).abs() + (mp - mt_).abs().sum(-1) + 100 * (cp - ct_).abs().sum(-1)).mean()
 
 def orient_loss(pred, true, n_objects):

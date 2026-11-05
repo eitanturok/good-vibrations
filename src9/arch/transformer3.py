@@ -11,8 +11,21 @@ heatmap_w x CenterNet penalty-reduced focal loss (alpha 2, beta 4, / n objects);
 maskae (a maskae.pt, src9/maskae.py): Linear(u -> z) -> the frozen mask-AE decoder replaces the decoder, + 0.1 x |z - AE encoder(true mask)|^2.
 readout cls (default per): a [cls] token first in each laser's band sequence (its LN'd output = the laser token) and first in the laser sequence
 (Linear(LN(its output)) -> u); [cls] sits at rope position 0 (no rotation) and is never dropped.
+readout pool: masked mean over the kept tokens of LN(h) -> Linear (freq: d -> d per laser; laser: d -> latent). readout query (DETR / Perceiver IO / Set-Transformer PMA_k):
+n_queries learned queries per stage, query_layers decoder layers (self-attn among queries, cross-attn with a learned key-only position embedding, MLP),
+concat the n_queries LN'd outputs -> Linear (freq: -> d per laser; laser: -> latent). abspos 1: learned absolute position embeddings N(0, 0.02) added to the token
+content before each stage (one per band / per laser), any readout. freeze_readout 1 (per only): W_b, W_l (+ biases) fixed at init. drop_rescale 1 (per only): the per readout sums x n / n_kept, inverted dropout (pool / query / cls / attention renormalize already). All default off = the old model.
+band_overlap K (0 = off): each band token also sees K bins on each side (window 65 + 2K, stride 65, still 18 tokens), the frequency axis zero-padded by K (= the mean, after the norm).
+tokenizer (default linear): mlp = Linear(in -> 2d) -> GELU -> Linear(2d -> d) instead of the shared Linear, shared by every band.
 gan_w (0 = off): a PatchGAN disc on masks (real = true, fake = sigmoid), hinge loss, stepped by its own Adam inside loss() on every microbatch;
 + gan_w x -D(fake), off until epoch 50, ramped 0 -> gan_w over epochs 50-100.
+norm (default sample): z-score each sample over (L,n_bins,C); laser = per (sample, bin, channel) over the lasers; freq = per (sample, laser, channel) over the bins
+(laser / freq: std clamped >= 1e-3 x the sample's median std). log_mag 1: x = log(x + 1e-3 x the sample's mean |X|) before the norm (default 0 = linear |X|).
+imom_w (0 = off): imom_w x utils.instance_moment_loss(p, true instances) (hybrid / s8-mag-nopose-imom's imoment term, weight 1 there).
+imom_norm "scale": utils.instance_moment_loss(scale=True), the scale-invariant moments (log area ratio + centroid / s + covariance / s^2, s = sqrt(true area)).
+imom_start (0 = off): imom_w and outline_w are 0 before epoch imom_start, then ramped linearly to full over the next 50 epochs.
+outline_w (0 = off): hybrid's edge term without a 2nd decoder channel: the predicted outline is utils.outline (3x3 dilation - erosion) of the mask probs p,
+outline_w x [(1 - dice_w) bce(outline(p), outline(true)) + dice_w (1 - dice)] (hybrid: bce_dice(edge_logits, outline(true)), dice_w 0.5).
 train only: speaker gain, laser jitter (each on a random fraction speaker_gain_p / laser_jitter_p of the samples), token dropout (each laser / band dropped iid with prob laser_drop / band_drop, >= 1 of each kept)."""
 import torch
 import torch.nn as nn
@@ -21,7 +34,7 @@ from composer import ComposerModel
 from torchmetrics import MeanMetric
 
 from maskae import load as maskae_load
-from utils import speaker_gain, laser_jitter, bce_dice, lovasz_hinge, METRICS
+from utils import speaker_gain, laser_jitter, bce_dice, lovasz_hinge, instance_moment_loss, outline, METRICS
 
 #*** 1 blocks
 
@@ -65,63 +78,139 @@ class TwoBranchUp(nn.Module):
 
 def mlp(d, n_out): return nn.Sequential(nn.Linear(d, d), nn.ReLU(), nn.Linear(d, n_out))
 
+def heads_attn(q, k, v, h, keep=None):
+    """(N,Tq,D), (N,Tk,D), (N,Tk,D) -> (N,Tq,D): h-head softmax attention, no rope; keep (N,Tk) 0 = masked key"""
+    split = lambda t: t.view(*t.shape[:2], h, -1).transpose(1, 2)                   # (N,H,T,D/H)
+    a = F.scaled_dot_product_attention(split(q), split(k), split(v), attn_mask=None if keep is None else keep[:, None, None].bool())
+    return a.transpose(1, 2).flatten(2)
+
+class QueryLayer(nn.Module):
+    """DETR decoder layer (pre-norm): self-attention among the queries, cross-attention to the memory (key = W_k(mem + kpos), value = W_v mem), MLP"""
+    def __init__(self, d, heads, mlp=4):
+        super().__init__()
+        self.h, self.n1, self.qkv, self.o1 = heads, nn.LayerNorm(d), nn.Linear(d, 3 * d), nn.Linear(d, d)
+        self.n2, self.q, self.k, self.v, self.o2 = nn.LayerNorm(d), nn.Linear(d, d), nn.Linear(d, d), nn.Linear(d, d), nn.Linear(d, d)
+        self.n3, self.mlp = nn.LayerNorm(d), nn.Sequential(nn.Linear(d, mlp * d), nn.GELU(), nn.Linear(mlp * d, d))
+
+    def forward(self, x, mem, kpos, keep):                                          # (N,K,D) queries, (N,T,D) LN'd memory, (T,D), (N,T)
+        x = x + self.o1(heads_attn(*self.qkv(self.n1(x)).chunk(3, -1), self.h))
+        x = x + self.o2(heads_attn(self.q(self.n2(x)), self.k(mem + kpos), self.v(mem), self.h, keep))
+        return x + self.mlp(self.n3(x))
+
+class QueryReadout(nn.Module):
+    """(N,T,D) LN'd tokens -> (N,d_out): n_q learned queries (DETR / Perceiver IO / PMA_k), `layers` QueryLayers, concat the n_q LN'd outputs -> Linear.
+    keys get a learned key-only position embedding kpos (one per token, as DETR adds its spatial encoding to the keys at every layer); values don't."""
+    def __init__(self, n_tokens, d, heads, n_q, layers, d_out):
+        super().__init__()
+        self.queries, self.kpos = nn.Parameter(torch.randn(n_q, d) * 0.02), nn.Parameter(torch.randn(n_tokens, d) * 0.02)
+        self.layers, self.norm, self.out = nn.ModuleList([QueryLayer(d, heads) for _ in range(layers)]), nn.LayerNorm(d), nn.Linear(n_q * d, d_out)
+
+    def forward(self, mem, keep):
+        x = self.queries.to(mem.dtype).expand(len(mem), -1, -1)
+        for l in self.layers: x = l(x, mem, self.kpos.to(mem.dtype), keep)
+        return self.out(self.norm(x).flatten(1))                                       # (N,d_out)
+
+def masked_mean(x, m): return (x * m[..., None]).sum(1) / m.sum(1, keepdim=True).clamp_min(1)  # (N,T,D), (N,T) -> (N,D)
+
 #*** 2 encoder
 
+READOUTS = ("per", "cls", "pool", "query")
+
+def stage_readout(self, readout, n, d, heads, d_out, n_queries, query_layers, freeze_readout, cls_proj):
+    """the readout params of a stage (n tokens -> d_out): per = n (d -> d_out) matrices; cls = a [cls] token (+ Linear (d -> d_out) if cls_proj: the laser stage);
+    pool = Linear(masked mean); query = QueryReadout. freeze_readout (per only): W, b fixed at init"""
+    assert readout in READOUTS, readout
+    self.cls = nn.Parameter(torch.randn(d) * 0.02) if readout == "cls" else None
+    if readout == "per":
+        self.read_w, self.read_b = per_token(n, d, d_out)                              # (n,d,d_out), (d_out,)
+        if freeze_readout: self.read_w.requires_grad_(False); self.read_b.requires_grad_(False)
+    elif readout == "cls" and cls_proj or readout == "pool": self.read = nn.Linear(d, d_out)
+    elif readout == "query": self.query = QueryReadout(n, d, heads, n_queries, query_layers, d_out)
+    assert not freeze_readout or readout == "per", "--freeze-readout is for --readout per"
+
 class FreqEncoder(nn.Module):
-    """(B,L,n_bands,d) band tokens -> (B,L,d): blocks over each laser's bands, then f = sum_b m_b W_b LN(h_b) + b (per) or LN(h_cls) (cls)"""
-    def __init__(self, n_bands, d, heads, layers, readout="per"):
+    """(B,L,n_bands,d) band tokens -> (B,L,d): (+ abspos) blocks over each laser's bands, then f = sum_b m_b W_b LN(h_b) + b (per), LN(h_cls) (cls),
+    W mean_b(m_b LN(h_b)) + b (pool), or QueryReadout(LN(h)) (query)"""
+    def __init__(self, n_bands, d, heads, layers, readout="per", abspos=0, n_queries=16, query_layers=1, freeze_readout=0, drop_rescale=0):
         super().__init__()
-        self.freqs = nn.ModuleList([Block(d, heads) for _ in range(layers)])
+        self.drop_rescale = drop_rescale
+        self.readout, self.freqs = readout, nn.ModuleList([Block(d, heads) for _ in range(layers)])
         self.read_norm, pos = nn.LayerNorm(d), torch.arange(n_bands)[:, None]
-        if readout == "per": self.cls, (self.read_w, self.read_b) = None, per_token(n_bands, d, d)  # (n_bands,d,d), (d,)
-        else: self.cls, pos = nn.Parameter(torch.randn(d) * 0.02), torch.cat([torch.zeros(1, 1), pos])  # [cls] at position 0
+        stage_readout(self, readout, n_bands, d, heads, d, n_queries, query_layers, freeze_readout, cls_proj=False)
+        if readout == "cls": pos = torch.cat([torch.zeros(1, 1), pos])                # [cls] at position 0
+        self.abspos = nn.Parameter(torch.randn(n_bands, d) * 0.02) if abspos else None  # learned, added to each band token's content
         self.register_buffer("rope", rope(pos, d // heads), persistent=False)        # 1D: band index
 
     def forward(self, x, m_b):                                                       # (B,L,n_bands,d), (B,n_bands)
         B, L, n_bands, _ = x.shape
+        if self.abspos is not None: x = x + self.abspos.to(x.dtype)
         x, keep = x.flatten(0, 1), m_b.repeat_interleave(L, 0)                        # (B*L,n_bands,d), (B*L,n_bands)
         if self.cls is not None: x, keep = torch.cat([self.cls.to(x.dtype).expand(len(x), 1, -1), x], 1), F.pad(keep, (1, 0), value=1)
         for blk in self.freqs: x = blk(x, self.rope, keep)
         if self.cls is not None: return self.read_norm(x[:, 0]).view(B, L, -1)        # (B,L,d)
+        if self.readout == "pool": return self.read(masked_mean(self.read_norm(x), keep.to(x.dtype))).view(B, L, -1)
+        if self.readout == "query": return self.query(self.read_norm(x), keep).view(B, L, -1)
         x = self.read_norm(x.view(B, L, n_bands, -1)) * m_b[:, None, :, None].to(x.dtype)
+        if self.drop_rescale: x = x * (n_bands / m_b.sum(1)).to(x.dtype)[:, None, None, None]  # inverted dropout: sum over kept bands x n / n_kept (= 1 at eval)
         return torch.einsum("blpd,pde->ble", x, self.read_w) + self.read_b             # (B,L,d)
 
 class LaserEncoder(nn.Module):
-    """(B,L,d) laser tokens -> u (B,latent_dim): blocks over the lasers, then u = LN(sum_l m_l W_l LN(t_l) + b (per) or W LN(t_cls) + b (cls)) + W_mask [m_l, m_b]"""
-    def __init__(self, rows, cols, n_bands, d, heads, layers, latent_dim, readout="per"):
+    """(B,L,d) laser tokens -> u (B,latent_dim): (+ abspos) blocks over the lasers, then u = LN(r) + W_mask [m_l, m_b], r = sum_l m_l W_l LN(t_l) + b (per),
+    W LN(t_cls) + b (cls), W mean_l(m_l LN(t_l)) + b (pool), or QueryReadout(LN(t)) (query)"""
+    def __init__(self, rows, cols, n_bands, d, heads, layers, latent_dim, readout="per", abspos=0, n_queries=16, query_layers=1, freeze_readout=0, drop_rescale=0):
         super().__init__()
-        L = rows * cols
-        self.lasers = nn.ModuleList([Block(d, heads) for _ in range(layers)])
+        L, self.drop_rescale = rows * cols, drop_rescale
+        self.readout, self.lasers = readout, nn.ModuleList([Block(d, heads) for _ in range(layers)])
         rc = torch.stack(torch.meshgrid(torch.arange(rows), torch.arange(cols), indexing="ij"), -1).view(L, 2)
-        if readout == "per": self.cls, (self.read_w, self.read_b) = None, per_token(L, d, latent_dim)  # (L,d,latent_dim), (latent_dim,)
-        else: self.cls, self.read, rc = nn.Parameter(torch.randn(d) * 0.02), nn.Linear(d, latent_dim), torch.cat([torch.zeros(1, 2, dtype=rc.dtype), rc])  # [cls] at (0, 0) rotation = none
+        stage_readout(self, readout, L, d, heads, latent_dim, n_queries, query_layers, freeze_readout, cls_proj=True)
+        if readout == "cls": rc = torch.cat([torch.zeros(1, 2, dtype=rc.dtype), rc])  # [cls] at (0, 0) rotation = none
         self.read_norm, self.u_norm = nn.LayerNorm(d), nn.LayerNorm(latent_dim)
         self.w_mask = nn.Linear(L + n_bands, latent_dim)
+        self.abspos = nn.Parameter(torch.randn(L, d) * 0.02) if abspos else None       # learned, added to each laser token's content
         self.register_buffer("rope", rope(rc, d // heads), persistent=False)         # 2D: laser (row, col), row-major
 
     def forward(self, x, m_l, m_b):                                                  # (B,L,d), (B,L), (B,n_bands)
+        if self.abspos is not None: x = x + self.abspos.to(x.dtype)
         if self.cls is not None:
             x = torch.cat([self.cls.to(x.dtype).expand(len(x), 1, -1), x], 1)
             for blk in self.lasers: x = blk(x, self.rope, F.pad(m_l, (1, 0), value=1))
             u = self.read(self.read_norm(x[:, 0]))
         else:
             for blk in self.lasers: x = blk(x, self.rope, m_l)
-            u = torch.einsum("bld,lde->be", self.read_norm(x) * m_l[..., None].to(x.dtype), self.read_w) + self.read_b
+            if self.readout == "pool": u = self.read(masked_mean(self.read_norm(x), m_l.to(x.dtype)))
+            elif self.readout == "query": u = self.query(self.read_norm(x), m_l)
+            else:
+                x = self.read_norm(x) * m_l[..., None].to(x.dtype)
+                if self.drop_rescale: x = x * (m_l.shape[1] / m_l.sum(1)).to(x.dtype)[:, None, None]  # inverted dropout over the kept lasers
+                u = torch.einsum("bld,lde->be", x, self.read_w) + self.read_b
         return self.u_norm(u) + self.w_mask(torch.cat([m_l, m_b], -1).to(u.dtype))   # (B,latent_dim) the bottleneck
 
 class Encoder(nn.Module):
     """(B,L,n_bins,C) |X| -> u (B,latent_dim): per-sample z -> cut into bands -> shared Linear to d -> freq enc -> laser enc"""
-    def __init__(self, n_channels, n_bins, rows, cols, bins_per_band, d, heads, freq_layers, laser_layers, latent_dim, readout="per"):
+    def __init__(self, n_channels, n_bins, rows, cols, bins_per_band, d, heads, freq_layers, laser_layers, latent_dim, readout="per", norm="sample", log_mag=0,
+                 abspos=0, n_queries=16, query_layers=1, freeze_readout=0, drop_rescale=0, band_overlap=0, tokenizer="linear"):
         super().__init__()
+        assert norm in ("sample", "laser", "freq"), norm
+        self.norm, self.log_mag = norm, log_mag
         assert n_bins % bins_per_band == 0, (n_bins, bins_per_band)
         self.L, self.n_bands, self.bins_per_band = rows * cols, n_bins // bins_per_band, bins_per_band  # 1170 bins -> 18 bands
-        self.embed = nn.Linear(bins_per_band * n_channels, d)                         # shared by every band
-        self.freq_enc = FreqEncoder(self.n_bands, d, heads, freq_layers, readout)
-        self.laser_enc = LaserEncoder(rows, cols, self.n_bands, d, heads, laser_layers, latent_dim, readout)
+        assert tokenizer in ("linear", "mlp"), tokenizer
+        self.overlap, n_in = band_overlap, (bins_per_band + 2 * band_overlap) * n_channels  # window = 65 + 2K bins
+        self.embed = nn.Linear(n_in, d) if tokenizer == "linear" else nn.Sequential(nn.Linear(n_in, 2 * d), nn.GELU(), nn.Linear(2 * d, d))  # shared by every band
+        ro = dict(abspos=abspos, n_queries=n_queries, query_layers=query_layers, freeze_readout=freeze_readout, drop_rescale=drop_rescale)
+        self.freq_enc = FreqEncoder(self.n_bands, d, heads, freq_layers, readout, **ro)
+        self.laser_enc = LaserEncoder(rows, cols, self.n_bands, d, heads, laser_layers, latent_dim, readout, **ro)
 
     def forward(self, x, m_l, m_b):
-        x = (x - x.mean((1, 2, 3), keepdim=True)) / (x.std((1, 2, 3), keepdim=True) + 1e-6)  # z-score each sample
-        x = x.reshape(*x.shape[:2], self.n_bands, self.bins_per_band, -1).flatten(-2)  # tokenize (B,L,n_bands,bins*C)
+        if self.log_mag: x = torch.log(x.clamp_min(0) + 1e-3 * x.mean((1, 2, 3), keepdim=True))  # eps = 1e-3 x the sample's mean |X|
+        if self.norm == "sample": x = (x - x.mean((1, 2, 3), keepdim=True)) / (x.std((1, 2, 3), keepdim=True) + 1e-6)  # z-score each sample
+        else:                                                                          # z over lasers (dim 1) or freq bins (dim 2)
+            dim = 1 if self.norm == "laser" else 2
+            std = x.std(dim, keepdim=True)
+            floor = 1e-3 * std.flatten(1).median(1).values.view(-1, 1, 1, 1)          # >= 1e-3 x the sample's median std: near-silent rows don't blow up
+            x = (x - x.mean(dim, keepdim=True)) / (torch.maximum(std, floor) + 1e-6)
+        if self.overlap: x = F.pad(x, (0, 0, self.overlap, self.overlap)).unfold(2, self.bins_per_band + 2 * self.overlap, self.bins_per_band).transpose(-1, -2).flatten(-2)  # (B,L,n_bands,(65+2K)*C)
+        else: x = x.reshape(*x.shape[:2], self.n_bands, self.bins_per_band, -1).flatten(-2)  # tokenize (B,L,n_bands,bins*C)
         return self.laser_enc(self.freq_enc(self.embed(x), m_b), m_l, m_b)            # (B,L,n_bands,d) -> (B,L,d) -> (B,latent_dim)
 
 #*** 3 decoder
@@ -174,10 +263,14 @@ def drop(B, n, p, device):
 class Transformer3(ComposerModel):
     def __init__(self, data_info, speaker_gain=0.35, speaker_gain_hz=20.0, laser_jitter=0.5, height=64, width=64, bins_per_band=65,
                  d=256, heads=8, freq_layers=4, laser_layers=8, latent_dim=512, laser_drop=0.2, band_drop=0.2, dice_w=0.5, objrecall_w=0.0, boundary_w=0.0,
-                 mask_loss="bce_dice", maskae="", readout="per", heatmap_w=0.0, laser_jitter_p=1.0, speaker_gain_p=1.0, gan_w=0.0):
+                 mask_loss="bce_dice", maskae="", readout="per", heatmap_w=0.0, laser_jitter_p=1.0, speaker_gain_p=1.0, gan_w=0.0, norm="sample", log_mag=0,
+                 abspos=0, n_queries=16, query_layers=1, freeze_readout=0, drop_rescale=0, band_overlap=0, tokenizer="linear", imom_w=0.0, outline_w=0.0, imom_norm="", imom_start=0):
         super().__init__()
+        assert imom_norm in ("", "scale"), imom_norm
+        self.imom_w, self.outline_w, self.imom_norm, self.imom_start = imom_w, outline_w, imom_norm, imom_start
         self.freq_hz, self.grid_rc = data_info["freq_range"], (data_info["n_laser_rows"], data_info["n_laser_cols"])
-        self.encoder = Encoder(data_info["n_channels"], data_info["n_freqs"], *self.grid_rc, bins_per_band, d, heads, freq_layers, laser_layers, latent_dim, readout)
+        self.encoder = Encoder(data_info["n_channels"], data_info["n_freqs"], *self.grid_rc, bins_per_band, d, heads, freq_layers, laser_layers, latent_dim, readout, norm, log_mag,
+                               abspos, n_queries, query_layers, freeze_readout, drop_rescale, band_overlap, tokenizer)
         if maskae:                                                                     # u -> z -> the frozen mask-AE decoder
             assert (height, width) == (64, 64), (height, width)
             self.ae = maskae_load(maskae)
@@ -203,8 +296,13 @@ class Transformer3(ComposerModel):
             if self.speaker_gain > 0: x = speaker_gain(x, self.freq_hz, self.speaker_gain, self.speaker_gain_hz, self.speaker_gain_p)
             if self.laser_jitter > 0: x = laser_jitter(x, *self.grid_rc, self.laser_jitter, self.laser_jitter_p)
             if self.laser_drop or self.band_drop: m_l, m_b = drop(B, L, self.laser_drop, x.device), drop(B, n_bands, self.band_drop, x.device)
+        return self.forward_tokens(x, m_l, m_b)
+
+    def forward_tokens(self, x, m_l, m_b):
+        """(B,L,n_bins,C) post-aug |X|, (B,L) / (B,n_bands) keep masks -> outputs; debug_nan (set by run.py --debug-nan 1): + the encoder's inputs, for callbacks.NaNDebug"""
         u = self.encoder(x, m_l, m_b)                                                  # (B,latent_dim)
         out = dict(object_logits=self.object_head(u), box_logits=self.box_head(u), latent=u)
+        if getattr(self, "debug_nan", 0): out |= dict(x_in=x, m_l=m_l, m_b=m_b)
         if self.ae is not None: out["z"] = self.decoder[0](u); y = self.ae.decode(out["z"])  # (B,z_dim) -> (B,H,W)
         else: y = self.decoder(u)                                                      # (B,H,W)
         if self.heatmap_w: y, out["heatmap_logits"] = y[:, 0], y[:, 1]
@@ -235,6 +333,16 @@ class Transformer3(ComposerModel):
         if self.boundary_w:
             losses["boundary"] = (p * batch["sdf"]).mean()
             total = total + self.boundary_w * min(1.0, self.epoch / 50) * losses["boundary"]
+        ramp = min(1.0, max(0.0, (self.epoch - self.imom_start) / 50)) if self.imom_start else 1.0  # imom + outline: off until imom_start, full 50 epochs later
+        if self.imom_w:
+            losses["imoment"] = instance_moment_loss(p, (batch["inst"] > 0.5).float(), scale=self.imom_norm == "scale")
+            total = total + self.imom_w * ramp * losses["imoment"]
+        if self.outline_w:                                                             # bce_dice on probabilities: the outline of p is no sigmoid of a logit
+            o, t = outline(p), outline(true.float())
+            with torch.autocast(o.device.type, enabled=False): bce = F.binary_cross_entropy(o, t)  # fp32; autocast refuses bce on probabilities
+            dice = 1 - (2 * (o * t).flatten(1).sum(1) + 1e-6).div((o + t).flatten(1).sum(1) + 1e-6).mean()
+            losses["outline"] = (1 - self.dice_w) * bce + self.dice_w * dice
+            total = total + self.outline_w * ramp * losses["outline"]
         if self.gan_w:                                                                 # 1 disc step (hinge) on this microbatch, then the generator's adversarial term
             real, fake, ps = true.float()[:, None], p[:, None], list(self.disc.parameters())
             if self.d_opt is None: self.d_opt = torch.optim.Adam(ps, 1e-4, betas=(0.5, 0.999))

@@ -49,8 +49,11 @@ def per_sample(run, epoch, thr):
             b = p[i] > thr
             (tt, ecc), (tp, _) = axis(y), axis(b)
             e = abs(tt - tp) % np.pi
+            (ty, tx), (py, px) = ([c.mean() / n for c, n in zip(np.nonzero(m), m.shape)] if m.any() else (np.nan,) * 2 for m in (y, b))
             rows.append(dict(box=f.parent.parent.name, split=f.parent.name, iou=(b & y).sum() / max((b | y).sum(), 1), miss=float(not (b & y).any()),
-                             orient=np.degrees(min(e, np.pi - e)) if ecc > 0.2 and not np.isnan(tp) else np.nan))
+                             orient=np.degrees(min(e, np.pi - e)) if ecc > 0.2 and not np.isnan(tp) else np.nan,
+                             speaker=int(info["speaker"][i]), position_id=int(info["position_id"][i]),
+                             cx=tx, cy=ty, pred_cx=px, pred_cy=py))
     if not rows: raise FileNotFoundError(f"{run}: no eval outputs at epoch {epoch}")
     return pd.DataFrame(rows)
 
