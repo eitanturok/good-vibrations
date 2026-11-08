@@ -1,0 +1,13 @@
+id,box,object,split,iou,pred_box,pred_obj,pred_com_r,pred_com_c,true_com_r,true_com_c
+2929-7,cardboard,cube,eval/cardboard/cube,0.8667,cardboard,red-cube,49.68,36.5,49.41,36.44
+3909-1,cardboard,candle,eval/cardboard/candle,0.9226,cardboard,candle,30.45,31.09,30.48,30.87
+3718-1,cardboard,soap dispenser,eval/cardboard/soap-dispenser,0.9143,cardboard,soap dispenser,38.13,45.52,37.76,45.49
+3322-5,cardboard,vase,eval/cardboard/vase,0.9032,cardboard,vase,41.05,38.44,40.77,38.49
+2486-3,plastic,cube,eval/plastic/cube,0.8571,plastic,red-cube,38.15,32.95,37.93,32.81
+1936-5,plastic,candle,eval/plastic/candle,0.9145,plastic,candle,16.02,45.99,16.15,45.85
+1760-1,plastic,soap dispenser,eval/plastic/soap-dispenser,1.0,plastic,soap dispenser,17.05,37.5,16.82,37.52
+2286-7,plastic,vase,eval/plastic/vase,0.8488,plastic,vase,48.18,36.24,48.6,36.19
+41-3,gastro,cube,eval/gastro/cube,0.75,gastro,red-cube,46.21,40.52,45.97,40.35
+760-7,gastro,candle,eval/gastro/candle,0.9225,gastro,candle,28.02,45.38,28.16,45.38
+1056-7,gastro,soap dispenser,eval/gastro/soap-dispenser,0.9259,gastro,soap dispenser,25.88,54.49,25.87,54.44
+568-1,gastro,vase,eval/gastro/vase,0.9429,gastro,vase,51.21,38.72,51.23,38.63
