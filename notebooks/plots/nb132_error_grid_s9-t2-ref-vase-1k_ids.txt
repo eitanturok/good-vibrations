@@ -1,0 +1,21 @@
+s9-t2-ref-vase-1k@1000 · panel -> sample (row-major; mask p > 0.08, classes on b = p > 0.08)
+a1	2026_10_11_cardboard_four_objs/003191-7	pos 3191	spk 7	ID id/cube	1 obj	IoU s9-t2-ref-vase-1k@1000 0.00
+a2	2026_09_27_gastronorm_four_objs/000083	pos 17	spk 4	OOD unseen-speaker/cube-unseen-speaker-unseen	1 obj	IoU s9-t2-ref-vase-1k@1000 0.00
+a3	2026_10_11_cardboard_four_objs/004341-5	pos 4341	spk 5	OOD cylinder/cylinder-500g	1 obj	IoU s9-t2-ref-vase-1k@1000 0.00
+a4	2026_10_11_cardboard_four_objs/004737-1	pos 4737	spk 1	OOD unseen-laser/vase-laser-shifted-3	1 obj	IoU s9-t2-ref-vase-1k@1000 0.00
+b1	2026_10_11_cardboard_four_objs/004078-7	pos 4078	spk 7	ID multiple/cube-vase	2 obj	IoU s9-t2-ref-vase-1k@1000 0.39
+b2	2026_09_27_gastronorm_four_objs/005661	pos 1133	spk 3	ID multiple/two-cubes	2 obj	IoU s9-t2-ref-vase-1k@1000 0.32
+b3	2026_10_05_green_plastic_four_objs/002751-1	pos 2751	spk 1	ID multiple/two-cubes	2 obj	IoU s9-t2-ref-vase-1k@1000 0.26
+b4	2026_10_05_green_plastic_four_objs/002780-5	pos 2780	spk 5	ID multiple/cube-vase	2 obj	IoU s9-t2-ref-vase-1k@1000 0.47
+c1	2026_10_11_cardboard_four_objs/004735-1	pos 4735	spk 1	OOD unseen-laser/vase-laser-shifted-3	1 obj	IoU s9-t2-ref-vase-1k@1000 0.00
+c2	2026_09_27_gastronorm_four_objs/000663	pos 133	spk 4	OOD unseen-speaker/cube-unseen-speaker-unseen	1 obj	IoU s9-t2-ref-vase-1k@1000 0.00
+c3	2026_10_05_green_plastic_four_objs/001906-3	pos 1906	spk 3	OOD lid/cube-with-lid	1 obj	IoU s9-t2-ref-vase-1k@1000 0.00
+c4	2026_10_11_cardboard_four_objs/004087-5	pos 4087	spk 5	ID multiple/cube-vase	2 obj	IoU s9-t2-ref-vase-1k@1000 0.19
+d1	2026_10_05_green_plastic_four_objs/002872-7	pos 2872	spk 7	OOD unseen-object/portable-charger	1 obj	IoU s9-t2-ref-vase-1k@1000 0.11
+d2	2026_10_11_cardboard_four_objs/004092-7	pos 4092	spk 7	ID multiple/cube-vase	2 obj	IoU s9-t2-ref-vase-1k@1000 0.51
+d3	2026_09_27_gastronorm_four_objs/006149	pos 1231	spk 1	OOD cylinder/cylinder-1000g	1 obj	IoU s9-t2-ref-vase-1k@1000 0.15
+d4	2026_10_05_green_plastic_four_objs/002896-5	pos 2896	spk 5	OOD unseen-laser/cube-shifted-lasers-3-backside	1 obj	IoU s9-t2-ref-vase-1k@1000 0.04
+e1	2026_09_27_gastronorm_four_objs/005479	pos 1097	spk 1	OOD rotated/soap-dispenser-sideways	1 obj	IoU s9-t2-ref-vase-1k@1000 0.34
+e2	2026_10_11_cardboard_four_objs/004558-5	pos 4558	spk 5	other unseen-angle/soap-dispenser-unseen-angle	1 obj	IoU s9-t2-ref-vase-1k@1000 0.46
+e3	2026_10_05_green_plastic_four_objs/001763-7	pos 1763	spk 7	OOD rotated/soap-dispenser-sideways	1 obj	IoU s9-t2-ref-vase-1k@1000 0.36
+e4	2026_10_11_cardboard_four_objs/004469-7	pos 4469	spk 7	OOD unseen-object/portable-charger	1 obj	IoU s9-t2-ref-vase-1k@1000 0.42

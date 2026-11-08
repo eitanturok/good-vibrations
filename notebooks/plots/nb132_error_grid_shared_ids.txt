@@ -1,0 +1,21 @@
+shared samples = decres-rescale-v1@300's worst offenders, drawn for every run · panel -> sample (row-major)
+a1	2026_10_11_cardboard_four_objs/004321-5	pos 4321	spk 5	OOD cylinder/cylinder-500g	1 obj	IoU decres-rescale@300 0.00	IoU t4-nowmask@300 0.13	IoU t2-ref@1000 0.00
+a2	2026_10_05_green_plastic_four_objs/002873-7	pos 2873	spk 7	OOD unseen-object/portable-charger	1 obj	IoU decres-rescale@300 0.00	IoU t4-nowmask@300 0.00	IoU t2-ref@1000 0.00
+a3	2026_10_11_cardboard_four_objs/004715-3	pos 4715	spk 3	other control/vase-without-lid	1 obj	IoU decres-rescale@300 0.00	IoU t4-nowmask@300 0.00	IoU t2-ref@1000 0.00
+a4	2026_10_11_cardboard_four_objs/004725-3	pos 4725	spk 3	OOD lid/vase-with-lid	1 obj	IoU decres-rescale@300 0.00	IoU t4-nowmask@300 0.00	IoU t2-ref@1000 0.00
+b1	2026_10_11_cardboard_four_objs/004275-7	pos 4275	spk 7	train train/train	2 obj	IoU decres-rescale@300 0.28	IoU t4-nowmask@300 0.40	IoU t2-ref@1000 0.77
+b2	2026_10_05_green_plastic_four_objs/002795-5	pos 2795	spk 5	ID multiple/cube-vase	2 obj	IoU decres-rescale@300 0.25	IoU t4-nowmask@300 0.23	IoU t2-ref@1000 0.48
+b3	2026_09_27_gastronorm_four_objs/005609	pos 1123	spk 1	ID multiple/two-cubes	2 obj	IoU decres-rescale@300 0.31	IoU t4-nowmask@300 0.28	IoU t2-ref@1000 0.27
+b4	2026_10_11_cardboard_four_objs/004078-3	pos 4078	spk 3	ID multiple/cube-vase	2 obj	IoU decres-rescale@300 0.51	IoU t4-nowmask@300 0.39	IoU t2-ref@1000 0.41
+c1	2026_10_11_cardboard_four_objs/004735-7	pos 4735	spk 7	OOD unseen-laser/vase-laser-shifted-3	1 obj	IoU decres-rescale@300 0.00	IoU t4-nowmask@300 0.00	IoU t2-ref@1000 0.00
+c2	2026_10_05_green_plastic_four_objs/001918-1	pos 1918	spk 1	OOD lid/cube-with-lid	1 obj	IoU decres-rescale@300 0.00	IoU t4-nowmask@300 0.00	IoU t2-ref@1000 0.00
+c3	2026_10_11_cardboard_four_objs/004147-1	pos 4147	spk 1	ID multiple/cube-vase	2 obj	IoU decres-rescale@300 0.43	IoU t4-nowmask@300 0.40	IoU t2-ref@1000 0.36
+c4	2026_09_27_gastronorm_four_objs/006311	pos 1263	spk 3	OOD lid/cube-with-lid	1 obj	IoU decres-rescale@300 0.00	IoU t4-nowmask@300 0.00	IoU t2-ref@1000 0.00
+d1	2026_10_11_cardboard_four_objs/004081-5	pos 4081	spk 5	train train/train	2 obj	IoU decres-rescale@300 0.57	IoU t4-nowmask@300 0.84	IoU t2-ref@1000 0.92
+d2	2026_09_27_gastronorm_four_objs/006139	pos 1229	spk 1	OOD cylinder/cylinder-1000g	1 obj	IoU decres-rescale@300 0.15	IoU t4-nowmask@300 0.17	IoU t2-ref@1000 0.23
+d3	2026_10_05_green_plastic_four_objs/001906-3	pos 1906	spk 3	OOD lid/cube-with-lid	1 obj	IoU decres-rescale@300 0.22	IoU t4-nowmask@300 0.34	IoU t2-ref@1000 0.00
+d4	2026_10_11_cardboard_four_objs/004208-7	pos 4208	spk 7	ID multiple/two-cubes	2 obj	IoU decres-rescale@300 0.33	IoU t4-nowmask@300 0.25	IoU t2-ref@1000 0.34
+e1	2026_09_27_gastronorm_four_objs/005479	pos 1097	spk 1	OOD rotated/soap-dispenser-sideways	1 obj	IoU decres-rescale@300 0.34	IoU t4-nowmask@300 0.35	IoU t2-ref@1000 0.34
+e2	2026_10_11_cardboard_four_objs/004688-3	pos 4688	spk 3	other broken/glass-cup-broken	1 obj	IoU decres-rescale@300 0.49	IoU t4-nowmask@300 0.41	IoU t2-ref@1000 0.39
+e3	2026_10_05_green_plastic_four_objs/002865-5	pos 2865	spk 5	OOD unseen-object/portable-charger	1 obj	IoU decres-rescale@300 0.21	IoU t4-nowmask@300 0.20	IoU t2-ref@1000 0.16
+e4	2026_09_27_gastronorm_four_objs/005588	pos 1118	spk 7	ID multiple/two-cubes	2 obj	IoU decres-rescale@300 0.20	IoU t4-nowmask@300 0.01	IoU t2-ref@1000 0.25

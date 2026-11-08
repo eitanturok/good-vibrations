@@ -49,7 +49,7 @@ DEFAULTS["transformer3"] = COMMON | dict(window="tukey", t_warmup="50ep", max_du
                                         abspos=0, n_queries=16, query_layers=1, freeze_readout=0, drop_rescale=0, band_overlap=0, tokenizer="linear", imom_w=0.0, outline_w=0.0, imom_norm="", imom_start=0,
                                         compile=0)  # eager by default: drop30-v1 / base300-v1 and earlier transformer3 runs trained compiled
 DEFAULTS["transformer4"] = COMMON | dict(window="tukey", t_warmup="50ep", max_duration="300ep", checkpoint_interval="100ep", microbatch=128, **AUGS, compile=0,
-                                        decoder="two", latent_norm="ln", freq_rope="linear")  # eager; base300-v1: transformer3's training defaults. decoder: two (Up) | one | res | res-coord | res-xattn-freq | res-xattn-laser; latent_norm: ln | rescale; freq_rope: linear | log (arch/transformer4.py)
+                                        decoder="two", latent_norm="ln", freq_rope="linear", laser_jitter_p=1.0, speaker_gain_p=1.0, laser_drop_p=1.0, band_drop_p=1.0)  # eager; base300-v1: transformer3's training defaults. decoder: two (Up) | one | res | res-coord | res-xattn-freq | res-xattn-laser; latent_norm: ln | rescale; freq_rope: linear | log (arch/transformer4.py)
 DEFAULTS["transformer_calib"] = DEFAULTS["transformer"]  # transformer with empty-box calibration instead of per-box stats, bce + dice
 
 def run():
@@ -68,7 +68,7 @@ def run():
     assert not args.eval_only or args.checkpoint_path, "--eval-only needs --checkpoint-path"
     T2 = ("height", "width", "freq_cls", "laser_cls", "freq_layers", "band_proj", "laser_proj", "band_v", "laser_v", "laser_layers", "rope", "heads", "readout", "latent_dim", "d", "norm", "box_emb", "pos", "laser_drop", "band_drop", "outline", "aux", "loss", "dice_w", "area_w", "tversky", "tv_alpha", "tv_beta", "ms_dice", "edge_w")  # transformer2-only knobs
     T3 = ("height", "width", "bins_per_band", "d", "heads", "freq_layers", "laser_layers", "latent_dim", "laser_drop", "band_drop", "dice_w", "objrecall_w", "boundary_w", "mask_loss", "maskae", "readout", "heatmap_w", "laser_jitter_p", "speaker_gain_p", "gan_w", "norm", "log_mag", "abspos", "n_queries", "query_layers", "freeze_readout", "drop_rescale", "band_overlap", "tokenizer", "imom_w", "outline_w", "imom_norm", "imom_start")  # transformer3 knobs
-    own = {"transformer2": T2, "transformer3": T3, "transformer4": ("decoder", "latent_norm", "freq_rope")}.get(args.model, ())
+    own = {"transformer2": T2, "transformer3": T3, "transformer4": ("decoder", "latent_norm", "freq_rope", "laser_jitter_p", "speaker_gain_p", "laser_drop_p", "band_drop_p")}.get(args.model, ())
 
     seed_all(args.seed)
     device = "gpu" if torch.cuda.is_available() else "cpu"

@@ -1,0 +1,21 @@
+t4-nowmask-v1@300 · panel -> sample (row-major; mask p > 0.08, classes on b = p > 0.08)
+a1	2026_10_11_cardboard_four_objs/003147-5	pos 3147	spk 5	ID id/cube	1 obj	IoU t4-nowmask-v1@300 0.00
+a2	2026_09_27_gastronorm_four_objs/000268	pos 54	spk 4	OOD unseen-speaker/cube-unseen-speaker-unseen	1 obj	IoU t4-nowmask-v1@300 0.00
+a3	2026_10_11_cardboard_four_objs/004331-3	pos 4331	spk 3	OOD cylinder/cylinder-500g	1 obj	IoU t4-nowmask-v1@300 0.00
+a4	2026_10_11_cardboard_four_objs/004467-1	pos 4467	spk 1	OOD unseen-object/portable-charger	1 obj	IoU t4-nowmask-v1@300 0.00
+b1	2026_10_11_cardboard_four_objs/004078-3	pos 4078	spk 3	ID multiple/cube-vase	2 obj	IoU t4-nowmask-v1@300 0.39
+b2	2026_09_27_gastronorm_four_objs/005659	pos 1133	spk 1	ID multiple/two-cubes	2 obj	IoU t4-nowmask-v1@300 0.08
+b3	2026_10_11_cardboard_four_objs/004132-7	pos 4132	spk 7	ID multiple/cube-vase	2 obj	IoU t4-nowmask-v1@300 0.48
+b4	2026_10_11_cardboard_four_objs/004114-5	pos 4114	spk 5	ID multiple/cube-vase	2 obj	IoU t4-nowmask-v1@300 0.55
+c1	2026_10_11_cardboard_four_objs/004744-3	pos 4744	spk 3	OOD unseen-laser/vase-laser-shifted-4	1 obj	IoU t4-nowmask-v1@300 0.00
+c2	2026_10_05_green_plastic_four_objs/001912-1	pos 1912	spk 1	OOD lid/cube-with-lid	1 obj	IoU t4-nowmask-v1@300 0.00
+c3	2026_10_11_cardboard_four_objs/004720-7	pos 4720	spk 7	other control/vase-without-lid	1 obj	IoU t4-nowmask-v1@300 0.00
+c4	2026_10_11_cardboard_four_objs/004147-1	pos 4147	spk 1	ID multiple/cube-vase	2 obj	IoU t4-nowmask-v1@300 0.40
+d1	2026_10_11_cardboard_four_objs/004150-7	pos 4150	spk 7	ID multiple/cube-vase	2 obj	IoU t4-nowmask-v1@300 0.44
+d2	2026_09_27_gastronorm_four_objs/000707	pos 142	spk 3	ID id/cube	1 obj	IoU t4-nowmask-v1@300 0.12
+d3	2026_10_05_green_plastic_four_objs/001781-5	pos 1781	spk 5	OOD cylinder/cylinder-500g	1 obj	IoU t4-nowmask-v1@300 0.21
+d4	2026_10_11_cardboard_four_objs/004702-4	pos 4702	spk 4	OOD unseen-speaker/vase-unseen-speaker-unseen	1 obj	IoU t4-nowmask-v1@300 0.13
+e1	2026_09_27_gastronorm_four_objs/005479	pos 1097	spk 1	OOD rotated/soap-dispenser-sideways	1 obj	IoU t4-nowmask-v1@300 0.35
+e2	2026_10_11_cardboard_four_objs/004264-3	pos 4264	spk 3	ID multiple/two-cubes	2 obj	IoU t4-nowmask-v1@300 0.50
+e3	2026_10_05_green_plastic_four_objs/002874-5	pos 2874	spk 5	OOD unseen-object/portable-charger	1 obj	IoU t4-nowmask-v1@300 0.24
+e4	2026_10_11_cardboard_four_objs/004557-7	pos 4557	spk 7	other unseen-angle/soap-dispenser-unseen-angle	1 obj	IoU t4-nowmask-v1@300 0.42

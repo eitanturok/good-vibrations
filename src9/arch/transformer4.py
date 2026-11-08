@@ -26,9 +26,10 @@ SPEAKER_GAIN, SPEAKER_GAIN_HZ, LASER_JITTER = 0.35, 20.0, 0.5
 
 #*** 0 helper functions
 
-def drop(B, n, p, device):
-    """(B,n) keep mask: each token dropped with prob p, >= 1 kept"""
+def drop(B, n, p, device, p_sample=1.0):
+    """(B,n) keep mask: each token dropped with prob p, >= 1 kept; p_sample < 1: only a random fraction p_sample of the samples drop any"""
     keep = torch.rand(B, n, device=device) >= p
+    if p_sample < 1: keep |= torch.rand(B, 1, device=device) >= p_sample
     keep[torch.arange(B, device=device), torch.randint(0, n, (B,), device=device)] |= ~keep.any(1)
     return keep
 
@@ -244,9 +245,9 @@ class Decoder(nn.Module):
 #*** 7 model
 
 class Transformer4(ComposerModel):
-    def __init__(self, info, speaker_gain=SPEAKER_GAIN, speaker_gain_hz=SPEAKER_GAIN_HZ, laser_jitter=LASER_JITTER, decoder="two", latent_norm="ln", freq_rope="linear"):
+    def __init__(self, info, speaker_gain=SPEAKER_GAIN, speaker_gain_hz=SPEAKER_GAIN_HZ, laser_jitter=LASER_JITTER, laser_jitter_p=1.0, speaker_gain_p=1.0, laser_drop_p=1.0, band_drop_p=1.0, decoder="two", latent_norm="ln", freq_rope="linear"):
         super().__init__()
-        self.sg, self.sg_hz, self.jitter = speaker_gain, speaker_gain_hz, laser_jitter
+        self.sg, self.sg_hz, self.jitter, self.jitter_p, self.sg_p, self.ld_p, self.bd_p = speaker_gain, speaker_gain_hz, laser_jitter, laser_jitter_p, speaker_gain_p, laser_drop_p, band_drop_p
         self.freq_hz, self.grid_rc = info["freq_range"], (info["n_laser_rows"], info["n_laser_cols"])
         self.encoder = Encoder(info["n_channels"], info["n_freqs"], *self.grid_rc, latent_norm, freq_rope, self.freq_hz)
         self.decoder = Decoder(decoder, self.grid_rc)
@@ -260,9 +261,9 @@ class Transformer4(ComposerModel):
         x, B, L, n_bands = batch["fft"], len(batch["fft"]), self.encoder.L, self.encoder.n_bands
         m_l, m_b = x.new_ones(B, L, dtype=torch.bool), x.new_ones(B, n_bands, dtype=torch.bool)  # keep masks (token dropout)
         if self.training:
-            x = speaker_gain(x, self.freq_hz, self.sg, self.sg_hz)
-            x = laser_jitter(x, *self.grid_rc, self.jitter)
-            m_l, m_b = drop(B, L, LASER_DROP, x.device), drop(B, n_bands, BAND_DROP, x.device)
+            x = speaker_gain(x, self.freq_hz, self.sg, self.sg_hz, self.sg_p)
+            x = laser_jitter(x, *self.grid_rc, self.jitter, self.jitter_p)
+            m_l, m_b = drop(B, L, LASER_DROP, x.device, self.ld_p), drop(B, n_bands, BAND_DROP, x.device, self.bd_p)
         src = self.decoder.tokens                                                     # None, or the Encoder tokens the xattn decoder reads ("freq" | "laser")
         u, t = self.encoder(x, m_l, m_b, src) if src else (self.encoder(x, m_l, m_b), None)
         obj, box = self.object_head(u), self.box_head(u)                              # heads before the decoder: u's grads sum in transformer3's order (bit-equal)
