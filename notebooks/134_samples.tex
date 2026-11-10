@@ -1,0 +1,27 @@
+% nb134 sample grid. Use in a paper: \usepackage{graphicx}, then
+%   \begin{figure*}\centering \input{134_samples} \caption{...}\end{figure*}
+\newcommand{\sampledir}{plots/nb134_samples}  % relative to the main .tex file
+
+% \sample{stem}{label}{iou}: GT photo | predicted mask, text underneath
+\newcommand{\sample}[3]{%
+  \begin{tabular}{@{}c@{}}
+    \includegraphics[width=0.16\linewidth,height=0.12\linewidth,keepaspectratio]{\sampledir/#1_true.png}\,%
+    \includegraphics[width=0.16\linewidth,height=0.12\linewidth,keepaspectratio]{\sampledir/#1_pred.png}\\
+    \small #2 \quad IoU #3
+  \end{tabular}}
+
+\sample{41-3_in-distribution-cube}{in-distribution: cube}{0.75}
+\sample{3909-1_in-distribution-candle}{in-distribution: candle}{0.92}
+\sample{1760-1_in-distribution-soap-dispenser}{in-distribution: soap dispenser}{1.00}
+
+\sample{3322-5_in-distribution-vase}{in-distribution: vase}{0.90}
+\sample{2799-7_multi-object-cube-and-vase}{multi-object: cube and vase}{0.60}
+\sample{1149-1_multi-object-two-cubes}{multi-object: two cubes}{0.83}
+
+\sample{1866-5_unseen-object-coffee-pot}{unseen object: coffee pot}{0.83}
+\sample{4481-5_unseen-object-tomato-sauce}{unseen object: tomato sauce}{0.84}
+\sample{4541-1_unseen-rotation-soap-dispenser}{unseen rotation: soap dispenser}{0.70}
+
+\sample{463-1_unseen-position-vase}{unseen position: vase}{0.93}
+\sample{4703-4_unseen-speaker-vase}{unseen speaker: vase}{0.77}
+\sample{2884-3_unseen-speckle-cube}{unseen speckle: cube}{0.57}
