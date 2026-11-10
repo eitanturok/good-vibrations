@@ -1,0 +1,67 @@
+group,split,kind,box,speakers,objects,n_samples,n_iou,iou_mean,iou_std,iou
+train,train,train,"cardboard, gastronorm, green-plastic","1, 3, 5, 7","candle, cylinder-1000g, cylinder-100g, cylinder-200g, cylinder-500g, empty, glass-cup, green-cube+red-cube, red-cube, red-cube+vase, soap dispenser, vase",11219,11050,0.8898089709922119,0.12573278162922097,0.890 ± 0.126
+cube,cube,easy eval,cardboard,"1, 3, 5, 7",red-cube,221,221,0.5146268884638883,0.2506151873879048,0.515 ± 0.251
+cube,cube,easy eval,gastronorm,"1, 3, 7",red-cube,147,147,0.5898229378633072,0.21311180472914446,0.590 ± 0.213
+cube,cube,easy eval,green-plastic,"1, 3, 5, 7",red-cube,200,200,0.7105678575120332,0.12095655402365417,0.711 ± 0.121
+cube,cube-rotated,easy eval,cardboard,"1, 3, 5, 7",red-cube,20,20,0.5086402640266717,0.2051170743141261,0.509 ± 0.205
+candle,candle,easy eval,cardboard,"1, 3, 5, 7",candle,230,230,0.8481503360000126,0.06349946505660502,0.848 ± 0.063
+candle,candle,easy eval,gastronorm,"1, 3, 7",candle,156,156,0.8512063009792732,0.061146100186160394,0.851 ± 0.061
+candle,candle,easy eval,green-plastic,"1, 3, 5, 7",candle,204,204,0.8149805194240093,0.09619786987476764,0.815 ± 0.096
+soap,soap-dispenser,easy eval,cardboard,"1, 3, 5, 7",soap dispenser,215,215,0.7123443178550537,0.14067424683201424,0.712 ± 0.141
+soap,soap-dispenser,easy eval,gastronorm,"1, 3, 7",soap dispenser,146,146,0.7952744245085764,0.10513378535632269,0.795 ± 0.105
+soap,soap-dispenser,easy eval,green-plastic,"1, 3, 5, 7",soap dispenser,234,234,0.8076477577571921,0.10116457588477495,0.808 ± 0.101
+soap,soap-dispenser-rotated,easy eval,cardboard,"1, 3, 5, 7",soap dispenser,100,100,0.5845316402467335,0.14348652445261684,0.585 ± 0.143
+soap,soap-dispenser-sideways,easy eval,gastronorm,"1, 3, 7",soap dispenser,18,18,0.4567158812600709,0.051317271459584896,0.457 ± 0.051
+soap,soap-dispenser-sideways,easy eval,green-plastic,"1, 3, 5, 7",soap dispenser,28,28,0.5224051569187101,0.07822675846545735,0.522 ± 0.078
+vase,vase,easy eval,cardboard,"1, 3, 5, 7",vase,164,164,0.8212749340132867,0.08607260377148117,0.821 ± 0.086
+vase,vase,easy eval,gastronorm,"1, 3, 7",vase,135,135,0.8094915111661194,0.14204061582930583,0.809 ± 0.142
+vase,vase,easy eval,green-plastic,"1, 3, 5, 7",vase,139,139,0.8219868642482908,0.08000693415105042,0.822 ± 0.080
+glass cup,glass-cup,easy eval,cardboard,"1, 3, 5, 7",glass-cup,12,12,0.4966719713224332,0.15496538131134738,0.497 ± 0.155
+glass cup,glass-cup-broken,easy eval,cardboard,"1, 3, 5, 7",glass-cup,12,12,0.4084835272723573,0.18831698758454704,0.408 ± 0.188
+cylinder,cylinder-100g,hard eval,cardboard,"1, 3, 5, 7",cylinder-100g,36,36,0.0,0.0,0.000 ± 0.000
+cylinder,cylinder-100g,hard eval,gastronorm,"1, 3, 7",cylinder-100g,6,6,0.036944444444444446,0.040694207431998454,0.037 ± 0.041
+cylinder,cylinder-100g,hard eval,green-plastic,"1, 3, 5, 7",cylinder-100g,28,28,0.05664935166765999,0.03805897732890616,0.057 ± 0.038
+cylinder,cylinder-200g,hard eval,cardboard,"1, 3, 5, 7",cylinder-200g,40,40,0.02039141414141414,0.07738926885670061,0.020 ± 0.077
+cylinder,cylinder-200g,hard eval,green-plastic,"1, 3, 5, 7",cylinder-200g,35,35,0.10324081719001305,0.05088669170328019,0.103 ± 0.051
+cylinder,cylinder-500g,hard eval,cardboard,"1, 3, 5, 7",cylinder-500g,40,40,0.050581135806942255,0.10533711284934864,0.051 ± 0.105
+cylinder,cylinder-500g,hard eval,gastronorm,"1, 3, 7",cylinder-500g,27,27,0.1285844031477936,0.08104432241442175,0.129 ± 0.081
+cylinder,cylinder-500g,hard eval,green-plastic,"1, 3, 5, 7",cylinder-500g,32,32,0.19827649357144392,0.0346564296300232,0.198 ± 0.035
+cylinder,cylinder-1000g,hard eval,cardboard,"1, 3, 5, 7",cylinder-1000g,28,28,0.21282859355561842,0.2322930731611567,0.213 ± 0.232
+cylinder,cylinder-1000g,hard eval,gastronorm,"1, 3, 7",cylinder-1000g,27,27,0.267284688774734,0.07740202854745919,0.267 ± 0.077
+cylinder,cylinder-1000g,hard eval,green-plastic,"1, 3, 5, 7",cylinder-1000g,32,32,0.32666722127046516,0.07864607826401201,0.327 ± 0.079
+multiple objects,cube-vase,hard eval,cardboard,"1, 3, 5, 7",red-cube+vase,66,66,0.4580852574187463,0.1129924969767821,0.458 ± 0.113
+multiple objects,cube-vase,hard eval,gastronorm,"1, 3, 7",red-cube+vase,27,27,0.37934474541796775,0.1293844111669054,0.379 ± 0.129
+multiple objects,cube-vase,hard eval,green-plastic,"1, 3, 5, 7",red-cube+vase,32,32,0.4778914427058879,0.14328979394381375,0.478 ± 0.143
+multiple objects,two-cubes,hard eval,cardboard,"1, 3, 5, 7",green-cube+red-cube,79,79,0.2832068541768573,0.14050278353900003,0.283 ± 0.141
+multiple objects,two-cubes,hard eval,gastronorm,"1, 3, 7",green-cube+red-cube,42,42,0.3020305048539434,0.20229472830647122,0.302 ± 0.202
+multiple objects,two-cubes,hard eval,green-plastic,"1, 3, 5, 7",green-cube+red-cube,64,64,0.4356656204287593,0.14073660505339475,0.436 ± 0.141
+unseen object,biscoff,unseen eval,cardboard,"1, 3, 5, 7",biscoff,36,36,0.5559125854100736,0.09034375970120341,0.556 ± 0.090
+unseen object,coffee-pot,unseen eval,cardboard,"1, 3, 5, 7",coffee pot,36,36,0.6045885006852842,0.15528654336940595,0.605 ± 0.155
+unseen object,coffee-pot,unseen eval,gastronorm,"1, 3, 7",coffee pot,24,24,0.660494325838835,0.06208156940370887,0.660 ± 0.062
+unseen object,coffee-pot,unseen eval,green-plastic,"1, 3, 5, 7",coffee pot,343,343,0.6149211690654492,0.10668234220129048,0.615 ± 0.107
+unseen object,portable-charger,unseen eval,cardboard,"1, 3, 5, 7",portable-charger,36,36,0.29190321154246957,0.13985963869473442,0.292 ± 0.140
+unseen object,portable-charger,unseen eval,green-plastic,"1, 3, 5, 7",portable-charger,40,40,0.3145152970263768,0.11185738477554986,0.315 ± 0.112
+unseen object,portable-charger-sideways,unseen eval,cardboard,"1, 3, 5, 7",portable-charger,36,36,0.38301693749344784,0.12258003240428005,0.383 ± 0.123
+unseen object,tomato-sauce,unseen eval,cardboard,"1, 3, 5, 7",tomato sauce,35,35,0.7090017858499271,0.08261360255850927,0.709 ± 0.083
+unseen speaker,cube-unseen-speaker-baseline,unseen eval,gastronorm,"1, 3, 7",red-cube,105,105,0.6575698233705589,0.16417033163179073,0.658 ± 0.164
+unseen speaker,cube-unseen-speaker-baseline,unseen eval,green-plastic,"1, 3, 5, 7",red-cube,159,159,0.7405919353848407,0.13358601998595226,0.741 ± 0.134
+unseen speaker,cube-unseen-speaker-unseen,unseen eval,gastronorm,4,red-cube,35,35,0.1868420388912226,0.15204838924432257,0.187 ± 0.152
+unseen speaker,cube-unseen-speaker-unseen,unseen eval,green-plastic,4,red-cube,40,40,0.6488597985222381,0.15127127322559106,0.649 ± 0.151
+unseen speaker,vase-unseen-speaker-baseline,unseen eval,cardboard,"1, 3, 5, 7",vase,40,40,0.6647886560304193,0.118176360503892,0.665 ± 0.118
+unseen speaker,vase-unseen-speaker-unseen,unseen eval,cardboard,4,vase,10,10,0.41462247829927384,0.20690398897251622,0.415 ± 0.207
+unseen rotation,soap-dispenser-unseen-angle,unseen eval,cardboard,"1, 3, 5, 7",soap dispenser,108,108,0.4978438905895999,0.16689482047705756,0.498 ± 0.167
+unseen laser speckle,cube-shifted-lasers-1,unseen eval,green-plastic,"1, 3, 5, 7",red-cube,32,32,0.5035895635265843,0.14017283074090692,0.504 ± 0.140
+unseen laser speckle,cube-shifted-lasers-2,unseen eval,green-plastic,"1, 3, 5, 7",red-cube,32,32,0.30552191271611673,0.1395875970614605,0.306 ± 0.140
+unseen laser speckle,cube-shifted-lasers-3-backside,unseen eval,green-plastic,"1, 3, 5, 7",red-cube,32,32,0.06464310012693585,0.09195337011369459,0.065 ± 0.092
+unseen laser speckle,vase-laser-shifted-2,unseen eval,cardboard,"1, 3, 5, 7",vase,36,36,0.4035230005353706,0.22306393070099095,0.404 ± 0.223
+unseen laser speckle,vase-laser-shifted-3,unseen eval,cardboard,"1, 3, 5, 7",vase,36,36,0.036241578076559644,0.10973560583551598,0.036 ± 0.110
+unseen laser speckle,vase-laser-shifted-4,unseen eval,cardboard,"1, 3, 5, 7","empty, vase",36,24,0.056569797009155987,0.1553369206690721,0.057 ± 0.155
+unseen position,unseen-position,unseen eval,cardboard,"1, 3, 5, 7",vase,52,52,0.5841404901677218,0.18656610964306064,0.584 ± 0.187
+unseen position,unseen-position,unseen eval,gastronorm,"1, 3, 7",vase,77,77,0.7518048754650329,0.08836669514206763,0.752 ± 0.088
+unseen position,unseen-position,unseen eval,green-plastic,"1, 3, 5, 7",vase,68,68,0.6894506895888366,0.09306993443654818,0.689 ± 0.093
+lid,cube-with-lid,unseen eval,gastronorm,"1, 3, 7",red-cube,15,15,0.12722742770580747,0.12906276310429726,0.127 ± 0.129
+lid,cube-with-lid,unseen eval,green-plastic,"1, 3, 5, 7",red-cube,32,32,0.04395281859185692,0.07443809520379631,0.044 ± 0.074
+lid,cube-without-lid,unseen eval,gastronorm,"1, 3, 7",red-cube,15,15,0.5270609584930406,0.10400788771858104,0.527 ± 0.104
+lid,cube-without-lid,unseen eval,green-plastic,"1, 3, 5, 7",red-cube,32,32,0.5830463854848167,0.12383985278747849,0.583 ± 0.124
+lid,vase-with-lid,unseen eval,cardboard,"1, 3, 5, 7",vase,36,36,0.08367589865144884,0.19644109632381615,0.084 ± 0.196
+lid,vase-without-lid,unseen eval,cardboard,"1, 3, 5, 7",vase,36,36,0.38990714413123917,0.29683611181135017,0.390 ± 0.297
