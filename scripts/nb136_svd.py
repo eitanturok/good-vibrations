@@ -7,11 +7,12 @@ from dataset import build_dataset
 from arch.transformer4 import Transformer4
 from sklearn.linear_model import RidgeCV
 OUT = ROOT / "runs/_src9_cache/nb136"
+SUF = sys.argv[1] if len(sys.argv) > 1 else ""   # "_single" -> top-K curves on q1_single.npz's half 1, write q1_svd_single.npz (the SVD itself is unchanged)
 torch.backends.cuda.matmul.allow_tf32 = False; torch.backends.cudnn.allow_tf32 = False
 
 tr_dl, ev, tr_ev, info = build_dataset("tukey", num_workers=0)
 TRD, EVD = tr_ev.dataloader.dataloader.dataset.dataset, ev[0].dataloader.dataloader.dataset.dataset
-B, Q = np.load(OUT / "base.npz"), np.load(OUT / "q1.npz")
+B, Q = np.load(OUT / "base.npz"), np.load(OUT / f"q1{SUF}.npz")
 BOX = {"2026_09_27_gastronorm_four_objs": "gastro", "2026_10_05_green_plastic_four_objs": "plastic", "2026_10_11_cardboard_four_objs": "cardboard"}
 def feat(x):  # (n,100,1170,2) -> (n,100,18,2): what the encoder sees (per-sample z-score), mean over each band's 65 bins
     x = (x - x.mean((1, 2, 3), keepdim=True)) / x.std((1, 2, 3), keepdim=True)
@@ -59,5 +60,5 @@ with torch.no_grad():
                 r.append(((p & ye).flatten(1).sum(1) / (p | ye).flatten(1).sum(1).clamp_min(1)).mean().item())
             curves[f"c|{b}|{unit}|svd"] = np.array(r)
         print(b, {k: v.round(3).tolist() for k, v in curves.items() if f"|{b}|" in k}, flush=True)
-np.savez(OUT / "q1_svd.npz", **{f"imp_b|{b}": v for b, v in imp_b.items()}, **{f"imp_l|{b}": v for b, v in imp_l.items()}, **{f"scree|{b}": v for b, v in scree.items()}, **curves)
+np.savez(OUT / f"q1_svd{SUF}.npz", **{f"imp_b|{b}": v for b, v in imp_b.items()}, **{f"imp_l|{b}": v for b, v in imp_l.items()}, **{f"scree|{b}": v for b, v in scree.items()}, **curves)
 print("done")

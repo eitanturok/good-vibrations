@@ -18,7 +18,7 @@ pick = []
 for k in np.unique(key):
     if k.split("|")[2] in ID | {"empty"}: ix = np.nonzero(key == k)[0]; pick += sorted(rng.choice(ix, min(100, len(ix)), replace=False).tolist())
 pick = np.array(pick); print(len(pick), "captures", flush=True)
-SIG, LVL, EZ = [], [], []
+SIG, LVL, EZ, XN = [], [], [], []
 with torch.no_grad():
     for s in range(0, len(pick), 128):
         x = torch.stack([DS[int(B["i"][tr[j]])]["fft"] for j in pick[s:s + 128]]).cuda()   # (n,100,1170,2) |X| / sample std
@@ -26,5 +26,6 @@ with torch.no_grad():
         SIG.append(c.std(2).cpu()); LVL.append((10 * (c ** 2).mean(2).log10()).cpu())
         z = (x - x.mean((1, 2, 3), keepdim=True)) / x.std((1, 2, 3), keepdim=True)          # what the encoder sees
         EZ.append((z ** 2).mean((1, 3)).view(len(x), 18, 65).mean(2).cpu())                # mean z² per band
-np.savez(OUT / "res.npz", idx=tr[pick], key=key[pick], sigma=torch.cat(SIG).numpy(), level=torch.cat(LVL).numpy().astype(np.float32), ez=torch.cat(EZ).numpy())
+        XN.append((x / x.std((1, 2, 3), keepdim=True)).mean((1, 3)).view(len(x), 18, 65).mean(2).cpu())  # linear |X| / σ_sample (z before the mean shift), per band
+np.savez(OUT / "res.npz", idx=tr[pick], key=key[pick], sigma=torch.cat(SIG).numpy(), level=torch.cat(LVL).numpy().astype(np.float32), ez=torch.cat(EZ).numpy(), xn=torch.cat(XN).numpy())
 print("done")
