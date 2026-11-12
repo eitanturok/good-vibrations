@@ -1,12 +1,12 @@
 """The 2-D colour legend of the viz's colour = "xy" mode, drawn on a photo of each box.
 
-Writes into figures/dimensionality_reduction/box_position_legened/:
-  gastro.pdf, plastic.pdf, cardboard.pdf   overhead empty-box photo + a uniform grid of big dots over the box floor, in the xy colour
-  <box>_45deg.pdf                          the same grid on the 45 degree photo of the box, placed on the floor by a homography
-  legend.pdf                               the same grid over the full colour range, no photo
+Writes into figures_src/dimensionality_reduction/box_position_legend_out/:
+  gastro.svg, plastic.svg, cardboard.svg   overhead empty-box photo + a uniform grid of big dots over the box floor, in the xy colour
+  <box>_45deg.svg                          the same grid on the 45 degree photo of the box, placed on the floor by a homography
+  legend.svg                               the same grid over the full colour range, no photo
 
 Run:
-  .venv/bin/python figures/dimensionality_reduction/box_position_legend.py
+  .venv/bin/python figures_src/dimensionality_reduction/box_position_legend.py
 """
 import colorsys
 from pathlib import Path
@@ -22,7 +22,7 @@ from PIL import Image
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[1]
-OUT = HERE / "box_position_legened"
+OUT = HERE / "box_position_legend_out"
 META = ROOT / "runs/_src9_cache/nb137/decres-rescale-aug10-v1/meta.csv"  # written by viz.py
 MASK_SIZE = 64  # x / y in meta.csv are the mask centre of mass in a 64 x 64 mask (x = column, y = row)
 
@@ -117,9 +117,9 @@ for box, sample in EMPTY_PHOTO.items():
     ax.imshow(photo, extent=(-0.5, MASK_SIZE - 0.5, MASK_SIZE - 0.5, -0.5), aspect="auto")
     ax.scatter(x, y, c=xy_colours(x, y), s=DOT_SIZE, edgecolors="white", linewidths=0.75, zorder=3)
     l_axis(ax, x, y, "white")
-    fig.savefig(OUT / f"{box}.pdf", bbox_inches="tight", pad_inches=0, dpi=300)
+    fig.savefig(OUT / f"{box}.svg", bbox_inches="tight", pad_inches=0, dpi=300)
     plt.close(fig)
-    print(f"{box} -> {OUT / f'{box}.pdf'}")
+    print(f"{box} -> {OUT / f'{box}.svg'}")
 
     # The same grid on the 45 degree photo. The floor is a plane, so a homography (3 x 3 matrix, fixed by the four
     # floor corners) maps mask coordinates to pixels of the tilted photo exactly.
@@ -158,15 +158,15 @@ for box, sample in EMPTY_PHOTO.items():
     ax.set_xlim(0, width)
     ax.set_ylim(height, 0)
     ax.axis("off")
-    fig.savefig(OUT / f"{box}_45deg.pdf", bbox_inches="tight", pad_inches=0, dpi=300)
+    fig.savefig(OUT / f"{box}_45deg.svg", bbox_inches="tight", pad_inches=0, dpi=300)
     plt.close(fig)
-    print(f"{box} 45 deg -> {OUT / f'{box}_45deg.pdf'}")
+    print(f"{box} 45 deg -> {OUT / f'{box}_45deg.svg'}")
 
 # 4: the legend, the same grid with no photo.
 x, y = grid(df.x.quantile(0.005), df.x.quantile(0.995), df.y.quantile(0.005), df.y.quantile(0.995))
 fig, ax = square_axes()
 ax.scatter(x, y, c=xy_colours(x, y), s=DOT_SIZE)
 l_axis(ax, x, y, "black")
-fig.savefig(OUT / "legend.pdf", bbox_inches="tight")
+fig.savefig(OUT / "legend.svg", bbox_inches="tight")
 plt.close(fig)
-print(f"legend -> {OUT / 'legend.pdf'}")
+print(f"legend -> {OUT / 'legend.svg'}")

@@ -4,8 +4,8 @@ PCA / UMAP of the model's input, latent or output vectors. Each sample is drawn 
 (assets/objects/individual) with a contour in the point colour, in 3-D (three.js, plotly-style walls / ticks) or 2-D.
 Everything except run / epoch / port is a dropdown in the page (viz.html, next to this file).
 
-  .venv/bin/python figures/dimensionality_reduction/viz.py --run decres-rescale-aug10-v1 [--epoch 200] [--port 8610]
-  .venv/bin/python figures/dimensionality_reduction/viz.py --run decres-rescale-aug10-v1 --precompute   # cache every dropdown subset, then exit
+  .venv/bin/python figures_src/dimensionality_reduction/viz.py --run decres-rescale-aug10-v1 [--epoch 200] [--port 8610]
+  .venv/bin/python figures_src/dimensionality_reduction/viz.py --run decres-rescale-aug10-v1 --precompute   # cache every dropdown subset, then exit
 
 Caches (runs/_src9_cache/nb137/<run>[/ep<N>]):
   feats.npz + meta.csv   one eager fp32 pass of the checkpoint (transformer4 runs only)
