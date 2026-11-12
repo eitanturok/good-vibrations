@@ -8,6 +8,8 @@ x (B, L=100 lasers on a 10x10 grid, 1170 bins, C=2) linear |X|
    res-xattn-freq / res-xattn-laser = res + a cross-attention block onto the 100 laser tokens after the 8x8 and 16x16 doublings) -> 3 convs
 -> 64x64 mask logits (0.5 bce + 0.5 dice)
 -> heads on u: object class (CE, "unseen" ignored) and box class (CE), x 0.1 each.
+   (--spk-grl-w W > 0: + a speaker head on GRL(u), CE x W; GRL = identity forward, -lambda x grad backward (Ganin & Lempitsky DANN), so the encoder
+    is pushed to make u speaker-free. lambda = spk_grl_lambda, or with --spk-grl-ramp N (epochs) lambda x (2 / (1 + exp(-10 p)) - 1), p = epoch / N)
 train only: speaker gain (sd 0.35, knots every 20 Hz), laser jitter (+-0.5 cells), each laser / band token dropped iid with prob 0.2 (>= 1 of each kept)."""
 import math
 from functools import partial
@@ -32,6 +34,16 @@ def drop(B, n, p, device, p_sample=1.0):
     if p_sample < 1: keep |= torch.rand(B, 1, device=device) >= p_sample
     keep[torch.arange(B, device=device), torch.randint(0, n, (B,), device=device)] |= ~keep.any(1)
     return keep
+
+class GradReverse(torch.autograd.Function):
+    """identity forward, -lam * grad backward (gradient reversal layer)"""
+    @staticmethod
+    def forward(ctx, x, lam): ctx.lam = lam; return x.view_as(x)
+    @staticmethod
+    def backward(ctx, g): return -ctx.lam * g, None
+
+SPEAKERS = (1, 3, 5, 7)                                                              # train speakers; the rest (4 = the unseen one) -> ignore index len(SPEAKERS)
+SPK_IDX = torch.tensor([SPEAKERS.index(s) if s in SPEAKERS else len(SPEAKERS) for s in range(8)])
 
 def aux_head(n_out): return nn.Sequential(nn.Linear(LATENT, LATENT), nn.ReLU(), nn.Linear(LATENT, n_out))
 
@@ -245,7 +257,8 @@ class Decoder(nn.Module):
 #*** 7 model
 
 class Transformer4(ComposerModel):
-    def __init__(self, info, speaker_gain=SPEAKER_GAIN, speaker_gain_hz=SPEAKER_GAIN_HZ, laser_jitter=LASER_JITTER, laser_jitter_p=1.0, speaker_gain_p=1.0, laser_drop_p=1.0, band_drop_p=1.0, decoder="two", latent_norm="ln", freq_rope="linear"):
+    def __init__(self, info, speaker_gain=SPEAKER_GAIN, speaker_gain_hz=SPEAKER_GAIN_HZ, laser_jitter=LASER_JITTER, laser_jitter_p=1.0, speaker_gain_p=1.0, laser_drop_p=1.0, band_drop_p=1.0, decoder="two", latent_norm="ln", freq_rope="linear",
+                 spk_grl_w=0.0, spk_grl_lambda=1.0, spk_grl_ramp=0, adapter_dim=0):
         super().__init__()
         self.sg, self.sg_hz, self.jitter, self.jitter_p, self.sg_p, self.ld_p, self.bd_p = speaker_gain, speaker_gain_hz, laser_jitter, laser_jitter_p, speaker_gain_p, laser_drop_p, band_drop_p
         self.freq_hz, self.grid_rc = info["freq_range"], (info["n_laser_rows"], info["n_laser_cols"])
@@ -253,7 +266,12 @@ class Transformer4(ComposerModel):
         self.decoder = Decoder(decoder, self.grid_rc)
         self.n_known = len(info["objects"]) - 1                                       # objects[-1] = "unseen": no logit, ignored by the CE
         self.object_head, self.box_head = aux_head(self.n_known), aux_head(len(info["boxes"]))
-        keys = [k for k in METRICS if k not in ("n_objects_err", "com_err")]
+        self.spk_w, self.spk_lam, self.spk_ramp, self.epoch = spk_grl_w, spk_grl_lambda, spk_grl_ramp, 0
+        if spk_grl_w: self.speaker_head = aux_head(len(SPEAKERS))                     # only when on: same params / state_dict / RNG draws as before otherwise
+        if adapter_dim:
+            self.adapter = nn.Sequential(nn.LayerNorm(LATENT), nn.Linear(LATENT, adapter_dim), nn.GELU(), nn.Linear(adapter_dim, LATENT))
+            nn.init.zeros_(self.adapter[3].weight); nn.init.zeros_(self.adapter[3].bias)
+        keys = [k for k in METRICS if k not in ("n_objects_err", "com_err", "speaker_acc") or (k == "speaker_acc" and spk_grl_w)]
         self.train_metrics, self.test_metrics = {k: MeanMetric() for k in keys}, {k: MeanMetric() for k in keys}
         for k, m in [*self.train_metrics.items(), *self.test_metrics.items()]: m.key = k
 
@@ -267,14 +285,21 @@ class Transformer4(ComposerModel):
         src = self.decoder.tokens                                                     # None, or the Encoder tokens the xattn decoder reads ("freq" | "laser")
         u, t = self.encoder(x, m_l, m_b, src) if src else (self.encoder(x, m_l, m_b), None)
         obj, box = self.object_head(u), self.box_head(u)                              # heads before the decoder: u's grads sum in transformer3's order (bit-equal)
+        if hasattr(self, "adapter"): u = u + self.adapter(u)
         y = self.decoder(u, t, m_l)
-        return dict(mask_logits=y, mask_pred=y.sigmoid(), object_logits=obj, box_logits=box, latent=u)
+        out = dict(mask_logits=y, mask_pred=y.sigmoid(), object_logits=obj, box_logits=box, latent=u)
+        if self.spk_w:
+            lam = self.spk_lam * (2 / (1 + math.exp(-10 * min(self.epoch / self.spk_ramp, 1.0))) - 1 if self.spk_ramp else 1.0)
+            out["speaker_logits"], out["speaker"] = self.speaker_head(GradReverse.apply(u, lam)), SPK_IDX.to(u.device)[batch["speaker"]]
+        return out
 
     def loss(self, out, batch):
         mask = bce_dice(out["mask_logits"], batch["mask_true"], DICE_W)
         obj = F.cross_entropy(out["object_logits"], batch["object"], ignore_index=self.n_known)
         box = F.cross_entropy(out["box_logits"], batch["box"])
-        return dict(total=mask + AUX_W * obj + AUX_W * box, mask=mask, object=obj, box=box)
+        if not self.spk_w: return dict(total=mask + AUX_W * obj + AUX_W * box, mask=mask, object=obj, box=box)
+        spk = F.cross_entropy(out["speaker_logits"].float(), out["speaker"], ignore_index=len(SPEAKERS))
+        return dict(total=mask + AUX_W * obj + AUX_W * box + self.spk_w * spk, mask=mask, object=obj, box=box, speaker=spk)
 
     def get_metrics(self, is_train=False): return self.train_metrics if is_train else self.test_metrics
     def update_metric(self, batch, out, metric): metric.update(METRICS[metric.key](out, batch))

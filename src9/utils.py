@@ -152,7 +152,8 @@ def orient_err(out, batch):
 def object_acc(out, batch): return (out["object_logits"].argmax(-1) == batch["object"])[batch["object"] < out["object_logits"].shape[-1]].float()
 def n_objects_err(out, batch): return (out["n_objects_logits"].argmax(-1) - batch["n_objects"]).abs().float()
 def box_acc(out, batch): return (out["box_logits"].argmax(-1) == batch["box"]).float()
+def speaker_acc(out, batch): return (out["speaker_logits"].argmax(-1) == out["speaker"])[out["speaker"] < out["speaker_logits"].shape[-1]].float()  # transformer4 --spk-grl-w
 def com_error(out, batch): return com_err(out["com"], batch["coms"], batch["n_objects"])
 
 METRICS = {"iou08": iou08, "miss08": miss08, "obj_recall": obj_recall, "biou": biou, "area_ratio": area_ratio, "orient_err": orient_err, "iou": iou,
-           "object_acc": object_acc, "n_objects_err": n_objects_err, "box_acc": box_acc, "com_err": com_error}
+           "object_acc": object_acc, "n_objects_err": n_objects_err, "box_acc": box_acc, "com_err": com_error, "speaker_acc": speaker_acc}

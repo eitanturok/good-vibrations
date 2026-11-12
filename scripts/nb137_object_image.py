@@ -3,6 +3,7 @@
 Everything except run/epoch/port is a dropdown in the page (scripts/nb137_object_image.html).
 
   .venv/bin/python scripts/nb137_object_image.py --run decres-rescale-aug10-v1 [--epoch 200] [--port 8610]
+  .venv/bin/python scripts/nb137_object_image.py --run decres-rescale-aug10-v1 [--epoch 200] --precompute   # cache every dropdown subset, then exit
 
 Caches (runs/_src9_cache/nb137/<run>[/ep<N>]): feats.npz + meta.csv (one eager fp32 pass of the checkpoint, transformer4 runs only;
 the default run at the latest epoch reuses nb137's existing cache) and red_*.npz (one per PCA/UMAP fit, same keys as nb137)."""
@@ -14,7 +15,8 @@ from scipy.ndimage import binary_dilation
 ROOT = Path(__file__).resolve().parents[1]
 # same settings as nb137 cell 1 (IGNORE / UMAP are part of the reduction cache key)
 IGNORE = ["eval/cardboard/vase-laser-shifted-4", "shifted", "unseen-speaker", "cylinder", "portable-charger", "biscoff", "coffee", "lid"]
-HIDE = ["shifted", "unseen-speaker", "cylinder", "portable-charger", "biscoff", "coffee", "lid"]
+DISPLAY_OFF = [  # display-picker entries containing any of these start unticked
+    "shifted", "unseen-speaker", "cylinder", "portable-charger", "biscoff", "coffee", "lid"]
 UMAP = dict(n_neighbors=30, min_dist=0.1)
 RENAME = {"green-cube+red-cube": "two objects", "red-cube+vase": "two objects", "soap dispenser": "soap", "red-cube": "cube"}
 COLOURS = {"empty": "black", "two objects": "black", "gastro": "#2ca02c", "plastic": "#1f77b4", "cardboard": "#ff7f0e"}  # fixed colours (boxes as in nb136)
@@ -23,12 +25,13 @@ IMAGES = {"candle": "candle", "red-cube": "cube", "soap dispenser": "soap", "vas
 CAT = ["split", "set", "box", "object", "speaker"]
 NUM = ["x", "y", "iou", "area", "n_objects"]
 BEST = ["none", "xy", "split", "set", "box", "object", "speaker", "x", "y", "iou"]  # pick components by this feature (see best())
-PALETTE = ["#636EFA", "#EF553B", "#00CC96", "#AB63FA", "#FFA15A", "#19D3F3", "#FF6692", "#B6E880", "#FF97FF", "#FECB52"]  # plotly default
+PALETTE = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd", "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf"]  # tab10 (more distinct than plotly's blue/violet pair)
 BOXES = {"2026_09_27_gastronorm_four_objs": "gastro", "2026_10_05_green_plastic_four_objs": "plastic", "2026_10_11_cardboard_four_objs": "cardboard"}
 
 ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
 ap.add_argument("--run", default="decres-rescale-aug10-v1"); ap.add_argument("--epoch", type=int, default=None, help="checkpoint epoch (default: latest)")
 ap.add_argument("--port", type=int, default=8610)
+ap.add_argument("--precompute", action="store_true", help="fit + cache every dropdown subset (box × speaker × object × vector × method), then exit")
 A = ap.parse_args()
 
 # ---- features for (run, epoch): cached, else one eager fp32 pass (same as scripts/nb136_base.py)
@@ -75,10 +78,9 @@ if not (C / "feats.npz").exists():
 F, df = dict(np.load(C / "feats.npz")), pd.read_csv(C / "meta.csv", dtype={"speaker": str})
 if "area" not in df: df["area"] = np.load(ROOT / "runs/_src9_cache/nb136/base.npz")["y"].sum((1, 2))  # old nb137 cache (default run only)
 keep = ~df.split.isin(IGNORE).values
-df["hidden"] = (df.split + " " + df.object).str.contains("|".join(HIDE), regex=True).values
+df["disp"] = np.where(df.split == "train", "train/" + df.object, df.split)  # display-picker entry: eval split, or train/<object>
 df["n_objects"] = np.where(df.object == "empty", 0, df.object.str.count(r"\+") + 1); df["object_raw"] = df.object; df["object"] = df.object.replace(RENAME)
 df = df[keep].reset_index(drop=True); F = {k: v[keep] for k, v in F.items()}
-shown = df[~df.hidden]
 
 # ---- sprites: object picture + contour ring (64 px PNG data URIs), one per raw object, sent once
 def png(a): b = io.BytesIO(); Image.fromarray(a).save(b, "PNG"); return "data:image/png;base64," + base64.b64encode(b.getvalue()).decode()
@@ -89,9 +91,10 @@ def sprite(o):
     a[(64 - h) // 2:(64 - h) // 2 + h, (64 - w) // 2:(64 - w) // 2 + w] = np.asarray(im)
     al = a[..., 3] > 128; ring = np.zeros_like(a); ring[binary_dilation(al, iterations=4) & ~al] = 255
     return [png(a), png(ring)]
-OBJS = sorted(shown.object_raw.unique()); IX = {o: i for i, o in enumerate(OBJS)}
-META = dict(run=A.run, ckpt=ckpt, sprites=[sprite(o) for o in OBJS], box=["all", *sorted(shown.box.unique())], speaker=["all", *sorted(shown.speaker.unique(), key=int)],
-            object=["all", *shown.object.value_counts().index], data=["latent", "input", "output"], method=["pca", "umap"], colour=["xy", *CAT, *NUM], size=["none", *CAT, *NUM], best=BEST)
+OBJS = sorted(df.object_raw.unique()); IX = {o: i for i, o in enumerate(OBJS)}
+META = dict(run=A.run, ckpt=ckpt, sprites=[sprite(o) for o in OBJS], box=["all", *sorted(df.box.unique())], speaker=["all", *sorted(df.speaker.unique(), key=int)],
+            object=["all", *df.object.value_counts().index], vector=["latent", "input", "output"], split=["both", "train", "test"], method=["pca", "umap"], colour=["xy", *CAT, *NUM], size=["none", *CAT, *NUM], best=BEST,
+            splits=[[s, int(n), not any(h in s for h in DISPLAY_OFF)] for s, n in df.disp.value_counts().items()])  # display picker: [split, n, ticked by default (no DISPLAY_OFF match)]
 
 # ---- reduction (same cache key as nb137 reduce(); disk + memory cache)
 @functools.lru_cache(maxsize=64)
@@ -100,16 +103,21 @@ def reduce(box, spk, obj, data, method):
     if spk: m &= df.speaker.isin(spk).values
     if obj: m &= df.object.isin(obj).values
     if m.sum() < 10: return m, None, None
-    key = (method, sorted(IGNORE), box, list(spk) if spk else None, list(obj) if obj else None, data) + (("k10",) if method == "pca" else tuple(sorted(UMAP.items())))
+    tr = (df.set == "train").values[m]  # fit on the train rows of the subset only, then project every row of the subset (train + eval)
+    if tr.sum() < 10: return m, None, None
+    key = (method, sorted(IGNORE), box, list(spk) if spk else None, list(obj) if obj else None, data) + (("k10",) if method == "pca" else tuple(sorted(UMAP.items()))) + ("fit=train",)
     f = C / f"red_{hashlib.sha1(repr(key).encode()).hexdigest()[:10]}.npz"
     if not f.exists() or len(np.load(f)["r"]) != m.sum():
         from sklearn.decomposition import PCA
-        t0 = time.time(); X = F[data][m] - F[data][m].mean(0)
-        if method == "pca": p = PCA(10, random_state=0); r = p.fit_transform(X); ev = p.explained_variance_ratio_
+        t0 = time.time(); X = F[data][m]; X = X - X[tr].mean(0)
+        if method == "pca": p = PCA(10, random_state=0).fit(X[tr]); r = p.transform(X); ev = p.explained_variance_ratio_
         else:
             import umap
-            r = umap.UMAP(n_components=3, **(UMAP | dict(n_neighbors=min(UMAP["n_neighbors"], len(X) - 1))), random_state=0).fit_transform(PCA(min(50, *X.shape), random_state=0).fit_transform(X)); ev = np.full(3, np.nan)
-        np.savez(f, r=r, ev=ev); print(f"fitted {method} {box or 'all'} {data} in {time.time() - t0:.0f}s", flush=True)
+            pc = PCA(min(50, *X[tr].shape), random_state=0).fit(X[tr]); Z = pc.transform(X)
+            u = umap.UMAP(n_components=3, **(UMAP | dict(n_neighbors=min(UMAP["n_neighbors"], int(tr.sum()) - 1))), random_state=0).fit(Z[tr])
+            r = np.zeros((len(X), 3), np.float32); r[tr] = u.embedding_; r[~tr] = u.transform(Z[~tr]) if (~tr).any() else r[~tr]; ev = np.full(3, np.nan)
+        tmp = f.with_suffix(".tmp.npz"); np.savez(tmp, r=r, ev=ev); tmp.replace(f)  # atomic: a running server never sees a half-written file
+        print(f"fitted {method} {box or 'all'} {data} on {tr.sum()} train, projected {len(X)} in {time.time() - t0:.0f}s", flush=True)
     z = np.load(f); return m, z["r"], z["ev"] if "ev" in z else np.full(3, np.nan)
 
 # ---- colours (quantised to 16 levels/channel → few distinct tinted sprites)
@@ -120,8 +128,9 @@ def colours(d, c):
         lo, hi = d[["x", "y"]].min().values, d[["x", "y"]].max().values; u = np.clip((d[["x", "y"]].values - lo) / (hi - lo), 0, 1)
         return [hexq(named(COLOURS[o])) if o in COLOURS else hexq(colorsys.hls_to_rgb(.8 * a, .8 - .55 * b, .9)) if a == a else hexq(named("lightgray")) for o, (a, b) in zip(d.object, u)], {}
     if c in CAT:
-        keys = sorted(d[c].astype(str).unique()); cm = {k: hexq(named(COLOURS.get(k, PALETTE[i % len(PALETTE)]))) for i, k in enumerate(keys)}
-        return [cm[k] for k in d[c].astype(str)], cm
+        keys = sorted(df[c].astype(str).unique(), key=lambda k: (not k.isdigit(), int(k) if k.isdigit() else 0, k))  # ALL values in the data → a value keeps its colour in every view
+        cm = {k: hexq(named(COLOURS.get(k, PALETTE[i % len(PALETTE)]))) for i, k in enumerate(keys)}; shown = set(d[c].astype(str))
+        return [cm[k] for k in d[c].astype(str)], {k: v for k, v in cm.items() if k in shown}
     import matplotlib; v = d[c].astype(float); lo, hi = v.min(), v.max(); t = ((v - lo) / (hi - lo + 1e-12)).fillna(0)
     return [hexq(matplotlib.colormaps["viridis"](x)[:3]) for x in t], {f"{lo:.3g}": hexq(matplotlib.colormaps["viridis"](0.)[:3]), f"{hi:.3g}": hexq(matplotlib.colormaps["viridis"](1.)[:3])}
 
@@ -158,10 +167,13 @@ def best(r, d, f, n):  # → (0-based component indices, score text)
 def plot(q):
     g = lambda k, dv=None: q.get(k, [dv])[0]
     box, spk, obj = [None if g(k, "all") == "all" else g(k) for k in ("box", "speaker", "object")]
-    data, method, colour, size = g("data", "latent"), g("method", "pca"), g("colour", "xy"), g("size", "none")
+    data, split, method, colour, size = g("vector", "latent"), g("split", "both"), g("method", "pca"), g("colour", "xy"), g("size", "none")
     m, r, ev = reduce(box, (spk,) if spk else None, (obj,) if obj else None, data, method)
     if r is None: return dict(error=f"only {m.sum()} samples (< 10)")
-    v = ~df.hidden.values[m]; d, r = df[m][v].reset_index(drop=True), r[v]
+    display = g("display", "").split(",")  # entries ticked in the display picker (never affects the fit)
+    v = df.disp.isin(display).values[m] & (True if split == "both" else (df.set.values[m] == "train") == (split == "train"))
+    if not v.any(): return dict(error=f"nothing to display (split {split}, {len(display)} ticked display entries) in this subset")
+    d, r = df[m][v].reset_index(drop=True), r[v]
     idx = [int(g(k)) - 1 for k in ("x", "y", "z") if g(k, "none") != "none"][:3]; bf, btxt = g("best", "none"), ""
     if bf != "none": idx, btxt = best(r, d, bf, 3 if g("z", "none") != "none" else 2)  # z = none → best 2-D pair, else best 3
     if len(idx) < 2 or max(idx) >= r.shape[1]: return dict(error=f"pick 2-3 components ≤ {r.shape[1]} for {method}")
@@ -170,10 +182,22 @@ def plot(q):
     xyz = np.stack([nrm(r[:, i]) for i in idx] + ([np.zeros(len(d))] if len(idx) == 2 else []), 1).round(4)
     col, legend = colours(d, colour); sc, sleg = sizes(d, size)
     hov = [html.escape(f"{s.split('/')[-1]} · {o} · spk {k} · pos {p} · true {x:.0f},{y:.0f} · iou {u:.2f}") for s, o, k, p, x, y, u in zip(d.split, d.object, d.speaker, d.pos, d.x, d.y, d.iou)]
-    title = (f"{A.run} · {ckpt.split('-')[0]} · box {box or 'all'} · speaker {spk or 'all'} · object {obj or 'all'} · {data} ({F[data].shape[1]}-d) · {method} · n {len(d)}"
+    title = (f"{A.run} · {ckpt.split('-')[0]} · box {box or 'all'} · speaker {spk or 'all'} · object {obj or 'all'} · {data} ({F[data].shape[1]}-d) · {method} fit on train · showing {split} · n {len(d)}"
              f" · colour {colour} · size {size}" + (" (x = hue, y = lightness of the true mask CoM)" if colour == "xy" else "") + (f" · best {bf}: {btxt}" if bf != "none" else ""))
     return dict(title=title, axes=names, ticks=[ticks(r[:, i]) for i in idx], d3=len(idx) == 3, legend=legend, size_legend=sleg, picked=[i + 1 for i in idx], ncomp=int(r.shape[1]),
                 pts=[[*xyz[i].tolist(), IX[d.object_raw[i]], col[i], hov[i], round(float(sc[i]), 3)] for i in range(len(d))])
+
+if A.precompute:  # PCA first (fast), then UMAP; within each: no filter → speaker → object → speaker × object
+    import itertools
+    SP, OB, BX = META["speaker"][1:], META["object"][1:], [None, *META["box"][1:]]
+    combos = [(None, None)] + [(s, None) for s in SP] + [(None, o) for o in OB] + list(itertools.product(SP, OB))
+    jobs = [(mt, s, o, b, v) for mt in ("pca", "umap") for s, o in combos for b in BX for v in ("latent", "input", "output")]
+    t0, done, skip = time.time(), 0, 0
+    for n, (mt, s, o, b, v) in enumerate(jobs):
+        try: _, r, _ = reduce(b, (s,) if s else None, (o,) if o else None, v, mt); done += r is not None; skip += r is None
+        except Exception as e: print(f"FAILED {mt} box={b} spk={s} obj={o} {v}: {e!r}", flush=True)
+        if n % 50 == 0: print(f"[{n}/{len(jobs)}] {time.time() - t0:.0f}s · {done} cached · {skip} too small", flush=True)
+    print(f"precompute done: {done} fits cached, {skip} subsets too small, {time.time() - t0:.0f}s"); sys.exit()
 
 PAGE = (ROOT / "scripts/nb137_object_image.html")
 class H(http.server.BaseHTTPRequestHandler):

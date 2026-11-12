@@ -49,7 +49,7 @@ DEFAULTS["transformer3"] = COMMON | dict(window="tukey", t_warmup="50ep", max_du
                                         abspos=0, n_queries=16, query_layers=1, freeze_readout=0, drop_rescale=0, band_overlap=0, tokenizer="linear", imom_w=0.0, outline_w=0.0, imom_norm="", imom_start=0,
                                         compile=0)  # eager by default: drop30-v1 / base300-v1 and earlier transformer3 runs trained compiled
 DEFAULTS["transformer4"] = COMMON | dict(window="tukey", t_warmup="50ep", max_duration="300ep", checkpoint_interval="100ep", microbatch=128, **AUGS, compile=0,
-                                        decoder="two", latent_norm="ln", freq_rope="linear", laser_jitter_p=1.0, speaker_gain_p=1.0, laser_drop_p=1.0, band_drop_p=1.0)  # eager; base300-v1: transformer3's training defaults. decoder: two (Up) | one | res | res-coord | res-xattn-freq | res-xattn-laser; latent_norm: ln | rescale; freq_rope: linear | log (arch/transformer4.py)
+                                        decoder="two", latent_norm="ln", freq_rope="linear", laser_jitter_p=1.0, speaker_gain_p=1.0, laser_drop_p=1.0, band_drop_p=1.0, spk_grl_w=0.0, spk_grl_lambda=1.0, spk_grl_ramp=0, adapter_dim=0, init_from="", freeze_base=0)  # spk_grl_*: speaker head behind a gradient reversal layer (0 = off); eager; base300-v1: transformer3's training defaults. decoder: two (Up) | one | res | res-coord | res-xattn-freq | res-xattn-laser; latent_norm: ln | rescale; freq_rope: linear | log (arch/transformer4.py)
 DEFAULTS["transformer_calib"] = DEFAULTS["transformer"]  # transformer with empty-box calibration instead of per-box stats, bce + dice
 
 def run():
@@ -68,7 +68,7 @@ def run():
     assert not args.eval_only or args.checkpoint_path, "--eval-only needs --checkpoint-path"
     T2 = ("height", "width", "freq_cls", "laser_cls", "freq_layers", "band_proj", "laser_proj", "band_v", "laser_v", "laser_layers", "rope", "heads", "readout", "latent_dim", "d", "norm", "box_emb", "pos", "laser_drop", "band_drop", "outline", "aux", "loss", "dice_w", "area_w", "tversky", "tv_alpha", "tv_beta", "ms_dice", "edge_w")  # transformer2-only knobs
     T3 = ("height", "width", "bins_per_band", "d", "heads", "freq_layers", "laser_layers", "latent_dim", "laser_drop", "band_drop", "dice_w", "objrecall_w", "boundary_w", "mask_loss", "maskae", "readout", "heatmap_w", "laser_jitter_p", "speaker_gain_p", "gan_w", "norm", "log_mag", "abspos", "n_queries", "query_layers", "freeze_readout", "drop_rescale", "band_overlap", "tokenizer", "imom_w", "outline_w", "imom_norm", "imom_start")  # transformer3 knobs
-    own = {"transformer2": T2, "transformer3": T3, "transformer4": ("decoder", "latent_norm", "freq_rope", "laser_jitter_p", "speaker_gain_p", "laser_drop_p", "band_drop_p")}.get(args.model, ())
+    own = {"transformer2": T2, "transformer3": T3, "transformer4": ("decoder", "latent_norm", "freq_rope", "laser_jitter_p", "speaker_gain_p", "laser_drop_p", "band_drop_p", "spk_grl_w", "spk_grl_lambda", "spk_grl_ramp", "adapter_dim")}.get(args.model, ())
 
     seed_all(args.seed)
     device = "gpu" if torch.cuda.is_available() else "cpu"
@@ -81,6 +81,12 @@ def run():
     augs |= {k: getattr(args, k) for k in own}
 
     model = {"boombox": Boombox, "hybrid": Hybrid, "transformer": Transformer, "transformer_calib": TransformerCalib, "transformer2": Transformer2, "transformer3": Transformer3, "transformer4": Transformer4}[args.model](info, **augs)
+    if getattr(args, "init_from", ""):                                               # fine-tune: start from a checkpoint's weights; only new modules may be missing
+        miss, unexp = model.load_state_dict(torch.load(args.init_from, map_location="cpu", weights_only=False)["state"]["model"], strict=False)
+        assert not unexp and all(k.startswith(("adapter.", "speaker_head.")) for k in miss), (miss, unexp); print(f"init from {args.init_from}, new: {sorted({k.split('.')[0] for k in miss})}")
+    if getattr(args, "freeze_base", 0):                                              # train only the adapter + speaker head
+        for n, q in model.named_parameters(): q.requires_grad = n.startswith(("adapter.", "speaker_head."))
+        print(f"trainable: {sum(q.numel() for q in model.parameters() if q.requires_grad):,}")
     n_params = sum(p.numel() for p in model.parameters())
     print(f"{args.model}: {n_params:,} parameters")
     if args.run_name: Path(f"runs/{args.run_name}").mkdir(parents=True, exist_ok=True); Path(f"runs/{args.run_name}/args.json").write_text(json.dumps(vars(args), indent=1))
@@ -94,7 +100,7 @@ def run():
         # pool-m-v1 / query-m-v1): it pads that residual buffer's per-laser stride 7200 -> 7232, the fused LN-backward kernel writes d(embed output) at the dense stride, and
         # the embed weight / bias grad kernels read it at the padded one, past its end (garbage -> nan / inf grads, illegal memory access). aligned d (256) unaffected
         from torch._inductor import config as inductor_config; inductor_config.comprehensive_padding = False
-    opt = torch.optim.AdamW([q for n, q in model.named_parameters() if not n.startswith("disc.")], args.lr, weight_decay=args.weight_decay)
+    opt = torch.optim.AdamW([q for n, q in model.named_parameters() if not n.startswith("disc.") and q.requires_grad], args.lr, weight_decay=args.weight_decay)
     if args.debug_nan: assert args.model == "transformer3", "--debug-nan is for transformer3"; model.debug_nan = 1  # + x_in / m_l / m_b in the outputs
     callbacks = [NaNDebug(model, opt)] * bool(args.debug_nan) + [LRMonitor(), SpeedMonitor(), RuntimeEstimator(skip_batches=64, time_unit="minutes"), NaNMonitor(), OptimizerMonitor(batch_log_interval=10),
                  VisualizeSMask(args.image_interval), OutputSaver(args.eval_interval, info["objects"]), PositionLogger(), EvalSummary(CATEGORIES, NOT_OOD), SetEpoch()]

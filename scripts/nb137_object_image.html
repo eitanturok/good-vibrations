@@ -5,16 +5,20 @@
   body { margin: 0; font: 12px sans-serif; background: #fff; color: #222 }
   #top { padding: 6px 10px; display: flex; flex-wrap: wrap; gap: 4px 12px; align-items: center }
   #top label { white-space: nowrap } #top select { font: inherit }
-  #title { padding: 0 10px; color: #555 } #leg { padding: 4px 10px } #leg span { margin-right: 10px }
-  #wrap { position: relative } canvas { display: block }
+  #wrap { position: relative; overflow: hidden } canvas { display: block }
+  #title { position: absolute; font-size: 8px; line-height: 10px; color: #555; white-space: nowrap; pointer-events: none }  /* placed by layout(), same as the SVG */
+  #leg { position: absolute; display: flex; font-size: 10px; color: #222; pointer-events: none }
+  #leg > div > div { height: 13px; display: flex; align-items: center; white-space: nowrap } #leg i { flex: none; display: inline-block }
   #tip { position: absolute; pointer-events: none; background: #fffe; border: 1px solid #999; padding: 2px 5px; display: none; white-space: nowrap }
+  #disp { position: relative } #disp > button { font: inherit }
+  #dpanel { position: absolute; z-index: 10; top: 100%; left: 0; background: #fff; border: 1px solid #aaa; padding: 6px; display: none; width: 340px; box-shadow: 0 2px 8px #0003 }
+  #dpanel input[type=text] { width: 100%; box-sizing: border-box; font: inherit; margin-bottom: 4px } #dlist { max-height: 60vh; overflow-y: auto }
+  #dlist label { display: block; white-space: nowrap } #dlist .n { color: #999 }
   #busy { position: absolute; left: 50%; top: 40%; transform: translate(-50%); background: #fffd; padding: 8px 14px; border: 1px solid #ccc; display: none }
 </style></head>
 <body>
 <div id="top"></div>
-<div id="title"></div>
-<div id="wrap"><canvas id="c"></canvas><div id="tip"></div><div id="busy">computing…</div></div>
-<div id="leg"></div>
+<div id="wrap"><canvas id="c"></canvas><div id="title"></div><div id="leg"></div><div id="tip"></div><div id="busy">computing…</div></div>
 <script type="importmap">{"imports": {"three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js", "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"}}</script>
 <script type="module">
 import * as THREE from 'three';
@@ -24,7 +28,7 @@ const META = await (await fetch('/api/meta')).json();
 
 // ---- controls (state kept in the URL hash, so reload / share keeps the view settings)
 const PCS = n => [...Array(n)].map((_, i) => String(i + 1));
-const CTL = {box: META.box, speaker: META.speaker, object: META.object, data: META.data, method: META.method, colour: META.colour, size: META.size,
+const CTL = {box: META.box, speaker: META.speaker, object: META.object, vector: META.vector, split: META.split, method: META.method, colour: META.colour, size: META.size,
              best: META.best, x: PCS(10), y: PCS(10), z: ['none', ...PCS(10)]};
 const DEF = {x: '1', y: '2', z: '3'}, saved = Object.fromEntries(new URLSearchParams(location.hash.slice(1)));
 for (const [k, opts] of Object.entries(CTL)) {
@@ -37,8 +41,40 @@ function lockAxes() { $('x').disabled = $('y').disabled = $('best').value != 'no
 function setOpts(k, opts) { const s = $(k), v = s.value; s.innerHTML = opts.map(o => `<option>${o}</option>`).join(''); s.value = opts.includes(v) ? v : (DEF[k] && opts.includes(DEF[k]) ? DEF[k] : opts[0]); }
 if ($('method').value == 'umap') for (const a of ['x', 'y', 'z']) setOpts(a, a == 'z' ? ['none', ...PCS(3)] : PCS(3));
 lockAxes();
+// ---- display picker: searchable checklist of every split (unticked → not drawn; the fit is unaffected). Default = DISPLAY_OFF entries unticked.
+const DEF_ON = () => META.splits.filter(s => s[2]).map(s => s[0]);
+const display = new Set(saved.display !== undefined ? saved.display.split(',').filter(x => x) : DEF_ON());
+const disp = document.createElement('span'); disp.id = 'disp';
+disp.innerHTML = `<button></button><div id="dpanel"><input type="text" placeholder="search splits… (Enter = tick matches only)">
+  <div><button data-a="1">tick shown</button> <button data-a="0">untick shown</button> <button data-a="d">defaults</button></div><div id="dlist"></div></div>`;
+$('top').append(disp);
+const dbtn = disp.firstChild, dp = disp.querySelector('#dpanel'), dq = dp.querySelector('input'), dl = dp.querySelector('#dlist');
+dl.innerHTML = META.splits.map(([s, n]) => `<label><input type="checkbox" value="${s}"> ${s} <span class="n">${n}</span></label>`).join('');
+const boxes = [...dl.querySelectorAll('input')];
+let dt = 0; const dirty = () => { clearTimeout(dt); dt = setTimeout(load, 400); };  // debounce: ticking several boxes → one request
+function dsync() { boxes.forEach(b => b.checked = display.has(b.value)); dbtn.textContent = `display ${display.size}/${boxes.length} splits ▾`; }
+function dfilter() { const q = dq.value.toLowerCase().split(/\s+/).filter(x => x); boxes.forEach(b => b.parentNode.style.display = q.every(w => b.value.toLowerCase().includes(w)) ? '' : 'none'); }
+const vis = () => boxes.filter(b => b.parentNode.style.display != 'none');
+boxes.forEach(b => b.onchange = () => { b.checked ? display.add(b.value) : display.delete(b.value); dsync(); dirty(); });
+dp.querySelectorAll('button').forEach(b => b.onclick = () => {
+  if (b.dataset.a == 'd') { display.clear(); DEF_ON().forEach(s => display.add(s)); }
+  else vis().forEach(x => b.dataset.a == '1' ? display.add(x.value) : display.delete(x.value));
+  dsync(); dirty(); });
+dq.oninput = dfilter;
+dq.onkeydown = e => { if (e.key == 'Enter') { const v = new Set(vis().map(b => b.value)); display.clear(); v.forEach(x => display.add(x)); dsync(); dirty(); }
+                      if (e.key == 'Escape') dp.style.display = 'none'; };
+dbtn.onclick = () => { const o = dp.style.display != 'block'; dp.style.display = o ? 'block' : 'none'; if (o) dq.focus(); };
+addEventListener('mousedown', e => { if (!disp.contains(e.target)) dp.style.display = 'none'; });
+dsync();
 const sl = document.createElement('input'); sl.type = 'range'; sl.min = 4; sl.max = 100; sl.value = saved.img ?? 28;
 const sz = document.createElement('label'); sz.append('image size ', sl); $('top').append(sz);
+// density: show the first p% of a farthest-point order (evenly spread, nested, deterministic); the slider only changes draw ranges
+const dn = document.createElement('input'); dn.type = 'range'; dn.min = 0; dn.max = 100; dn.value = saved.density ?? 100;
+const dnN = document.createElement('span'); dnN.style.color = '#777';
+const dnl = document.createElement('label'); dnl.append('density ', dn, ' ', dnN); $('top').append(dnl);
+dn.oninput = () => { density(); hash(); render(); };
+const save = document.createElement('button'); save.textContent = 'save SVG'; save.title = 'download the current view (this exact camera) as a cropped SVG'; save.onclick = async () => { save.disabled = true; save.textContent = 'saving…'; await new Promise(r => requestAnimationFrame(() => setTimeout(r, 0)));  // let the label paint first
+  try { saveSvg(); } finally { save.disabled = false; save.textContent = 'save SVG'; } }; $('top').append(save);
 const help = document.createElement('span'); help.style.color = '#777'; $('top').append(help);
 
 // ---- three.js scene (rebuilt per plot; camera kept unless 2-D ↔ 3-D changes)
@@ -56,19 +92,19 @@ function home() {  // OrbitControls fixes its orbit axis from cam.up at construc
   ctl.target.set(0, 0, 0); ctl.update(); render();
 }
 cv.ondblclick = home;
-function resize() { const w = innerWidth, h = Math.max(400, innerHeight - $('top').offsetHeight - $('title').offsetHeight - $('leg').offsetHeight - 8);
+function resize() { const w = innerWidth, h = Math.max(400, innerHeight - $('top').offsetHeight - (parseFloat($('wrap').style.paddingTop) || 0) - 8);
   R.setSize(w, h); cam.aspect = w / h; cam.updateProjectionMatrix(); render(); }
 addEventListener('resize', resize);
 
 const load1 = u => new Promise(r => { const i = new Image(); i.onload = () => r(i); i.src = u; });
 const im = await Promise.all(META.sprites.map(s => s ? Promise.all(s.map(load1)) : null));
-const texCache = {};
+const texCache = {}, TEX = 64;  // texture px (sprites are 64 px); the drawn size is set by the point size, not by this
 function texture(i, col) {  // object picture with its contour ring tinted in the point colour (cached per object × colour)
   const key = i + col; if (texCache[key]) return texCache[key];
-  const s = document.createElement('canvas'); s.width = s.height = 64; const h = s.getContext('2d');
-  if (im[i]) { h.drawImage(im[i][1], 0, 0); h.globalCompositeOperation = 'source-in'; h.fillStyle = col; h.fillRect(0, 0, 64, 64);
-               h.globalCompositeOperation = 'source-over'; h.drawImage(im[i][0], 0, 0); }
-  else { h.strokeStyle = col; h.lineWidth = 8; h.beginPath(); h.moveTo(14, 14); h.lineTo(50, 50); h.moveTo(50, 14); h.lineTo(14, 50); h.stroke(); }
+  const s = document.createElement('canvas'); s.width = s.height = TEX; const h = s.getContext('2d');
+  if (im[i]) { h.drawImage(im[i][1], 0, 0, TEX, TEX); h.globalCompositeOperation = 'source-in'; h.fillStyle = col; h.fillRect(0, 0, TEX, TEX);
+               h.globalCompositeOperation = 'source-over'; h.drawImage(im[i][0], 0, 0, TEX, TEX); }
+  else { h.strokeStyle = col; h.scale(TEX / 64, TEX / 64); h.lineWidth = 8; h.beginPath(); h.moveTo(14, 14); h.lineTo(50, 50); h.moveTo(50, 14); h.lineTo(14, 50); h.stroke(); }  // cross drawn in 64-px units
   const t = new THREE.CanvasTexture(s); t.colorSpace = THREE.SRGBColorSpace; return texCache[key] = t;
 }
 function text(s, px = 32, col = '#444') {
@@ -76,7 +112,7 @@ function text(s, px = 32, col = '#444') {
   c.width = Math.ceil(h.measureText(s).width) + 8; c.height = px * 1.3;
   h.font = px + 'px sans-serif'; h.fillStyle = col; h.textBaseline = 'middle'; h.fillText(s, 4, c.height / 2);
   const t = new THREE.CanvasTexture(c); t.colorSpace = THREE.SRGBColorSpace;
-  const sp = new THREE.Sprite(new THREE.SpriteMaterial({map: t, depthTest: false})); sp.scale.set(c.width / c.height * .09 * px / 40, .09 * px / 40, 1); return sp;
+  const sp = new THREE.Sprite(new THREE.SpriteMaterial({map: t, depthTest: false})); sp.userData = {s, col}; sp.scale.set(c.width / c.height * .09 * px / 40, .09 * px / 40, 1); return sp;
 }
 const S = () => sl.value / 130;  // world size of an image
 sl.oninput = () => { pts.forEach(o => o.material.size = S() * o.userData.sc); hash(); render(); };
@@ -86,11 +122,13 @@ function build() {
   scene.remove(root); root = new THREE.Group(); scene.add(root);
   const P = D.pts, groups = {};
   P.forEach((p, n) => { const k = p[3] + '|' + p[4] + '|' + p[6]; (groups[k] ??= {i: p[3], col: p[4], sc: p[6], idx: []}).idx.push(n); });  // one draw call per object × colour × size
+  Object.values(groups).forEach(g => g.idx.sort((a, b) => D.rank[a] - D.rank[b]));  // FPS order within each group → density = a draw-range prefix
   pts = Object.values(groups).map(g => {
     const geo = new THREE.BufferGeometry(); geo.setAttribute('position', new THREE.Float32BufferAttribute(g.idx.flatMap(n => P[n].slice(0, 3)), 3));
     const o = new THREE.Points(geo, new THREE.PointsMaterial({size: S() * g.sc, map: texture(g.i, g.col), alphaTest: .5, sizeAttenuation: true}));
     o.userData.idx = g.idx; o.userData.sc = g.sc; root.add(o); return o;
   });
+  density();
   // plotly-style axes: grey walls with white grid lines at the ticks; walls sit on the far side of the camera
   const TK = d3 ? D.ticks : [...D.ticks, []];
   walls = [0, 1, 2].map(j => {
@@ -115,36 +153,123 @@ function render() {
   labels.forEach((l, j) => {
     const pos = (t, off) => { const q = [0, 0, 0]; q[j] = t;
       if (j < 2) { const o = 1 - j; q[o] = sg[o] * off; q[2] = d3 ? -1 : 0; } else { q[0] = sg[0] * off; q[1] = -sg[1]; } return q; };
-    l.ticks.forEach(([t, s]) => s.position.set(...pos(t, 1.12)));
-    const tp = pos(0, d3 ? 1.4 : 1.25); if (j == 2) tp[2] = 0; l.title.position.set(...tp);
+    // offsets from each label's own size: inner edge 0.03 off the wall; 2-D x labels by half height, y labels by half width; 3-D ≈ by the larger half
+    const half = sp => d3 ? .35 * Math.max(sp.scale.x, sp.scale.y) : (j == 0 ? sp.scale.y : sp.scale.x) / 2, tk = Math.max(0, ...l.ticks.map(([t, s]) => half(s)));
+    l.ticks.forEach(([t, s]) => s.position.set(...pos(t, 1.03 + half(s))));
+    const tp = pos(0, 1.03 + 2 * tk + .03 + half(l.title)); if (j == 2) tp[2] = 0; l.title.position.set(...tp);
   });
   R.render(scene, cam);
+  if (!lay) lay = requestAnimationFrame(() => { lay = 0; layout(); });  // title + legend follow the drawn bounds
 }
-function hash() { const p = Object.fromEntries(Object.keys(CTL).map(k => [k, $(k).value])); p.img = sl.value; history.replaceState(null, '', '#' + new URLSearchParams(p)); }
+let lay = 0;
+function fps(P) {  // greedy farthest-point order over the drawn (per-axis normalised) coordinates; start = point nearest the centre → rank[n]
+  const n = P.length, d = new Float64Array(n).fill(Infinity), rank = new Int32Array(n), done = new Uint8Array(n), r2 = p => p[0] ** 2 + p[1] ** 2 + p[2] ** 2;
+  let c = 0; for (let i = 1; i < n; i++) if (r2(P[i]) < r2(P[c])) c = i;
+  for (let k = 0; k < n; k++) {
+    rank[c] = k; done[c] = 1; const [x, y, z] = P[c]; let b = -1, bd = -1;
+    for (let i = 0; i < n; i++) { if (done[i]) continue; const e = (P[i][0] - x) ** 2 + (P[i][1] - y) ** 2 + (P[i][2] - z) ** 2;
+      if (e < d[i]) d[i] = e; if (d[i] > bd) { bd = d[i]; b = i; } }
+    c = b;
+  }
+  return rank;
+}
+function density() {  // show the first round(p·N) points of the FPS order: per group, the prefix with rank < k (hover + SVG + crop all respect the draw range)
+  if (!D) return; const N = D.pts.length, k = Math.round(dn.value / 100 * N);
+  pts.forEach(o => { let c = 0; while (c < o.userData.idx.length && D.rank[o.userData.idx[c]] < k) c++; o.geometry.setDrawRange(0, c); });
+  dnN.textContent = `${k}/${N}`;
+}
+function hash() { const p = Object.fromEntries(Object.keys(CTL).map(k => [k, $(k).value])); p.img = sl.value; p.density = dn.value; p.display = [...display].join(','); history.replaceState(null, '', '#' + new URLSearchParams(p)); }
 
 let seq = 0;
 async function load() {
   hash(); const my = ++seq; $('busy').style.display = 'block';
-  const q = new URLSearchParams(Object.fromEntries(Object.keys(CTL).map(k => [k, $(k).value])));
+  const q = new URLSearchParams(Object.fromEntries(Object.keys(CTL).map(k => [k, $(k).value]))); q.set('display', [...display].join(','));
   const r = await (await fetch('/api/plot?' + q)).json();
   if (my != seq) return;  // a newer request superseded this one
   $('busy').style.display = 'none';
   if (r.error) { $('title').textContent = '⚠ ' + r.error; return; }
-  const was = d3; D = r; d3 = r.d3; build();
+  const was = d3; D = r; d3 = r.d3; D.rank = fps(D.pts); build();
   if ($('best').value != 'none') { $('x').value = r.picked[0]; $('y').value = r.picked[1]; if (r.picked[2]) $('z').value = r.picked[2]; hash(); }  // show the chosen components
-  $('title').textContent = r.title + ` · ${META.ckpt}`;
-  $('leg').innerHTML = (Object.keys(r.legend).length ? 'colour: ' : '') + Object.entries(r.legend).map(([k, c]) => `<span><b style="color:${c}">■</b> ${k}</span>`).join('')
-    + (Object.keys(r.size_legend).length ? ' &nbsp; size: ' + Object.entries(r.size_legend).map(([k, f]) => `<span><b style="font-size:${16 * f}px">●</b> ${k}</span>`).join('') : '');
   help.textContent = d3 ? 'drag = rotate, right-drag / shift-drag = pan, scroll = zoom, double-click = reset' : 'drag = pan, scroll = zoom, double-click = reset';
   if (was !== d3) home();
   resize();
+}
+// ---- figure layout, shared by the live view (layout) and the SVG (saveSvg): project the scene through the current camera, crop to the
+// drawn content (bb, canvas px), small title wrapped to the figure width above it, legend column(s) right of it, top-aligned
+const r1 = x => +x.toFixed(1), LH = 13, TF = 8;
+const esc = s => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+function project(svg) {  // → {bb, body, defs}; the SVG strings (+ texture data URIs) only when svg, the live view needs just bb
+  root.updateMatrixWorld(true); cam.updateMatrixWorld();
+  const W = cv.clientWidth, H = cv.clientHeight, f = H / 2, th = Math.tan(cam.fov * Math.PI / 360);
+  const P = v => { const d = -v.clone().applyMatrix4(cam.matrixWorldInverse).z, q = v.clone().project(cam); return [(q.x + 1) / 2 * W, (1 - q.y) / 2 * H, d]; };
+  const bb = [1e9, 1e9, -1e9, -1e9], grow = (x0, y0, x1, y1) => { bb[0] = Math.min(bb[0], x0); bb[1] = Math.min(bb[1], y0); bb[2] = Math.max(bb[2], x1); bb[3] = Math.max(bb[3], y1); };
+  const body = [], defs = {};
+  walls.forEach(w => { if (!w.visible) return; w.children.forEach(o => {
+    if (!o.isMesh && !svg) return;
+    const a = o.geometry.attributes.position, q = [...Array(a.count)].map((_, i) => P(new THREE.Vector3().fromBufferAttribute(a, i).applyMatrix4(o.matrixWorld)));
+    if (o.isMesh) { const c = [0, 1, 3, 2].map(i => q[i]); c.forEach(p => grow(p[0], p[1], p[0], p[1])); if (svg) body.push(`<polygon points="${c.map(p => r1(p[0]) + ',' + r1(p[1])).join(' ')}" fill="#e5ecf6"/>`); }
+    else for (let i = 0; i < q.length; i += 2) body.push(`<line x1="${r1(q[i][0])}" y1="${r1(q[i][1])}" x2="${r1(q[i + 1][0])}" y2="${r1(q[i + 1][1])}" stroke="#fff" stroke-width="1"/>`);
+  }); });
+  const ims = [], v = new THREE.Vector3();
+  pts.forEach(o => { const a = o.geometry.attributes.position, t = o.material.map;
+    let u; if (svg) defs[t.uuid] ??= `<image id="t${Object.keys(defs).length}" width="${TEX}" height="${TEX}" href="${u = t.image.toDataURL()}" xlink:href="${u}"/>`;
+    const id = 't' + Object.keys(defs).indexOf(t.uuid);
+    for (let i = 0; i < Math.min(a.count, o.geometry.drawRange.count); i++) { const [x, y, d] = P(v.fromBufferAttribute(a, i)); if (d <= 0) continue;
+      const s = o.material.size * f / d;
+      if (svg) ims.push([d, x, y, s, id]); grow(x - s / 2, y - s / 2, x + s / 2, y + s / 2); } });
+  ims.sort((a, b) => b[0] - a[0]).forEach(([d, x, y, s, id]) => body.push(`<use href="#${id}" xlink:href="#${id}" transform="translate(${r1(x - s / 2)},${r1(y - s / 2)}) scale(${(s / TEX).toFixed(5)})"/>`));
+  labels.forEach(l => [...l.ticks.map(t => t[1]), l.title].forEach(sp => { const [x, y, d] = P(sp.position); if (d <= 0) return;
+    const fs = sp.scale.y * f / (d * th) / 1.3, w = sp.scale.x * f / (d * th); grow(x - w / 2, y - fs * .65, x + w / 2, y + fs * .65);
+    if (svg) body.push(`<text x="${r1(x)}" y="${r1(y)}" font-size="${fs.toFixed(1)}" fill="${sp.userData.col}" text-anchor="middle" dominant-baseline="central">${esc(sp.userData.s)}</text>`); }));
+  bb[0] -= 4; bb[1] -= 4; bb[2] += 4; bb[3] += 4;  // full extent of every drawn element at this camera, NOT clipped to the screen (labels off-screen still land in the SVG)
+  return {bb, body, defs};
+}
+const mctx = document.createElement('canvas').getContext('2d'), tw = (s, px, bold) => { mctx.font = `${bold ? 'bold ' : ''}${px}px sans-serif`; return mctx.measureText(s).width; };  // text width (same font as the SVG)
+function figure(bb) {  // legend columns + title lines for a plot cropped to bb (all positions relative to the crop's top-left)
+  const pw = bb[2] - bb[0], ph = bb[3] - bb[1];
+  const rows = [...(Object.keys(D.legend).length ? [['h', 'colour']] : []), ...Object.entries(D.legend).map(([k, c]) => ['c', k, c]),
+                ...(Object.keys(D.size_legend).length ? [['h', 'size']] : []), ...Object.entries(D.size_legend).map(([k, s]) => ['s', k, s])];
+  const per = Math.max(8, Math.floor(ph / LH)), cols = [];
+  rows.forEach((r, i) => (cols[Math.floor(i / per)] ??= []).push(r));
+  const cw = cols.map(c => 26 + Math.max(...c.map(r => tw(r[1], 10, r[0] == 'h')))), lw = cols.length ? 6 + cw.reduce((a, b) => a + b, 0) : 0;
+  const TW = pw + lw, tl = [];  // title: small, word-wrapped to the figure width
+  let line = ''; (D.title + ` · ${META.ckpt}`).split(' · ').forEach(w => { const t = line ? line + ' · ' + w : w; if (tw(t, TF) > TW && line) { tl.push(line); line = w; } else line = t; }); tl.push(line);
+  return {pw, ph, rows, per, cols, cw, TW, tl, top: tl.length * TF * 1.25 + 3};
+}
+function layout() {  // live view: title + legend exactly where the SVG puts them (wrap gets a top padding so the title never covers the bar)
+  if (!D) return; const b = project(false).bb, bb = [Math.max(b[0], 0), Math.max(b[1], 0), Math.min(b[2], cv.clientWidth), Math.min(b[3], cv.clientHeight)], F = figure(bb), pad = Math.ceil(F.top);  // live: crop clamped to the canvas
+  if ($('wrap').style.paddingTop != pad + 'px') { $('wrap').style.paddingTop = pad + 'px'; resize(); return; }  // resize → render → layout again
+  const t = $('title'); t.innerHTML = F.tl.map(esc).join('<br>'); t.style.left = bb[0] + 'px'; t.style.top = (pad + bb[1] - F.top) + 'px';
+  const L = $('leg'); L.style.left = (bb[2] + 6) + 'px'; L.style.top = (pad + bb[1]) + 'px';
+  L.innerHTML = F.cols.map((c, j) => `<div style="width:${F.cw[j]}px">` + c.map(r => `<div>` + (r[0] == 'h' ? `<b>${esc(r[1])}</b>` : (r[0] == 'c'
+    ? `<i style="width:9px;height:9px;margin-right:5px;background:${r[2]}"></i>`
+    : `<i style="width:${10 * r[2]}px;height:${10 * r[2]}px;border-radius:50%;background:#444;margin-left:${4.5 - 5 * r[2]}px;margin-right:${9.5 - 5 * r[2]}px"></i>`) + esc(r[1])) + `</div>`).join('') + `</div>`).join('');
+}
+function saveSvg() {  // download the current view (this exact camera) as a cropped SVG
+  if (!D) return; render(); const {bb, body, defs} = project(true), {pw, ph, rows, per, cols, cw, TW, tl, top} = figure(bb), leg = [];
+  let cx = pw + 6; cols.forEach((c, j) => { c.forEach((r, i) => { const y = i * LH + LH / 2;
+    if (r[0] == 'h') leg.push(`<text x="${r1(cx)}" y="${y}" font-size="10" font-weight="bold" fill="#222" dominant-baseline="central">${esc(r[1])}</text>`);
+    else { leg.push(r[0] == 'c' ? `<rect x="${r1(cx)}" y="${y - 4.5}" width="9" height="9" fill="${r[2]}"/>` : `<circle cx="${r1(cx + 4.5)}" cy="${y}" r="${(5 * r[2]).toFixed(1)}" fill="#444"/>`);
+           leg.push(`<text x="${r1(cx + 14)}" y="${y}" font-size="10" fill="#222" dominant-baseline="central">${esc(r[1])}</text>`); } }); cx += cw[j]; });
+  const TH = Math.max(top + ph, top + Math.min(rows.length, per) * LH);
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" viewBox="0 0 ${r1(TW)} ${r1(TH)}" preserveAspectRatio="xMidYMid meet" font-family="sans-serif">
+<defs>${Object.values(defs).join('')}</defs>
+<rect width="100%" height="100%" fill="#fff"/>
+${tl.map((t, i) => `<text x="0" y="${r1((i + .5) * TF * 1.25)}" font-size="${TF}" fill="#555" dominant-baseline="central">${esc(t)}</text>`).join('\n')}
+<g transform="translate(${r1(-bb[0])},${r1(top - bb[1])})">
+${body.join('\n')}
+</g>
+<g transform="translate(0,${r1(top)})">${leg.join('')}</g>
+</svg>`;
+  const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([svg], {type: 'image/svg+xml'}));
+  a.download = `nb137_${META.run}_${['vector', 'method', 'colour'].map(k => $(k).value).join('_')}_${D.axes.length}d.svg`; a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 1000);
 }
 // hover: nearest image under the cursor
 const ray = new THREE.Raycaster(), m = new THREE.Vector2(); let raf = 0;
 cv.onmousemove = e => { if (raf || !D) return; raf = requestAnimationFrame(() => { raf = 0;
   m.set(e.offsetX / cv.clientWidth * 2 - 1, -e.offsetY / cv.clientHeight * 2 + 1); ray.params.Points.threshold = S() * .35; ray.setFromCamera(m, cam);
   const h = ray.intersectObjects(pts)[0];
-  if (h) { tip.style.display = 'block'; tip.style.left = (e.offsetX + 12) + 'px'; tip.style.top = (e.offsetY + 12) + 'px'; tip.innerHTML = D.pts[h.object.userData.idx[h.index]][5]; }
+  if (h) { tip.style.display = 'block'; tip.style.left = (e.offsetX + 12) + 'px'; tip.style.top = (e.offsetY + 12 + cv.offsetTop) + 'px'; tip.innerHTML = D.pts[h.object.userData.idx[h.index]][5]; }
   else tip.style.display = 'none'; }); };
 cv.onmouseleave = () => tip.style.display = 'none';
 load();
