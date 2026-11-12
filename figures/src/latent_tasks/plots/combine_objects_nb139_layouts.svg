@@ -1,0 +1,197 @@
+<?xml version="1.0" encoding="utf-8" standalone="no"?>
+<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN"
+  "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd">
+<svg xmlns:xlink="http://www.w3.org/1999/xlink" width="523.733523pt" height="323.186364pt" viewBox="0 0 523.733523 323.186364" xmlns="http://www.w3.org/2000/svg" version="1.1">
+ <metadata>
+  <rdf:RDF xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:cc="http://creativecommons.org/ns#" xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+   <cc:Work>
+    <dc:type rdf:resource="http://purl.org/dc/dcmitype/StillImage"/>
+    <dc:date>2026-11-12T22:00:17.120899</dc:date>
+    <dc:format>image/svg+xml</dc:format>
+    <dc:creator>
+     <cc:Agent>
+      <dc:title>Matplotlib v3.10.8, https://matplotlib.org/</dc:title>
+     </cc:Agent>
+    </dc:creator>
+   </cc:Work>
+  </rdf:RDF>
+ </metadata>
+ <defs>
+  <style type="text/css">*{stroke-linejoin: round; stroke-linecap: butt}</style>
+ </defs>
+ <g id="figure_1">
+  <g id="patch_1">
+   <path d="M 0 323.186364 
+L 523.733523 323.186364 
+L 523.733523 0 
+L 0 0 
+z
+" style="fill: #ffffff"/>
+  </g>
+  <g id="axes_1">
+   <g clip-path="url(#pa0eaa60a48)">
+    <image xlink:href="data:image/png;base64,
+iVBORw0KGgoAAAANSUhEUgAAAT4AAAE+CAYAAAAUOHwwAAAEmUlEQVR4nO3dQW7CQBAAwdmI/3/ZuScckFhjoKseAD61Rox3WTNzDEDIz9UPAPBqwgfkCB+QI3xAjvABOcIH5AgfkCN8QI7wATnCB+QIH5AjfECO8AE5wgfkCB+QI3xAjvABOcIH5AgfkCN8QI7wATnCB+QIH5AjfECO8AE5wgfkCB+QI3xAjvABOcIH5AgfkCN8QI7wATnCB+QIH5AjfECO8AE5wgfkCB+QI3xAjvABOcIH5AgfkCN8QI7wATnCB+QIH5AjfECO8AE5wgfkCB+QI3xAjvABOcIH5AgfkCN8QI7wATnCB+QIH5AjfECO8AE5wgfkCB+QI3xAzu3qB+C1juM4/TvWWqd/BzzDxAfkCB+QI3xAjvABOZYbbHdvgWLhwTsx8QE5wgfkCB+QI3xAjvABOcIH5AgfkCN8QI7wATnCB+QIH5AjfECO8AE5wgfkCB+QI3xAjvABOcIH5Lh6nu1cM8+7M/EBOcIH5AgfkCN8QM6amf9/ggrwxUx8QI7wATnCB+QIH5AjfECO8AE5wgfkCB+QI3xAjvABOcIH5AgfkCN8QI7wATnCB+QIH5AjfECO8AE5wgfkCB+QI3xAjvABOcIH5AgfkCN8QI7wATnCB+QIH5AjfECO8AE5wgfkCB+QI3xAjvABOcIH5AgfkCN8QI7wATnCB+QIH5AjfECO8AE5wgfkCB+QI3xAjvABOcIH5AgfkCN8QI7wATnCB+QIH5AjfECO8AE5wgfkCB+QI3xAjvABOcIH5AgfkCN8QI7wATnCB+QIH5AjfECO8AE5wgfkCB+QI3xAjvABOcIH5AgfkCN8QI7wATnCB+QIH5AjfECO8AE5wgfkCB+QI3xAjvABOcIH5AgfkCN8QI7wATnCB+QIH5AjfECO8AE5wgfkCB+QI3xAjvABOcIH5AgfkCN8QI7wATnCB+QIH5AjfECO8AE5wgfkCB+QI3xAjvABOcIH5AgfkCN8QI7wATnCB+QIH5AjfECO8AE5wgfkCB+QI3xAjvABOcIH5NyufgD4JMdxbP28tdbWz+MxJj4gR/iAHOEDcoQPyFkzs/fXWvgSuxcZz7AE2cvEB+QIH5AjfECO8AE5Tm7AvNcig/OZ+IAc4QNyhA/IET4gx3IDPsDf5YuTHM8x8QE5wgfkCB+QI3xAjvABOcIH5AgfkCN8QI7wATlObsAHcFJjLxMfkCN8QI7wATnCB+QIH5AjfECO8AE5wgfkeIEZ5v4Lwv5r93uZ+IAc4QNyhA/IET4gR/iAHOEDcoQPyBE+IEf4gBwnN+DNuGb+fCY+IEf4gBzhA3KED8hZM+PuHXjQ7quqLDKuYeIDcoQPyBE+IEf4gBzLDSDHxAfkCB+QI3xAjvABOcIH5AgfkCN8QI7wATnCB+QIH5AjfECO8AE5wgfkCB+QI3xAjvABOcIH5AgfkCN8QI7wATnCB+QIH5AjfECO8AE5wgfkCB+QI3xAjvABOcIH5AgfkCN8QI7wATnCB+QIH5AjfECO8AE5wgfkCB+QI3xAjvABOcIH5AgfkCN8QI7wATnCB+QIH5AjfECO8AE5wgfk/AKUNx+LZIGj4AAAAABJRU5ErkJggg==" id="imagea89fb6c327" transform="scale(1 -1) translate(0 -228.96)" x="10.766761" y="-26.912727" width="228.96" height="228.96"/>
+   </g>
+   <g id="patch_2">
+    <path d="M 7.2 24.033239 
+L 242.60625 24.033239 
+L 242.60625 259.439489 
+L 7.2 259.439489 
+L 7.2 24.033239 
+z
+" style="fill: none; stroke: #e6a700; stroke-width: 5; stroke-linejoin: miter"/>
+   </g>
+   <g id="text_1">
+    <!-- $\hat{I}$ (prediction) -->
+    <g transform="translate(80.878125 21.6)">
+     <text>
+      <tspan x="0" y="-0.046875" style="font-size: 15px; font-family: 'Latin Modern Math'">I</tspan>
+      <tspan x="5.414993" y="-0.046875" style="font-size: 15px; font-family: 'Latin Modern Math'"> </tspan>
+      <tspan x="7.259998" y="-3.6875" style="font-size: 15px; font-family: 'Latin Modern Math'">̂</tspan>
+      <tspan x="10.394989" y="-0.046875" style="font-size: 15px; font-family: 'Latin Modern Math'">(</tspan>
+      <tspan x="16.22998" y="-0.046875" style="font-size: 15px; font-family: 'Latin Modern Math'">p</tspan>
+      <tspan x="24.569962" y="-0.046875" style="font-size: 15px; font-family: 'Latin Modern Math'">r</tspan>
+      <tspan x="30.449951" y="-0.046875" style="font-size: 15px; font-family: 'Latin Modern Math'">e</tspan>
+      <tspan x="37.10994" y="-0.046875" style="font-size: 15px; font-family: 'Latin Modern Math'">d</tspan>
+      <tspan x="45.449921" y="-0.046875" style="font-size: 15px; font-family: 'Latin Modern Math'">i</tspan>
+      <tspan x="49.619904" y="-0.046875" style="font-size: 15px; font-family: 'Latin Modern Math'">c</tspan>
+      <tspan x="56.279892" y="-0.046875" style="font-size: 15px; font-family: 'Latin Modern Math'">t</tspan>
+      <tspan x="62.114883" y="-0.046875" style="font-size: 15px; font-family: 'Latin Modern Math'">i</tspan>
+      <tspan x="66.284866" y="-0.046875" style="font-size: 15px; font-family: 'Latin Modern Math'">o</tspan>
+      <tspan x="73.784851" y="-0.046875" style="font-size: 15px; font-family: 'Latin Modern Math'">n</tspan>
+      <tspan x="82.124832" y="-0.046875" style="font-size: 15px; font-family: 'Latin Modern Math'">)</tspan>
+     </text>
+    </g>
+   </g>
+  </g>
+  <g id="axes_2">
+   <g clip-path="url(#p3050ef8ef0)">
+    <image xlink:href="data:image/png;base64,
+iVBORw0KGgoAAAANSUhEUgAAAT4AAAE+CAYAAAAUOHwwAAAEl0lEQVR4nO3dQW7CQBAAwdmI/395c08cCQmwA1115OI9tUYeeVkzswcg5OvqAwCcTfiAHOEDcoQPyBE+IEf4gBzhA3KED8gRPiBH+IAc4QNyhA/IET4gR/iAHOEDcoQPyBE+IEf4gBzhA3KED8gRPiBH+IAc4QNyhA/IET4gR/iAHOEDcoQPyBE+IEf4gBzhA3KED8gRPiBH+IAc4QNyhA/IET4gR/iAHOEDcoQPyBE+IEf4gBzhA3KED8gRPiBH+IAc4QNyhA/IET4gR/iAHOEDcoQPyBE+IEf4gBzhA3KED8gRPiBH+IAc4QNyhA/IET4gR/iAHOEDcoQPyLldfQDOtfe+5LlrrUueC0dMfECO8AE5wgfkCB+QI3xAjvABOcIH5AgfkCN8QI7wATnCB+QIH5AjfECO8AE5wgfkCB+QI3xAjvABOcIH5AgfkCN8QI7wATnCB+QIH5AjfECO8AE5wgfkCB+Qs2ZmX30IgDOZ+IAc4QNyhA/IET4gR/iAHOEDcoQPyBE+IEf4gBzhA3KED8gRPiBH+IAc4QNyhA/IET4gR/iAHOEDcoQPyBE+IEf4gBzhA3KED8gRPiBH+IAc4QNyhA/IET4gR/iAHOEDcoQPyBE+IEf4gBzhA3KED8gRPiBH+IAc4QNyhA/IET4gR/iAHOEDcoQPyBE+IEf4gBzhA3KED8gRPiBH+IAc4QNyhA/IET4gR/iAHOEDcoQPyBE+IEf4gBzhA3KED8gRPiBH+IAc4QNyhA/IET4gR/iAHOEDcoQPyBE+IEf4gBzhA3KED8gRPiBH+IAc4QNyhA/IET4gR/iAHOEDcoQPyBE+IEf4gBzhA3KED8gRPiBH+IAc4QNyhA/IET4gR/iAHOEDcoQPyBE+IEf4gBzhA3KED8gRPiBH+IAc4QNyhA/IET4gR/iAHOEDcoQPyBE+IEf4gBzhA3KED8gRPiBH+IAc4QNyhA/IET4gR/iAHOEDcoQPyBE+IEf4gBzhA3KED8i5XX0A+ER771+/rbUuOAlHTHxAjvABOcIH5AgfkLNm5vdbWODQ0dLi2SxBXs/EB+QIH5AjfECO8AE5lhvwhzMWGfey8HguEx+QI3xAjvABOcIH5LiWCuZ/LTJ4PRMfkCN8QI7wATnCB+RYbsAb+Ll88SXHY0x8QI7wATnCB+QIH5AjfECO8AE5wgfkCB+QI3xAjvABOcIH5AgfkCN8QI7wATnCB+QIH5AjfECO8AE5rp6HN+Cq+ecy8QE5wgfkCB+QI3xAjuUGzPHy4Od/2fI5THxAjvABOcIH5AgfkLNmxhtcuNMZCw9fabyeiQ/IET4gR/iAHOEDciw34EH3LjwsLf4PEx+QI3xAjvABOcIH5FhuADkmPiBH+IAc4QNyhA/IET4gR/iAHOEDcoQPyBE+IEf4gBzhA3KED8gRPiBH+IAc4QNyhA/IET4gR/iAHOEDcoQPyBE+IEf4gBzhA3KED8gRPiBH+IAc4QNyhA/IET4gR/iAHOEDcoQPyBE+IEf4gBzhA3KED8gRPiBH+IAc4QNyhA/IET4gR/iAHOEDcoQPyPkG484ke1jsDykAAAAASUVORK5CYII=" id="image57274e50ec" transform="scale(1 -1) translate(0 -228.96)" x="284.694034" y="-26.912727" width="228.96" height="228.96"/>
+   </g>
+   <g id="patch_3">
+    <path d="M 281.127273 24.033239 
+L 516.533523 24.033239 
+L 516.533523 259.439489 
+L 281.127273 259.439489 
+L 281.127273 24.033239 
+z
+" style="fill: none; stroke: #8c8c8c; stroke-width: 1.2; stroke-linejoin: miter"/>
+   </g>
+   <g id="text_2">
+    <!-- $I$ (ground truth) -->
+    <g transform="translate(345.205398 21.6)">
+     <text>
+      <tspan x="0" y="-0.515625" style="font-size: 15px; font-family: 'Latin Modern Math'">I</tspan>
+      <tspan x="5.414993" y="-0.515625" style="font-size: 15px; font-family: 'Latin Modern Math'"> </tspan>
+      <tspan x="10.394989" y="-0.515625" style="font-size: 15px; font-family: 'Latin Modern Math'">(</tspan>
+      <tspan x="16.22998" y="-0.515625" style="font-size: 15px; font-family: 'Latin Modern Math'">g</tspan>
+      <tspan x="23.729965" y="-0.515625" style="font-size: 15px; font-family: 'Latin Modern Math'">r</tspan>
+      <tspan x="29.609955" y="-0.515625" style="font-size: 15px; font-family: 'Latin Modern Math'">o</tspan>
+      <tspan x="37.10994" y="-0.515625" style="font-size: 15px; font-family: 'Latin Modern Math'">u</tspan>
+      <tspan x="45.449921" y="-0.515625" style="font-size: 15px; font-family: 'Latin Modern Math'">n</tspan>
+      <tspan x="53.789902" y="-0.515625" style="font-size: 15px; font-family: 'Latin Modern Math'">d</tspan>
+      <tspan x="62.129883" y="-0.515625" style="font-size: 15px; font-family: 'Latin Modern Math'"> </tspan>
+      <tspan x="67.109879" y="-0.515625" style="font-size: 15px; font-family: 'Latin Modern Math'">t</tspan>
+      <tspan x="72.94487" y="-0.515625" style="font-size: 15px; font-family: 'Latin Modern Math'">r</tspan>
+      <tspan x="78.82486" y="-0.515625" style="font-size: 15px; font-family: 'Latin Modern Math'">u</tspan>
+      <tspan x="87.164841" y="-0.515625" style="font-size: 15px; font-family: 'Latin Modern Math'">t</tspan>
+      <tspan x="92.999832" y="-0.515625" style="font-size: 15px; font-family: 'Latin Modern Math'">h</tspan>
+      <tspan x="101.339813" y="-0.515625" style="font-size: 15px; font-family: 'Latin Modern Math'">)</tspan>
+     </text>
+    </g>
+   </g>
+  </g>
+  <g id="text_3">
+   <!-- IoU$(I, \hat{I})$ = 0.85  (rank 1 of 35)      CoM distance = 0.3 px  (rank 1 of 35) -->
+   <g transform="translate(43.296761 312.736364)">
+    <text>
+     <tspan x="0" y="-0.953125" style="font-size: 13px; font-family: 'Latin Modern Math'">I</tspan>
+     <tspan x="4.692993" y="-0.953125" style="font-size: 13px; font-family: 'Latin Modern Math'">o</tspan>
+     <tspan x="11.192993" y="-0.953125" style="font-size: 13px; font-family: 'Latin Modern Math'">U</tspan>
+     <tspan x="20.942993" y="-0.953125" style="font-size: 13px; font-family: 'Latin Modern Math'">(</tspan>
+     <tspan x="25.999985" y="-0.953125" style="font-size: 13px; font-family: 'Latin Modern Math'">I</tspan>
+     <tspan x="30.692978" y="-0.953125" style="font-size: 13px; font-family: 'Latin Modern Math'">,</tspan>
+     <tspan x="36.472778" y="-0.953125" style="font-size: 13px; font-family: 'Latin Modern Math'">I</tspan>
+     <tspan x="41.165771" y="-0.953125" style="font-size: 13px; font-family: 'Latin Modern Math'">)</tspan>
+     <tspan x="42.661652" y="-4.15625" style="font-size: 13px; font-family: 'Latin Modern Math'">̂</tspan>
+     <tspan x="46.222763" y="-0.953125" style="font-size: 13px; font-family: 'Latin Modern Math'"> </tspan>
+     <tspan x="50.538757" y="-0.953125" style="font-size: 13px; font-family: 'Latin Modern Math'">=</tspan>
+     <tspan x="60.652756" y="-0.953125" style="font-size: 13px; font-family: 'Latin Modern Math'"> </tspan>
+     <tspan x="64.96875" y="-0.953125" style="font-size: 13px; font-family: 'Latin Modern Math'">0</tspan>
+     <tspan x="71.46875" y="-0.953125" style="font-size: 13px; font-family: 'Latin Modern Math'">.</tspan>
+     <tspan x="75.082748" y="-0.953125" style="font-size: 13px; font-family: 'Latin Modern Math'">8</tspan>
+     <tspan x="81.582748" y="-0.953125" style="font-size: 13px; font-family: 'Latin Modern Math'">5</tspan>
+     <tspan x="88.082748" y="-0.953125" style="font-size: 13px; font-family: 'Latin Modern Math'"> </tspan>
+     <tspan x="92.398743" y="-0.953125" style="font-size: 13px; font-family: 'Latin Modern Math'"> </tspan>
+     <tspan x="96.714737" y="-0.953125" style="font-size: 13px; font-family: 'Latin Modern Math'">(</tspan>
+     <tspan x="101.771729" y="-0.953125" style="font-size: 13px; font-family: 'Latin Modern Math'">r</tspan>
+     <tspan x="106.867722" y="-0.953125" style="font-size: 13px; font-family: 'Latin Modern Math'">a</tspan>
+     <tspan x="113.367722" y="-0.953125" style="font-size: 13px; font-family: 'Latin Modern Math'">n</tspan>
+     <tspan x="120.595718" y="-0.953125" style="font-size: 13px; font-family: 'Latin Modern Math'">k</tspan>
+     <tspan x="127.459717" y="-0.953125" style="font-size: 13px; font-family: 'Latin Modern Math'"> </tspan>
+     <tspan x="131.775711" y="-0.953125" style="font-size: 13px; font-family: 'Latin Modern Math'">1</tspan>
+     <tspan x="138.275711" y="-0.953125" style="font-size: 13px; font-family: 'Latin Modern Math'"> </tspan>
+     <tspan x="142.591705" y="-0.953125" style="font-size: 13px; font-family: 'Latin Modern Math'">o</tspan>
+     <tspan x="149.091705" y="-0.953125" style="font-size: 13px; font-family: 'Latin Modern Math'">f</tspan>
+     <tspan x="153.069702" y="-0.953125" style="font-size: 13px; font-family: 'Latin Modern Math'"> </tspan>
+     <tspan x="157.385696" y="-0.953125" style="font-size: 13px; font-family: 'Latin Modern Math'">3</tspan>
+     <tspan x="163.885696" y="-0.953125" style="font-size: 13px; font-family: 'Latin Modern Math'">5</tspan>
+     <tspan x="170.385696" y="-0.953125" style="font-size: 13px; font-family: 'Latin Modern Math'">)</tspan>
+     <tspan x="175.442688" y="-0.953125" style="font-size: 13px; font-family: 'Latin Modern Math'"> </tspan>
+     <tspan x="179.758682" y="-0.953125" style="font-size: 13px; font-family: 'Latin Modern Math'"> </tspan>
+     <tspan x="184.074677" y="-0.953125" style="font-size: 13px; font-family: 'Latin Modern Math'"> </tspan>
+     <tspan x="188.390671" y="-0.953125" style="font-size: 13px; font-family: 'Latin Modern Math'"> </tspan>
+     <tspan x="192.706665" y="-0.953125" style="font-size: 13px; font-family: 'Latin Modern Math'"> </tspan>
+     <tspan x="197.022659" y="-0.953125" style="font-size: 13px; font-family: 'Latin Modern Math'"> </tspan>
+     <tspan x="201.338654" y="-0.953125" style="font-size: 13px; font-family: 'Latin Modern Math'">C</tspan>
+     <tspan x="210.724655" y="-0.953125" style="font-size: 13px; font-family: 'Latin Modern Math'">o</tspan>
+     <tspan x="217.224655" y="-0.953125" style="font-size: 13px; font-family: 'Latin Modern Math'">M</tspan>
+     <tspan x="229.14566" y="-0.953125" style="font-size: 13px; font-family: 'Latin Modern Math'"> </tspan>
+     <tspan x="233.461655" y="-0.953125" style="font-size: 13px; font-family: 'Latin Modern Math'">d</tspan>
+     <tspan x="240.689651" y="-0.953125" style="font-size: 13px; font-family: 'Latin Modern Math'">i</tspan>
+     <tspan x="244.30365" y="-0.953125" style="font-size: 13px; font-family: 'Latin Modern Math'">s</tspan>
+     <tspan x="249.425644" y="-0.953125" style="font-size: 13px; font-family: 'Latin Modern Math'">t</tspan>
+     <tspan x="254.482635" y="-0.953125" style="font-size: 13px; font-family: 'Latin Modern Math'">a</tspan>
+     <tspan x="260.982635" y="-0.953125" style="font-size: 13px; font-family: 'Latin Modern Math'">n</tspan>
+     <tspan x="268.210632" y="-0.953125" style="font-size: 13px; font-family: 'Latin Modern Math'">c</tspan>
+     <tspan x="273.982635" y="-0.953125" style="font-size: 13px; font-family: 'Latin Modern Math'">e</tspan>
+     <tspan x="279.754639" y="-0.953125" style="font-size: 13px; font-family: 'Latin Modern Math'"> </tspan>
+     <tspan x="284.070633" y="-0.953125" style="font-size: 13px; font-family: 'Latin Modern Math'">=</tspan>
+     <tspan x="294.184631" y="-0.953125" style="font-size: 13px; font-family: 'Latin Modern Math'"> </tspan>
+     <tspan x="298.500626" y="-0.953125" style="font-size: 13px; font-family: 'Latin Modern Math'">0</tspan>
+     <tspan x="305.000626" y="-0.953125" style="font-size: 13px; font-family: 'Latin Modern Math'">.</tspan>
+     <tspan x="308.614624" y="-0.953125" style="font-size: 13px; font-family: 'Latin Modern Math'">3</tspan>
+     <tspan x="315.114624" y="-0.953125" style="font-size: 13px; font-family: 'Latin Modern Math'"> </tspan>
+     <tspan x="319.430618" y="-0.953125" style="font-size: 13px; font-family: 'Latin Modern Math'">p</tspan>
+     <tspan x="326.658615" y="-0.953125" style="font-size: 13px; font-family: 'Latin Modern Math'">x</tspan>
+     <tspan x="333.522614" y="-0.953125" style="font-size: 13px; font-family: 'Latin Modern Math'"> </tspan>
+     <tspan x="337.838608" y="-0.953125" style="font-size: 13px; font-family: 'Latin Modern Math'"> </tspan>
+     <tspan x="342.154602" y="-0.953125" style="font-size: 13px; font-family: 'Latin Modern Math'">(</tspan>
+     <tspan x="347.211594" y="-0.953125" style="font-size: 13px; font-family: 'Latin Modern Math'">r</tspan>
+     <tspan x="352.307587" y="-0.953125" style="font-size: 13px; font-family: 'Latin Modern Math'">a</tspan>
+     <tspan x="358.807587" y="-0.953125" style="font-size: 13px; font-family: 'Latin Modern Math'">n</tspan>
+     <tspan x="366.035583" y="-0.953125" style="font-size: 13px; font-family: 'Latin Modern Math'">k</tspan>
+     <tspan x="372.899582" y="-0.953125" style="font-size: 13px; font-family: 'Latin Modern Math'"> </tspan>
+     <tspan x="377.215576" y="-0.953125" style="font-size: 13px; font-family: 'Latin Modern Math'">1</tspan>
+     <tspan x="383.715576" y="-0.953125" style="font-size: 13px; font-family: 'Latin Modern Math'"> </tspan>
+     <tspan x="388.03157" y="-0.953125" style="font-size: 13px; font-family: 'Latin Modern Math'">o</tspan>
+     <tspan x="394.53157" y="-0.953125" style="font-size: 13px; font-family: 'Latin Modern Math'">f</tspan>
+     <tspan x="398.509567" y="-0.953125" style="font-size: 13px; font-family: 'Latin Modern Math'"> </tspan>
+     <tspan x="402.825562" y="-0.953125" style="font-size: 13px; font-family: 'Latin Modern Math'">3</tspan>
+     <tspan x="409.325562" y="-0.953125" style="font-size: 13px; font-family: 'Latin Modern Math'">5</tspan>
+     <tspan x="415.825562" y="-0.953125" style="font-size: 13px; font-family: 'Latin Modern Math'">)</tspan>
+    </text>
+   </g>
+  </g>
+ </g>
+ <defs>
+  <clipPath id="pa0eaa60a48">
+   <rect x="10.766761" y="27.6" width="228.272727" height="228.272727"/>
+  </clipPath>
+  <clipPath id="p3050ef8ef0">
+   <rect x="284.694034" y="27.6" width="228.272727" height="228.272727"/>
+  </clipPath>
+ </defs>
+</svg>
