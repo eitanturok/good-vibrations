@@ -28,7 +28,7 @@ RUN, K, R_PX, TH, TOP, BAD = "decres-rescale-aug10-v1", 5, 2.0, .08, 3, "shifted
 OBJS = ["red-cube", "soap dispenser", "candle", "vase"]
 PAIRS = {"red-cube+vase": [("red-cube", "red-cube0"), ("vase", "vase0")], "green-cube+red-cube": [("red-cube", "green-cube0"), ("red-cube", "red-cube0")]}
 ICON = {"red-cube": "cube", "vase": "vase", "candle": "candle", "soap dispenser": "soap"}
-NAME = {"combine": "combine objects", "swap": "object swap", "boxswap": "box swap", "compose": "composition", "compose_simple": "simple composition"}
+NAME = {"combine": "combine objects", "swap": "object swap", "boxswap": "box swap", "compose": "composition", "compose_simple": "add position", "addpos_pooled": "add position", "addpos_objpos": "add position", "addpos_single": "add position"}  # simple composition = "add position" (paper framing)
 C, DC = ROOT / "runs/_src9_cache/nb137" / RUN, ROOT / "runs/_src9_cache/nb139" / RUN / "decode"; DC.mkdir(parents=True, exist_ok=True)
 
 # ---- nb139 cells 1-2
@@ -59,7 +59,7 @@ def combine():
                 m = (Y.sum(0) - Y[i]) / (n - 1); c = m - .5 * (mo[0] + mo[1]); ok = np.arange(n) == i
                 for u, v in itertools.product(NB[0][i], NB[1][i]):
                     zh = .5 * (Z[u] + Z[v]) + c; cs, a = score(zh, Y, ok, m); mg = cs[i] - np.delete(cs, i).max()
-                    if u == NB[0][i][0] and v == NB[1][i][0]: rc.append(a); I.append(inst(zh, p.index[i], p.index, ok, m))
+                    if u == NB[0][i][0] and v == NB[1][i][0]: rc.append(a); I.append(inst(zh, p.index[i], p.index, ok, m) | dict(u=u, v=v, c=c))
                     if best is None or mg > best[0]: best = (mg, i, u, v, zh, c, ok, m)
             mg, i, u, v, zh, c, ok, m = best
             ex = inst(zh, p.index[i], p.index, ok, m, mg=mg) | dict(terms=[(1, .5 * Z[u], ("photo", u), f"½ · {parts[0][0]} {PS(u)}"), (1, .5 * Z[v], ("photo", v), f"½ · {parts[1][0]} {PS(v)}"),
@@ -84,7 +84,7 @@ def swap():
             mX, mY = Z[xs.index].mean(0), Z[ys.index].mean(0); rc, I = swap_search(xs, ys, mY - mX, mY); ex = best_ex(I)
             ex |= dict(terms=[(1, Z[ex["src"]], ("photo", ex["src"]), f"{X} at p {PS(ex['src'])}"), (-1, mX, ("icon", X), f"mean {X}"), (1, mY, ("icon", Yo), f"mean {Yo}")],
                        gt=f"ground truth\n({Yo} at p) {PS(ex['t'])}")
-            yield dict(analogy="swap", key=(box, spk, X, Yo), sub=f"{X} → {Yo} · {box} · spk {spk}", top1=np.mean(np.array(rc) == 1), inst=I, ex=ex, Q=np.sort(np.r_[xs.index, ys.index]))
+            yield dict(analogy="swap", key=(box, spk, X, Yo), sub=f"{X} → {Yo} · {box} · spk {spk}", top1=np.mean(np.array(rc) == 1), inst=I, ex=ex, Q=np.sort(np.r_[xs.index, ys.index]), mX=mX, mY=mY)
 def boxswap():
     for spk, S in df.groupby("speaker"):
         for X in OBJS:
@@ -127,7 +127,7 @@ def compose_simple():
             if not rc: continue
             ex = best_ex(I); ex |= dict(terms=[(1, ex["mX"], ("icon", X), f"mean {X} in {box}"), (1, ex["mPos"], ("box", box, ex["p"]), "mean at p"), (-1, mRest, ("box", box, None), f"mean {box}")],
                                         gt=f"ground truth\n({X} at p) {PS(ex['t'])}")
-            yield dict(analogy="compose_simple", key=(spk, box, X), sub=f"{X} in {box} · spk {spk}", top1=np.mean(np.array(rc) == 1), inst=I, ex=ex, Q=np.sort(S.index))
+            yield dict(analogy="compose_simple", key=(spk, box, X), sub=f"{X} in {box} · spk {spk}", top1=np.mean(np.array(rc) == 1), inst=I, ex=ex, Q=np.sort(S.index), mRest=mRest)
 GEN = dict(combine=combine, swap=swap, boxswap=boxswap, compose=compose, compose_simple=compose_simple)
 
 # ---- decoder (latest checkpoint, fp32, tf32 off, eager); res decoder: no xattn, no adapter → decoder(u) alone. Loaded lazily, once.
@@ -174,7 +174,7 @@ def run(cfg, k):
                          iou_source_decoded_vs_analogy_expected=iou(SB[i], PCD[t]) if q["src"] is not None else np.nan, com_source_decoded_vs_analogy_expected=np.hypot(*(CS[i] - cm(PCD[t:t + 1])[0])) if q["src"] is not None else np.nan,
                          area_analogy_decoded=c["I_hat"][i].astype(np.float32).sum(), area_analogy_expected=c["cand_decoded"][t].astype(np.float32).sum(), area_ground_truth=GC[t].sum(), empty_analogy_decoded=not Ih[i].any()))
     M = pd.DataFrame(rows); M.to_csv(DC / f"{cfg['analogy']}_{k}.csv", index=False)
-    return M, Ih[-1], GC[cand.get_loc(cfg["ex"]["t"])]
+    return M, Ih, GC
 
 # ---- figure (same design as the object-swap figure): rows image | latent vector (2-D PCA, one small plot per term) | layout (Î ≈ I)
 PRED = "#E6A700"  # the prediction's single identity: gold, gold ★ with a dark edge
@@ -188,8 +188,8 @@ def thumb(ax, xy, img, px=52, off=(0, 34), al=.25):
     if im is None: ax.add_artist(AnnotationBbox(TextArea(img[1], textprops=dict(fontsize=15, color="0.3", style="italic")), xy, xybox=off, boxcoords="offset points", bboxprops=dict(ec="0.5", fc="0.95", boxstyle="square,pad=0.4", alpha=max(al, .6))))
     else: t = im.copy(); t.thumbnail((px * 3, px * 3)); ax.add_artist(AnnotationBbox(OffsetImage(np.asarray(t), zoom=1 / 3, alpha=al), xy, xybox=off, boxcoords="offset points", frameon=False))
 OWN, CHAIN = [(20, 30), (0, 36), (-38, 22), (0, 36)], [(-6, -28), (16, 36), (-14, 28), (16, 36)]  # thumbnail offsets per term (own panel / chain in the prediction panel)
-def figure(cfg, M, Ih, gt, out):
-    ex, e = cfg["ex"], M.iloc[-1]; T = ex["terms"]; nt = len(T); za, zgt = ex["z"], Z[ex["t"]]
+def figure(cfg, e, Ih, gt, out, fit=False):  # e = the example's metrics row, Ih / gt = its Î / I; fit: latent panels stretch (no equal aspect), thumbnails pushed off the arrow tips
+    ex = cfg["ex"]; T = ex["terms"]; nt = len(T); za, zgt = ex["z"], Z[ex["t"]]
     assert np.allclose(sum(s * z for s, z, _, _ in T), za, atol=1e-3)  # the terms add up to ẑ
     OPS = [("−" if s < 0 else "+") for s, _, _, _ in T[1:]] + ["=", "≈"]; cols = [1 + 2 * i for i in range(nt + 2)]; pc, gc = cols[-2], cols[-1]
     f = plt.figure(figsize=(38, 13.5))
@@ -209,24 +209,31 @@ def figure(cfg, M, Ih, gt, out):
     Q = Z[cfg["Q"]]; W = np.linalg.svd(Q - Q.mean(0), full_matrices=False)[2][:2].T; pj = lambda x: x @ W
     V = [(s * pj(z), col) for (s, z, _, _), col in zip(T, ["tab:red", "0.45", "tab:orange", "tab:purple"])]; pa, pg = pj(za), pj(zgt)
     chain = np.cumsum([np.zeros(2)] + [v for v, _ in V], 0); assert np.allclose(chain[-1], pa, atol=1e-3)
-    pts = np.r_[chain, [v for v, _ in V], [pa, pg], np.zeros((1, 2))]; lo, hi = pts.min(0), pts.max(0); pad = (hi - lo).max() * .06
+    pts = np.r_[chain, [v for v, _ in V], [pa, pg], np.zeros((1, 2))]; lo, hi = pts.min(0), pts.max(0); pad = (hi - lo) * .15 if fit else (hi - lo).max() * .06
+    span = np.maximum(hi, 0) - np.minimum(lo, 0) + 2 * pad
+    x0 = np.array([min(lo[0], 0), min(lo[1], 0)]) - (pad if fit else np.array([pad, pad]))
+    def away(d, r=50):  # offset (points) beside the tip of the arrow 0 → d: perpendicular to it (off the arrow), on the side facing the panel centre (inside, off the edges)
+        u = np.asarray(d, float) / span; n = np.linalg.norm(u)
+        if n == 0: return (0, r)
+        q = np.array([-u[1], u[0]]) / n; tip = (np.asarray(d, float) - x0) / span; q = q if q @ (.5 - tip) >= 0 else -q; return tuple(r * q)
     for i, cI in enumerate(cols):
         ax = f.add_subplot(gs[1, cI])
-        ax.set_xlim(min(lo[0], 0) - pad, max(hi[0], 0) + pad); ax.set_ylim(min(lo[1], 0) - pad, max(hi[1], 0) + pad); ax.set_aspect("equal")
+        pd_ = pad if fit else np.array([pad, pad]); ax.set_xlim(min(lo[0], 0) - pd_[0], max(hi[0], 0) + pd_[0]); ax.set_ylim(min(lo[1], 0) - pd_[1], max(hi[1], 0) + pd_[1])
+        if not fit: ax.set_aspect("equal")
         for sp in ("top", "right"): ax.spines[sp].set_visible(False)
         for sp in ("left", "bottom"): ax.spines[sp].set_position("zero"); ax.spines[sp].set_color("0.6")
         ax.set_xticks([]); ax.set_yticks([]); ax.text(ax.get_xlim()[1], 0, " PC1", va="center", ha="left", fontsize=9); ax.text(0, ax.get_ylim()[1], "PC2", va="bottom", ha="center", fontsize=9)
         if i < nt:
-            arrow(ax, (0, 0), V[i][0], V[i][1]); thumb(ax, V[i][0], T[i][2], off=OWN[i], al=1.)
+            arrow(ax, (0, 0), V[i][0], V[i][1]); thumb(ax, V[i][0], T[i][2], off=away(V[i][0]) if fit else OWN[i], al=1.)
             if T[i][0] < 0: ax.annotate(f"− {T[i][3]}", V[i][0] * .5, xytext=(0, -8), textcoords="offset points", color="0.35", fontsize=13, ha="center", va="top")
         elif i == nt:
-            for (v, col), a0, a1_, (_, _, img, _), off in zip(V, chain[:-1], chain[1:], T, CHAIN): arrow(ax, a0, a1_, col, al=.65, lw=2.2); thumb(ax, (a0 + a1_) / 2, img, off=off, al=.6)
+            for (v, col), a0, a1_, (_, _, img, _), off in zip(V, chain[:-1], chain[1:], T, CHAIN): arrow(ax, a0, a1_, col, al=.65, lw=2.2); thumb(ax, (a0 + a1_) / 2, img, off=away(v, 40) if fit else off, al=.6)  # fit: perpendicular to the segment
             arrow(ax, (0, 0), pa, PRED, lw=3.6); ax.scatter(*pa, marker="*", s=400, c=PRED, edgecolors="0.15", linewidths=1.2, zorder=10, clip_on=False)  # the prediction
             ax.annotate(r"$\hat{z}$", pa, xytext=(10, 6), textcoords="offset points", fontsize=16, color="0.1")
         else:
             arrow(ax, (0, 0), pa, PRED, al=.4, lw=2.2); ax.scatter(*pa, marker="*", s=400, c=PRED, edgecolors="0.15", linewidths=1.2, zorder=10, clip_on=False)
             arrow(ax, (0, 0), pg, "k", ls=(0, (4, 2.5)), lw=2.0); ax.scatter(*pg, s=70, facecolors="none", edgecolors="k", linewidths=1.5, zorder=9, clip_on=False)  # ground-truth tip
-            ax.annotate(r"$z$", pg, xytext=(8, 4), textcoords="offset points", fontsize=16, color="0.1"); thumb(ax, pg, ("photo", ex["t"]), off=(-44, 24), al=1.)
+            ax.annotate(r"$z$", pg, xytext=(8, 4), textcoords="offset points", fontsize=16, color="0.1"); thumb(ax, pg, ("photo", ex["t"]), off=away(pg) if fit else (-44, 24), al=1.)
         if i < nt: ao = f.add_subplot(gs[1, cI + 1]); ao.set_axis_off(); ao.text(.5, .5, OPS[i], ha="center", va="center", fontsize=34, weight="bold")
     # row 3: layout — Î ≈ I, with decoder / label arrows from the latent row
     for cI, m, how in ((pc, Ih.astype(float), "decoder"), (gc, gt.astype(float), "label")):
@@ -250,16 +257,148 @@ def figure(cfg, M, Ih, gt, out):
 # ---- run: rank configs as the notebook (pandas sort of top1, descending), decode + figure + summary for the top 3
 only = sys.argv[1:]; SUM = []
 for an, gen in GEN.items():
-    if only and an != only[0]: continue
+    if only and an != only[0] or only[:1] in (["cube_best"], ["goals"], ["pooled"]): continue
     CF = list(gen()); T = pd.DataFrame([dict(top1=c_["top1"]) for c_ in CF]).sort_values("top1", ascending=False)
     for k, ix in enumerate(T.index[:TOP], 1):
         if len(only) > 1 and k != int(only[1]): continue
-        cfg = CF[ix]; M, Ih, gt = run(cfg, k); H = M[~M.example]
+        cfg = CF[ix]; M, Ih, GC = run(cfg, k); H = M[~M.example]
         print(f"{NAME[an]} #{k} {cfg['sub']}: n {len(H)} · nb top1 {cfg['top1']:.3f} · IoU {H.iou_analogy_decoded_vs_ground_truth.mean():.3f} · rank@1 cos {np.mean(H.rank_cos_latent == 1):.3f} IoU {np.mean(H.rank_iou_layout == 1):.3f}")
         SUM.append(dict(analogy=NAME[an], k=k, config=cfg["sub"], n=len(H), n_candidates=H.n_candidates.median(), nb_top1_cos=cfg["top1"], latent_cos_rank1=np.mean(H.rank_cos_latent == 1),
                         mean_iou=H.iou_analogy_decoded_vs_ground_truth.mean(), iou_rank1=np.mean(H.rank_iou_layout == 1), mean_iou_rank=H.rank_iou_layout.mean(),
                         median_com_px=H.com_analogy_decoded_vs_ground_truth.median(), com_rank1=np.mean(H.rank_com_layout == 1), mean_com_rank=H.rank_com_layout.mean(),
                         ceiling_iou=H.iou_analogy_expected_vs_ground_truth.mean(), baseline_iou=H.iou_source_decoded_vs_ground_truth.mean(), empty=int(H.empty_analogy_decoded.sum())))
-        figure(cfg, M, Ih, gt, ROOT / f"notebooks/out/139_decode_{an}_{k}.pdf")
+        figure(cfg, M.iloc[-1], Ih[-1], GC[cfg["cand"].get_loc(cfg["ex"]["t"])], ROOT / f"notebooks/out/139_decode_{an}_{k}.pdf")
 if not only:
     S = pd.DataFrame(SUM); S.to_csv(DC / "summary.csv", index=False); print(S.round(3).to_string())
+
+# ---- best samples of "mean red-cube in box + box at p (from the box's OTHER objects) = red-cube at p" (simple composition, X = red-cube), every box × speaker:
+#      keep instances with the true recording rank 1 under latent cos AND layout IoU, sort by IoU(I, Î) (CoM tie-break); top 3 overall (distinct boxes first) + top 1 per box
+if only[:1] == ["cube_best"]:
+    X, R, PK = "red-cube", [], []
+    for cfg in compose_simple():
+        spk, box, ob = cfg["key"]
+        if ob != X: continue
+        M, Ih, GC = run(cfg, f"cube_{box}_{spk}"); H = M[~M.example].reset_index(drop=True)
+        ok = H[(H.rank_cos_latent == 1) & (H.rank_iou_layout == 1)].sort_values(["iou_analogy_decoded_vs_ground_truth", "com_analogy_decoded_vs_ground_truth"], ascending=[False, True])
+        R.append(dict(box=box, speaker=spk, n=len(H), mean_iou=H.iou_analogy_decoded_vs_ground_truth.mean(), iou_rank1=np.mean(H.rank_iou_layout == 1), cos_rank1=np.mean(H.rank_cos_latent == 1),
+                      median_com_px=H.com_analogy_decoded_vs_ground_truth.median(), n_rank1_both=len(ok), best_iou=ok.iou_analogy_decoded_vs_ground_truth.max() if len(ok) else np.nan))
+        for i in ok.index: PK.append((cfg, i, H.loc[i], Ih[i], GC[cfg["cand"].get_loc(H.target_row[i])]))
+    T = pd.DataFrame(R); T.to_csv(DC / "cube_best_table.csv", index=False); print(T.round(3).to_string())
+    PK.sort(key=lambda t: (-t[2].iou_analogy_decoded_vs_ground_truth, t[2].com_analogy_decoded_vs_ground_truth))
+    top = []
+    for t in PK:  # distinct boxes first, then fill
+        if len(top) < 3 and t[0]["key"][1] not in {u[0]["key"][1] for u in top}: top.append(t)
+    top += [t for t in PK if t not in top][:3 - len(top)]
+    per_box = {}
+    for t in PK: per_box.setdefault(t[0]["key"][1], t)
+    picks = [(f"best_{j + 1}", t) for j, t in enumerate(top)] + [(f"box_{b}", t) for b, t in per_box.items()]
+    rows = []
+    for tag, (cfg, i, e, Ih_, gt) in picks:
+        spk, box, _ = cfg["key"]; q = cfg["inst"][i]; assert q["t"] == e.target_row
+        ex = dict(q) | dict(terms=[(1, q["mX"], ("icon", X), f"mean {X} in {box}"), (1, q["mPos"], ("box", box, q["p"]), f"position p in {box}"), (-1, cfg["mRest"], ("box", box, None), f"mean {box}")],
+                            gt=f"ground truth\n({X} at p) {PS(q['t'])}")
+        figure(dict(cfg, ex=ex, sub=f"{X} · {box} · spk {spk} · best sample"), e, Ih_, gt, ROOT / f"notebooks/out/139_goal_addpos_cube_{tag}.pdf")
+        rows.append(dict(pick=tag, box=box, speaker=spk, target=PS(q["t"]), iou=e.iou_analogy_decoded_vs_ground_truth, com_px=e.com_analogy_decoded_vs_ground_truth, rank_cos=e.rank_cos_latent,
+                         rank_l1=e.rank_l1_latent, rank_iou=e.rank_iou_layout, rank_com=e.rank_com_layout, n_candidates=e.n_candidates))
+    P = pd.DataFrame(rows); P.to_csv(DC / "cube_best_picks.csv", index=False); print(P.round(3).to_string())
+
+# ---- three goals (paper framing): add position (= simple composition), swap object (= object swap), combine objects (= pair). In the #1 config of each:
+#      the 3 best instances (rank 1 under latent cos AND layout IoU, sorted by IoU(I, Î) then CoM), at clearly different positions / arrangements (≥ 8 px apart)
+def terms_for(an, cfg, q):
+    if an == "combine":
+        pair = cfg["key"][0]; (o0, _), (o1, _) = PAIRS[pair]
+        return [(1, .5 * Z[q["u"]], ("photo", q["u"]), f"½ · {o0} {PS(q['u'])}"), (1, .5 * Z[q["v"]], ("photo", q["v"]), f"½ · {o1} {PS(q['v'])}"), (1, q["c"], ("tile", "c"), "c (mean interaction)")], f"ground truth\n({pair}) {PS(q['t'])}"
+    if an == "swap":
+        _, _, X, Yo = cfg["key"]
+        return [(1, Z[q["src"]], ("photo", q["src"]), f"{X} at p {PS(q['src'])}"), (-1, cfg["mX"], ("icon", X), f"mean {X}"), (1, cfg["mY"], ("icon", Yo), f"mean {Yo}")], f"ground truth\n({Yo} at p) {PS(q['t'])}"
+    _, box, X = cfg["key"]
+    return [(1, q["mX"], ("icon", X), f"mean {X} in {box}"), (1, q["mPos"], ("box", box, q["p"]), f"position p in {box}"), (-1, cfg["mRest"], ("box", box, None), f"mean {box}")], f"ground truth\n({X} at p) {PS(q['t'])}"
+if only[:1] == ["goals"]:
+    GOALS = [("addpos", "compose_simple", ("7", "plastic", "vase")), ("swap", "swap", ("plastic", "7", "red-cube", "vase")), ("combine", "combine", ("red-cube+vase", "plastic", "3"))]
+    rows, lines = [], []
+    for goal, an, key in GOALS:
+        cfg = next(c_ for c_ in GEN[an]() if c_["key"] == key)
+        k = {"compose_simple": 1, "swap": 1, "combine": 1}[an]; M, Ih, GC = run(cfg, k); H = M[~M.example].reset_index(drop=True)
+        ok = H[(H.rank_cos_latent == 1) & (H.rank_iou_layout == 1)].sort_values(["iou_analogy_decoded_vs_ground_truth", "com_analogy_decoded_vs_ground_truth"], ascending=[False, True])
+        where = lambda j: df.loc[j, [f"{key[0]}_x0", f"{key[0]}_y0", f"{key[0]}_x1", f"{key[0]}_y1"]].values.astype(float) if an == "combine" else df.loc[j, ["x", "y"]].values.astype(float)
+        pick = []
+        for i in ok.index:
+            if all(np.linalg.norm(where(H.target_row[i]) - where(H.target_row[j])) >= 8 for j in pick): pick.append(i)
+            if len(pick) == 3: break
+        for b, i in enumerate(pick, 1):
+            q, e = cfg["inst"][i], H.loc[i]; assert q["t"] == e.target_row; T_, gtl = terms_for(an, cfg, q)
+            figure(dict(cfg, ex=dict(q) | dict(terms=T_, gt=gtl), sub=f"{cfg['sub']} · best {b} of {len(H)}", analogy=an), e, Ih[i], GC[cfg["cand"].get_loc(q["t"])], ROOT / f"notebooks/out/139_goal_{goal}_best_{b}.pdf")
+            rows.append(dict(goal=goal, config=cfg["sub"], best=b, target=PS(q["t"]), source=PS(q["src"]) if q["src"] is not None else "", iou=e.iou_analogy_decoded_vs_ground_truth, com_px=e.com_analogy_decoded_vs_ground_truth,
+                             rank_cos=e.rank_cos_latent, rank_l1=e.rank_l1_latent, rank_iou=e.rank_iou_layout, rank_com=e.rank_com_layout, n_candidates=e.n_candidates))
+        lines.append(dict(goal=goal, config=cfg["sub"], n=len(H), mean_iou=H.iou_analogy_decoded_vs_ground_truth.mean(), n_rank1_both=len(ok),
+                          pick_ious=" / ".join(f"{H.iou_analogy_decoded_vs_ground_truth[i]:.2f}" for i in pick)))
+    P, L_ = pd.DataFrame(rows), pd.DataFrame(lines); P.to_csv(DC / "goals_picks.csv", index=False); L_.to_csv(DC / "goals_table.csv", index=False)
+    print(P.round(3).to_string()); print(L_.round(3).to_string())
+
+# ---- add position, pooled variants (single-object recordings only: no pairs, no empty, not X; K = 10 nearest to p in the box's 64×64 frame; one speaker;
+#      every recording at the target position (within R_PX, the candidates counted as true) is left out of every mean). Per box b:
+#      mean_b = single-object mean, mX_b = X mean, pos_b(p) = mean of the K nearest non-X single-object samples to p − mean_b
+#      pooled: ẑ = mean_tbox + (mean_b mX_b − mean_b mean_b) + mean_b pos_b(p)     objpos: ẑ = (mean_b mX_b − mean_b mean_b) + Kmean_tbox(p)
+#      single: ẑ = mX_tbox + pos_tbox(p)                                                  (mean_b = average over the boxes this speaker has)
+KP = 10
+def addpos_variants(s, tbox, X):
+    SO = df[(df.speaker == s) & ~df.object.str.contains("+", regex=False) & (df.object != "empty")]
+    tg = SO[(SO.box == tbox) & (SO.object == X)]
+    if len(tg) < 30: return None
+    BX = sorted(SO.box.unique()); sumA = {b: Z[SO.index[SO.box == b]].sum(0) for b in BX}; nA = {b: (SO.box == b).sum() for b in BX}
+    sumX = {b: Z[SO.index[(SO.box == b) & (SO.object == X)]].sum(0) for b in BX}; nX = {b: ((SO.box == b) & (SO.object == X)).sum() for b in BX}
+    NX = {b: SO[(SO.box == b) & (SO.object != X)] for b in BX}; ctr = Z[tg.index].mean(0); out = {v: [] for v in ("pooled", "objpos", "single")}
+    for j, r in tg.iterrows():
+        ok = np.hypot(tg.x.values - r.x, tg.y.values - r.y) <= R_PX
+        if ok.all(): continue
+        drop = Z[tg.index[ok]].sum(0); nd = ok.sum()
+        mb = {b: (sumA[b] - (drop if b == tbox else 0)) / (nA[b] - (nd if b == tbox else 0)) for b in BX}
+        mx = {b: (sumX[b] - (drop if b == tbox else 0)) / (nX[b] - (nd if b == tbox else 0)) for b in BX if nX[b] - (nd if b == tbox else 0) > 0}
+        km = {}
+        for b in BX:
+            d = np.hypot(NX[b].x.values - r.x, NX[b].y.values - r.y); nn = NX[b].index[np.argsort(d)[:KP]]; km[b] = (Z[nn].mean(0), len(nn), d[np.argsort(d)[:KP]].max())
+        dX = np.mean([mx[b] for b in mx], 0) - np.mean([mb[b] for b in BX], 0); pos_all = np.mean([km[b][0] - mb[b] for b in BX], 0)
+        Z3 = dict(pooled=mb[tbox] + dX + pos_all, objpos=dX + km[tbox][0], single=mx[tbox] + km[tbox][0] - mb[tbox])
+        for v, zh in Z3.items():
+            cs, a = score(zh, Z[tg.index], ok, ctr)
+            out[v].append(inst(zh, tg.index[ok][np.argmax(cs[ok])], tg.index, ok, ctr, mg=cs[ok].max() - cs[~ok].max()) | dict(a=a, p=(r.x, r.y), nK=km[tbox][1], rK=km[tbox][2],
+                          parts=dict(mt=mb[tbox], dX=dX, pos_all=pos_all, km=km[tbox][0], mxt=mx[tbox], pt=km[tbox][0] - mb[tbox]), nbox=len(BX)))
+    Q = np.sort(SO.index)
+    return {v: dict(analogy=f"addpos_{v}", key=(v, tbox, X, s), sub=f"{X} in {tbox} · spk {s}", top1=np.mean([q["a"] == 1 for q in I]), inst=I, ex=best_ex(I), Q=Q) for v, I in out.items()}
+def terms_addpos(v, tbox, X, q):
+    P_ = q["parts"]
+    if v == "pooled": return [(1, P_["mt"], ("box", tbox, None), f"mean {tbox}"), (1, P_["dX"], ("icon", X), f"{X} (all boxes)"), (1, P_["pos_all"], ("box", tbox, q["p"]), "position p (all boxes)")]
+    if v == "objpos": return [(1, P_["dX"], ("icon", X), f"{X} (all boxes)"), (1, P_["km"], ("box", tbox, q["p"]), f"position p in {tbox}")]
+    return [(1, P_["mxt"], ("icon", X), f"mean {X} in {tbox}"), (1, P_["pt"], ("box", tbox, q["p"]), f"position p in {tbox}")]
+if only[:1] == ["pooled"]:
+    R, BEST = [], {}
+    for X in ("vase", "red-cube"):
+        for tbox in ("plastic", "gastro", "cardboard"):
+            for s in ("1", "3", "5", "7"):
+                V3 = addpos_variants(s, tbox, X)
+                if V3 is None: continue
+                old = next((c_ for c_ in compose_simple() if c_["key"] == (s, tbox, X)), None)
+                for v, cfg in list(V3.items()) + [("old", old)]:
+                    if cfg is None: continue
+                    tag = f"{tbox}_{X.replace(' ', '_')}_{s}"; M, Ih, GC = run(cfg, f"cube_{tbox}_{s}" if v == "old" and X == "red-cube" else tag); H = M[~M.example].reset_index(drop=True)
+                    ok = H[(H.rank_cos_latent == 1) & (H.rank_iou_layout == 1)].sort_values(["iou_analogy_decoded_vs_ground_truth", "com_analogy_decoded_vs_ground_truth"], ascending=[False, True])
+                    R.append(dict(variant=v, box=tbox, object=X, speaker=s, n=len(H), mean_iou=H.iou_analogy_decoded_vs_ground_truth.mean(), iou_rank1=np.mean(H.rank_iou_layout == 1),
+                                  cos_rank1=np.mean(H.rank_cos_latent == 1), median_com_px=H.com_analogy_decoded_vs_ground_truth.median(), best_iou=ok.iou_analogy_decoded_vs_ground_truth.max() if len(ok) else np.nan,
+                                  nK=np.mean([q.get("nK", np.nan) for q in cfg["inst"]]), rK_px=np.mean([q.get("rK", np.nan) for q in cfg["inst"]]), n_boxes=cfg["inst"][0].get("nbox", 1)))
+                    if (v, tbox, X) in (("pooled", "plastic", "vase"), ("objpos", "cardboard", "red-cube")): BEST.setdefault((v, tbox, X), []).append((H.iou_analogy_decoded_vs_ground_truth.mean(), cfg, H, ok, Ih, GC))
+    T = pd.DataFrame(R); T.to_csv(DC / "addpos_variants_table.csv", index=False); print(T.round(3).to_string())
+    rows = []
+    for (v, tbox, X), L in BEST.items():
+        _, cfg, H, ok, Ih, GC = max(L, key=lambda t: t[0])  # the best speaker = highest mean IoU
+        pick = []
+        for i in ok.index:
+            if all(np.hypot(*(df.loc[H.target_row[i], ["x", "y"]].values - df.loc[H.target_row[j], ["x", "y"]].values).astype(float)) >= 8 for j in pick): pick.append(i)
+            if len(pick) == 3: break
+        for b, i in enumerate(pick, 1):
+            q, e = cfg["inst"][i], H.loc[i]; assert q["t"] == e.target_row
+            ex = dict(q) | dict(terms=terms_addpos(v, tbox, X, q), gt=f"ground truth\n({X} at p) {PS(q['t'])}")
+            figure(dict(cfg, ex=ex, sub=f"{cfg['sub']} · {'pooled over boxes' if v == 'pooled' else 'object + position in a box'} · best {b} of {len(H)}"), e, Ih[i], GC[cfg["cand"].get_loc(q["t"])],
+                   ROOT / f"notebooks/out/139_goal_addpos_{v}_{tbox}_{X.replace(' ', '_')}_best_{b}.pdf", fit=True)
+            rows.append(dict(variant=v, box=tbox, object=X, speaker=cfg["key"][3], best=b, target=PS(q["t"]), iou=e.iou_analogy_decoded_vs_ground_truth, com_px=e.com_analogy_decoded_vs_ground_truth,
+                             rank_cos=e.rank_cos_latent, rank_l1=e.rank_l1_latent, rank_iou=e.rank_iou_layout, rank_com=e.rank_com_layout, n_candidates=e.n_candidates, nK=q["nK"], config_mean_iou=H.iou_analogy_decoded_vs_ground_truth.mean()))
+    P = pd.DataFrame(rows); P.to_csv(DC / "addpos_variants_picks.csv", index=False); print(P.round(3).to_string())
