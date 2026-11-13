@@ -10,6 +10,7 @@ x (B, L=100 lasers on a 10x10 grid, 1170 bins, C=2) linear |X|
 -> heads on u: object class (CE, "unseen" ignored) and box class (CE), x 0.1 each.
    (--spk-grl-w W > 0: + a speaker head on GRL(u), CE x W; GRL = identity forward, -lambda x grad backward (Ganin & Lempitsky DANN), so the encoder
     is pushed to make u speaker-free. lambda = spk_grl_lambda, or with --spk-grl-ramp N (epochs) lambda x (2 / (1 + exp(-10 p)) - 1), p = epoch / N)
+--lasers i,j,..: only those lasers exist (sliced before the z-score + freq stage, masked in the laser stage; laser-count ablation, scripts/laser_ablation.sh).
 train only: speaker gain (sd 0.35, knots every 20 Hz), laser jitter (+-0.5 cells), each laser / band token dropped iid with prob 0.2 (>= 1 of each kept)."""
 import math
 from functools import partial
@@ -146,11 +147,14 @@ class Encoder(nn.Module):
         self.L, self.n_bands = rows * cols, n_bins // BINS                             # 100 lasers, 1170 / 65 = 18 bands
         self.embed = nn.Linear(BINS * n_channels, D)
         self.freq_enc, self.laser_enc = FreqEncoder(self.n_bands, freq_rope, freq_hz, n_bins), LaserEncoder(rows, cols, latent_norm)
+        self.register_buffer("idx", None, persistent=False)                            # --lasers: the kept laser indices (None = all)
 
     def forward(self, x, m_l, m_b, tokens=None):                                     # (B,L,n_bins,C) -> (B,LATENT); tokens "freq" | "laser": also return those (B,L,D) tokens
+        if self.idx is not None: x = x[:, self.idx]                                   # --lasers: only the kept lasers are seen (z-score + freq stage)
         x = (x - x.mean((1, 2, 3), keepdim=True)) / (x.std((1, 2, 3), keepdim=True) + 1e-6)
         x = x.reshape(*x.shape[:2], self.n_bands, BINS, -1).flatten(-2)               # (B,L,n_bands,BINS*C)
         f = self.freq_enc(self.embed(x), m_b)
+        if self.idx is not None: f = f.new_zeros(len(f), self.L, f.shape[-1]).index_copy(1, self.idx, f)  # back on the 10x10 grid; the rest are masked in m_l
         if tokens is None: return self.laser_enc(f, m_l)
         u, t = self.laser_enc(f, m_l, tokens=True)
         return u, (f if tokens == "freq" else t)
@@ -258,11 +262,12 @@ class Decoder(nn.Module):
 
 class Transformer4(ComposerModel):
     def __init__(self, info, speaker_gain=SPEAKER_GAIN, speaker_gain_hz=SPEAKER_GAIN_HZ, laser_jitter=LASER_JITTER, laser_jitter_p=1.0, speaker_gain_p=1.0, laser_drop_p=1.0, band_drop_p=1.0, decoder="two", latent_norm="ln", freq_rope="linear",
-                 spk_grl_w=0.0, spk_grl_lambda=1.0, spk_grl_ramp=0, adapter_dim=0):
+                 spk_grl_w=0.0, spk_grl_lambda=1.0, spk_grl_ramp=0, adapter_dim=0, lasers=""):
         super().__init__()
         self.sg, self.sg_hz, self.jitter, self.jitter_p, self.sg_p, self.ld_p, self.bd_p = speaker_gain, speaker_gain_hz, laser_jitter, laser_jitter_p, speaker_gain_p, laser_drop_p, band_drop_p
         self.freq_hz, self.grid_rc = info["freq_range"], (info["n_laser_rows"], info["n_laser_cols"])
         self.encoder = Encoder(info["n_channels"], info["n_freqs"], *self.grid_rc, latent_norm, freq_rope, self.freq_hz)
+        if lasers: self.encoder.idx = torch.tensor(sorted(int(i) for i in lasers.split(",")))  # buffer only: same params / state_dict / RNG draws as the full model
         self.decoder = Decoder(decoder, self.grid_rc)
         self.n_known = len(info["objects"]) - 1                                       # objects[-1] = "unseen": no logit, ignored by the CE
         self.object_head, self.box_head = aux_head(self.n_known), aux_head(len(info["boxes"]))
@@ -282,6 +287,10 @@ class Transformer4(ComposerModel):
             x = speaker_gain(x, self.freq_hz, self.sg, self.sg_hz, self.sg_p)
             x = laser_jitter(x, *self.grid_rc, self.jitter, self.jitter_p)
             m_l, m_b = drop(B, L, LASER_DROP, x.device, self.ld_p), drop(B, n_bands, BAND_DROP, x.device, self.bd_p)
+        if (idx := self.encoder.idx) is not None:                                     # --lasers: the other lasers are always dropped (>= 1 kept laser stays)
+            keep = torch.zeros(L, dtype=torch.bool, device=x.device).index_fill(0, idx, True)
+            m_l = m_l & keep
+            m_l = m_l | (keep & ~m_l.any(1, keepdim=True))
         src = self.decoder.tokens                                                     # None, or the Encoder tokens the xattn decoder reads ("freq" | "laser")
         u, t = self.encoder(x, m_l, m_b, src) if src else (self.encoder(x, m_l, m_b), None)
         obj, box = self.object_head(u), self.box_head(u)                              # heads before the decoder: u's grads sum in transformer3's order (bit-equal)
